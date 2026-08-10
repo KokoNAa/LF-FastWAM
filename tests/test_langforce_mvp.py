@@ -235,7 +235,7 @@ class LangForcePriorTest(unittest.TestCase):
 
     def test_query_checkpoint_round_trip(self):
         before = self.model.action_expert.latent_action_queries.detach().clone()
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
             path = f"{tmpdir}/tiny.pt"
             self.model.save_checkpoint(path)
             restored = tiny_fastwam()
