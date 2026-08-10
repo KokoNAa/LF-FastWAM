@@ -109,6 +109,22 @@ post_vs_prior_loss_ratio
 fraction_post_better_than_prior
 ```
 
+For a four-GPU preliminary evaluation of all ten LIBERO-Spatial tasks, run the
+controlled Correct/Null matrix. The default is five trials per task, ten
+inference steps, and seed 42:
+
+```bash
+PYTHON_BIN=/opt/conda/bin/python \
+bash scripts/eval_lf_lora_spatial_matrix.sh 4 5 10 42
+```
+
+This runs B0, B1, and M1 sequentially by condition while parallelizing tasks
+across four GPUs, then writes `lf_mvp_summary.json` and `.csv`. The Spatial
+tasks all move the same black bowl to the same plate and differ only in the
+bowl's initial location. Consequently, they support a preliminary
+Correct/Null comparison but do not provide valid shuffled hard negatives or a
+meaningful DTL estimate.
+
 ## Correct / Null / Shuffled evaluation
 
 Copy the example manifest, replace placeholders with exact LIBERO task names and
