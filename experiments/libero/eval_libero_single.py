@@ -36,6 +36,7 @@ from experiments.libero.libero_utils import (
     save_rollout_video,
 )
 from experiments.libero.init_state_utils import load_libero_task_init_states
+from experiments.libero.language_condition import normalize_instruction_condition
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
@@ -362,9 +363,9 @@ def _resolve_language_intervention(
     cfg: DictConfig,
 ) -> tuple[str, str, bool]:
     """Resolve correct/null/shuffled policy language for one task."""
-    condition = str(
+    condition = normalize_instruction_condition(
         cfg.EVALUATION.get("instruction_condition", "correct")
-    ).strip().lower()
+    )
     if condition == "correct":
         return condition, task_description, False
     if condition == "null":
