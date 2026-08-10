@@ -35,11 +35,12 @@ from experiments.libero.libero_utils import (
     save_prediction_video,
     save_rollout_video,
 )
+from experiments.libero.init_state_utils import load_libero_task_init_states
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
-from libero.libero import benchmark
+from libero.libero import benchmark, get_libero_path
 from action_ensembler import ActionEnsembler
 
 OmegaConf.register_new_resolver("eval", eval)
@@ -874,7 +875,11 @@ def eval_single_process(cfg: DictConfig):
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.EVALUATION.task_suite_name]()
     task = task_suite.get_task(cfg.EVALUATION.task_id)
-    initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
+    initial_states = load_libero_task_init_states(
+        task_suite,
+        int(cfg.EVALUATION.task_id),
+        get_libero_path("init_states"),
+    )
 
     while len(initial_states) < int(cfg.EVALUATION.num_trials):
         initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
