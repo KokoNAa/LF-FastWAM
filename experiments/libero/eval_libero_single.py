@@ -813,6 +813,13 @@ def run_single_task(
     if instruction_condition == "shuffled":
         # The simulator success predicate still represents the original task.
         results["default_task_successes"] = results["successes"]
+    try:
+        env.close()
+    except Exception:
+        # Evaluation results are already complete at this point. Keep a
+        # renderer-cleanup failure from discarding them, but retain the full
+        # traceback in the task log for diagnosis.
+        logging.warning("Failed to close LIBERO environment cleanly.", exc_info=True)
     return results
 
 
