@@ -87,6 +87,7 @@ def create_fastwam(
     action_scheduler=None,
     loss=None,
     langforce_mvp=None,
+    lora=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -143,6 +144,13 @@ def create_fastwam(
             f"`langforce_mvp` must be dict-like, got {type(langforce_mvp)}"
         )
 
+    if isinstance(lora, DictConfig):
+        lora = OmegaConf.to_container(lora, resolve=True)
+    if lora is None:
+        lora = {}
+    if not isinstance(lora, dict):
+        raise ValueError(f"`lora` must be dict-like, got {type(lora)}")
+
     return FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -166,6 +174,7 @@ def create_fastwam(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         langforce_mvp_config=langforce_mvp,
+        lora_config=lora,
     )
 
 

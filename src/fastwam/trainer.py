@@ -46,6 +46,7 @@ class Wan22Trainer:
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
+        self.save_training_state = bool(cfg.get("save_training_state", True))
         
         self.resume = cfg.resume
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
@@ -80,12 +81,24 @@ class Wan22Trainer:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
-        # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
+        # In LoRA mode only adapters plus explicitly selected small modules are
+        # exposed to the optimizer; full fine-tuning retains the old behavior.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+        trainable_params = [
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+        ]
+        if not trainable_params:
+            raise ValueError("No trainable parameters were selected for optimization.")
+        trainable_count = sum(parameter.numel() for parameter in trainable_params)
+        total_count = sum(parameter.numel() for parameter in self.model.parameters())
+        logger.info(
+            "Optimizer parameters: trainable=%d total=%d fraction=%.6f",
+            trainable_count,
+            total_count,
+            trainable_count / max(total_count, 1),
+        )
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -285,6 +298,14 @@ class Wan22Trainer:
 
     @staticmethod
     def _apply_dit_only_train_mode(model):
+        if hasattr(model, "prepare_trainable_parameters"):
+            report = model.prepare_trainable_parameters()
+            logger.info(
+                "Prepared model trainability: trainable=%d total=%d",
+                report["trainable"],
+                report["total"],
+            )
+            return
         model.eval()
         model.requires_grad_(False)
         model.dit.train()
@@ -589,12 +610,14 @@ class Wan22Trainer:
             ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
         self.accelerator.wait_for_everyone()
 
-        state_path = os.path.join(self.state_dir, step_tag)
-        ensure_dir(state_path)
-        self.accelerator.save_state(output_dir=state_path)
-        if self.accelerator.is_main_process:
-            self._save_trainer_state(state_path)
-        self.accelerator.wait_for_everyone()
+        state_path = None
+        if self.save_training_state:
+            state_path = os.path.join(self.state_dir, step_tag)
+            ensure_dir(state_path)
+            self.accelerator.save_state(output_dir=state_path)
+            if self.accelerator.is_main_process:
+                self._save_trainer_state(state_path)
+            self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 

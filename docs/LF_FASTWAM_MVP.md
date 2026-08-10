@@ -64,6 +64,40 @@ bash scripts/train_lf_mvp_matrix.sh \
   42
 ```
 
+### Four-GPU LoRA path
+
+When only the LIBERO-Spatial shard is available, use the dedicated LoRA task.
+It freezes the Wan/FastWAM base, injects rank-16 adapters into attention, FFN,
+and text projections of both experts, and additionally trains the latent Query,
+action input/output heads, and proprio projection. The default micro-batch is
+one per GPU with four-way gradient accumulation (effective global batch 16).
+
+```bash
+bash scripts/train_lf_lora_spatial_smoke.sh \
+  4 \
+  ./checkpoints/fastwam_release/libero_uncond_2cam224.pt \
+  2 \
+  42
+```
+
+After the two-step smoke test succeeds, run the controlled B0/B1/M1 matrix:
+
+```bash
+RUN_TAG=lf-spatial-lora \
+bash scripts/train_lf_mvp_matrix.sh \
+  4 \
+  libero_spatial_lf_lora_2cam224 \
+  ./checkpoints/fastwam_release/libero_uncond_2cam224.pt \
+  200 \
+  42
+```
+
+LoRA runs save `fastwam_lora_adapter_v1` weight files containing only adapter
+parameters and the selected small action modules. The adapter records the
+absolute base-checkpoint path and automatically loads that base before applying
+its deltas. DeepSpeed optimizer/model state saving is disabled for this task to
+avoid duplicating the frozen multi-gigabyte base model.
+
 Inspect the first M1 logs for finite values of:
 
 ```text

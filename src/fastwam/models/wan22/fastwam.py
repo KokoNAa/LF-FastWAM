@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -9,6 +10,12 @@ from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
+from .lora import (
+    inject_lora,
+    is_lora_parameter_name,
+    matches_any_pattern,
+    normalize_lora_config,
+)
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
@@ -149,7 +156,121 @@ class FastWAM(torch.nn.Module):
                 "`posterior_advantage_margin_ratio` must be in [0, 1)."
             )
 
+        self.lora_config = normalize_lora_config(None)
+        self.lora_enabled = False
+        self.lora_base_checkpoint: Optional[str] = None
+
         self.to(self.device)
+
+    def configure_lora(self, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        normalized = normalize_lora_config(config)
+        if not normalized["enabled"]:
+            if self.lora_enabled:
+                raise ValueError("Cannot disable LoRA after adapters have been injected.")
+            self.lora_config = normalized
+            return {"enabled": False, "modules": [], "parameters": 0}
+
+        if self.lora_enabled:
+            comparable_keys = (
+                "rank",
+                "alpha",
+                "dropout",
+                "experts",
+                "target_modules",
+                "extra_trainable_patterns",
+            )
+            mismatch = {
+                key: (self.lora_config.get(key), normalized.get(key))
+                for key in comparable_keys
+                if self.lora_config.get(key) != normalized.get(key)
+            }
+            if mismatch:
+                raise ValueError(f"LoRA is already configured differently: {mismatch}")
+            return self.lora_report()
+
+        injected: list[str] = []
+        expert_modules = {
+            "video": self.video_expert,
+            "action": self.action_expert,
+        }
+        for expert_name in normalized["experts"]:
+            names = inject_lora(
+                expert_modules[expert_name],
+                target_modules=normalized["target_modules"],
+                rank=normalized["rank"],
+                alpha=normalized["alpha"],
+                dropout=normalized["dropout"],
+            )
+            injected.extend(f"{expert_name}_expert.{name}" for name in names)
+
+        self.lora_config = normalized
+        self.lora_enabled = True
+        report = self.lora_report()
+        logger.info(
+            "Injected LoRA: experts=%s rank=%d alpha=%.2f dropout=%.3f "
+            "modules=%d adapter_parameters=%d",
+            normalized["experts"],
+            normalized["rank"],
+            normalized["alpha"],
+            normalized["dropout"],
+            len(report["modules"]),
+            report["parameters"],
+        )
+        return report
+
+    def lora_report(self) -> dict[str, Any]:
+        modules = []
+        parameter_count = 0
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear) and hasattr(module, "lora_A"):
+                modules.append(name)
+                parameter_count += module.lora_A.numel() + module.lora_B.numel()
+        return {
+            "enabled": self.lora_enabled,
+            "modules": modules,
+            "parameters": int(parameter_count),
+        }
+
+    def _adapter_parameter_ids(self) -> set[int]:
+        if not self.lora_enabled:
+            return set()
+        extra_patterns = self.lora_config["extra_trainable_patterns"]
+        return {
+            id(parameter)
+            for name, parameter in self.named_parameters()
+            if is_lora_parameter_name(name)
+            or matches_any_pattern(name, extra_patterns)
+        }
+
+    def prepare_trainable_parameters(self) -> dict[str, int]:
+        """Freeze the base model and expose only configured adapter parameters."""
+        self.eval()
+        self.requires_grad_(False)
+        self.dit.train()
+
+        if self.lora_enabled:
+            adapter_ids = self._adapter_parameter_ids()
+            for parameter in self.parameters():
+                if id(parameter) in adapter_ids:
+                    parameter.requires_grad_(True)
+        else:
+            self.dit.requires_grad_(True)
+            if self.proprio_encoder is not None:
+                self.proprio_encoder.train()
+                self.proprio_encoder.requires_grad_(True)
+
+        trainable = sum(
+            parameter.numel()
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        )
+        total = sum(parameter.numel() for parameter in self.parameters())
+        if trainable <= 0:
+            raise ValueError("Training configuration produced zero trainable parameters.")
+        return {
+            "trainable": int(trainable),
+            "total": int(total),
+        }
 
     @classmethod
     def from_wan22_pretrained(
@@ -176,6 +297,7 @@ class FastWAM(torch.nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
         langforce_mvp_config: Optional[dict[str, Any]] = None,
+        lora_config: Optional[dict[str, Any]] = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -244,6 +366,7 @@ class FastWAM(torch.nn.Module):
                 "SKIPPED_PRETRAIN" if skip_dit_load_from_pretrain else action_dit_pretrained_path
             ),
         }
+        model.configure_lora(lora_config)
         return model
 
     def to(self, *args, **kwargs):
@@ -1523,8 +1646,45 @@ class FastWAM(torch.nn.Module):
             mask_language=mask_language,
         )
 
+    def _lora_adapter_state_dict(self) -> dict[str, torch.Tensor]:
+        adapter_ids = self._adapter_parameter_ids()
+        state = self.mot.state_dict()
+        names = {
+            name
+            for name, parameter in self.mot.named_parameters()
+            if id(parameter) in adapter_ids
+        }
+        return {
+            name: state[name].detach().to(device="cpu")
+            for name in sorted(names)
+        }
+
     def save_checkpoint(self, path, optimizer=None, step=None):
+        if self.lora_enabled:
+            payload = {
+                "format": "fastwam_lora_adapter_v1",
+                "mot_trainable": self._lora_adapter_state_dict(),
+                "lora_config": dict(self.lora_config),
+                "base_checkpoint": self.lora_base_checkpoint,
+                "step": step,
+                "torch_dtype": str(self.torch_dtype),
+            }
+            adapter_ids = self._adapter_parameter_ids()
+            if self.proprio_encoder is not None and any(
+                id(parameter) in adapter_ids
+                for parameter in self.proprio_encoder.parameters()
+            ):
+                payload["proprio_encoder"] = {
+                    name: value.detach().to(device="cpu")
+                    for name, value in self.proprio_encoder.state_dict().items()
+                }
+            if optimizer is not None:
+                payload["optimizer"] = optimizer.state_dict()
+            torch.save(payload, path)
+            return
+
         payload = {
+            "format": "fastwam_full_v1",
             "mot": self.mot.state_dict(),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
@@ -1535,14 +1695,91 @@ class FastWAM(torch.nn.Module):
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
+    @staticmethod
+    def _resolve_adapter_base_checkpoint(
+        adapter_path: str, base_checkpoint: str
+    ) -> str:
+        candidate = Path(base_checkpoint).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(adapter_path).resolve().parent / candidate
+        candidate = candidate.resolve()
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                "LoRA adapter base checkpoint was not found: "
+                f"{candidate} (adapter={adapter_path})"
+            )
+        return str(candidate)
+
+    def _load_lora_adapter(self, path: str, payload: dict, optimizer=None):
+        base_checkpoint = payload.get("base_checkpoint")
+        if base_checkpoint:
+            resolved_base = self._resolve_adapter_base_checkpoint(
+                path, str(base_checkpoint)
+            )
+            self.load_checkpoint(resolved_base, optimizer=None)
+
+        saved_lora_config = payload.get("lora_config")
+        if not isinstance(saved_lora_config, dict):
+            raise ValueError(f"LoRA adapter missing `lora_config`: {path}")
+        self.configure_lora(saved_lora_config)
+
+        adapter_state = payload.get("mot_trainable")
+        if not isinstance(adapter_state, dict) or not adapter_state:
+            raise ValueError(f"LoRA adapter missing non-empty `mot_trainable`: {path}")
+        current_state = self.mot.state_dict()
+        unexpected = sorted(set(adapter_state) - set(current_state))
+        if unexpected:
+            raise ValueError(
+                f"LoRA adapter contains unknown MoT keys: {unexpected[:20]}"
+            )
+        shape_mismatches = {
+            name: (tuple(value.shape), tuple(current_state[name].shape))
+            for name, value in adapter_state.items()
+            if tuple(value.shape) != tuple(current_state[name].shape)
+        }
+        if shape_mismatches:
+            raise ValueError(
+                f"LoRA adapter shape mismatches: {shape_mismatches}"
+            )
+        self.mot.load_state_dict(adapter_state, strict=False)
+
+        if self.proprio_encoder is not None and "proprio_encoder" in payload:
+            self.proprio_encoder.load_state_dict(
+                payload["proprio_encoder"], strict=True
+            )
+        if optimizer is not None and "optimizer" in payload:
+            optimizer.load_state_dict(payload["optimizer"])
+        logger.info(
+            "Loaded LoRA adapter from %s (trainable_tensors=%d base=%s).",
+            path,
+            len(adapter_state),
+            self.lora_base_checkpoint,
+        )
+        return payload
+
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
+        if payload.get("format") == "fastwam_lora_adapter_v1":
+            return self._load_lora_adapter(str(path), payload, optimizer=optimizer)
+
         if "mot" in payload:
             incompatible = self.mot.load_state_dict(payload["mot"], strict=False)
-            if incompatible.missing_keys or incompatible.unexpected_keys:
+            missing_lora = [
+                key for key in incompatible.missing_keys if is_lora_parameter_name(key)
+            ]
+            missing_other = [
+                key for key in incompatible.missing_keys if not is_lora_parameter_name(key)
+            ]
+            if missing_lora:
+                logger.info(
+                    "Base checkpoint has no LoRA tensors; keeping zero-init adapters "
+                    "(missing=%d).",
+                    len(missing_lora),
+                )
+            if missing_other or incompatible.unexpected_keys:
                 logger.warning(
                     "Loaded MoT checkpoint with strict=False. missing=%s unexpected=%s",
-                    incompatible.missing_keys,
+                    missing_other,
                     incompatible.unexpected_keys,
                 )
         elif "dit" in payload:
@@ -1560,6 +1797,7 @@ class FastWAM(torch.nn.Module):
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
+        self.lora_base_checkpoint = str(Path(path).expanduser().resolve())
         return payload
 
     def forward(self, *args, **kwargs):

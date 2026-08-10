@@ -74,3 +74,31 @@ langforce_mvp:
   lambda_posterior_advantage: 0.10
   posterior_advantage_margin_ratio: 0.05
   detach_prior_video_cache: true
+
+# Parameter-efficient fine-tuning. Disabled by default so released full
+# checkpoints retain their original behavior; LoRA adapters auto-enable when
+# an adapter checkpoint is loaded.
+lora:
+  enabled: false
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  experts: [video, action]
+  target_modules:
+    - text_embedding.0
+    - text_embedding.2
+    - blocks.*.self_attn.q
+    - blocks.*.self_attn.k
+    - blocks.*.self_attn.v
+    - blocks.*.self_attn.o
+    - blocks.*.cross_attn.q
+    - blocks.*.cross_attn.k
+    - blocks.*.cross_attn.v
+    - blocks.*.cross_attn.o
+    - blocks.*.ffn.0
+    - blocks.*.ffn.2
+  extra_trainable_patterns:
+    - action_expert.latent_action_queries
+    - action_expert.action_encoder.*
+    - action_expert.head.*
+    - proprio_encoder.*

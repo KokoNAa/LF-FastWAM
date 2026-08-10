@@ -1,0 +1,43 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam
+  - _self_
+
+# The currently available server dataset contains LIBERO-Spatial only.
+data:
+  train:
+    dataset_dirs:
+      - ./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+    pretrained_norm_stats: ./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json
+
+# Per-process micro batch. With four GPUs and accumulation=4 the effective
+# global batch is 16 while keeping L40S activation memory conservative.
+batch_size: 1
+num_workers: 2
+gradient_accumulation_steps: 4
+
+model:
+  mot_checkpoint_mixed_attn: true
+  lora:
+    enabled: true
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+weight_decay: 0.0
+num_epochs: 10
+max_steps: null
+max_grad_norm: 1.0
+log_every: 1
+save_every: 0
+eval_every: 0
+
+# LoRA weights are saved as compact adapters. DeepSpeed state contains the
+# frozen base model and is intentionally skipped for the controlled MVP runs.
+save_training_state: false
+resume: null
+

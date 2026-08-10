@@ -228,6 +228,9 @@ Set it to `false` if you want to save a fully rendered video.
 
 ## Training
 
+For the LangForce latent-query MVP and the four-GPU LoRA training path, see
+[`docs/LF_FASTWAM_MVP.md`](docs/LF_FASTWAM_MVP.md).
+
 ### 1) Precompute T5 embedding cache before training
 
 Use `scripts/precompute_text_embeds.py` to precompute embeddings for each training task:
