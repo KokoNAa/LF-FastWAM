@@ -140,6 +140,11 @@ bowl's initial location. Consequently, they support a preliminary
 Correct/Null comparison but do not provide valid shuffled hard negatives or a
 meaningful DTL estimate.
 
+Before a full evaluation of a longer checkpoint, use a Correct-only recovery
+gate with one trial per task by setting `EVAL_CONDITIONS=correct` and overriding
+the three checkpoint paths and `OUTPUT_ROOT`. If B1/M1 remain at zero, do not
+spend compute on the full Correct/Null matrix yet.
+
 ## Correct / Null / Shuffled evaluation
 
 Copy the example manifest, replace placeholders with exact LIBERO task names and

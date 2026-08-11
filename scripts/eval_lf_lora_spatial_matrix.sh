@@ -27,6 +27,19 @@ B0_CKPT="${B0_CKPT:-${RUN_ROOT}/runs/libero_spatial_lf_lora_2cam224/lf-b0-lf-spa
 B1_CKPT="${B1_CKPT:-${RUN_ROOT}/runs/libero_spatial_lf_lora_2cam224/lf-b1-lf-spatial-lora-200-v1/checkpoints/weights/step_000200.pt}"
 M1_CKPT="${M1_CKPT:-${RUN_ROOT}/runs/libero_spatial_lf_lora_2cam224/lf-m1-lf-spatial-lora-200-v1/checkpoints/weights/step_000200.pt}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${RUN_ROOT}/evaluate_results/lf_spatial_200step_seed${EVAL_SEED}_trials${NUM_TRIALS}}"
+EVAL_CONDITIONS="${EVAL_CONDITIONS:-correct null}"
+read -r -a CONDITION_LIST <<<"${EVAL_CONDITIONS}"
+
+if (( ${#CONDITION_LIST[@]} == 0 )); then
+  echo "EVAL_CONDITIONS must contain at least one condition." >&2
+  exit 1
+fi
+for condition in "${CONDITION_LIST[@]}"; do
+  if [[ "${condition}" != "correct" && "${condition}" != "null" ]]; then
+    echo "Unsupported Spatial matrix condition: ${condition}. Expected correct and/or null." >&2
+    exit 1
+  fi
+done
 
 for required_file in "${STATS_PATH}" "${B0_CKPT}" "${B1_CKPT}" "${M1_CKPT}"; do
   if [[ ! -f "${required_file}" ]]; then
@@ -103,13 +116,13 @@ M1_OVERRIDES=(
   model.langforce_mvp.enable_posterior_advantage=true
 )
 
-for condition in correct null; do
+for condition in "${CONDITION_LIST[@]}"; do
   run_condition B0 "${condition}" "${B0_CKPT}" "${B0_OVERRIDES[@]}"
 done
-for condition in correct null; do
+for condition in "${CONDITION_LIST[@]}"; do
   run_condition B1 "${condition}" "${B1_CKPT}" "${B1_OVERRIDES[@]}"
 done
-for condition in correct null; do
+for condition in "${CONDITION_LIST[@]}"; do
   run_condition M1 "${condition}" "${M1_CKPT}" "${M1_OVERRIDES[@]}"
 done
 
@@ -119,5 +132,5 @@ done
   --run "M1=${OUTPUT_ROOT}/M1" \
   --output-prefix "${OUTPUT_ROOT}/lf_mvp_summary"
 
-echo "[LF-FastWAM] Spatial Correct/Null matrix complete: ${OUTPUT_ROOT}"
+echo "[LF-FastWAM] Spatial matrix complete (conditions: ${EVAL_CONDITIONS}): ${OUTPUT_ROOT}"
 echo "[LF-FastWAM] Spatial tasks share the same object and receptacle; do not report shuffled DTL from this suite."
