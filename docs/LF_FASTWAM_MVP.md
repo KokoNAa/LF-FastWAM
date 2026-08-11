@@ -92,6 +92,21 @@ bash scripts/train_lf_mvp_matrix.sh \
   42
 ```
 
+For a controlled one-epoch run on the 53,229-example Spatial shard (effective
+global batch 16), use 3,328 optimizer steps and retain intermediate adapters
+every 500 steps:
+
+```bash
+RUN_TAG=lf-spatial-lora-1epoch-v1 \
+bash scripts/train_lf_mvp_matrix.sh \
+  4 \
+  libero_spatial_lf_lora_2cam224 \
+  ./checkpoints/fastwam_release/libero_uncond_2cam224.pt \
+  3328 \
+  42 \
+  save_every=500
+```
+
 LoRA runs save `fastwam_lora_adapter_v1` weight files containing only adapter
 parameters and the selected small action modules. The adapter records the
 absolute base-checkpoint path and automatically loads that base before applying
