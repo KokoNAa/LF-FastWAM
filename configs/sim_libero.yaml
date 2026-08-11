@@ -36,8 +36,10 @@ EVALUATION:
   rand_device: cpu
   tiled: false
 
-  # Language-intervention condition: correct / null / shuffled. Shuffled
-  # requires either a manifest or an explicit per-run instruction override.
+  # Language-intervention condition: correct / null / shuffled / counterfactual.
+  # Shuffled keeps the source success predicate (DTL). Counterfactual imports
+  # the paired task's goal predicate while keeping the source scene/state (CIS).
+  # Counterfactual always requires an audited manifest.
   instruction_condition: correct
   language_intervention_manifest: null
   instruction_override: null

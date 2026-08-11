@@ -37,6 +37,11 @@ from experiments.libero.libero_utils import (
 )
 from experiments.libero.init_state_utils import load_libero_task_init_states
 from experiments.libero.language_condition import normalize_instruction_condition
+from experiments.libero.language_interventions import (
+    load_language_intervention_manifest,
+    select_language_intervention_record,
+    validate_counterfactual_problem,
+)
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
@@ -124,7 +129,9 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     # deprecated legacy checkpoint loading
     payload = torch.load(ckpt, map_location="cpu")
     if not isinstance(payload, dict):
-        raise ValueError(f"Legacy checkpoint payload must be dict, got: {type(payload)}")
+        raise ValueError(
+            f"Legacy checkpoint payload must be dict, got: {type(payload)}"
+        )
 
     if "mot" in payload and hasattr(model, "mot"):
         missing, unexpected = model.mot.load_state_dict(payload["mot"], strict=False)
@@ -158,7 +165,9 @@ def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarra
     pil_image = Image.fromarray(image)
     src_w, src_h = pil_image.size
     scale = max(width / src_w, height / src_h)
-    resized = pil_image.resize((round(src_w * scale), round(src_h * scale)), resample=Image.BILINEAR)
+    resized = pil_image.resize(
+        (round(src_w * scale), round(src_h * scale)), resample=Image.BILINEAR
+    )
     rw, rh = resized.size
     left = max((rw - width) // 2, 0)
     top = max((rh - height) // 2, 0)
@@ -177,7 +186,9 @@ def _normalize_proprio(
         )
     state_key = state_meta[0]["key"]
 
-    state_batch = {"state": {state_key: torch.as_tensor(proprio, dtype=torch.float32).unsqueeze(0)}}
+    state_batch = {
+        "state": {state_key: torch.as_tensor(proprio, dtype=torch.float32).unsqueeze(0)}
+    }
     state_batch = processor.action_state_transform(state_batch)
     state_batch = processor.normalizer.forward(state_batch)
     return state_batch["state"][state_key]
@@ -203,7 +214,9 @@ def _obs_to_model_input(
     def _meta_to_hw(meta: dict, camera_idx: int) -> tuple[int, int]:
         shape = meta["shape"]
         if len(shape) != 3:
-            raise ValueError(f"shape_meta.images[{camera_idx}].shape must be [C,H,W], got {shape}")
+            raise ValueError(
+                f"shape_meta.images[{camera_idx}].shape must be [C,H,W], got {shape}"
+            )
         return int(shape[1]), int(shape[2])
 
     concatenation = cfg.data.train.get("concat_multi_camera", "horizontal")
@@ -223,7 +236,9 @@ def _obs_to_model_input(
         else:
             raise ValueError(f"Invalid concat_multi_camera: {concatenation}")
     else:
-        raise ValueError(f"LIBERO eval currently supports num_output_cameras in [1, 2], got {num_cameras}.")
+        raise ValueError(
+            f"LIBERO eval currently supports num_output_cameras in [1, 2], got {num_cameras}."
+        )
 
     actual_h, actual_w = int(rgb.shape[0]), int(rgb.shape[1])
     expected_h, expected_w = int(height), int(width)
@@ -258,7 +273,9 @@ def _extract_sim_state(obs: dict) -> np.ndarray:
     return state
 
 
-def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np.ndarray:
+def _denormalize_action(
+    action: torch.Tensor, processor: FastWAMProcessor
+) -> np.ndarray:
     if action.ndim == 2:
         action = action.unsqueeze(0)
     if action.ndim != 3:
@@ -278,7 +295,9 @@ def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np
 
 
 def _get_num_video_frames(cfg: DictConfig) -> int:
-    return (int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1
+    return (int(cfg.data.train.num_frames) - 1) // int(
+        cfg.data.train.action_video_freq_ratio
+    ) + 1
 
 
 def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
@@ -293,7 +312,9 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
         )
 
 
-def _select_predicted_future_frames(pred_video: list[Image.Image], cfg: DictConfig) -> list[Image.Image]:
+def _select_predicted_future_frames(
+    pred_video: list[Image.Image], cfg: DictConfig
+) -> list[Image.Image]:
     if len(pred_video) == 0:
         raise ValueError("`infer_joint` returned an empty predicted video.")
 
@@ -308,14 +329,20 @@ def _get_future_frame_capture_steps(cfg: DictConfig) -> list[int]:
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     action_video_freq_ratio = int(cfg.data.train.action_video_freq_ratio)
     num_future_frames = replan_steps // action_video_freq_ratio
-    return [step_idx * action_video_freq_ratio for step_idx in range(num_future_frames + 1)]
+    return [
+        step_idx * action_video_freq_ratio for step_idx in range(num_future_frames + 1)
+    ]
 
 
 def _frame_to_rgb_array(frame: Any) -> np.ndarray:
     if isinstance(frame, dict):
         images = []
         for value in frame.values():
-            value_array = np.array(value) if isinstance(value, Image.Image) else np.array(value, copy=True)
+            value_array = (
+                np.array(value)
+                if isinstance(value, Image.Image)
+                else np.array(value, copy=True)
+            )
             images.append(value_array)
         return np.concatenate(images, axis=1)
     if isinstance(frame, Image.Image):
@@ -344,7 +371,9 @@ def _compute_clip_mean_psnr(
         target_h, target_w = pred_image.shape[:2]
         if gt_image.shape[:2] != (target_h, target_w):
             gt_image = np.array(
-                Image.fromarray(gt_image).resize((target_w, target_h), resample=Image.BILINEAR)
+                Image.fromarray(gt_image).resize(
+                    (target_w, target_h), resample=Image.BILINEAR
+                )
             )
 
         gt_f32 = gt_image.astype(np.float32)
@@ -361,33 +390,27 @@ def _compute_clip_mean_psnr(
 def _resolve_language_intervention(
     task_description: str,
     cfg: DictConfig,
-) -> tuple[str, str, bool]:
-    """Resolve correct/null/shuffled policy language for one task."""
+) -> tuple[str, str, bool, Optional[dict[str, Any]]]:
+    """Resolve policy language and its optional paired manifest record."""
     condition = normalize_instruction_condition(
         cfg.EVALUATION.get("instruction_condition", "correct")
     )
     if condition == "correct":
-        return condition, task_description, False
+        return condition, task_description, False, None
     if condition == "null":
         # Keep a normal encoder input but mask every language position inside
         # FastWAM. Proprio/state tokens remain visible.
-        return condition, task_description, True
-    if condition == "counterfactual":
-        raise ValueError(
-            "Paired counterfactual rollout requires switching to the alternate "
-            "task's success predicate and is not supported by the single-task "
-            "LIBERO runner. Use correct/null/shuffled for MVP evaluation."
-        )
-    if condition != "shuffled":
+        return condition, task_description, True, None
+    if condition not in {"shuffled", "counterfactual"}:
         raise ValueError(
             "EVALUATION.instruction_condition must be one of "
-            "correct/null/shuffled, got "
+            "correct/null/shuffled/counterfactual, got "
             f"{condition!r}."
         )
 
     override = cfg.EVALUATION.get("instruction_override")
-    if override is not None and str(override).strip():
-        return condition, str(override).strip(), False
+    if condition == "shuffled" and override is not None and str(override).strip():
+        return condition, str(override).strip(), False, None
 
     manifest_path_cfg = cfg.EVALUATION.get("language_intervention_manifest")
     if manifest_path_cfg is None:
@@ -396,46 +419,138 @@ def _resolve_language_intervention(
             "EVALUATION.instruction_override or "
             "EVALUATION.language_intervention_manifest."
         )
-    manifest_path = Path(
-        os.path.expanduser(os.path.expandvars(str(manifest_path_cfg)))
-    )
+    manifest_path = Path(os.path.expanduser(os.path.expandvars(str(manifest_path_cfg))))
     if not manifest_path.is_file():
         raise FileNotFoundError(
             f"Language-intervention manifest not found: {manifest_path}"
         )
 
-    suite_name = str(cfg.EVALUATION.task_suite_name)
-    task_id = int(cfg.EVALUATION.task_id)
-    matches = []
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            matches_id = (
-                record.get("task_suite_name") == suite_name
-                and int(record.get("task_id", -1)) == task_id
-            )
-            matches_name = (
-                str(record.get("task_name", "")).strip().casefold()
-                == task_description.strip().casefold()
-            )
-            if matches_id or matches_name:
-                record["_line_number"] = line_number
-                matches.append(record)
-    if len(matches) != 1:
-        raise ValueError(
-            "Expected exactly one language-intervention manifest record for "
-            f"{suite_name}/{task_id} ({task_description!r}), found {len(matches)}."
-        )
-    field = "shuffled_instruction"
-    instruction = str(matches[0].get(field, "")).strip()
+    record = select_language_intervention_record(
+        load_language_intervention_manifest(manifest_path),
+        suite_name=str(cfg.EVALUATION.task_suite_name),
+        task_id=int(cfg.EVALUATION.task_id),
+        task_description=task_description,
+    )
+    field = (
+        "shuffled_instruction"
+        if condition == "shuffled"
+        else "counterfactual_instruction"
+    )
+    instruction = str(record.get(field, "")).strip()
     if not instruction:
         raise ValueError(
-            f"Manifest line {matches[0]['_line_number']} has no non-empty `{field}`."
+            f"Manifest line {record.get('_line_number', '?')} has no non-empty "
+            f"`{field}`."
         )
-    return condition, instruction, False
+    if (
+        condition == "counterfactual"
+        and record.get("counterfactual_is_executable") is not True
+    ):
+        raise ValueError(
+            f"Manifest line {record.get('_line_number', '?')} must mark "
+            "counterfactual_is_executable=true."
+        )
+    return condition, instruction, False, record
+
+
+def _resolve_counterfactual_task(
+    record: dict[str, Any],
+) -> tuple[str, int, Any]:
+    suite_name = str(
+        record.get(
+            "counterfactual_task_suite_name",
+            record.get("task_suite_name", ""),
+        )
+    ).strip()
+    if not suite_name:
+        raise ValueError("Counterfactual manifest record has no task suite selector.")
+    benchmark_dict = benchmark.get_benchmark_dict()
+    if suite_name not in benchmark_dict:
+        raise ValueError(f"Unknown counterfactual task suite: {suite_name!r}.")
+    task_suite = benchmark_dict[suite_name]()
+
+    raw_task_id = record.get("counterfactual_task_id")
+    if raw_task_id is not None:
+        task_id = int(raw_task_id)
+        return suite_name, task_id, task_suite.get_task(task_id)
+
+    expected_name = str(record.get("counterfactual_task_name", "")).strip()
+    matches = [
+        task_id
+        for task_id in range(int(task_suite.n_tasks))
+        if task_suite.get_task(task_id).language.strip().casefold()
+        == expected_name.casefold()
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "Expected exactly one counterfactual task matching "
+            f"{suite_name}/{expected_name!r}, found {len(matches)}."
+        )
+    task_id = matches[0]
+    return suite_name, task_id, task_suite.get_task(task_id)
+
+
+def _activate_counterfactual_goal(
+    env,
+    record: dict[str, Any],
+    policy_instruction: str,
+) -> dict[str, Any]:
+    """Replace only the success goal while preserving source scene and state."""
+    from libero.libero.envs import bddl_utils as BDDLUtils
+
+    suite_name, task_id, task = _resolve_counterfactual_task(record)
+    task_instruction = str(task.language).strip()
+    if task_instruction.casefold() != policy_instruction.strip().casefold():
+        raise ValueError(
+            "Counterfactual manifest instruction does not match the selected "
+            f"LIBERO task: {policy_instruction!r} != {task_instruction!r}."
+        )
+
+    bddl_path = (
+        Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
+    )
+    counterfactual_problem = BDDLUtils.robosuite_parse_problem(str(bddl_path))
+    inner_env = getattr(env, "env", None)
+    if inner_env is None or not hasattr(inner_env, "parsed_problem"):
+        raise TypeError(
+            "Counterfactual evaluation requires a LIBERO ControlEnv wrapper "
+            "with an inner parsed_problem."
+        )
+    source_problem = inner_env.parsed_problem
+    counterfactual_goal = validate_counterfactual_problem(
+        source_problem,
+        counterfactual_problem,
+    )
+
+    runtime_entities = set(getattr(inner_env, "object_states_dict", {}))
+    runtime_missing = sorted(
+        {str(entity) for predicate in counterfactual_goal for entity in predicate[1:]}
+        - runtime_entities
+    )
+    if runtime_missing:
+        raise ValueError(
+            "Counterfactual predicate entities are absent from the instantiated "
+            f"source environment: {runtime_missing}."
+        )
+
+    source_goal = [list(predicate) for predicate in source_problem["goal_state"]]
+    inner_env.parsed_problem["goal_state"] = counterfactual_goal
+    logging.info(
+        "Activated paired counterfactual predicate for %s/%s: %s -> %s",
+        suite_name,
+        task_id,
+        source_goal,
+        counterfactual_goal,
+    )
+    return {
+        "pair_id": record.get("pair_id"),
+        "counterfactual_task_suite_name": suite_name,
+        "counterfactual_task_id": task_id,
+        "counterfactual_task_name": task_instruction,
+        "counterfactual_bddl_file": str(bddl_path),
+        "source_goal_state": source_goal,
+        "counterfactual_goal_state": counterfactual_goal,
+    }
 
 
 def _predict_action_chunk(
@@ -493,7 +608,9 @@ def _predict_action_chunk(
     elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
 
-    inference_method = model.infer_joint if visualize_future_video else model.infer_action
+    inference_method = (
+        model.infer_joint if visualize_future_video else model.infer_action
+    )
     if mask_language:
         if "mask_language" not in inspect.signature(inference_method).parameters:
             raise ValueError(
@@ -508,7 +625,9 @@ def _predict_action_chunk(
         inference_start = time.perf_counter()
         if visualize_future_video:
             pred = model.infer_joint(**infer_kwargs)
-            predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
+            predicted_future_frames = _select_predicted_future_frames(
+                pred["video"], cfg
+            )
         else:
             pred = model.infer_action(**infer_kwargs)
         if str(model_device).startswith("cuda"):
@@ -619,7 +738,10 @@ def run_single_episode(
             current_replan_step = 0
             if use_action_ensembler:
                 ensembler.add_actions(action_chunk, t)
-                pending_actions = [ensembler.get_action(ts).tolist() for ts in range(t, t + replan_steps)]
+                pending_actions = [
+                    ensembler.get_action(ts).tolist()
+                    for ts in range(t, t + replan_steps)
+                ]
             else:
                 pending_actions = action_chunk[:replan_steps].tolist()
             replay_images.append(imgs.copy())
@@ -634,7 +756,9 @@ def run_single_episode(
                 current_predicted_future_clip["gt_frames"].append(get_libero_image(obs))
             if done or len(pending_actions) == 0:
                 expected_frame_count = 1 + sum(
-                    1 for capture_step in capture_steps if capture_step <= current_replan_step
+                    1
+                    for capture_step in capture_steps
+                    if capture_step <= current_replan_step
                 )
                 gt_len = len(current_predicted_future_clip["gt_frames"])
                 pred_len = len(current_predicted_future_clip["pred_frames"])
@@ -659,9 +783,9 @@ def run_single_episode(
                         expected_frame_count,
                         pred_len,
                     )
-                current_predicted_future_clip["pred_frames"] = current_predicted_future_clip["pred_frames"][
-                    :expected_frame_count
-                ]
+                current_predicted_future_clip["pred_frames"] = (
+                    current_predicted_future_clip["pred_frames"][:expected_frame_count]
+                )
                 assert len(current_predicted_future_clip["gt_frames"]) == len(
                     current_predicted_future_clip["pred_frames"]
                 ), (
@@ -684,7 +808,9 @@ def run_single_episode(
     pbar.close()
 
     episode_mean_psnr = (
-        float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
+        float(np.mean(episode_future_clip_psnr))
+        if len(episode_future_clip_psnr) > 0
+        else None
     )
     return (
         bool(done),
@@ -710,9 +836,23 @@ def run_single_task(
     model_device: str,
 ) -> dict:
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
-    instruction_condition, policy_instruction, mask_language = (
-        _resolve_language_intervention(task_description, cfg)
-    )
+    (
+        instruction_condition,
+        policy_instruction,
+        mask_language,
+        intervention_record,
+    ) = _resolve_language_intervention(task_description, cfg)
+    counterfactual_metadata = None
+    if instruction_condition == "counterfactual":
+        if intervention_record is None:
+            raise ValueError(
+                "Counterfactual evaluation requires a paired manifest record."
+            )
+        counterfactual_metadata = _activate_counterfactual_goal(
+            env,
+            intervention_record,
+            policy_instruction,
+        )
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     results = {
         "successes": 0,
@@ -725,7 +865,14 @@ def run_single_task(
         "inference_latencies_ms": [],
         "latency_p50_ms": None,
         "latency_p95_ms": None,
+        "success_predicate": (
+            "counterfactual" if instruction_condition == "counterfactual" else "source"
+        ),
     }
+    if intervention_record is not None:
+        results["pair_id"] = intervention_record.get("pair_id")
+    if counterfactual_metadata is not None:
+        results.update(counterfactual_metadata)
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
@@ -801,7 +948,9 @@ def run_single_task(
                 )
 
     if visualize_future_video:
-        valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
+        valid_episode_psnr = [
+            x for x in results["episode_future_video_psnr"] if x is not None
+        ]
         if len(valid_episode_psnr) > 0:
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
     if results["inference_latencies_ms"]:
@@ -814,6 +963,9 @@ def run_single_task(
     if instruction_condition == "shuffled":
         # The simulator success predicate still represents the original task.
         results["default_task_successes"] = results["successes"]
+    elif instruction_condition == "counterfactual":
+        # The simulator success predicate was replaced before reset/rollout.
+        results["counterfactual_successes"] = results["successes"]
     try:
         env.close()
     except Exception:
@@ -824,7 +976,9 @@ def run_single_task(
     return results
 
 
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
+@hydra.main(
+    version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml"
+)
 def eval_single_process(cfg: DictConfig):
     start_time = time.time()
     partial_state = PartialState()
@@ -862,7 +1016,9 @@ def eval_single_process(cfg: DictConfig):
     else:
         action_horizon = int(action_horizon_cfg)
     if action_horizon <= 0:
-        raise ValueError(f"EVALUATION.action_horizon must be positive, got {action_horizon}")
+        raise ValueError(
+            f"EVALUATION.action_horizon must be positive, got {action_horizon}"
+        )
 
     video_size = cfg.data.train.get("video_size", [224, 224])
     if len(video_size) != 2:
@@ -876,7 +1032,9 @@ def eval_single_process(cfg: DictConfig):
     local_log_dir.mkdir(parents=True, exist_ok=True)
     video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "videos"
     video_dir.mkdir(parents=True, exist_ok=True)
-    predicted_video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"
+    predicted_video_dir = (
+        local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"
+    )
     if bool(cfg.EVALUATION.get("visualize_future_video", False)):
         predicted_video_dir.mkdir(parents=True, exist_ok=True)
 
@@ -890,7 +1048,9 @@ def eval_single_process(cfg: DictConfig):
     )
 
     while len(initial_states) < int(cfg.EVALUATION.num_trials):
-        initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
+        initial_states.extend(
+            initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))]
+        )
 
     results = {
         "task_suite": cfg.EVALUATION.task_suite_name,
@@ -924,7 +1084,9 @@ def eval_single_process(cfg: DictConfig):
     results["duration"] = time.time() - start_time
     output_dir = Path(cfg.EVALUATION.output_dir) / cfg.EVALUATION.task_suite_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / f"gpu{cfg.gpu_id}_task{cfg.EVALUATION.task_id}_results.json"
+    output_file = (
+        output_dir / f"gpu{cfg.gpu_id}_task{cfg.EVALUATION.task_id}_results.json"
+    )
 
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=4, cls=NumpyEncoder)
@@ -934,7 +1096,9 @@ def eval_single_process(cfg: DictConfig):
         f"{results['successes']}/{cfg.EVALUATION.num_trials} successes"
     )
     if results.get("future_video_psnr_mean") is not None:
-        print(f"Task {cfg.EVALUATION.task_id} future-video PSNR mean: {results['future_video_psnr_mean']:.4f}")
+        print(
+            f"Task {cfg.EVALUATION.task_id} future-video PSNR mean: {results['future_video_psnr_mean']:.4f}"
+        )
     print(f"Time taken: {results['duration']:.2f} seconds")
     return results
 

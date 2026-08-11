@@ -53,9 +53,7 @@ def validate_manifest(path: Path) -> int:
                         int(record["task_id"]),
                     )
                 except (TypeError, ValueError):
-                    errors.append(
-                        f"line {line_number}: `task_id` must be an integer"
-                    )
+                    errors.append(f"line {line_number}: `task_id` must be an integer")
                     task_key = ("invalid", str(line_number))
             else:
                 task_key = ("task_name", str(record.get("task_name", "")).casefold())
@@ -72,14 +70,44 @@ def validate_manifest(path: Path) -> int:
                     f"line {line_number}: shuffled instruction equals correct instruction"
                 )
 
-            counterfactual = str(
-                record.get("counterfactual_instruction", "")
-            ).strip()
+            counterfactual = str(record.get("counterfactual_instruction", "")).strip()
             executable = record.get("counterfactual_is_executable")
             if counterfactual and executable is not True:
                 errors.append(
                     f"line {line_number}: counterfactual instruction must be marked executable"
                 )
+            if counterfactual:
+                for field in (
+                    "counterfactual_task_suite_name",
+                    "counterfactual_task_id",
+                    "counterfactual_task_name",
+                ):
+                    if field not in record or str(record.get(field, "")).strip() == "":
+                        errors.append(
+                            f"line {line_number}: counterfactual record requires `{field}`"
+                        )
+                try:
+                    counterfactual_task_id = int(record["counterfactual_task_id"])
+                    if counterfactual_task_id < 0:
+                        raise ValueError
+                except (KeyError, TypeError, ValueError):
+                    errors.append(
+                        f"line {line_number}: `counterfactual_task_id` must be a non-negative integer"
+                    )
+                if counterfactual.casefold() == correct:
+                    errors.append(
+                        f"line {line_number}: counterfactual instruction equals correct instruction"
+                    )
+                counterfactual_task_name = str(
+                    record.get("counterfactual_task_name", "")
+                ).strip()
+                if (
+                    counterfactual_task_name
+                    and counterfactual_task_name.casefold() != counterfactual.casefold()
+                ):
+                    errors.append(
+                        f"line {line_number}: counterfactual task name does not match instruction"
+                    )
 
     if record_count == 0:
         errors.append("manifest contains no records")

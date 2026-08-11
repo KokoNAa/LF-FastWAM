@@ -200,10 +200,40 @@ The summary contains `SR_correct`, `SR_null`, language-reliance gap,
 default-task leakage under shuffled language, optional counterfactual success
 from externally predicate-correct results, and latency p50/p95.
 
-Paired counterfactual rollout is intentionally rejected by the single-task
-LIBERO runner: changing only the instruction while retaining the original task
-success predicate would produce an invalid CIS number. It should be enabled only
-with an alternate executable task and its corresponding success predicate.
+## DTL / CIS paired evaluation
+
+The paired runner uses LIBERO-Object because each source scene contains one
+basket and several manipulable objects. The manifest builder chooses a
+different object that is present in the source scene, keeps the source
+simulator and initial state unchanged, and imports only the paired task's BDDL
+goal predicate for the `counterfactual` condition:
+
+```bash
+python scripts/prepare_libero_object_interventions.py \
+  --output configs/eval/libero_object_dtl_cis.jsonl
+python scripts/validate_language_intervention_manifest.py \
+  configs/eval/libero_object_dtl_cis.jsonl
+```
+
+Run a one-trial gate on four GPUs before the formal five-trial matrix:
+
+```bash
+PYTHON_BIN=/opt/conda/bin/python \
+bash scripts/eval_lf_lora_object_dtl_cis.sh 4 1 10 42
+```
+
+The three conditions have distinct semantics:
+
+- `correct`: source instruction and source success predicate (`SR_correct`).
+- `shuffled`: paired alternate instruction but source success predicate
+  (`DTL_shuffle`, lower is better).
+- `counterfactual`: the same paired instruction and alternate BDDL goal
+  predicate (`CIS`, higher is better).
+
+The counterfactual path fails closed unless the paired BDDL uses the same
+LIBERO environment class, has a different goal, and every goal operand exists
+in the instantiated source scene. This prevents an instruction-only swap from
+being reported as CIS while still checking the original predicate.
 
 ## Acceptance gates
 
