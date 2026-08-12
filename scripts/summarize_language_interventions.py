@@ -78,7 +78,7 @@ def main() -> None:
         action="append",
         required=True,
         metavar="LABEL=PATH",
-        help="Repeat for B0, B1, and M1 result directories.",
+        help="Repeat for each model result directory (for example B0 and M1).",
     )
     parser.add_argument("--output-prefix", type=Path, required=True)
     args = parser.parse_args()

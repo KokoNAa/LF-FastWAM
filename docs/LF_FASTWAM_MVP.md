@@ -235,6 +235,51 @@ LIBERO environment class, has a different goal, and every goal operand exists
 in the instantiated source scene. This prevents an instruction-only swap from
 being reported as CIS while still checking the original predicate.
 
+### Object-only B0/M1 training
+
+For a domain-controlled conclusion without mixing suites, download only the
+official FastWAM LIBERO-Object archive and extract it under the configured data
+root. Precompute the ten Object instruction embeddings before training:
+
+```bash
+huggingface-cli download yuanty/LIBERO-fastwam \
+  libero_object_no_noops_lerobot.tar.gz \
+  --repo-type dataset \
+  --local-dir ./data/libero_mujoco3.3.2
+
+tar -xzf ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot.tar.gz \
+  -C ./data/libero_mujoco3.3.2
+
+torchrun --standalone --nproc_per_node=4 scripts/precompute_text_embeds.py \
+  task=libero_object_lf_lora_2cam224 \
+  overwrite=false
+```
+
+Train B0 and M1 from the same released base, with the same seed, rank-16 LoRA,
+effective global batch 16, and exactly one Object epoch. The optimizer-step
+count is derived from the extracted dataset length:
+
+```bash
+RUN_TAG=lf-object-lora-1epoch-v1 \
+STATS_PATH=./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json \
+bash scripts/train_lf_lora_object_b0_m1.sh \
+  4 \
+  ./checkpoints/fastwam_release/libero_uncond_2cam224.pt \
+  42
+```
+
+The paired evaluation script now defaults to these Object-only B0/M1 runs and
+automatically selects their final `step_*.pt` adapters:
+
+```bash
+bash scripts/eval_lf_lora_object_dtl_cis.sh 4 1 10 42
+```
+
+Only expand the gate from one to five trials after both models recover high
+Object `SR_correct`. Report `DTL_shuffle` and CIS only alongside that recovery
+check; a low DTL from a model with collapsed Correct success is not evidence of
+language adherence.
+
 ## Acceptance gates
 
 - `SR_correct` drop versus B0 is at most 2 percentage points.

@@ -23,13 +23,12 @@ PYTHON_BIN="$(command -v "${PYTHON_BIN}")"
 export PYTHON_BIN
 
 STATS_PATH="${STATS_PATH:-${RUN_ROOT}/checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json}"
-B0_CKPT="${B0_CKPT:-${RUN_ROOT}/runs/libero_spatial_lf_lora_2cam224/lf-b0-lf-spatial-lora-1epoch-v1/checkpoints/weights/step_003328.pt}"
-B1_CKPT="${B1_CKPT:-${RUN_ROOT}/runs/libero_spatial_lf_lora_2cam224/lf-b1-lf-spatial-lora-1epoch-v1/checkpoints/weights/step_003328.pt}"
-M1_CKPT="${M1_CKPT:-${RUN_ROOT}/runs/libero_spatial_lf_lora_2cam224/lf-m1-lf-spatial-lora-1epoch-v1/checkpoints/weights/step_003328.pt}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${RUN_ROOT}/evaluate_results/lf_object_dtl_cis_1epoch_seed${EVAL_SEED}_trials${NUM_TRIALS}}"
+B0_CKPT="${B0_CKPT:-}"
+M1_CKPT="${M1_CKPT:-}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${RUN_ROOT}/evaluate_results/lf_object_only_b0_m1_dtl_cis_1epoch_seed${EVAL_SEED}_trials${NUM_TRIALS}}"
 MANIFEST_PATH="${MANIFEST_PATH:-${OUTPUT_ROOT}/libero_object_dtl_cis.jsonl}"
 EVAL_CONDITIONS="${EVAL_CONDITIONS:-correct shuffled counterfactual}"
-EVAL_MODELS="${EVAL_MODELS:-B0 B1 M1}"
+EVAL_MODELS="${EVAL_MODELS:-B0 M1}"
 read -r -a CONDITION_LIST <<<"${EVAL_CONDITIONS}"
 read -r -a MODEL_LIST <<<"${EVAL_MODELS}"
 
@@ -44,19 +43,43 @@ for condition in "${CONDITION_LIST[@]}"; do
   fi
 done
 if (( ${#MODEL_LIST[@]} == 0 )); then
-  echo "EVAL_MODELS must contain at least one of B0, B1, M1." >&2
+  echo "EVAL_MODELS must contain B0 and/or M1." >&2
   exit 1
 fi
 for model_label in "${MODEL_LIST[@]}"; do
-  if [[ "${model_label}" != "B0" && "${model_label}" != "B1" && "${model_label}" != "M1" ]]; then
+  if [[ "${model_label}" != "B0" && "${model_label}" != "M1" ]]; then
     echo "Unsupported model label: ${model_label}." >&2
     exit 1
   fi
 done
 
-for required_file in "${STATS_PATH}" "${B0_CKPT}" "${B1_CKPT}" "${M1_CKPT}"; do
-  if [[ ! -f "${required_file}" ]]; then
-    echo "Required evaluation file not found: ${required_file}" >&2
+resolve_latest_checkpoint() {
+  local weights_dir="$1"
+  local checkpoint
+  checkpoint="$(find "${weights_dir}" -maxdepth 1 -type f -name 'step_*.pt' 2>/dev/null | sort | tail -n 1)"
+  if [[ -z "${checkpoint}" ]]; then
+    echo "No step_*.pt checkpoint found under ${weights_dir}." >&2
+    return 1
+  fi
+  echo "${checkpoint}"
+}
+
+if [[ " ${EVAL_MODELS} " == *" B0 "* && -z "${B0_CKPT}" ]]; then
+  B0_CKPT="$(resolve_latest_checkpoint "${RUN_ROOT}/runs/libero_object_lf_lora_2cam224/lf-b0-lf-object-lora-1epoch-v1/checkpoints/weights")"
+fi
+if [[ " ${EVAL_MODELS} " == *" M1 "* && -z "${M1_CKPT}" ]]; then
+  M1_CKPT="$(resolve_latest_checkpoint "${RUN_ROOT}/runs/libero_object_lf_lora_2cam224/lf-m1-lf-object-lora-1epoch-v1/checkpoints/weights")"
+fi
+
+if [[ ! -f "${STATS_PATH}" ]]; then
+  echo "Required dataset stats not found: ${STATS_PATH}" >&2
+  exit 1
+fi
+for model_label in "${MODEL_LIST[@]}"; do
+  checkpoint_var="${model_label}_CKPT"
+  checkpoint="${!checkpoint_var}"
+  if [[ ! -f "${checkpoint}" ]]; then
+    echo "Required ${model_label} checkpoint not found: ${checkpoint}" >&2
     exit 1
   fi
 done
@@ -103,7 +126,7 @@ run_condition() {
   EXP_NAME="lf-${model_label}-${condition}" \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
   "${PYTHON_BIN}" experiments/libero/run_libero_manager.py \
-    task=libero_spatial_lf_lora_2cam224 \
+    task=libero_object_lf_lora_2cam224 \
     "ckpt=${checkpoint}" \
     "seed=${EVAL_SEED}" \
     "EVALUATION.dataset_stats_path=${STATS_PATH}" \
@@ -122,12 +145,6 @@ B0_OVERRIDES=(
   model.action_dit_config.use_latent_action_queries=false
   model.langforce_mvp.enabled=false
 )
-B1_OVERRIDES=(
-  model.action_dit_config.use_latent_action_queries=true
-  model.langforce_mvp.enabled=true
-  model.langforce_mvp.enable_prior=false
-  model.langforce_mvp.enable_posterior_advantage=false
-)
 M1_OVERRIDES=(
   model.action_dit_config.use_latent_action_queries=true
   model.langforce_mvp.enabled=true
@@ -141,10 +158,6 @@ for model_label in "${MODEL_LIST[@]}"; do
     B0)
       checkpoint="${B0_CKPT}"
       model_overrides=("${B0_OVERRIDES[@]}")
-      ;;
-    B1)
-      checkpoint="${B1_CKPT}"
-      model_overrides=("${B1_OVERRIDES[@]}")
       ;;
     M1)
       checkpoint="${M1_CKPT}"
