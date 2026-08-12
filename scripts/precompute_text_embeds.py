@@ -36,6 +36,15 @@ def _init_distributed():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     if torch.cuda.is_available():
+        visible_device_count = torch.cuda.device_count()
+        if local_rank >= visible_device_count:
+            raise RuntimeError(
+                "Distributed text-cache precompute launched local rank "
+                f"{local_rank}, but PyTorch sees only {visible_device_count} CUDA "
+                "device(s). Reduce --nproc_per_node or expose more GPUs via "
+                "CUDA_VISIBLE_DEVICES. A single process is sufficient for the "
+                "ten LIBERO suite instructions."
+            )
         torch.cuda.set_device(local_rank)
 
     if not dist.is_initialized():

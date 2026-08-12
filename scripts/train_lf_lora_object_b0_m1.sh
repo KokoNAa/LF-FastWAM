@@ -10,6 +10,17 @@ OBJECT_DATASET="data/libero_mujoco3.3.2/libero_object_no_noops_lerobot"
 DEFAULT_STATS_PATH="$(dirname "${BASE_CHECKPOINT}")/libero_uncond_2cam224_dataset_stats.json"
 STATS_PATH="${STATS_PATH:-${DEFAULT_STATS_PATH}}"
 
+if ! [[ "${NPROC_PER_NODE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GPU process count must be a positive integer, got: ${NPROC_PER_NODE}" >&2
+  exit 1
+fi
+VISIBLE_GPU_COUNT="$(${PYTHON_BIN:-python} -c 'import torch; print(torch.cuda.device_count())')"
+if (( VISIBLE_GPU_COUNT < NPROC_PER_NODE )); then
+  echo "Requested ${NPROC_PER_NODE} GPU processes, but PyTorch sees only ${VISIBLE_GPU_COUNT} CUDA device(s)." >&2
+  echo "Check nvidia-smi -L and CUDA_VISIBLE_DEVICES before starting B0/M1 training." >&2
+  exit 1
+fi
+
 if [[ ! -f "${BASE_CHECKPOINT}" ]]; then
   echo "Base checkpoint not found: ${BASE_CHECKPOINT}" >&2
   exit 1

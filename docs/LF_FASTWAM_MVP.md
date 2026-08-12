@@ -250,9 +250,19 @@ huggingface-cli download yuanty/LIBERO-fastwam \
 tar -xzf ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot.tar.gz \
   -C ./data/libero_mujoco3.3.2
 
-torchrun --standalone --nproc_per_node=4 scripts/precompute_text_embeds.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/precompute_text_embeds.py \
   task=libero_object_lf_lora_2cam224 \
   +overwrite=false
+```
+
+The cache contains only ten suite instructions, so one GPU avoids loading four
+copies of the T5 encoder and also works when the current container exposes only
+one GPU. Before the four-GPU training launch, confirm that PyTorch sees all four
+devices:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -c \
+  'import torch; print("visible_gpus=", torch.cuda.device_count()); assert torch.cuda.device_count() == 4'
 ```
 
 Train B0 and M1 from the same released base, with the same seed, rank-16 LoRA,
