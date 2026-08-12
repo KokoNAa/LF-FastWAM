@@ -252,7 +252,7 @@ tar -xzf ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot.tar.gz \
 
 torchrun --standalone --nproc_per_node=4 scripts/precompute_text_embeds.py \
   task=libero_object_lf_lora_2cam224 \
-  overwrite=false
+  +overwrite=false
 ```
 
 Train B0 and M1 from the same released base, with the same seed, rank-16 LoRA,
