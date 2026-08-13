@@ -860,6 +860,7 @@ class FastWAM(torch.nn.Module):
         video_pre: dict[str, Any],
         final_video_hidden: torch.Tensor,
         video_kv_cache: list[dict[str, torch.Tensor]],
+        pred_action_m1: Optional[torch.Tensor] = None,
         action_tokens: torch.Tensor,
         timestep_action: torch.Tensor,
         context: torch.Tensor,
@@ -933,14 +934,23 @@ class FastWAM(torch.nn.Module):
             )
             return self.action_expert.post_dit(action_hidden, action_pre)
 
-        if route_scale <= 0.0:
-            # Exact M1 posterior-query policy.
-            pred_action = _run_policy(
-                base_queries,
-                m1_posterior_interface=True,
+        if route_scale < 1.0 and pred_action_m1 is None:
+            raise RuntimeError(
+                "TC-C recovery requires the exact joint-MoT M1 action output; "
+                "the sequential Video-cache path cannot synthesize it."
             )
-            router_metrics["policy_recovery_output_gap"] = pred_action.new_zeros(())
-            return pred_action, z_language, router_metrics
+
+        if route_scale <= 0.0:
+            # The caller ran the original joint-MoT posterior policy. Returning
+            # that exact tensor makes recovery a function-level invariant,
+            # including under BF16 SDPA and stochastic LoRA dropout.
+            router_metrics["policy_recovery_output_gap"] = (
+                pred_action_m1.new_zeros(())
+            )
+            router_metrics["policy_recovery_joint_m1"] = (
+                pred_action_m1.new_ones(())
+            )
+            return pred_action_m1, z_language, router_metrics
 
         if route_scale >= 1.0:
             # Final TC-C policy: Router is the only language/visual interface.
@@ -953,10 +963,6 @@ class FastWAM(torch.nn.Module):
 
         # Both branches share the same Video cache. This linear flow-velocity
         # blend makes the policy function continuous while shortcuts disappear.
-        pred_action_m1 = _run_policy(
-            base_queries,
-            m1_posterior_interface=True,
-        )
         pred_action_router = _run_policy(
             routed_full,
             m1_posterior_interface=False,
@@ -972,7 +978,134 @@ class FastWAM(torch.nn.Module):
             .norm(dim=-1)
             .mean()
         )
+        router_metrics["policy_recovery_joint_m1"] = (
+            pred_action_m1.new_ones(())
+        )
         return pred_action, z_language, router_metrics
+
+    def _run_joint_m1_policy_with_video_cache(
+        self,
+        *,
+        video_pre: dict[str, Any],
+        action_tokens: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        full_context_mask: torch.Tensor,
+        state_only_context_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]], torch.Tensor]:
+        """Run the original M1 posterior policy and expose its Video state.
+
+        Recovery must preserve the actual joint-MoT computation. Replaying the
+        Action Expert later from a sequential Video prefill is algebraically
+        similar, but changes BF16 attention kernels and LoRA-dropout RNG order
+        on the full model. Those differences are large enough to invalidate a
+        pretrained policy.
+        """
+        base_queries = self.action_expert.transition_queries.expand(
+            action_tokens.shape[0], -1, -1
+        )
+        action_pre = self._prepare_action_tokens(
+            action_tokens=action_tokens,
+            timestep=timestep_action,
+            context=context,
+            full_context_mask=full_context_mask,
+            state_only_context_mask=state_only_context_mask,
+            mode="posterior",
+            transition_query_tokens=base_queries,
+            policy_recovery=True,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=int(action_pre["tokens"].shape[1]),
+            video_tokens_per_frame=int(
+                video_pre["meta"]["tokens_per_frame"]
+            ),
+            device=video_pre["tokens"].device,
+            num_queries=int(action_pre["meta"]["num_queries"]),
+            action_reads_raw_video=False,
+            queries_read_raw_video=True,
+        )
+        joint_result = self.mot(
+            embeds_all={
+                "video": video_pre["tokens"],
+                "action": action_pre["tokens"],
+            },
+            attention_mask=attention_mask,
+            freqs_all={
+                "video": video_pre["freqs"],
+                "action": action_pre["freqs"],
+            },
+            context_all={
+                "video": {
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+            },
+            t_mod_all={
+                "video": video_pre["t_mod"],
+                "action": action_pre["t_mod"],
+            },
+            return_video_cache=True,
+        )
+        if not isinstance(joint_result, tuple):
+            raise RuntimeError("Joint M1 forward did not return Video K/V cache.")
+        tokens_out, video_kv_cache = joint_result
+        pred_action_m1 = self.action_expert.post_dit(
+            tokens_out["action"], action_pre
+        )
+        return pred_action_m1, video_kv_cache, tokens_out["video"]
+
+    def _forward_tc_v2_train(
+        self,
+        *,
+        video_pre: dict[str, Any],
+        action_tokens: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        full_context_mask: torch.Tensor,
+        state_only_context_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Run exact-M1 recovery or the final pure-Router training path."""
+        route_scale = self._transition_router_scale()
+        pred_action_m1 = None
+        if route_scale < 1.0:
+            (
+                pred_action_m1,
+                video_kv_cache,
+                final_video_hidden,
+            ) = self._run_joint_m1_policy_with_video_cache(
+                video_pre=video_pre,
+                action_tokens=action_tokens,
+                timestep_action=timestep_action,
+                context=context,
+                full_context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
+            )
+        else:
+            (
+                video_kv_cache,
+                final_video_hidden,
+            ) = self._run_video_expert_to_final_hidden(video_pre)
+
+        pred_action, z_language, router_metrics = (
+            self._forward_tc_v2_action_from_video_hidden(
+                video_pre=video_pre,
+                final_video_hidden=final_video_hidden,
+                video_kv_cache=video_kv_cache,
+                pred_action_m1=pred_action_m1,
+                action_tokens=action_tokens,
+                timestep_action=timestep_action,
+                context=context,
+                full_context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
+            )
+        )
+        return pred_action, final_video_hidden, z_language, router_metrics
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
@@ -1376,20 +1509,17 @@ class FastWAM(torch.nn.Module):
         router_metrics: dict[str, torch.Tensor] = {}
         if self.transition_contract_enabled:
             (
-                video_kv_cache,
+                pred_action_post,
                 final_video_hidden,
-            ) = self._run_video_expert_to_final_hidden(video_pre)
-            pred_action_post, z_language, router_metrics = (
-                self._forward_tc_v2_action_from_video_hidden(
-                    video_pre=video_pre,
-                    final_video_hidden=final_video_hidden,
-                    video_kv_cache=video_kv_cache,
-                    action_tokens=noisy_action,
-                    timestep_action=timestep_action,
-                    context=context,
-                    full_context_mask=full_context_mask,
-                    state_only_context_mask=state_only_context_mask,
-                )
+                z_language,
+                router_metrics,
+            ) = self._forward_tc_v2_train(
+                video_pre=video_pre,
+                action_tokens=noisy_action,
+                timestep_action=timestep_action,
+                context=context,
+                full_context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
             )
             pred_video = self.video_expert.post_dit(
                 final_video_hidden, video_pre
@@ -2251,6 +2381,7 @@ class FastWAM(torch.nn.Module):
             "policy_recovery_ratio": self.transition_policy_recovery_ratio,
             "router_ramp_ratio": self.transition_router_ramp_ratio,
             "policy_recovery_blend": "action_flow_velocity",
+            "policy_recovery_source": "joint_mot_posterior",
             "freeze_m1_during_recovery": (
                 self.transition_freeze_m1_during_recovery
             ),

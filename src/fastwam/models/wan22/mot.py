@@ -509,6 +509,8 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        *,
+        return_video_cache: bool = False,
     ):
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
@@ -530,6 +532,7 @@ class MoT(nn.Module):
             name: self._prepare_context_payload(context_all.get(name))
             for name in self.expert_order
         }
+        video_kv_cache: list[dict[str, torch.Tensor]] = []
 
         for layer_idx in range(self.num_layers):
             q_chunks = []
@@ -576,6 +579,8 @@ class MoT(nn.Module):
                     "gate_mlp": gate_mlp,
                     "use_gradient_checkpointing": use_gradient_checkpointing,
                 }
+                if return_video_cache and name == "video":
+                    video_kv_cache.append({"k": k, "v": v})
 
             # 3. concat all tokens for mixed attention
             q_cat = torch.cat(q_chunks, dim=1)
@@ -615,4 +620,11 @@ class MoT(nn.Module):
                 tokens_all[name] = updated_tokens
                 start = end
 
+        if return_video_cache:
+            if len(video_kv_cache) != self.num_layers:
+                raise RuntimeError(
+                    "Joint MoT forward did not collect one Video K/V cache "
+                    f"entry per layer: {len(video_kv_cache)} vs {self.num_layers}."
+                )
+            return tokens_all, video_kv_cache
         return tokens_all

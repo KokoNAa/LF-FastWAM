@@ -131,11 +131,8 @@ class TransitionContractTest(unittest.TestCase):
         noisy_action = torch.randn(2, 3, 3)
         timestep_action = torch.tensor([0.4, 0.6])
 
-        cache, final_hidden = self.model._run_video_expert_to_final_hidden(video_pre)
-        recovered, _, metrics = self.model._forward_tc_v2_action_from_video_hidden(
+        recovered, final_hidden, _, metrics = self.model._forward_tc_v2_train(
             video_pre=video_pre,
-            final_video_hidden=final_hidden,
-            video_kv_cache=cache,
             action_tokens=noisy_action,
             timestep_action=timestep_action,
             context=context,
@@ -190,8 +187,57 @@ class TransitionContractTest(unittest.TestCase):
             },
         )
         expected = self.model.action_expert.post_dit(joint["action"], action_pre)
-        torch.testing.assert_close(recovered, expected, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(recovered, expected, rtol=0, atol=0)
         self.assertEqual(float(metrics["router_route_scale"]), 0.0)
+        self.assertEqual(float(metrics["policy_recovery_joint_m1"]), 1.0)
+        torch.testing.assert_close(final_hidden, joint["video"], rtol=0, atol=0)
+
+    def test_recovery_start_preserves_joint_m1_dropout_rng(self):
+        dropout_config = {**LORA_CONFIG, "dropout": 0.5}
+        self.model.configure_lora(dropout_config)
+        with torch.no_grad():
+            for module in self.model.modules():
+                if hasattr(module, "lora_B"):
+                    module.lora_B.normal_(mean=0.0, std=0.05)
+        self.model.train()
+        self.model.set_training_progress(0, 100)
+
+        video_pre = self.model.video_expert.pre_dit(
+            x=torch.randn(2, 2, 2, 2, 2),
+            timestep=torch.tensor([0.2, 0.3]),
+            context=torch.randn(2, 4, 10),
+            context_mask=torch.ones(2, 4, dtype=torch.bool),
+            action=torch.randn(2, 3, 3),
+            fuse_vae_embedding_in_latents=True,
+        )
+        noisy_action = torch.randn(2, 3, 3)
+        timestep_action = torch.tensor([0.4, 0.6])
+        context = torch.randn(2, 4, 10)
+        full_mask = torch.ones(2, 4, dtype=torch.bool)
+        state_mask = torch.zeros_like(full_mask)
+
+        rng_state = torch.random.get_rng_state()
+        recovered, final_hidden, _, _ = self.model._forward_tc_v2_train(
+            video_pre=video_pre,
+            action_tokens=noisy_action,
+            timestep_action=timestep_action,
+            context=context,
+            full_context_mask=full_mask,
+            state_only_context_mask=state_mask,
+        )
+        torch.random.set_rng_state(rng_state)
+        expected, _, expected_video = (
+            self.model._run_joint_m1_policy_with_video_cache(
+                video_pre=video_pre,
+                action_tokens=noisy_action,
+                timestep_action=timestep_action,
+                context=context,
+                full_context_mask=full_mask,
+                state_only_context_mask=state_mask,
+            )
+        )
+        torch.testing.assert_close(recovered, expected, rtol=0, atol=0)
+        torch.testing.assert_close(final_hidden, expected_video, rtol=0, atol=0)
 
     def test_recovery_ramp_blends_complete_policy_outputs(self):
         self.model.eval()
@@ -204,11 +250,8 @@ class TransitionContractTest(unittest.TestCase):
             action=torch.randn(2, 3, 3),
             fuse_vae_embedding_in_latents=True,
         )
-        cache, final_hidden = self.model._run_video_expert_to_final_hidden(video_pre)
-        _, _, metrics = self.model._forward_tc_v2_action_from_video_hidden(
+        _, _, _, metrics = self.model._forward_tc_v2_train(
             video_pre=video_pre,
-            final_video_hidden=final_hidden,
-            video_kv_cache=cache,
             action_tokens=torch.randn(2, 3, 3),
             timestep_action=torch.tensor([0.4, 0.6]),
             context=torch.randn(2, 4, 10),
@@ -299,6 +342,10 @@ class TransitionContractTest(unittest.TestCase):
             self.assertEqual(
                 payload["architecture_metadata"]["policy_recovery_blend"],
                 "action_flow_velocity",
+            )
+            self.assertEqual(
+                payload["architecture_metadata"]["policy_recovery_source"],
+                "joint_mot_posterior",
             )
             self.assertNotIn(
                 "transition_contract_modules.*",

@@ -18,7 +18,7 @@ Final-layer current-frame Video hidden → Transition Visual Router
                 Action Expert [H_route, A_t]
 ```
 
-最终部署时，Action token 和 routed query 在 MoT 中都不能直接读取 raw video；Action Expert 的 cross-attention 也只保留 proprio，不直接读取 T5。训练恢复期前 10% 冻结已恢复的 M1 adapter、精确运行 M1 posterior-query 策略，同时 Contract 在后台训练完整 Router；随后 20% 解冻 LoRA 并并行计算共享同一 Video KV cache 的 M1 与纯 Router 动作流，线性混合两者的预测速度，30% 之后完全关闭 M1 shortcut。这样切换的是完整策略函数，而不只是输入 Query embedding。
+最终部署时，Action token 和 routed query 在 MoT 中都不能直接读取 raw video；Action Expert 的 cross-attention 也只保留 proprio，不直接读取 T5。训练恢复期前 10% 冻结已恢复的 M1 adapter，并直接运行原始 joint-MoT posterior-query 策略；Router 所需的最终 Video hidden 和过渡期所需的逐层 Video KV 均从同一次 joint 前向导出，因此 BF16 attention 和 LoRA dropout 下也保持函数级一致。同时 Contract 在后台训练完整 Router；随后 20% 解冻 LoRA，并以同一次 joint-M1 输出与纯 Router 动作流线性混合预测速度，30% 之后完全关闭 M1 shortcut、切换到顺序 Video→Router→Action 路径。这样切换的是完整策略函数，而不只是输入 Query embedding。
 
 训练期另以 clean GT current/future latents 经 Video Expert patch embedding 后的 hidden 均值差构造 `z_F`，以 routed intent 的池化表示构造 `z_L`。`z_F` 默认在进入 Outcome projection 前 stop-gradient，避免 contract 反向扰动 Video Expert；这只增加一次 patch embedding，不会复制 30 层 Video Transformer。两者归一化后使用对称 InfoNCE。跨卡训练会收集全局 in-batch negatives；单卡 batch size 1 返回有限的零 contract loss，不会崩溃。
 
@@ -72,6 +72,7 @@ router_language_residual_norm
 router_visual_residual_norm
 router_policy_residual_norm
 policy_recovery_output_gap
+policy_recovery_joint_m1
 transition_contract_scale
 ```
 
