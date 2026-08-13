@@ -424,6 +424,22 @@ class Wan22Trainer:
             if group.get("tc_recovery_group") is not None:
                 group["lr"] = self._tc_recovery_base_lrs[index]
 
+    def _clear_frozen_policy_gradients(self):
+        """Keep frozen M1 gradients out of clipping and Adam moments."""
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        scale_fn = getattr(unwrapped, "_transition_router_scale", None)
+        if not callable(scale_fn) or not bool(
+            getattr(unwrapped, "transition_freeze_m1_during_recovery", False)
+        ):
+            return
+        if float(scale_fn()) > 0.0:
+            return
+        for group in self.optimizer.param_groups:
+            if group.get("tc_recovery_group") != "policy":
+                continue
+            for parameter in group.get("params", []):
+                parameter.grad = None
+
     def _capture_scheduled_learning_rates(self):
         """Record scheduler output before the next recovery LR mask is applied."""
         for index, group in enumerate(self.optimizer.param_groups):
@@ -843,6 +859,7 @@ class Wan22Trainer:
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
+                    self._clear_frozen_policy_gradients()
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self._restore_transition_recovery_learning_rates()
