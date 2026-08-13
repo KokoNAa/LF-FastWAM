@@ -224,8 +224,12 @@ class TransitionContractTest(unittest.TestCase):
         self.assertEqual(self.model._transition_router_scale(), 0.0)
         self.model.set_training_progress(20, 100)
         self.assertAlmostEqual(self.model._transition_router_scale(), 0.5)
+        self.model.set_training_progress(29, 100)
+        self.assertLess(self.model._transition_router_scale(), 1.0)
         self.model.set_training_progress(30, 100)
         self.assertEqual(self.model._transition_router_scale(), 1.0)
+        self.model.set_training_progress(10, 100)
+        self.assertEqual(self.model._transition_contract_scale(), 1.0)
         evaluation_model = tiny_fastwam(transition_contract=True).eval()
         self.assertEqual(evaluation_model._transition_router_scale(), 1.0)
 

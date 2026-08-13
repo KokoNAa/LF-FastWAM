@@ -314,7 +314,14 @@ class FastWAM(torch.nn.Module):
             return 0.0
         if self.transition_contract_ramp_ratio <= 0 or progress >= ramp_end:
             return 1.0
-        return float((progress - warmup_end) / self.transition_contract_ramp_ratio)
+        scale = (progress - warmup_end) / self.transition_contract_ramp_ratio
+        # Snap arithmetic representations of an exact schedule endpoint (for
+        # example 0.3 vs 0.1 + 0.2) to the intended closed interval boundary.
+        if scale >= 1.0 - 1.0e-12:
+            return 1.0
+        if scale <= 1.0e-12:
+            return 0.0
+        return float(scale)
 
     def _transition_router_scale(self) -> float:
         """Return the explicit training recovery scale; deployment is pure Router."""
@@ -327,9 +334,12 @@ class FastWAM(torch.nn.Module):
             return 0.0
         if self.transition_router_ramp_ratio <= 0 or progress >= ramp_end:
             return 1.0
-        return float(
-            (progress - recovery_end) / self.transition_router_ramp_ratio
-        )
+        scale = (progress - recovery_end) / self.transition_router_ramp_ratio
+        if scale >= 1.0 - 1.0e-12:
+            return 1.0
+        if scale <= 1.0e-12:
+            return 0.0
+        return float(scale)
 
     def configure_lora(self, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         normalized = normalize_lora_config(config)
