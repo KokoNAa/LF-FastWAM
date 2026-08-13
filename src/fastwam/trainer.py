@@ -417,12 +417,12 @@ class Wan22Trainer:
                 else 0.0
             )
             group["lr"] = masked_lr
-            scheduler_last_lrs = getattr(self.scheduler, "_last_lr", None)
-            if (
-                isinstance(scheduler_last_lrs, list)
-                and index < len(scheduler_last_lrs)
-            ):
-                scheduler_last_lrs[index] = masked_lr
+
+    def _restore_transition_recovery_learning_rates(self):
+        """Restore scheduled LRs after the masked optimizer update."""
+        for index, group in enumerate(self.optimizer.param_groups):
+            if group.get("tc_recovery_group") is not None:
+                group["lr"] = self._tc_recovery_base_lrs[index]
 
     def _capture_scheduled_learning_rates(self):
         """Record scheduler output before the next recovery LR mask is applied."""
@@ -845,6 +845,7 @@ class Wan22Trainer:
                 if self.accelerator.sync_gradients:
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
+                    self._restore_transition_recovery_learning_rates()
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
                         self._capture_scheduled_learning_rates()
