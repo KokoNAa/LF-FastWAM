@@ -87,6 +87,7 @@ def create_fastwam(
     action_scheduler=None,
     loss=None,
     langforce_mvp=None,
+    transition_contract=None,
     lora=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
@@ -144,6 +145,18 @@ def create_fastwam(
             f"`langforce_mvp` must be dict-like, got {type(langforce_mvp)}"
         )
 
+    if isinstance(transition_contract, DictConfig):
+        transition_contract = OmegaConf.to_container(
+            transition_contract, resolve=True
+        )
+    if transition_contract is None:
+        transition_contract = {}
+    if not isinstance(transition_contract, dict):
+        raise ValueError(
+            "`transition_contract` must be dict-like, got "
+            f"{type(transition_contract)}"
+        )
+
     if isinstance(lora, DictConfig):
         lora = OmegaConf.to_container(lora, resolve=True)
     if lora is None:
@@ -174,6 +187,7 @@ def create_fastwam(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         langforce_mvp_config=langforce_mvp,
+        transition_contract_config=transition_contract,
         lora_config=lora,
     )
 

@@ -261,6 +261,7 @@ class ActionDiT(nn.Module):
         use_queries: Optional[bool] = None,
         query_context_mask: Optional[torch.Tensor] = None,
         action_context_mask: Optional[torch.Tensor] = None,
+        transition_query_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if action_tokens.ndim != 3:
             raise ValueError(
@@ -318,10 +319,12 @@ class ActionDiT(nn.Module):
                 "`use_latent_action_queries=True`."
             )
         if not use_queries and (
-            query_context_mask is not None or action_context_mask is not None
+            query_context_mask is not None
+            or action_context_mask is not None
+            or transition_query_tokens is not None
         ):
             raise ValueError(
-                "Query/action-specific context masks require `use_queries=True`."
+                "Query-specific inputs require `use_queries=True`."
             )
 
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
@@ -338,7 +341,20 @@ class ActionDiT(nn.Module):
                     f"offset={self.query_rope_offset}, queries={num_queries}, "
                     f"cache={self.freqs.shape[0]}."
                 )
-            query_tokens = self.latent_action_queries.expand(batch_size, -1, -1)
+            if transition_query_tokens is None:
+                query_tokens = self.latent_action_queries.expand(
+                    batch_size, -1, -1
+                )
+            else:
+                expected = (batch_size, num_queries, self.hidden_dim)
+                if tuple(transition_query_tokens.shape) != expected:
+                    raise ValueError(
+                        "`transition_query_tokens` shape must be "
+                        f"{expected}, got {tuple(transition_query_tokens.shape)}."
+                    )
+                query_tokens = transition_query_tokens.to(
+                    device=action_emb.device, dtype=action_emb.dtype
+                )
             tokens = torch.cat([query_tokens, action_emb], dim=1)
 
             zero_timestep = torch.zeros_like(timestep)
@@ -424,8 +440,20 @@ class ActionDiT(nn.Module):
                 "seq_len": num_queries + action_seq_len,
                 "num_queries": num_queries,
                 "action_seq_len": action_seq_len,
+                "uses_transition_query_override": (
+                    transition_query_tokens is not None
+                ),
             },
         }
+
+    @property
+    def transition_queries(self) -> torch.nn.Parameter:
+        """Semantic alias that preserves the legacy checkpoint key."""
+        if not self.use_latent_action_queries:
+            raise AttributeError(
+                "Transition queries are unavailable when latent queries are disabled."
+            )
+        return self.latent_action_queries
 
     def post_dit(self, tokens: torch.Tensor, pre_state: Dict[str, Any]) -> torch.Tensor:
         num_queries = int(pre_state.get("meta", {}).get("num_queries", 0))
@@ -442,6 +470,19 @@ class ActionDiT(nn.Module):
             )
         return self.head(tokens[:, num_queries:])
 
+    def post_dit_with_hidden(
+        self, tokens: torch.Tensor, pre_state: Dict[str, Any]
+    ) -> Dict[str, torch.Tensor]:
+        """Return predictions plus hidden states without changing legacy callers."""
+        num_queries = int(pre_state.get("meta", {}).get("num_queries", 0))
+        action_hidden = tokens[:, num_queries:]
+        transition_hidden = tokens[:, :num_queries]
+        return {
+            "action_pred": self.head(action_hidden),
+            "transition_query_hidden": transition_hidden,
+            "action_hidden": action_hidden,
+        }
+
     def forward(
         self,
         action_tokens: torch.Tensor,
@@ -452,6 +493,7 @@ class ActionDiT(nn.Module):
         use_queries: Optional[bool] = None,
         query_context_mask: Optional[torch.Tensor] = None,
         action_context_mask: Optional[torch.Tensor] = None,
+        transition_query_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         pre_state = self.pre_dit(
             action_tokens=action_tokens,
@@ -461,6 +503,7 @@ class ActionDiT(nn.Module):
             use_queries=use_queries,
             query_context_mask=query_context_mask,
             action_context_mask=action_context_mask,
+            transition_query_tokens=transition_query_tokens,
         )
         x = pre_state["tokens"]
         context = pre_state["context"]

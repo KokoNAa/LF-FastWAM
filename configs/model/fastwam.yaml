@@ -75,6 +75,26 @@ langforce_mvp:
   posterior_advantage_margin_ratio: 0.05
   detach_prior_video_cache: true
 
+# Stage-1 TC-C is opt-in. It reuses the legacy latent-query checkpoint key but
+# changes its semantics to intended-transition queries. Prior/advantage must be
+# disabled when this block is enabled.
+transition_contract:
+  enabled: false
+  projection_dim: 512
+  temperature: 0.07
+  contract_weight: 0.05
+  outcome_stop_gradient: true
+  use_transition_router: true
+  router_num_heads: 8
+  direct_action_video_access: false
+  direct_action_text_access: false
+  direct_video_text_access: true
+  action_conditioned_video: false
+  use_action_effect: false
+  use_counterfactual_ranking: false
+  warmup_ratio: 0.05
+  ramp_ratio: 0.05
+
 # Parameter-efficient fine-tuning. Disabled by default so released full
 # checkpoints retain their original behavior; LoRA adapters auto-enable when
 # an adapter checkpoint is loaded.

@@ -192,6 +192,10 @@ class Wan22Trainer:
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
+            drop_last=bool(
+                getattr(self.model, "transition_contract_enabled", False)
+                and self.accelerator.num_processes > 1
+            ),
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
@@ -692,6 +696,10 @@ class Wan22Trainer:
 
             with self.accelerator.accumulate(self.model):
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
+                if hasattr(unwrapped_model, "set_training_progress"):
+                    unwrapped_model.set_training_progress(
+                        self.global_step, self.max_steps
+                    )
 
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)

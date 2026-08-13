@@ -37,7 +37,7 @@ def mask_only_model() -> FastWAM:
     return model
 
 
-def tiny_fastwam() -> FastWAM:
+def tiny_fastwam(*, transition_contract: bool = False) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
         in_dim=2,
@@ -85,12 +85,29 @@ def tiny_fastwam() -> FastWAM:
         device="cpu",
         torch_dtype=torch.float32,
         langforce_mvp_config={
-            "enabled": True,
-            "enable_prior": True,
-            "enable_posterior_advantage": True,
+            "enabled": not transition_contract,
+            "enable_prior": not transition_contract,
+            "enable_posterior_advantage": not transition_contract,
             "action_reads_raw_video": False,
             "action_reads_language": False,
             "detach_prior_video_cache": True,
+        },
+        transition_contract_config={
+            "enabled": transition_contract,
+            "projection_dim": 8,
+            "temperature": 0.07,
+            "contract_weight": 0.05,
+            "outcome_stop_gradient": True,
+            "use_transition_router": True,
+            "router_num_heads": 2,
+            "direct_action_video_access": False,
+            "direct_action_text_access": False,
+            "direct_video_text_access": True,
+            "action_conditioned_video": False,
+            "use_action_effect": False,
+            "use_counterfactual_ranking": False,
+            "warmup_ratio": 0.05,
+            "ramp_ratio": 0.05,
         },
     )
 

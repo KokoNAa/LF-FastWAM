@@ -625,6 +625,24 @@ class WanVideoDiT(torch.nn.Module):
         x = self.unpatchify(x, (f, h, w))
         return x
 
+    @staticmethod
+    def split_current_future_hidden(
+        x_tokens: torch.Tensor, *, tokens_per_frame: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expose current/future hidden groups for transition supervision."""
+        tokens_per_frame = int(tokens_per_frame)
+        if x_tokens.ndim != 3:
+            raise ValueError("`x_tokens` must be [B,N,D].")
+        if tokens_per_frame <= 0 or x_tokens.shape[1] <= tokens_per_frame:
+            raise ValueError(
+                "Current/future split needs at least two latent frames; "
+                f"tokens={x_tokens.shape[1]}, tokens_per_frame={tokens_per_frame}."
+            )
+        return (
+            x_tokens[:, :tokens_per_frame],
+            x_tokens[:, tokens_per_frame:],
+        )
+
     def forward(
         self,
         x: torch.Tensor,
