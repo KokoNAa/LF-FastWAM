@@ -168,7 +168,7 @@ class FastWAM(torch.nn.Module):
         self.transition_contract_enabled = bool(
             contract_config.get("enabled", False)
         )
-        self.transition_contract_version = 1
+        self.transition_contract_version = int(contract_config.get("version", 2))
         self.transition_contract_weight = float(
             contract_config.get("contract_weight", 0.05)
         )
@@ -181,6 +181,15 @@ class FastWAM(torch.nn.Module):
         self.transition_contract_ramp_ratio = float(
             contract_config.get("ramp_ratio", 0.05)
         )
+        self.transition_policy_recovery_ratio = float(
+            contract_config.get("policy_recovery_ratio", 0.10)
+        )
+        self.transition_router_ramp_ratio = float(
+            contract_config.get("router_ramp_ratio", 0.20)
+        )
+        self.transition_freeze_m1_during_recovery = bool(
+            contract_config.get("freeze_m1_during_recovery", True)
+        )
         self.outcome_stop_gradient = bool(
             contract_config.get("outcome_stop_gradient", True)
         )
@@ -191,8 +200,15 @@ class FastWAM(torch.nn.Module):
         self.transition_contract_loss = None
         self._transition_training_step = 0
         self._transition_training_max_steps = 1
+        self._transition_training_progress_active = False
+        self.transition_policy_init_checkpoint: Optional[str] = None
 
         if self.transition_contract_enabled:
+            if self.transition_contract_version != 2:
+                raise ValueError(
+                    "The current TC-C implementation requires "
+                    "`transition_contract.version=2`."
+                )
             if not bool(
                 getattr(self.action_expert, "use_latent_action_queries", False)
             ):
@@ -234,6 +250,18 @@ class FastWAM(torch.nn.Module):
                 raise ValueError("`warmup_ratio` must be in [0,1).")
             if not 0.0 <= self.transition_contract_ramp_ratio < 1.0:
                 raise ValueError("`ramp_ratio` must be in [0,1).")
+            if not 0.0 <= self.transition_policy_recovery_ratio < 1.0:
+                raise ValueError("`policy_recovery_ratio` must be in [0,1).")
+            if not 0.0 <= self.transition_router_ramp_ratio < 1.0:
+                raise ValueError("`router_ramp_ratio` must be in [0,1).")
+            if (
+                self.transition_policy_recovery_ratio
+                + self.transition_router_ramp_ratio
+                > 1.0
+            ):
+                raise ValueError(
+                    "`policy_recovery_ratio + router_ramp_ratio` must be <= 1."
+                )
 
             projection_dim = int(contract_config.get("projection_dim", 512))
             router_num_heads = int(contract_config.get("router_num_heads", 8))
@@ -276,6 +304,7 @@ class FastWAM(torch.nn.Module):
         """Set optimizer-step progress used by Stage-1 contract warm-up."""
         self._transition_training_step = max(0, int(step))
         self._transition_training_max_steps = max(1, int(max_steps))
+        self._transition_training_progress_active = True
 
     def _transition_contract_scale(self) -> float:
         progress = self._transition_training_step / self._transition_training_max_steps
@@ -287,13 +316,23 @@ class FastWAM(torch.nn.Module):
             return 1.0
         return float((progress - warmup_end) / self.transition_contract_ramp_ratio)
 
+    def _transition_router_scale(self) -> float:
+        """Return the explicit training recovery scale; deployment is pure Router."""
+        if not self._transition_training_progress_active:
+            return 1.0
+        progress = self._transition_training_step / self._transition_training_max_steps
+        recovery_end = self.transition_policy_recovery_ratio
+        ramp_end = recovery_end + self.transition_router_ramp_ratio
+        if progress < recovery_end:
+            return 0.0
+        if self.transition_router_ramp_ratio <= 0 or progress >= ramp_end:
+            return 1.0
+        return float(
+            (progress - recovery_end) / self.transition_router_ramp_ratio
+        )
+
     def configure_lora(self, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         normalized = normalize_lora_config(config)
-        if self.transition_contract_enabled:
-            patterns = list(normalized["extra_trainable_patterns"])
-            if "transition_contract_modules.*" not in patterns:
-                patterns.append("transition_contract_modules.*")
-            normalized["extra_trainable_patterns"] = patterns
         if not normalized["enabled"]:
             if self.lora_enabled:
                 raise ValueError("Cannot disable LoRA after adapters have been injected.")
@@ -364,7 +403,9 @@ class FastWAM(torch.nn.Module):
     def _adapter_parameter_ids(self) -> set[int]:
         if not self.lora_enabled:
             return set()
-        extra_patterns = self.lora_config["extra_trainable_patterns"]
+        extra_patterns = list(self.lora_config["extra_trainable_patterns"])
+        if self.transition_contract_enabled:
+            extra_patterns.append("transition_contract_modules.*")
         return {
             id(parameter)
             for name, parameter in self.named_parameters()
@@ -643,6 +684,7 @@ class FastWAM(torch.nn.Module):
         state_only_context_mask: torch.Tensor,
         mode: str,
         transition_query_tokens: Optional[torch.Tensor] = None,
+        policy_recovery: bool = False,
     ) -> dict[str, Any]:
         if not self.uses_transition_queries:
             return self.action_expert.pre_dit(
@@ -654,7 +696,7 @@ class FastWAM(torch.nn.Module):
             )
 
         num_queries = int(self.action_expert.num_latent_queries)
-        if self.transition_contract_enabled:
+        if self.transition_contract_enabled and not policy_recovery:
             if transition_query_tokens is None:
                 raise ValueError(
                     "TC-C action preparation requires routed transition query tokens."
@@ -694,11 +736,14 @@ class FastWAM(torch.nn.Module):
         video_tokens_per_frame: int,
         context: torch.Tensor,
         full_context_mask: torch.Tensor,
+        route_scale: Optional[float] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Encode language intent and route current visual evidence."""
         if not self.transition_contract_enabled:
             raise RuntimeError("Transition Contract is disabled.")
         current_video = video_tokens[:, : int(video_tokens_per_frame)]
+        if route_scale is None:
+            route_scale = self._transition_router_scale()
         batch_size = current_video.shape[0]
         transition_queries = self.action_expert.transition_queries.expand(
             batch_size, -1, -1
@@ -709,6 +754,7 @@ class FastWAM(torch.nn.Module):
             language_hidden=language_hidden,
             language_mask=full_context_mask,
             current_video_hidden=current_video,
+            route_scale=route_scale,
         )
         z_language = self.transition_contract_modules["intent_projection"](
             routed.mean(dim=1)
@@ -769,6 +815,154 @@ class FastWAM(torch.nn.Module):
         if self.transition_contract_loss is None:
             raise RuntimeError("Transition Contract loss is unavailable.")
         return self.transition_contract_loss(z_language, z_future)
+
+    def _run_video_expert_to_final_hidden(
+        self,
+        video_pre: dict[str, Any],
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor]:
+        """Run the full Video Expert once and expose its semantic hidden state."""
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        video_attention_mask = self.video_expert.build_video_to_video_mask(
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=int(
+                video_pre["meta"]["tokens_per_frame"]
+            ),
+            device=video_pre["tokens"].device,
+        )
+        result = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=video_attention_mask,
+            return_final_hidden=True,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError("Video Expert did not return final hidden states.")
+        return result
+
+    def _forward_tc_v2_action_from_video_hidden(
+        self,
+        *,
+        video_pre: dict[str, Any],
+        final_video_hidden: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        action_tokens: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        full_context_mask: torch.Tensor,
+        state_only_context_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Route final Video hidden and recover M1 before pure-Router training.
+
+        Recovery is interpolated on predicted action velocity, not only on the
+        input query embeddings. The M1 interface also lets posterior queries
+        read current-frame Video K/V and T5 context at every Action-Expert
+        layer, so query-only interpolation would remove those paths abruptly.
+        """
+        route_scale = self._transition_router_scale()
+        routed_full, z_language, router_metrics = self.encode_intended_transition(
+            video_tokens=final_video_hidden,
+            video_tokens_per_frame=int(
+                video_pre["meta"]["tokens_per_frame"]
+            ),
+            context=context,
+            full_context_mask=full_context_mask,
+            # Contract supervision trains the full router from step zero. Only
+            # the policy prefix is recovery-blended below.
+            route_scale=1.0,
+        )
+        base_queries = self.action_expert.transition_queries.expand(
+            routed_full.shape[0], -1, -1
+        )
+        router_metrics["router_route_scale"] = routed_full.new_tensor(route_scale)
+        router_metrics["router_policy_residual_norm"] = (
+            (routed_full - base_queries).float().norm(dim=-1).mean()
+        )
+
+        def _run_policy(
+            transition_tokens: torch.Tensor,
+            *,
+            m1_posterior_interface: bool,
+        ) -> torch.Tensor:
+            action_pre = self._prepare_action_tokens(
+                action_tokens=action_tokens,
+                timestep=timestep_action,
+                context=context,
+                full_context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
+                mode="posterior",
+                transition_query_tokens=transition_tokens,
+                policy_recovery=m1_posterior_interface,
+            )
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=int(video_pre["tokens"].shape[1]),
+                action_seq_len=int(action_pre["tokens"].shape[1]),
+                video_tokens_per_frame=int(
+                    video_pre["meta"]["tokens_per_frame"]
+                ),
+                device=video_pre["tokens"].device,
+                num_queries=int(action_pre["meta"]["num_queries"]),
+                action_reads_raw_video=False,
+                queries_read_raw_video=m1_posterior_interface,
+            )
+            action_hidden = self.mot.forward_action_with_video_cache(
+                action_tokens=action_pre["tokens"],
+                action_freqs=action_pre["freqs"],
+                action_t_mod=action_pre["t_mod"],
+                action_context_payload={
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=int(video_pre["tokens"].shape[1]),
+            )
+            return self.action_expert.post_dit(action_hidden, action_pre)
+
+        if route_scale <= 0.0:
+            # Exact M1 posterior-query policy.
+            pred_action = _run_policy(
+                base_queries,
+                m1_posterior_interface=True,
+            )
+            router_metrics["policy_recovery_output_gap"] = pred_action.new_zeros(())
+            return pred_action, z_language, router_metrics
+
+        if route_scale >= 1.0:
+            # Final TC-C policy: Router is the only language/visual interface.
+            pred_action = _run_policy(
+                routed_full,
+                m1_posterior_interface=False,
+            )
+            router_metrics["policy_recovery_output_gap"] = pred_action.new_zeros(())
+            return pred_action, z_language, router_metrics
+
+        # Both branches share the same Video cache. This linear flow-velocity
+        # blend makes the policy function continuous while shortcuts disappear.
+        pred_action_m1 = _run_policy(
+            base_queries,
+            m1_posterior_interface=True,
+        )
+        pred_action_router = _run_policy(
+            routed_full,
+            m1_posterior_interface=False,
+        )
+        pred_action = torch.lerp(
+            pred_action_m1,
+            pred_action_router,
+            float(route_scale),
+        )
+        router_metrics["policy_recovery_output_gap"] = (
+            (pred_action_router - pred_action_m1)
+            .float()
+            .norm(dim=-1)
+            .mean()
+        )
+        return pred_action, z_language, router_metrics
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
@@ -1168,76 +1362,77 @@ class FastWAM(torch.nn.Module):
             fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
         )
 
-        routed_transition_tokens = None
         z_language = None
         router_metrics: dict[str, torch.Tensor] = {}
         if self.transition_contract_enabled:
             (
-                routed_transition_tokens,
-                z_language,
-                router_metrics,
-            ) = self.encode_intended_transition(
-                video_tokens=video_pre["tokens"],
+                video_kv_cache,
+                final_video_hidden,
+            ) = self._run_video_expert_to_final_hidden(video_pre)
+            pred_action_post, z_language, router_metrics = (
+                self._forward_tc_v2_action_from_video_hidden(
+                    video_pre=video_pre,
+                    final_video_hidden=final_video_hidden,
+                    video_kv_cache=video_kv_cache,
+                    action_tokens=noisy_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    full_context_mask=full_context_mask,
+                    state_only_context_mask=state_only_context_mask,
+                )
+            )
+            pred_video = self.video_expert.post_dit(
+                final_video_hidden, video_pre
+            )
+        else:
+            action_pre = self._prepare_action_tokens(
+                action_tokens=noisy_action,
+                timestep=timestep_action,
+                context=context,
+                full_context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
+                mode="posterior",
+            )
+            video_tokens = video_pre["tokens"]
+            action_tokens = action_pre["tokens"]
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=video_tokens.shape[1],
+                action_seq_len=action_tokens.shape[1],
                 video_tokens_per_frame=int(
                     video_pre["meta"]["tokens_per_frame"]
                 ),
-                context=context,
-                full_context_mask=full_context_mask,
+                device=video_tokens.device,
+                num_queries=int(action_pre["meta"]["num_queries"]),
+                action_reads_raw_video=self.action_reads_raw_video,
             )
-
-        action_pre = self._prepare_action_tokens(
-            action_tokens=noisy_action,
-            timestep=timestep_action,
-            context=context,
-            full_context_mask=full_context_mask,
-            state_only_context_mask=state_only_context_mask,
-            mode="posterior",
-            transition_query_tokens=routed_transition_tokens,
-        )
-
-        video_tokens = video_pre["tokens"]
-        action_tokens = action_pre["tokens"]
-
-        attention_mask = self._build_mot_attention_mask(
-            video_seq_len=video_tokens.shape[1],
-            action_seq_len=action_tokens.shape[1],
-            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-            device=video_tokens.device,
-            num_queries=int(action_pre["meta"]["num_queries"]),
-            action_reads_raw_video=self.action_reads_raw_video,
-            queries_read_raw_video=not self.transition_contract_enabled,
-        )
-        tokens_out = self.mot(
-            embeds_all={
-                "video": video_tokens,
-                "action": action_tokens,
-            },
-            attention_mask=attention_mask,
-            freqs_all={
-                "video": video_pre["freqs"],
-                "action": action_pre["freqs"],
-            },
-            context_all={
-                "video": {
-                    "context": video_pre["context"],
-                    "mask": video_pre["context_mask"],
+            tokens_out = self.mot(
+                embeds_all={"video": video_tokens, "action": action_tokens},
+                attention_mask=attention_mask,
+                freqs_all={
+                    "video": video_pre["freqs"],
+                    "action": action_pre["freqs"],
                 },
-                "action": {
-                    "context": action_pre["context"],
-                    "mask": action_pre["context_mask"],
+                context_all={
+                    "video": {
+                        "context": video_pre["context"],
+                        "mask": video_pre["context_mask"],
+                    },
+                    "action": {
+                        "context": action_pre["context"],
+                        "mask": action_pre["context_mask"],
+                    },
                 },
-            },
-            t_mod_all={
-                "video": video_pre["t_mod"],
-                "action": action_pre["t_mod"],
-            },
-        )
-
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
-
-        pred_action_post = self.action_expert.post_dit(
-            tokens_out["action"], action_pre
-        )
+                t_mod_all={
+                    "video": video_pre["t_mod"],
+                    "action": action_pre["t_mod"],
+                },
+            )
+            pred_video = self.video_expert.post_dit(
+                tokens_out["video"], video_pre
+            )
+            pred_action_post = self.action_expert.post_dit(
+                tokens_out["action"], action_pre
+            )
 
         include_initial_video_step = inputs["first_frame_latents"] is None
         if inputs["first_frame_latents"] is not None:
@@ -1389,16 +1584,25 @@ class FastWAM(torch.nn.Module):
         )
         if state_only_context_mask is None:
             state_only_context_mask = context_mask
-        routed_transition_tokens = None
         if self.transition_contract_enabled:
-            routed_transition_tokens, _, _ = self.encode_intended_transition(
-                video_tokens=video_pre["tokens"],
-                video_tokens_per_frame=int(
-                    video_pre["meta"]["tokens_per_frame"]
-                ),
+            video_kv_cache, final_video_hidden = (
+                self._run_video_expert_to_final_hidden(video_pre)
+            )
+            pred_action, _, _ = self._forward_tc_v2_action_from_video_hidden(
+                video_pre=video_pre,
+                final_video_hidden=final_video_hidden,
+                video_kv_cache=video_kv_cache,
+                action_tokens=latents_action,
+                timestep_action=timestep_action,
                 context=context,
                 full_context_mask=context_mask,
+                state_only_context_mask=state_only_context_mask,
             )
+            pred_video = self.video_expert.post_dit(
+                final_video_hidden, video_pre
+            )
+            return pred_video, pred_action
+
         action_pre = self._prepare_action_tokens(
             action_tokens=latents_action,
             timestep=timestep_action,
@@ -1406,9 +1610,7 @@ class FastWAM(torch.nn.Module):
             full_context_mask=context_mask,
             state_only_context_mask=state_only_context_mask,
             mode="posterior",
-            transition_query_tokens=routed_transition_tokens,
         )
-
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_pre["tokens"].shape[1],
             action_seq_len=action_pre["tokens"].shape[1],
@@ -1416,9 +1618,7 @@ class FastWAM(torch.nn.Module):
             device=video_pre["tokens"].device,
             num_queries=int(action_pre["meta"]["num_queries"]),
             action_reads_raw_video=self.action_reads_raw_video,
-            queries_read_raw_video=not self.transition_contract_enabled,
         )
-
         tokens_out = self.mot(
             embeds_all={
                 "video": video_pre["tokens"],
@@ -1444,10 +1644,10 @@ class FastWAM(torch.nn.Module):
                 "action": action_pre["t_mod"],
             },
         )
-
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
-        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
-        return pred_video, pred_action
+        return (
+            self.video_expert.post_dit(tokens_out["video"], video_pre),
+            self.action_expert.post_dit(tokens_out["action"], action_pre),
+        )
 
     @torch.no_grad()
     def _predict_action_noise(
@@ -1471,16 +1671,21 @@ class FastWAM(torch.nn.Module):
         )
         if state_only_context_mask is None:
             state_only_context_mask = context_mask
-        routed_transition_tokens = None
         if self.transition_contract_enabled:
-            routed_transition_tokens, _, _ = self.encode_intended_transition(
-                video_tokens=video_pre["tokens"],
-                video_tokens_per_frame=int(
-                    video_pre["meta"]["tokens_per_frame"]
-                ),
+            video_kv_cache, final_video_hidden = (
+                self._run_video_expert_to_final_hidden(video_pre)
+            )
+            pred_action, _, _ = self._forward_tc_v2_action_from_video_hidden(
+                video_pre=video_pre,
+                final_video_hidden=final_video_hidden,
+                video_kv_cache=video_kv_cache,
+                action_tokens=latents_action,
+                timestep_action=timestep_action,
                 context=context,
                 full_context_mask=context_mask,
+                state_only_context_mask=state_only_context_mask,
             )
+            return pred_action
         action_pre = self._prepare_action_tokens(
             action_tokens=latents_action,
             timestep=timestep_action,
@@ -1488,7 +1693,6 @@ class FastWAM(torch.nn.Module):
             full_context_mask=context_mask,
             state_only_context_mask=state_only_context_mask,
             mode="posterior",
-            transition_query_tokens=routed_transition_tokens,
         )
 
         attention_mask = self._build_mot_attention_mask(
@@ -1498,7 +1702,6 @@ class FastWAM(torch.nn.Module):
             device=video_pre["tokens"].device,
             num_queries=int(action_pre["meta"]["num_queries"]),
             action_reads_raw_video=self.action_reads_raw_video,
-            queries_read_raw_video=not self.transition_contract_enabled,
         )
         tokens_out = self.mot(
             embeds_all={
@@ -1875,13 +2078,36 @@ class FastWAM(torch.nn.Module):
         )
         routed_transition_tokens = None
         if self.transition_contract_enabled:
-            routed_transition_tokens, _, _ = self.encode_intended_transition(
+            prefill_result = self.mot.prefill_video_cache(
                 video_tokens=video_pre["tokens"],
+                video_freqs=video_pre["freqs"],
+                video_t_mod=video_pre["t_mod"],
+                video_context_payload={
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                video_attention_mask=(
+                    self.video_expert.build_video_to_video_mask(
+                        video_seq_len=int(video_pre["tokens"].shape[1]),
+                        video_tokens_per_frame=int(
+                            video_pre["meta"]["tokens_per_frame"]
+                        ),
+                        device=video_pre["tokens"].device,
+                    )
+                ),
+                return_final_hidden=True,
+            )
+            if not isinstance(prefill_result, tuple):
+                raise RuntimeError("TC-C v2 Video prefill did not return hidden.")
+            video_kv_cache, final_video_hidden = prefill_result
+            routed_transition_tokens, _, _ = self.encode_intended_transition(
+                video_tokens=final_video_hidden,
                 video_tokens_per_frame=int(
                     video_pre["meta"]["tokens_per_frame"]
                 ),
                 context=context,
                 full_context_mask=context_mask,
+                route_scale=1.0,
             )
         video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
@@ -1902,18 +2128,21 @@ class FastWAM(torch.nn.Module):
                 else 0
             ),
             action_reads_raw_video=self.action_reads_raw_video,
-            queries_read_raw_video=not self.transition_contract_enabled,
+            queries_read_raw_video=False,
         )
-        video_kv_cache = self.mot.prefill_video_cache(
-            video_tokens=video_pre["tokens"],
-            video_freqs=video_pre["freqs"],
-            video_t_mod=video_pre["t_mod"],
-            video_context_payload={
-                "context": video_pre["context"],
-                "mask": video_pre["context_mask"],
-            },
-            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
-        )
+        if not self.transition_contract_enabled:
+            video_kv_cache = self.mot.prefill_video_cache(
+                video_tokens=video_pre["tokens"],
+                video_freqs=video_pre["freqs"],
+                video_t_mod=video_pre["t_mod"],
+                video_context_payload={
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                video_attention_mask=attention_mask[
+                    :video_seq_len, :video_seq_len
+                ],
+            )
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -2008,6 +2237,14 @@ class FastWAM(torch.nn.Module):
             "use_cf_ranking": False,
             "use_action_effect": False,
             "action_conditioned_video": False,
+            "router_visual_source": "video_expert_final_hidden",
+            "policy_recovery_ratio": self.transition_policy_recovery_ratio,
+            "router_ramp_ratio": self.transition_router_ramp_ratio,
+            "policy_recovery_blend": "action_flow_velocity",
+            "freeze_m1_during_recovery": (
+                self.transition_freeze_m1_during_recovery
+            ),
+            "policy_init_checkpoint": self.transition_policy_init_checkpoint,
         }
 
     def _transition_contract_state_dict(self) -> dict[str, torch.Tensor]:
@@ -2078,6 +2315,23 @@ class FastWAM(torch.nn.Module):
         return str(candidate)
 
     def _load_lora_adapter(self, path: str, payload: dict, optimizer=None):
+        adapter_source_path = str(Path(path).expanduser().resolve())
+        transition_state = payload.get("transition_contract")
+        if transition_state is not None:
+            if not self.transition_contract_enabled:
+                raise ValueError(
+                    "This adapter contains TC-FastWAM weights, but the current "
+                    "model has `transition_contract.enabled=false`. Enable the "
+                    "matching Stage-1 config before loading it."
+                )
+            metadata = payload.get("architecture_metadata") or {}
+            saved_version = metadata.get("transition_contract_version")
+            if saved_version != self.transition_contract_version:
+                raise ValueError(
+                    "TC checkpoint version mismatch: "
+                    f"checkpoint={saved_version}, model={self.transition_contract_version}."
+                )
+
         base_checkpoint = payload.get("base_checkpoint")
         if base_checkpoint:
             resolved_base = self._resolve_adapter_base_checkpoint(
@@ -2110,14 +2364,7 @@ class FastWAM(torch.nn.Module):
             )
         self.mot.load_state_dict(adapter_state, strict=False)
 
-        transition_state = payload.get("transition_contract")
         if transition_state is not None:
-            if not self.transition_contract_enabled:
-                raise ValueError(
-                    "This adapter contains TC-FastWAM weights, but the current "
-                    "model has `transition_contract.enabled=false`. Enable the "
-                    "matching Stage-1 config before loading it."
-                )
             self.transition_contract_modules.load_state_dict(
                 transition_state, strict=True
             )
@@ -2126,6 +2373,13 @@ class FastWAM(torch.nn.Module):
                 "Adapter has no Transition Contract tensors; keeping initialized "
                 "TC-C modules for backward-compatible B0/M1 loading."
             )
+        if self.transition_contract_enabled and transition_state is None:
+            # The loaded M1 adapter is the policy initialization, but the new
+            # TC adapter must remain self-contained with respect to the
+            # official FastWAM base rather than recursively depending on M1.
+            self.transition_policy_init_checkpoint = adapter_source_path
+        else:
+            self.transition_policy_init_checkpoint = None
 
         if self.proprio_encoder is not None and "proprio_encoder" in payload:
             self.proprio_encoder.load_state_dict(
@@ -2185,6 +2439,13 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     "Checkpoint contains TC-FastWAM weights; enable the matching "
                     "`transition_contract` config before loading."
+                )
+            metadata = payload.get("architecture_metadata") or {}
+            saved_version = metadata.get("transition_contract_version")
+            if saved_version != self.transition_contract_version:
+                raise ValueError(
+                    "TC checkpoint version mismatch: "
+                    f"checkpoint={saved_version}, model={self.transition_contract_version}."
                 )
             self.transition_contract_modules.load_state_dict(
                 transition_state, strict=True

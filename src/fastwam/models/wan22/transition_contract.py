@@ -109,6 +109,9 @@ class TransitionVisualRouter(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(action_dim, action_dim),
         )
+        # The external policy-output blend starts from the exact M1 posterior
+        # policy, while these non-zero residuals learn from Contract
+        # supervision in the background from step zero.
 
     @staticmethod
     def _diagnostics(
@@ -149,6 +152,7 @@ class TransitionVisualRouter(nn.Module):
         language_hidden: torch.Tensor,
         language_mask: torch.Tensor,
         current_video_hidden: torch.Tensor,
+        route_scale: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if transition_queries.ndim != 3:
             raise ValueError("`transition_queries` must be [B,K,D_action].")
@@ -169,7 +173,11 @@ class TransitionVisualRouter(nn.Module):
             language_mask,
             num_heads=self.num_heads,
         )
-        intended_queries = transition_queries + self.language_out(language_delta)
+        route_scale = float(route_scale)
+        if not 0.0 <= route_scale <= 1.0:
+            raise ValueError(f"`route_scale` must be in [0,1], got {route_scale}.")
+        language_residual = self.language_out(language_delta)
+        intended_queries = transition_queries + route_scale * language_residual
 
         visual_query = self.visual_q(self.visual_norm(intended_queries))
         visual_key = self.visual_k(current_video_hidden)
@@ -181,9 +189,24 @@ class TransitionVisualRouter(nn.Module):
             mask=None,
             num_heads=self.num_heads,
         )
-        routed = intended_queries + self.visual_out(visual_delta)
-        routed = routed + self.output_mlp(self.output_norm(routed))
-        return routed, self._diagnostics(routed, visual_weights)
+        visual_residual = self.visual_out(visual_delta)
+        route_residual = visual_residual + self.output_mlp(
+            self.output_norm(intended_queries + visual_residual)
+        )
+        routed = intended_queries + route_scale * route_residual
+        diagnostics = self._diagnostics(routed, visual_weights)
+        diagnostics.update(
+            {
+                "router_route_scale": routed.new_tensor(route_scale),
+                "router_language_residual_norm": language_residual.float()
+                .norm(dim=-1)
+                .mean(),
+                "router_visual_residual_norm": route_residual.float()
+                .norm(dim=-1)
+                .mean(),
+            }
+        )
+        return routed, diagnostics
 
 
 class OutcomeTransitionEncoder(nn.Module):

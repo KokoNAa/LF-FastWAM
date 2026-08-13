@@ -94,6 +94,7 @@ def tiny_fastwam(*, transition_contract: bool = False) -> FastWAM:
         },
         transition_contract_config={
             "enabled": transition_contract,
+            "version": 2,
             "projection_dim": 8,
             "temperature": 0.07,
             "contract_weight": 0.05,
@@ -108,6 +109,9 @@ def tiny_fastwam(*, transition_contract: bool = False) -> FastWAM:
             "use_counterfactual_ranking": False,
             "warmup_ratio": 0.05,
             "ramp_ratio": 0.05,
+            "policy_recovery_ratio": 0.10,
+            "router_ramp_ratio": 0.20,
+            "freeze_m1_during_recovery": True,
         },
     )
 

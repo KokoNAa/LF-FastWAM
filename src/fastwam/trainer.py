@@ -84,11 +84,33 @@ class Wan22Trainer:
         # In LoRA mode only adapters plus explicitly selected small modules are
         # exposed to the optimizer; full fine-tuning retains the old behavior.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = [
+        transition_modules = getattr(
+            self.model, "transition_contract_modules", None
+        )
+        transition_contract_enabled = bool(
+            getattr(self.model, "transition_contract_enabled", False)
+        )
+        transition_parameter_ids = (
+            {
+                id(parameter)
+                for parameter in transition_modules.parameters()
+            }
+            if transition_modules is not None
+            else set()
+        )
+        transition_params = [
             parameter
             for parameter in self.model.parameters()
             if parameter.requires_grad
+            and id(parameter) in transition_parameter_ids
         ]
+        policy_params = [
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+            and id(parameter) not in transition_parameter_ids
+        ]
+        trainable_params = policy_params + transition_params
         if not trainable_params:
             raise ValueError("No trainable parameters were selected for optimization.")
         trainable_count = sum(parameter.numel() for parameter in trainable_params)
@@ -99,8 +121,30 @@ class Wan22Trainer:
             total_count,
             trainable_count / max(total_count, 1),
         )
+        optimizer_groups = []
+        if transition_contract_enabled:
+            if policy_params:
+                optimizer_groups.append(
+                    {
+                        "params": policy_params,
+                        "tc_recovery_group": "policy",
+                    }
+                )
+            if transition_params:
+                optimizer_groups.append(
+                    {
+                        "params": transition_params,
+                        "tc_recovery_group": "router",
+                    }
+                )
+        else:
+            optimizer_groups.append({"params": trainable_params})
+        self._tc_optimizer_group_kinds = [
+            group.get("tc_recovery_group") for group in optimizer_groups
+        ]
+        self._tc_recovery_base_lrs = [self.learning_rate] * len(optimizer_groups)
         self.optimizer = torch.optim.AdamW(
-            trainable_params,
+            optimizer_groups,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.95),
@@ -133,6 +177,26 @@ class Wan22Trainer:
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, self.scheduler
         )
+        if len(self.optimizer.param_groups) != len(self._tc_optimizer_group_kinds):
+            raise RuntimeError(
+                "Accelerate changed the number of optimizer parameter groups; "
+                "TC-C recovery cannot safely mask the restored M1 policy."
+            )
+        for group, group_kind in zip(
+            self.optimizer.param_groups,
+            self._tc_optimizer_group_kinds,
+        ):
+            if group_kind is not None:
+                group["tc_recovery_group"] = group_kind
+        self._tc_recovery_base_lrs = [
+            float(group.get("lr", self.learning_rate))
+            for group in self.optimizer.param_groups
+        ]
+        scheduler_last_lrs = getattr(self.scheduler, "_last_lr", None)
+        if isinstance(scheduler_last_lrs, list) and len(scheduler_last_lrs) == len(
+            self._tc_recovery_base_lrs
+        ):
+            scheduler_last_lrs[:] = self._tc_recovery_base_lrs
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
         self._init_wandb()
@@ -292,7 +356,79 @@ class Wan22Trainer:
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
         logger.info("Loading weight checkpoint only: %s", resume)
         self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
+        self._sync_optimizer_recovery_parameter_groups()
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
+
+    def _sync_optimizer_recovery_parameter_groups(self):
+        """Initialize post-checkpoint learning-rate masks for recovery.
+
+        TC-C v2 initializes from an M1 adapter after Accelerate/DeepSpeed has
+        already built the optimizer. Its initial recovery window freezes those
+        restored policy tensors by setting the policy optimizer group LR to
+        zero until the Router ramp begins.
+        """
+        policy_parameter_entries = 0
+        router_parameter_entries = 0
+        for group in self.optimizer.param_groups:
+            group_kind = group.get("tc_recovery_group")
+            if group_kind is None:
+                continue
+            parameters = list(group.get("params", []))
+            if group_kind == "router":
+                router_parameter_entries += len(parameters)
+            else:
+                policy_parameter_entries += len(parameters)
+        logger.info(
+            "Initialized TC recovery optimizer groups: policy_tensors=%d "
+            "router_tensors=%d.",
+            policy_parameter_entries,
+            router_parameter_entries,
+        )
+        if bool(
+            getattr(
+                self.accelerator.unwrap_model(self.model),
+                "transition_contract_enabled",
+                False,
+            )
+        ) and (
+            policy_parameter_entries <= 0 or router_parameter_entries <= 0
+        ):
+            raise RuntimeError(
+                "TC-C v2 requires separate non-empty policy and Router optimizer groups."
+            )
+
+    def _apply_transition_recovery_learning_rates(self):
+        """Freeze/unfreeze restored M1 optimizer groups without rebuilding ZeRO."""
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        scale_fn = getattr(unwrapped, "_transition_router_scale", None)
+        if not callable(scale_fn) or not bool(
+            getattr(unwrapped, "transition_freeze_m1_during_recovery", False)
+        ):
+            return
+        router_scale = float(scale_fn())
+        for index, group in enumerate(self.optimizer.param_groups):
+            group_kind = group.get("tc_recovery_group")
+            if group_kind is None:
+                continue
+            base_lr = self._tc_recovery_base_lrs[index]
+            masked_lr = (
+                base_lr
+                if group_kind == "router" or router_scale > 0.0
+                else 0.0
+            )
+            group["lr"] = masked_lr
+            scheduler_last_lrs = getattr(self.scheduler, "_last_lr", None)
+            if (
+                isinstance(scheduler_last_lrs, list)
+                and index < len(scheduler_last_lrs)
+            ):
+                scheduler_last_lrs[index] = masked_lr
+
+    def _capture_scheduled_learning_rates(self):
+        """Record scheduler output before the next recovery LR mask is applied."""
+        for index, group in enumerate(self.optimizer.param_groups):
+            if group.get("tc_recovery_group") is not None:
+                self._tc_recovery_base_lrs[index] = float(group.get("lr", 0.0))
 
     def _set_dit_only_train_mode(self):
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
@@ -700,6 +836,7 @@ class Wan22Trainer:
                     unwrapped_model.set_training_progress(
                         self.global_step, self.max_steps
                     )
+                self._apply_transition_recovery_learning_rates()
 
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)
@@ -710,6 +847,7 @@ class Wan22Trainer:
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
+                        self._capture_scheduled_learning_rates()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.global_step += 1
                     global_loss = float(
@@ -724,7 +862,10 @@ class Wan22Trainer:
                     grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
-                    current_lr = float(self.optimizer.param_groups[0]["lr"])
+                    current_lr = max(
+                        float(group["lr"])
+                        for group in self.optimizer.param_groups
+                    )
 
                     if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
                         eta_str, steps_per_sec = self._estimate_eta()

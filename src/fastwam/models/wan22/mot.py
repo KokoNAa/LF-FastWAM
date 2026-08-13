@@ -304,7 +304,12 @@ class MoT(nn.Module):
         video_t_mod: torch.Tensor,
         video_context_payload: Optional[dict],
         video_attention_mask: torch.Tensor,
-    ) -> list[dict[str, torch.Tensor]]:
+        *,
+        return_final_hidden: bool = False,
+    ) -> (
+        list[dict[str, torch.Tensor]]
+        | tuple[list[dict[str, torch.Tensor]], torch.Tensor]
+    ):
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
         Args:
@@ -317,7 +322,9 @@ class MoT(nn.Module):
             video_attention_mask: Video self-attention mask, shape [Sv, Sv].
 
         Returns:
-            Layer-wise cache list with length `num_layers`.
+            Layer-wise cache list with length `num_layers`, optionally paired
+            with the final Video-Expert hidden tokens when
+            ``return_final_hidden=True``.
             Each entry contains:
                 - `k`: video key tensor [B, Sv, H*Dh]
                 - `v`: video value tensor [B, Sv, H*Dh]
@@ -384,6 +391,8 @@ class MoT(nn.Module):
                 context_payload=video_context_payload,
             )
             kv_cache.append({"k": k, "v": v})
+        if return_final_hidden:
+            return kv_cache, x
         return kv_cache
 
     def forward_action_with_video_cache(

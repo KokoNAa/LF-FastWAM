@@ -80,6 +80,7 @@ langforce_mvp:
 # disabled when this block is enabled.
 transition_contract:
   enabled: false
+  version: 2
   projection_dim: 512
   temperature: 0.07
   contract_weight: 0.05
@@ -94,6 +95,11 @@ transition_contract:
   use_counterfactual_ranking: false
   warmup_ratio: 0.05
   ramp_ratio: 0.05
+  # v2 keeps the pretrained/M1 posterior-query policy during early recovery,
+  # then linearly replaces it with final-Video-hidden routed transitions.
+  policy_recovery_ratio: 0.10
+  router_ramp_ratio: 0.20
+  freeze_m1_during_recovery: true
 
 # Parameter-efficient fine-tuning. Disabled by default so released full
 # checkpoints retain their original behavior; LoRA adapters auto-enable when
