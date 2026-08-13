@@ -871,8 +871,8 @@ class FastWAM(torch.nn.Module):
             ),
             context=context,
             full_context_mask=full_context_mask,
-            # Contract supervision trains the full router from step zero. Only
-            # the policy prefix is recovery-blended below.
+            # Contract supervision always sees the full Router output once its
+            # configured warm-up begins. Only the policy output is blended.
             route_scale=1.0,
         )
         base_queries = self.action_expert.transition_queries.expand(

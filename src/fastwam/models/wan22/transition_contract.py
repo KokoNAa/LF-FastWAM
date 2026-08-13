@@ -110,8 +110,8 @@ class TransitionVisualRouter(nn.Module):
             nn.Linear(action_dim, action_dim),
         )
         # The external policy-output blend starts from the exact M1 posterior
-        # policy, while these non-zero residuals learn from Contract
-        # supervision in the background from step zero.
+        # policy, while these non-zero residuals can learn from the Contract
+        # once its configured warm-up begins.
 
     @staticmethod
     def _diagnostics(

@@ -31,7 +31,7 @@ Stage 1 明确不包含：`z_A`、Action–Future contract、counterfactual rank
 - 保留 checkpoint key `latent_action_queries`，仅新增语义 alias `transition_queries`。
 - TC LoRA checkpoint 保存 router、projection、outcome encoder 与架构 metadata。
 - v2 正式训练必须从已完成的 Object M1 LoRA adapter 初始化；该 adapter 再引用官方 FastWAM base。
-- 动作策略通过输出速度 blend 在恢复起点精确等价于 M1 posterior 路径；Router 本身保持标准初始化并从第一步接收 Contract 梯度。
+- 动作策略通过输出速度 blend 在恢复起点精确等价于 M1 posterior 路径；Router 本身保持标准初始化，并在 Contract 的 5% warm-up 结束后开始接收其梯度。
 - 推理不执行 Outcome Encoder，也不读取 future teacher。
 - contract loss 在前 5% optimizer steps 为零，随后 5% 线性升到目标权重。
 
