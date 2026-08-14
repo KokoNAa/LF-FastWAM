@@ -22,6 +22,7 @@ def _masked_attention(
     mask: torch.Tensor | None,
     *,
     num_heads: int,
+    attention_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Multi-head attention with an all-masked-row-safe boolean mask."""
     batch, query_len, hidden_dim = query.shape
@@ -41,6 +42,19 @@ def _masked_attention(
     scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(
         head_dim
     )
+    if attention_bias is not None:
+        if attention_bias.shape == (batch, key_len):
+            attention_bias = attention_bias[:, None, None, :]
+        elif attention_bias.shape == (batch, query_len, key_len):
+            attention_bias = attention_bias[:, None, :, :]
+        else:
+            raise ValueError(
+                "Attention bias must be [B,K] or [B,Q,K], got "
+                f"{tuple(attention_bias.shape)}."
+            )
+        scores = scores + attention_bias.to(
+            device=scores.device, dtype=scores.dtype
+        )
     if mask is None:
         valid = torch.ones(
             (batch, 1, 1, key_len), dtype=torch.bool, device=scores.device
@@ -152,6 +166,8 @@ class TransitionVisualRouter(nn.Module):
         language_mask: torch.Tensor,
         current_video_hidden: torch.Tensor,
         route_scale: float = 1.0,
+        visual_attention_bias: torch.Tensor | None = None,
+        visual_attention_bias_scale: float = 0.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if transition_queries.ndim != 3:
             raise ValueError("`transition_queries` must be [B,K,D_action].")
@@ -187,6 +203,11 @@ class TransitionVisualRouter(nn.Module):
             visual_value,
             mask=None,
             num_heads=self.num_heads,
+            attention_bias=(
+                visual_attention_bias * float(visual_attention_bias_scale)
+                if visual_attention_bias is not None
+                else None
+            ),
         )
         visual_residual = self.visual_out(visual_delta)
         route_residual = visual_residual + self.output_mlp(
@@ -203,9 +224,192 @@ class TransitionVisualRouter(nn.Module):
                 "router_visual_residual_norm": route_residual.float()
                 .norm(dim=-1)
                 .mean(),
+                "router_grounding_bias_scale": routed.new_tensor(
+                    float(visual_attention_bias_scale)
+                ),
             }
         )
         return routed, diagnostics
+
+
+class StateConditionedTargetGrounder(nn.Module):
+    """Locate an instruction target in the current visual patch state.
+
+    Unlike the v5 task-average action prototypes, this module scores every
+    current-frame patch for every sample.  Its output is both supervised by a
+    training-only interaction teacher and injected as an attention bias into
+    the deployment Router.
+    """
+
+    def __init__(
+        self,
+        *,
+        language_dim: int,
+        video_dim: int,
+        hidden_dim: int = 256,
+        temperature: float = 0.07,
+    ) -> None:
+        super().__init__()
+        if language_dim <= 0 or video_dim <= 0 or hidden_dim <= 0:
+            raise ValueError("Grounding feature dimensions must be positive.")
+        if temperature <= 0:
+            raise ValueError("Grounding temperature must be positive.")
+        self.language_dim = int(language_dim)
+        self.video_dim = int(video_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.temperature = float(temperature)
+        self.language_norm = nn.LayerNorm(self.language_dim)
+        self.video_norm = nn.LayerNorm(self.video_dim)
+        self.language_projection = nn.Sequential(
+            nn.Linear(self.language_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.visual_projection = nn.Sequential(
+            nn.Linear(self.video_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+
+    def forward(
+        self,
+        *,
+        language_hidden: torch.Tensor,
+        language_mask: torch.Tensor,
+        current_video_hidden: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+    ]:
+        if language_hidden.ndim != 3 or current_video_hidden.ndim != 3:
+            raise ValueError("Grounder language/video inputs must be 3D.")
+        batch_size, token_count, video_dim = current_video_hidden.shape
+        if language_hidden.shape[0] != batch_size:
+            raise ValueError("Grounder inputs must share the batch dimension.")
+        if video_dim != self.video_dim:
+            raise ValueError(
+                f"Grounder expected video_dim={self.video_dim}, got {video_dim}."
+            )
+        if language_mask.shape != language_hidden.shape[:2]:
+            raise ValueError(
+                "Grounder language mask shape mismatch: "
+                f"{tuple(language_mask.shape)} vs {tuple(language_hidden.shape[:2])}."
+            )
+        if token_count <= 0:
+            raise ValueError("Grounder requires at least one visual patch.")
+
+        valid = language_mask.to(
+            device=language_hidden.device, dtype=language_hidden.dtype
+        )
+        language_pooled = (
+            language_hidden * valid[:, :, None]
+        ).sum(dim=1) / valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+        language_query = F.normalize(
+            self.language_projection(self.language_norm(language_pooled)).float(),
+            dim=-1,
+            eps=1e-6,
+        )
+        visual_features = F.normalize(
+            self.visual_projection(self.video_norm(current_video_hidden)).float(),
+            dim=-1,
+            eps=1e-6,
+        )
+        similarity = torch.einsum(
+            "bd,bnd->bn", language_query, visual_features
+        )
+        attention = torch.softmax(similarity / self.temperature, dim=-1)
+        probs = attention.clamp_min(1e-8)
+        entropy = -(probs * probs.log()).sum(dim=-1) / math.log(
+            max(2, token_count)
+        )
+        metrics = {
+            "state_grounding_attention_entropy": entropy.mean(),
+            "state_grounding_top1_mass": probs.max(dim=-1).values.mean(),
+            "state_grounding_similarity_max": similarity.max(dim=-1).values.mean(),
+        }
+        return similarity, attention, visual_features, metrics
+
+
+def _closest_factor_grid(
+    token_count: int, height: int, width: int
+) -> tuple[int, int]:
+    """Infer the patch grid whose aspect ratio matches the latent frame."""
+    if token_count <= 0 or height <= 0 or width <= 0:
+        raise ValueError("Token count and latent spatial dimensions must be positive.")
+    target_ratio = float(width) / float(height)
+    candidates = [
+        (rows, token_count // rows)
+        for rows in range(1, int(math.sqrt(token_count)) + 1)
+        if token_count % rows == 0
+    ]
+    candidates += [(cols, rows) for rows, cols in candidates if rows != cols]
+    return min(
+        candidates,
+        key=lambda shape: abs((shape[1] / shape[0]) - target_ratio),
+    )
+
+
+def interaction_patch_distribution(
+    clean_latents: torch.Tensor,
+    *,
+    tokens_per_frame: int,
+    topk_fraction: float = 0.15,
+    temperature: float = 0.25,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Build a state-specific interaction teacher from clean latent change.
+
+    The teacher is deliberately language-free.  It highlights current-frame
+    regions whose local latent appearance changes during the demonstrated
+    action chunk, providing an object/interaction anchor without requiring
+    privileged simulator coordinates at deployment.
+    """
+    if clean_latents.ndim != 5:
+        raise ValueError("`clean_latents` must be [B,C,T,H,W].")
+    if clean_latents.shape[2] <= 1:
+        raise ValueError("Interaction grounding requires current and future latents.")
+    if not 0.0 < topk_fraction <= 1.0:
+        raise ValueError("`topk_fraction` must be in (0,1].")
+    if temperature <= 0:
+        raise ValueError("Interaction teacher temperature must be positive.")
+
+    batch_size, _, _, height, width = clean_latents.shape
+    grid_h, grid_w = _closest_factor_grid(
+        int(tokens_per_frame), int(height), int(width)
+    )
+    current = clean_latents[:, :, :1].float()
+    future = clean_latents[:, :, 1:].float()
+    change = (future - current).square().mean(dim=1).amax(dim=1)
+    change = F.adaptive_avg_pool2d(
+        change[:, None], output_size=(grid_h, grid_w)
+    )[:, 0]
+    scores = change.flatten(1)
+    if scores.shape != (batch_size, int(tokens_per_frame)):
+        raise RuntimeError(
+            "Interaction teacher/token geometry mismatch: "
+            f"{tuple(scores.shape)} vs {(batch_size, int(tokens_per_frame))}."
+        )
+    score_mean = scores.mean(dim=-1, keepdim=True)
+    score_std = scores.std(dim=-1, keepdim=True, unbiased=False)
+    normalized = (scores - score_mean) / score_std.clamp_min(1e-6)
+    topk = max(1, int(math.ceil(scores.shape[1] * float(topk_fraction))))
+    keep = torch.zeros_like(scores, dtype=torch.bool)
+    keep.scatter_(1, normalized.topk(topk, dim=-1).indices, True)
+    masked = normalized.masked_fill(~keep, torch.finfo(normalized.dtype).min)
+    teacher = torch.softmax(masked / float(temperature), dim=-1)
+    valid = (score_std[:, 0] > 1e-6) & torch.isfinite(teacher).all(dim=-1)
+    teacher = torch.where(valid[:, None], teacher, torch.zeros_like(teacher))
+    probs = teacher.clamp_min(1e-8)
+    metrics = {
+        "state_grounding_teacher_valid_fraction": valid.float().mean(),
+        "state_grounding_teacher_top1_mass": teacher.max(dim=-1).values.mean(),
+        "state_grounding_teacher_entropy": (
+            -(probs * probs.log()).sum(dim=-1)
+            / math.log(max(2, teacher.shape[-1]))
+        ).mean(),
+    }
+    return teacher, valid, metrics
 
 
 class OutcomeTransitionEncoder(nn.Module):
@@ -697,6 +901,211 @@ def _gather_without_grad(tensor: torch.Tensor) -> torch.Tensor:
     gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, tensor)
     return torch.cat(gathered, dim=0)
+
+
+class StateTargetPrototypeBank(nn.Module):
+    """Training-only task appearance prototypes for same-state grounding.
+
+    Correct demonstrations update an appearance prototype using the
+    interaction teacher.  A counterfactual task prototype is then matched
+    against every patch in the *current* source state, yielding a spatial
+    target rather than a task-average action target.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_slots: int,
+        feature_dim: int,
+        momentum: float = 0.95,
+        temperature: float = 0.07,
+        topk_fraction: float = 0.10,
+    ) -> None:
+        super().__init__()
+        if num_slots <= 0 or feature_dim <= 0:
+            raise ValueError("State-target prototype dimensions must be positive.")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError("State-target prototype momentum must be in [0,1).")
+        if temperature <= 0:
+            raise ValueError("State-target prototype temperature must be positive.")
+        if not 0.0 < topk_fraction <= 1.0:
+            raise ValueError("State-target prototype top-k fraction must be in (0,1].")
+        self.num_slots = int(num_slots)
+        self.feature_dim = int(feature_dim)
+        self.momentum = float(momentum)
+        self.temperature = float(temperature)
+        self.topk_fraction = float(topk_fraction)
+        self.register_buffer(
+            "task_ids",
+            torch.full((self.num_slots,), -1, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "counts",
+            torch.zeros((self.num_slots,), dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "prototypes",
+            torch.zeros(
+                self.num_slots, self.feature_dim, dtype=torch.float32
+            ),
+            persistent=False,
+        )
+
+    def _slots_for(
+        self, task_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        task_ids = task_ids.to(device=self.task_ids.device, dtype=torch.long)
+        matches = task_ids[:, None] == self.task_ids[None, :]
+        available = matches.any(dim=1)
+        slots = matches.to(dtype=torch.long).argmax(dim=1)
+        return slots, available
+
+    def available_mask(self, task_ids: torch.Tensor) -> torch.Tensor:
+        return self._slots_for(task_ids)[1]
+
+    @torch.no_grad()
+    def update(
+        self,
+        *,
+        task_ids: torch.Tensor,
+        visual_features: torch.Tensor,
+        teacher_attention: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> None:
+        if task_ids.ndim != 1 or valid_mask.shape != task_ids.shape:
+            raise ValueError("State-target task IDs and valid mask must be [B].")
+        if visual_features.ndim != 3 or visual_features.shape[0] != task_ids.shape[0]:
+            raise ValueError("State-target visual features must be [B,N,D].")
+        if visual_features.shape[-1] != self.feature_dim:
+            raise ValueError("State-target visual feature dimension mismatch.")
+        if teacher_attention.shape != visual_features.shape[:2]:
+            raise ValueError("State-target teacher attention must be [B,N].")
+        pooled = torch.einsum(
+            "bn,bnd->bd",
+            teacher_attention.detach().float(),
+            visual_features.detach().float(),
+        )
+        pooled = F.normalize(pooled, dim=-1, eps=1e-6)
+        gathered_ids = _gather_without_grad(
+            task_ids.detach().to(device=self.task_ids.device, dtype=torch.long)
+        )
+        gathered_pooled = _gather_without_grad(
+            pooled.to(device=self.prototypes.device)
+        )
+        gathered_valid = _gather_without_grad(
+            valid_mask.detach().to(device=self.task_ids.device, dtype=torch.bool)
+        )
+        for task_id, feature, is_valid in zip(
+            gathered_ids.tolist(), gathered_pooled, gathered_valid.tolist()
+        ):
+            if not is_valid:
+                continue
+            matches = torch.nonzero(
+                self.task_ids == int(task_id), as_tuple=False
+            ).flatten()
+            if matches.numel() == 0:
+                empty = torch.nonzero(
+                    self.task_ids < 0, as_tuple=False
+                ).flatten()
+                if empty.numel() == 0:
+                    raise RuntimeError(
+                        "State-target prototype bank is full; increase its slots."
+                    )
+                slot = int(empty[0].item())
+                self.task_ids[slot] = int(task_id)
+                updated = feature
+            else:
+                slot = int(matches[0].item())
+                momentum = self.momentum if int(self.counts[slot].item()) > 0 else 0.0
+                updated = momentum * self.prototypes[slot] + (1.0 - momentum) * feature
+            self.prototypes[slot].copy_(
+                F.normalize(updated.float(), dim=-1, eps=1e-6)
+            )
+            self.counts[slot] += 1
+
+    def target_distribution(
+        self,
+        *,
+        task_ids: torch.Tensor,
+        visual_features: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if task_ids.ndim != 1 or valid_mask.shape != task_ids.shape:
+            raise ValueError("State-target task IDs and valid mask must be [B].")
+        if visual_features.ndim != 3 or visual_features.shape[0] != task_ids.shape[0]:
+            raise ValueError("State-target visual features must be [B,N,D].")
+        slots, available = self._slots_for(task_ids)
+        valid = valid_mask.to(device=available.device, dtype=torch.bool) & available
+        target = self.prototypes[slots].to(
+            device=visual_features.device, dtype=torch.float32
+        )
+        similarity = torch.einsum(
+            "bd,bnd->bn",
+            F.normalize(target, dim=-1, eps=1e-6),
+            F.normalize(visual_features.float(), dim=-1, eps=1e-6),
+        )
+        topk = max(
+            1,
+            int(math.ceil(similarity.shape[1] * self.topk_fraction)),
+        )
+        keep = torch.zeros_like(similarity, dtype=torch.bool)
+        keep.scatter_(1, similarity.topk(topk, dim=-1).indices, True)
+        masked = similarity.masked_fill(
+            ~keep, torch.finfo(similarity.dtype).min
+        )
+        attention = torch.softmax(masked / self.temperature, dim=-1)
+        attention = torch.where(
+            valid[:, None], attention, torch.zeros_like(attention)
+        )
+        return attention.detach(), valid, {
+            "state_grounding_target_valid_fraction": valid.float().mean(),
+            "state_grounding_prototype_count": (
+                (self.task_ids >= 0).sum().to(dtype=similarity.dtype)
+            ),
+            "state_grounding_target_teacher_top1_mass": attention.max(
+                dim=-1
+            ).values.mean(),
+        }
+
+    def retrieval_accuracy(
+        self,
+        *,
+        task_ids: torch.Tensor,
+        visual_features: torch.Tensor,
+        attention: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        pooled = F.normalize(
+            torch.einsum(
+                "bn,bnd->bd", attention.float(), visual_features.float()
+            ),
+            dim=-1,
+            eps=1e-6,
+        )
+        active = self.task_ids >= 0
+        if not bool(active.any()):
+            return pooled.sum() * 0.0
+        active_ids = self.task_ids[active]
+        logits = torch.matmul(
+            pooled,
+            F.normalize(
+                self.prototypes[active].to(
+                    device=pooled.device, dtype=pooled.dtype
+                ),
+                dim=-1,
+                eps=1e-6,
+            ).transpose(0, 1),
+        )
+        predicted_ids = active_ids.to(device=pooled.device)[logits.argmax(dim=1)]
+        valid = valid_mask.to(device=pooled.device, dtype=torch.bool)
+        if not bool(valid.any()):
+            return logits.sum() * 0.0
+        return (
+            predicted_ids[valid]
+            == task_ids.to(device=pooled.device, dtype=torch.long)[valid]
+        ).float().mean()
 
 
 class ContrastiveContractLoss(nn.Module):

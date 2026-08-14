@@ -13,6 +13,9 @@ from fastwam.models.wan22.transition_contract import (
     ContrastiveContractLoss,
     CounterfactualActionPrototypeBank,
     CounterfactualRankingLoss,
+    StateConditionedTargetGrounder,
+    StateTargetPrototypeBank,
+    interaction_patch_distribution,
 )
 from test_langforce_mvp import tiny_fastwam
 
@@ -288,6 +291,21 @@ class TransitionContractTest(unittest.TestCase):
         self.assertEqual(self.model._transition_contract_scale(), 1.0)
         evaluation_model = tiny_fastwam(transition_contract=True).eval()
         self.assertEqual(evaluation_model._transition_router_scale(), 1.0)
+        grounding_model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=6,
+        ).eval()
+        self.assertEqual(
+            grounding_model._transition_state_grounding_scale(), 1.0
+        )
+        grounding_model.set_training_progress(0, 100)
+        self.assertEqual(
+            grounding_model._transition_state_grounding_scale(), 0.0
+        )
+        grounding_model.set_training_progress(10, 100)
+        self.assertEqual(
+            grounding_model._transition_state_grounding_scale(), 1.0
+        )
 
     def test_v3_freezes_m1_policy_and_exposes_only_contract_parameters(self):
         model = tiny_fastwam(
@@ -584,6 +602,95 @@ class TransitionContractTest(unittest.TestCase):
             0.5,
         )
 
+    def test_interaction_teacher_tracks_local_future_change(self):
+        latents = torch.zeros(2, 1, 3, 2, 2)
+        latents[0, 0, 1:, 0, 1] = 4.0
+        latents[1, 0, 1:, 1, 0] = 3.0
+        teacher, valid, metrics = interaction_patch_distribution(
+            latents,
+            tokens_per_frame=4,
+            topk_fraction=0.25,
+            temperature=0.10,
+        )
+        self.assertEqual(tuple(teacher.shape), (2, 4))
+        self.assertEqual(valid.tolist(), [True, True])
+        torch.testing.assert_close(teacher.sum(dim=-1), torch.ones(2))
+        self.assertEqual(teacher.argmax(dim=-1).tolist(), [1, 2])
+        self.assertEqual(
+            float(metrics["state_grounding_teacher_valid_fraction"]), 1.0
+        )
+
+    def test_state_target_bank_matches_target_in_the_same_scene(self):
+        bank = StateTargetPrototypeBank(
+            num_slots=4,
+            feature_dim=3,
+            momentum=0.0,
+            temperature=0.05,
+            topk_fraction=0.25,
+        ).to(dtype=torch.bfloat16)
+        prototype_visual = torch.tensor(
+            [
+                [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            ]
+        )
+        teacher = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+        bank.update(
+            task_ids=torch.tensor([10, 20]),
+            visual_features=prototype_visual,
+            teacher_attention=teacher,
+            valid_mask=torch.ones(2, dtype=torch.bool),
+        )
+        same_scene = torch.tensor(
+            [
+                [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            ]
+        )
+        target, valid, metrics = bank.target_distribution(
+            task_ids=torch.tensor([20, 10]),
+            visual_features=same_scene,
+            valid_mask=torch.ones(2, dtype=torch.bool),
+        )
+        self.assertEqual(valid.tolist(), [True, True])
+        self.assertEqual(target.argmax(dim=-1).tolist(), [0, 0])
+        self.assertEqual(float(metrics["state_grounding_prototype_count"]), 2.0)
+        retrieval = bank.retrieval_accuracy(
+            task_ids=torch.tensor([20, 10]),
+            visual_features=same_scene,
+            attention=target,
+            valid_mask=valid,
+        )
+        self.assertEqual(float(retrieval), 1.0)
+
+    def test_state_grounder_changes_patch_scores_with_language_and_state(self):
+        grounder = StateConditionedTargetGrounder(
+            language_dim=4,
+            video_dim=5,
+            hidden_dim=3,
+            temperature=0.1,
+        )
+        language = torch.randn(2, 3, 4)
+        mask = torch.ones(2, 3, dtype=torch.bool)
+        video = torch.randn(2, 4, 5)
+        similarity, attention, features, metrics = grounder(
+            language_hidden=language,
+            language_mask=mask,
+            current_video_hidden=video,
+        )
+        self.assertEqual(tuple(similarity.shape), (2, 4))
+        self.assertEqual(tuple(features.shape), (2, 4, 3))
+        torch.testing.assert_close(attention.sum(dim=-1), torch.ones(2))
+        self.assertIn("state_grounding_attention_entropy", metrics)
+        _, changed_attention, _, _ = grounder(
+            language_hidden=language.flip(0),
+            language_mask=mask,
+            current_video_hidden=video.flip(1),
+        )
+        self.assertGreater(
+            (attention - changed_attention).abs().max().item(), 1.0e-7
+        )
+
     def test_counterfactual_ranking_uses_only_valid_examples(self):
         z_future = torch.eye(3)
         z_positive = torch.eye(3)
@@ -748,6 +855,55 @@ class TransitionContractTest(unittest.TestCase):
             )
         )
 
+    def test_tc_v6_state_grounding_supervision_reaches_grounder(self):
+        model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=6,
+        )
+        model.configure_lora(LORA_CONFIG)
+        model.prepare_trainable_parameters()
+        clean_latents = torch.zeros(2, 2, 2, 2, 2)
+        clean_latents[0, :, 1, 0, 1] = 3.0
+        clean_latents[1, :, 1, 1, 0] = 3.0
+        model._encode_video_latents = lambda *_args, **_kwargs: (
+            clean_latents.clone()
+        )
+        model.set_training_progress(10, 100)
+        sample = {
+            "video": torch.randn(2, 3, 5, 16, 16),
+            "action": torch.randn(2, 4, 3),
+            "context": torch.randn(2, 4, 10),
+            "context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_context": torch.randn(2, 4, 10),
+            "negative_context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_valid": torch.ones(2, dtype=torch.bool),
+            "transition_task_id": torch.tensor([10, 20]),
+            "counterfactual_task_id": torch.tensor([20, 10]),
+        }
+        loss, metrics = model.training_loss(sample)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("loss_state_grounding", metrics)
+        self.assertIn("loss_state_grounding_correct", metrics)
+        self.assertIn("loss_state_grounding_counterfactual", metrics)
+        self.assertIn(
+            "state_grounding_positive_counterfactual_overlap", metrics
+        )
+        self.assertEqual(metrics["router_grounding_bias_scale"], 2.0)
+        self.assertEqual(metrics["state_grounding_target_valid_fraction"], 1.0)
+        self.assertEqual(metrics["state_grounding_prototype_count"], 2.0)
+        loss.backward()
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                for parameter in model.transition_contract_modules[
+                    "state_target_grounder"
+                ].parameters()
+            )
+        )
+        self.assertTrue(
+            all(parameter.grad is None for parameter in model.mot.parameters())
+        )
+
     def test_counterfactual_manifest_loader_rejects_unsafe_pairs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "manifest.jsonl")
@@ -858,6 +1014,70 @@ class TransitionContractTest(unittest.TestCase):
         metadata = restored._transition_contract_metadata()
         self.assertEqual(metadata["transition_contract_version"], 5)
         self.assertTrue(metadata["use_cf_action_positive"])
+
+    def test_tc_v5_checkpoint_migrates_to_state_grounding_v6(self):
+        source = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=5,
+        )
+        source.configure_lora(LORA_CONFIG)
+        with torch.no_grad():
+            expected = next(
+                source.transition_contract_modules["router"].parameters()
+            )
+            expected.add_(0.654)
+            expected = expected.detach().clone()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "tc_v5.pt")
+            source.save_checkpoint(path, step=4000)
+            restored = tiny_fastwam(
+                transition_contract=True,
+                transition_contract_version=6,
+            )
+            restored.load_checkpoint(path)
+        actual = next(
+            restored.transition_contract_modules["router"].parameters()
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertIn(
+            "state_target_grounder", restored.transition_contract_modules
+        )
+        metadata = restored._transition_contract_metadata()
+        self.assertEqual(metadata["transition_contract_version"], 6)
+        self.assertTrue(metadata["use_state_conditioned_grounding"])
+        self.assertEqual(
+            metadata["router_visual_source"],
+            "video_expert_final_hidden_with_current_state_target_bias",
+        )
+
+    def test_tc_v6_grounder_round_trips_in_adapter_checkpoint(self):
+        source = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=6,
+        )
+        source.configure_lora(LORA_CONFIG)
+        with torch.no_grad():
+            expected = next(
+                source.transition_contract_modules[
+                    "state_target_grounder"
+                ].parameters()
+            )
+            expected.add_(0.777)
+            expected = expected.detach().clone()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "tc_v6.pt")
+            source.save_checkpoint(path, step=4000)
+            restored = tiny_fastwam(
+                transition_contract=True,
+                transition_contract_version=6,
+            )
+            restored.load_checkpoint(path)
+        actual = next(
+            restored.transition_contract_modules[
+                "state_target_grounder"
+            ].parameters()
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_lora_exposes_and_round_trips_transition_modules(self):
         self.model.configure_lora(LORA_CONFIG)

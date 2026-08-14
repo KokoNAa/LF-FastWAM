@@ -118,6 +118,9 @@ def tiny_fastwam(
             "use_counterfactual_action_positive": bool(
                 transition_contract and transition_contract_version >= 5
             ),
+            "use_state_conditioned_grounding": bool(
+                transition_contract and transition_contract_version >= 6
+            ),
             "action_future_weight": 1.0,
             "counterfactual_weight": 0.05,
             "counterfactual_margin": 0.2,
@@ -128,6 +131,20 @@ def tiny_fastwam(
             "counterfactual_action_separation_margin": 0.05,
             "counterfactual_action_prototype_slots": 16,
             "counterfactual_action_prototype_momentum": 0.9,
+            "state_grounding_weight": 0.10,
+            "state_grounding_correct_weight": 1.0,
+            "state_grounding_counterfactual_weight": 1.0,
+            "state_grounding_separation_weight": 0.25,
+            "state_grounding_overlap_margin": 0.25,
+            "state_grounding_router_bias": 2.0,
+            "state_grounding_teacher_topk": 0.25,
+            "state_grounding_teacher_temperature": 0.25,
+            "state_grounding_hidden_dim": 6,
+            "state_grounding_temperature": 0.07,
+            "state_grounding_prototype_slots": 16,
+            "state_grounding_prototype_momentum": 0.9,
+            "state_grounding_prototype_temperature": 0.07,
+            "state_grounding_prototype_topk": 0.25,
             "action_effect_hidden_dim": 8,
             "action_effect_num_heads": 2,
             "action_effect_num_layers": 1,

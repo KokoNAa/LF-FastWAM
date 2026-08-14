@@ -13,9 +13,9 @@ cd "${RUN_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 PYTHON_BIN="$(command -v "${PYTHON_BIN}")"
-TC_CHECKPOINT="${TC_CHECKPOINT:?Set TC_CHECKPOINT to a TC-Full v4/v5 adapter}"
+TC_CHECKPOINT="${TC_CHECKPOINT:?Set TC_CHECKPOINT to a TC-Full v4/v5/v6 adapter}"
 STATS_PATH="${STATS_PATH:-${DIFFSYNTH_MODEL_BASE_PATH:-${RUN_ROOT}/checkpoints}/fastwam_release/libero_uncond_2cam224_dataset_stats.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${RUN_ROOT}/evaluate_results/tc_v4_object_cis_diagnostics_seed${EVAL_SEED}_trials${NUM_TRIALS}_h${MAX_POLICY_STEPS}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${RUN_ROOT}/evaluate_results/tc_full_object_cis_diagnostics_seed${EVAL_SEED}_trials${NUM_TRIALS}_h${MAX_POLICY_STEPS}}"
 MANIFEST_PATH="${MANIFEST_PATH:-${OUTPUT_ROOT}/libero_object_dtl_cis.jsonl}"
 
 for value_name in NUM_GPUS NUM_TRIALS NUM_INFERENCE_STEPS MAX_POLICY_STEPS; do
@@ -49,12 +49,14 @@ if payload.get("format") != "fastwam_lora_adapter_v1":
 if int(payload.get("step", -1)) <= 0:
     raise SystemExit("Checkpoint has no positive training step")
 version = int(metadata.get("transition_contract_version", -1))
-if version not in {4, 5}:
-    raise SystemExit("CIS diagnostics require TC-Full v4/v5")
+if version not in {4, 5, 6}:
+    raise SystemExit("CIS diagnostics require TC-Full v4/v5/v6")
 if not metadata.get("use_action_effect") or not metadata.get("use_cf_ranking"):
     raise SystemExit("Checkpoint does not contain the complete TC-Full method")
-if version == 5 and not metadata.get("use_cf_action_positive"):
-    raise SystemExit("TC-Full v5 checkpoint has no action-positive supervision")
+if version >= 5 and not metadata.get("use_cf_action_positive"):
+    raise SystemExit(f"TC-Full v{version} checkpoint has no action-positive supervision")
+if version == 6 and not metadata.get("use_state_conditioned_grounding"):
+    raise SystemExit("TC-Full v6 checkpoint has no current-state target grounding")
 if not metadata.get("freeze_m1_policy"):
     raise SystemExit("Checkpoint does not protect the M1 policy")
 print(version)
@@ -62,8 +64,13 @@ PY
 )"
 if [[ "${TC_VERSION}" == "5" ]]; then
   USE_CF_ACTION_POSITIVE=true
+  USE_STATE_CONDITIONED_GROUNDING=false
+elif [[ "${TC_VERSION}" == "6" ]]; then
+  USE_CF_ACTION_POSITIVE=true
+  USE_STATE_CONDITIONED_GROUNDING=true
 else
   USE_CF_ACTION_POSITIVE=false
+  USE_STATE_CONDITIONED_GROUNDING=false
 fi
 echo "Validated TC-Full v${TC_VERSION} checkpoint: ${TC_CHECKPOINT}"
 
@@ -119,6 +126,7 @@ EXP_NAME="tc-v${TC_VERSION}-cis-diagnostics" \
   model.transition_contract.use_action_effect=true \
   model.transition_contract.use_counterfactual_ranking=true \
   "model.transition_contract.use_counterfactual_action_positive=${USE_CF_ACTION_POSITIVE}" \
+  "model.transition_contract.use_state_conditioned_grounding=${USE_STATE_CONDITIONED_GROUNDING}" \
   model.transition_contract.policy_distillation_enabled=true \
   model.transition_contract.policy_distillation_weight=1.0 \
   model.transition_contract.freeze_m1_policy=true

@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
@@ -24,9 +25,12 @@ from .transition_contract import (
     CounterfactualActionPrototypeBank,
     CounterfactualRankingLoss,
     OutcomeTransitionEncoder,
+    StateConditionedTargetGrounder,
+    StateTargetPrototypeBank,
     TransitionProjectionHead,
     TransitionVisualRouter,
     detached_metrics,
+    interaction_patch_distribution,
 )
 
 logger = get_logger(__name__)
@@ -199,6 +203,48 @@ class FastWAM(torch.nn.Module):
         self.transition_counterfactual_action_separation_margin = float(
             contract_config.get("counterfactual_action_separation_margin", 0.05)
         )
+        self.transition_state_grounding_weight = float(
+            contract_config.get("state_grounding_weight", 0.10)
+        )
+        self.transition_state_grounding_correct_weight = float(
+            contract_config.get("state_grounding_correct_weight", 1.0)
+        )
+        self.transition_state_grounding_counterfactual_weight = float(
+            contract_config.get("state_grounding_counterfactual_weight", 1.0)
+        )
+        self.transition_state_grounding_separation_weight = float(
+            contract_config.get("state_grounding_separation_weight", 0.25)
+        )
+        self.transition_state_grounding_overlap_margin = float(
+            contract_config.get("state_grounding_overlap_margin", 0.25)
+        )
+        self.transition_state_grounding_router_bias = float(
+            contract_config.get("state_grounding_router_bias", 2.0)
+        )
+        self.transition_state_grounding_teacher_topk = float(
+            contract_config.get("state_grounding_teacher_topk", 0.15)
+        )
+        self.transition_state_grounding_teacher_temperature = float(
+            contract_config.get("state_grounding_teacher_temperature", 0.25)
+        )
+        self.transition_state_grounding_hidden_dim = int(
+            contract_config.get("state_grounding_hidden_dim", 256)
+        )
+        self.transition_state_grounding_temperature = float(
+            contract_config.get("state_grounding_temperature", 0.07)
+        )
+        self.transition_state_grounding_prototype_slots = int(
+            contract_config.get("state_grounding_prototype_slots", 64)
+        )
+        self.transition_state_grounding_prototype_momentum = float(
+            contract_config.get("state_grounding_prototype_momentum", 0.95)
+        )
+        self.transition_state_grounding_prototype_temperature = float(
+            contract_config.get("state_grounding_prototype_temperature", 0.07)
+        )
+        self.transition_state_grounding_prototype_topk = float(
+            contract_config.get("state_grounding_prototype_topk", 0.10)
+        )
         self.transition_contract_temperature = float(
             contract_config.get("temperature", 0.07)
         )
@@ -241,6 +287,9 @@ class FastWAM(torch.nn.Module):
         self.transition_use_counterfactual_action_positive = bool(
             contract_config.get("use_counterfactual_action_positive", False)
         )
+        self.transition_use_state_conditioned_grounding = bool(
+            contract_config.get("use_state_conditioned_grounding", False)
+        )
         self.transition_contract_modules = nn.ModuleDict()
         self.transition_contract_loss = None
         self.transition_counterfactual_loss = None
@@ -250,10 +299,10 @@ class FastWAM(torch.nn.Module):
         self.transition_policy_init_checkpoint: Optional[str] = None
 
         if self.transition_contract_enabled:
-            if self.transition_contract_version not in {2, 3, 4, 5}:
+            if self.transition_contract_version not in {2, 3, 4, 5, 6}:
                 raise ValueError(
                     "The current TC implementation supports "
-                    "`transition_contract.version` 2, 3, 4, or 5."
+                    "`transition_contract.version` 2, 3, 4, 5, or 6."
                 )
             if not bool(
                 getattr(self.action_expert, "use_latent_action_queries", False)
@@ -296,7 +345,14 @@ class FastWAM(torch.nn.Module):
             ):
                 raise ValueError(
                     "Counterfactual action positive supervision requires "
-                    "`transition_contract.version=5`."
+                    "`transition_contract.version>=5`."
+                )
+            if self.transition_contract_version < 6 and (
+                self.transition_use_state_conditioned_grounding
+            ):
+                raise ValueError(
+                    "State-conditioned target grounding requires "
+                    "`transition_contract.version=6`."
                 )
             if self.langforce_prior_enabled or self.langforce_advantage_enabled:
                 raise ValueError(
@@ -329,6 +385,46 @@ class FastWAM(torch.nn.Module):
             if self.transition_counterfactual_action_separation_margin < 0:
                 raise ValueError(
                     "`counterfactual_action_separation_margin` must be non-negative."
+                )
+            if min(
+                self.transition_state_grounding_weight,
+                self.transition_state_grounding_correct_weight,
+                self.transition_state_grounding_counterfactual_weight,
+                self.transition_state_grounding_separation_weight,
+                self.transition_state_grounding_router_bias,
+            ) < 0:
+                raise ValueError("State-grounding weights must be non-negative.")
+            if not 0.0 <= self.transition_state_grounding_overlap_margin <= 1.0:
+                raise ValueError(
+                    "`state_grounding_overlap_margin` must be in [0,1]."
+                )
+            if not 0.0 < self.transition_state_grounding_teacher_topk <= 1.0:
+                raise ValueError(
+                    "`state_grounding_teacher_topk` must be in (0,1]."
+                )
+            if self.transition_state_grounding_teacher_temperature <= 0:
+                raise ValueError(
+                    "`state_grounding_teacher_temperature` must be positive."
+                )
+            if self.transition_state_grounding_hidden_dim <= 0:
+                raise ValueError("`state_grounding_hidden_dim` must be positive.")
+            if self.transition_state_grounding_temperature <= 0:
+                raise ValueError("`state_grounding_temperature` must be positive.")
+            if self.transition_state_grounding_prototype_slots <= 0:
+                raise ValueError(
+                    "`state_grounding_prototype_slots` must be positive."
+                )
+            if not 0.0 <= self.transition_state_grounding_prototype_momentum < 1.0:
+                raise ValueError(
+                    "`state_grounding_prototype_momentum` must be in [0,1)."
+                )
+            if self.transition_state_grounding_prototype_temperature <= 0:
+                raise ValueError(
+                    "`state_grounding_prototype_temperature` must be positive."
+                )
+            if not 0.0 < self.transition_state_grounding_prototype_topk <= 1.0:
+                raise ValueError(
+                    "`state_grounding_prototype_topk` must be in (0,1]."
                 )
             if self.transition_policy_distillation_weight < 0:
                 raise ValueError(
@@ -381,12 +477,19 @@ class FastWAM(torch.nn.Module):
                     raise ValueError(
                         "TC-Full v4+ requires `use_counterfactual_ranking=true`."
                     )
-            if self.transition_contract_version == 5 and (
+            if self.transition_contract_version >= 5 and (
                 not self.transition_use_counterfactual_action_positive
             ):
                 raise ValueError(
-                    "TC-Full v5 requires "
+                    "TC-Full v5+ requires "
                     "`use_counterfactual_action_positive=true`."
+                )
+            if self.transition_contract_version >= 6 and (
+                not self.transition_use_state_conditioned_grounding
+            ):
+                raise ValueError(
+                    "TC-Full v6 requires "
+                    "`use_state_conditioned_grounding=true`."
                 )
 
             projection_dim = int(contract_config.get("projection_dim", 512))
@@ -445,6 +548,29 @@ class FastWAM(torch.nn.Module):
                             "counterfactual_action_prototype_momentum", 0.95
                         )
                     ),
+                )
+            if self.transition_use_state_conditioned_grounding:
+                grounding_dim = self.transition_state_grounding_hidden_dim
+                self.transition_contract_modules["state_target_grounder"] = (
+                    StateConditionedTargetGrounder(
+                        language_dim=action_hidden_dim,
+                        video_dim=video_hidden_dim,
+                        hidden_dim=grounding_dim,
+                        temperature=self.transition_state_grounding_temperature,
+                    )
+                )
+                self.transition_contract_modules["state_target_prototypes"] = (
+                    StateTargetPrototypeBank(
+                        num_slots=self.transition_state_grounding_prototype_slots,
+                        feature_dim=grounding_dim,
+                        momentum=self.transition_state_grounding_prototype_momentum,
+                        temperature=(
+                            self.transition_state_grounding_prototype_temperature
+                        ),
+                        topk_fraction=(
+                            self.transition_state_grounding_prototype_topk
+                        ),
+                    )
                 )
             self.transition_contract_modules.to(dtype=self.torch_dtype)
             self.transition_contract_loss = ContrastiveContractLoss(
@@ -508,6 +634,12 @@ class FastWAM(torch.nn.Module):
         if scale <= 1.0e-12:
             return 0.0
         return float(scale)
+
+    def _transition_state_grounding_scale(self) -> float:
+        """Warm up the new v6 policy bias while keeping deployment fully active."""
+        if not self._transition_training_progress_active:
+            return 1.0
+        return self._transition_contract_scale()
 
     def configure_lora(self, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         normalized = normalize_lora_config(config)
@@ -927,7 +1059,17 @@ class FastWAM(torch.nn.Module):
         context: torch.Tensor,
         full_context_mask: torch.Tensor,
         route_scale: Optional[float] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        grounding_video_tokens: Optional[torch.Tensor] = None,
+        return_grounding_state: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
+        | tuple[
+            torch.Tensor,
+            torch.Tensor,
+            dict[str, torch.Tensor],
+            dict[str, torch.Tensor],
+        ]
+    ):
         """Encode language intent and route current visual evidence."""
         if not self.transition_contract_enabled:
             raise RuntimeError("Transition Contract is disabled.")
@@ -939,16 +1081,64 @@ class FastWAM(torch.nn.Module):
             batch_size, -1, -1
         )
         language_hidden = self.action_expert.text_embedding(context)
+        grounding_state: dict[str, torch.Tensor] = {}
+        visual_attention_bias = None
+        visual_attention_bias_scale = 0.0
+        if self.transition_use_state_conditioned_grounding:
+            if grounding_video_tokens is None:
+                grounding_video_tokens = current_video
+            grounding_video = grounding_video_tokens[
+                :, : int(video_tokens_per_frame)
+            ]
+            # Cached WAN contexts deliberately expose an all-true attention
+            # mask after zeroing padded rows. Mean pooling that mask would
+            # dilute short instructions with projection bias from many zero
+            # rows, so recover the non-zero language support for grounding.
+            grounding_language_mask = full_context_mask & (
+                context.detach().float().abs().amax(dim=-1) > 0
+            )
+            grounding_language_mask = torch.where(
+                ~grounding_language_mask.any(dim=-1, keepdim=True),
+                full_context_mask,
+                grounding_language_mask,
+            )
+            (
+                grounding_similarity,
+                grounding_attention,
+                grounding_visual_features,
+                grounding_metrics,
+            ) = self.transition_contract_modules["state_target_grounder"](
+                language_hidden=language_hidden,
+                language_mask=grounding_language_mask,
+                current_video_hidden=grounding_video,
+            )
+            visual_attention_bias = grounding_similarity
+            visual_attention_bias_scale = (
+                self.transition_state_grounding_router_bias
+                * self._transition_state_grounding_scale()
+            )
+            grounding_state = {
+                "attention": grounding_attention,
+                "similarity": grounding_similarity,
+                "visual_features": grounding_visual_features,
+            }
+        else:
+            grounding_metrics = {}
         routed, router_metrics = self.transition_contract_modules["router"](
             transition_queries=transition_queries,
             language_hidden=language_hidden,
             language_mask=full_context_mask,
             current_video_hidden=current_video,
             route_scale=route_scale,
+            visual_attention_bias=visual_attention_bias,
+            visual_attention_bias_scale=visual_attention_bias_scale,
         )
+        router_metrics.update(grounding_metrics)
         z_language = self.transition_contract_modules["intent_projection"](
             routed.mean(dim=1)
         )
+        if return_grounding_state:
+            return routed, z_language, router_metrics, grounding_state
         return routed, z_language, router_metrics
 
     def encode_realized_transition(
@@ -1120,6 +1310,182 @@ class FastWAM(torch.nn.Module):
             ),
         }
 
+    @staticmethod
+    def _state_grounding_cross_entropy(
+        *,
+        student_attention: torch.Tensor,
+        teacher_attention: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalized soft-label CE with an all-invalid-row-safe reduction."""
+        if student_attention.shape != teacher_attention.shape:
+            raise ValueError("State-grounding attention tensors must share [B,N].")
+        if valid_mask.shape != student_attention.shape[:1]:
+            raise ValueError("State-grounding valid mask must be [B].")
+        token_count = int(student_attention.shape[-1])
+        normalizer = max(1.0, math.log(max(2, token_count)))
+        per_sample = -(
+            teacher_attention.float()
+            * student_attention.float().clamp_min(1e-8).log()
+        ).sum(dim=-1) / normalizer
+        valid = valid_mask.to(device=per_sample.device, dtype=per_sample.dtype)
+        loss = (per_sample * valid).sum() / valid.sum().clamp_min(1.0)
+        if not bool(valid_mask.any()):
+            loss = (student_attention.sum() + teacher_attention.sum()) * 0.0
+        return loss
+
+    def compute_state_conditioned_grounding_loss(
+        self,
+        *,
+        clean_input_latents: torch.Tensor,
+        tokens_per_frame: int,
+        positive_state: dict[str, torch.Tensor],
+        counterfactual_state: dict[str, torch.Tensor],
+        transition_task_ids: torch.Tensor,
+        counterfactual_task_ids: torch.Tensor,
+        counterfactual_valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Supervise language targets in the current visual state.
+
+        Correct demonstrations provide a language-free interaction-region
+        teacher from local latent change.  Their grounded visual features
+        update a training-only task appearance bank.  The requested alternate
+        task prototype is then matched against patches in this exact source
+        state, yielding a counterfactual spatial positive without simulator
+        coordinates or task-average action labels.
+        """
+        if not self.transition_use_state_conditioned_grounding:
+            raise RuntimeError("State-conditioned target grounding is disabled.")
+        required = {"attention", "visual_features"}
+        if not required.issubset(positive_state) or not required.issubset(
+            counterfactual_state
+        ):
+            raise RuntimeError("State-grounding branches did not return their state.")
+
+        positive_attention = positive_state["attention"]
+        counterfactual_attention = counterfactual_state["attention"]
+        positive_visual = positive_state["visual_features"]
+        counterfactual_visual = counterfactual_state["visual_features"]
+        teacher_attention, teacher_valid, teacher_metrics = (
+            interaction_patch_distribution(
+                clean_input_latents.detach(),
+                tokens_per_frame=int(tokens_per_frame),
+                topk_fraction=self.transition_state_grounding_teacher_topk,
+                temperature=self.transition_state_grounding_teacher_temperature,
+            )
+        )
+        teacher_attention = teacher_attention.to(
+            device=positive_attention.device, dtype=positive_attention.dtype
+        )
+        teacher_valid = teacher_valid.to(
+            device=positive_attention.device, dtype=torch.bool
+        )
+        prototype_bank = self.transition_contract_modules[
+            "state_target_prototypes"
+        ]
+        prototype_bank.update(
+            task_ids=transition_task_ids,
+            visual_features=positive_visual,
+            teacher_attention=teacher_attention,
+            valid_mask=teacher_valid,
+        )
+        target_attention, target_valid, target_metrics = (
+            prototype_bank.target_distribution(
+                task_ids=counterfactual_task_ids,
+                visual_features=counterfactual_visual,
+                valid_mask=counterfactual_valid_mask,
+            )
+        )
+        target_attention = target_attention.to(
+            device=counterfactual_attention.device,
+            dtype=counterfactual_attention.dtype,
+        )
+        target_valid = target_valid.to(
+            device=counterfactual_attention.device, dtype=torch.bool
+        )
+
+        loss_correct = self._state_grounding_cross_entropy(
+            student_attention=positive_attention,
+            teacher_attention=teacher_attention,
+            valid_mask=teacher_valid,
+        )
+        loss_counterfactual = self._state_grounding_cross_entropy(
+            student_attention=counterfactual_attention,
+            teacher_attention=target_attention,
+            valid_mask=target_valid,
+        )
+        overlap = F.cosine_similarity(
+            positive_attention.float(),
+            counterfactual_attention.float(),
+            dim=-1,
+            eps=1e-8,
+        )
+        separation_per_sample = torch.relu(
+            overlap - self.transition_state_grounding_overlap_margin
+        )
+        target_valid_float = target_valid.to(dtype=separation_per_sample.dtype)
+        loss_separation = (
+            separation_per_sample * target_valid_float
+        ).sum() / target_valid_float.sum().clamp_min(1.0)
+        if not bool(target_valid.any()):
+            loss_separation = (
+                positive_attention.sum() + counterfactual_attention.sum()
+            ) * 0.0
+
+        loss = (
+            self.transition_state_grounding_correct_weight * loss_correct
+            + self.transition_state_grounding_counterfactual_weight
+            * loss_counterfactual
+            + self.transition_state_grounding_separation_weight
+            * loss_separation
+        )
+
+        def _valid_mean(
+            value: torch.Tensor, valid_mask: torch.Tensor
+        ) -> torch.Tensor:
+            valid = valid_mask.to(device=value.device, dtype=value.dtype)
+            return (value * valid).sum() / valid.sum().clamp_min(1.0)
+
+        correct_top1_match = (
+            positive_attention.argmax(dim=-1)
+            == teacher_attention.argmax(dim=-1)
+        ).to(dtype=positive_attention.dtype)
+        target_top1_match = (
+            counterfactual_attention.argmax(dim=-1)
+            == target_attention.argmax(dim=-1)
+        ).to(dtype=counterfactual_attention.dtype)
+        metrics = {
+            "loss_state_grounding_correct": loss_correct.detach(),
+            "loss_state_grounding_counterfactual": loss_counterfactual.detach(),
+            "loss_state_grounding_separation": loss_separation.detach(),
+            "state_grounding_correct_top1_acc": _valid_mean(
+                correct_top1_match, teacher_valid
+            ),
+            "state_grounding_counterfactual_top1_acc": _valid_mean(
+                target_top1_match, target_valid
+            ),
+            "state_grounding_positive_counterfactual_overlap": _valid_mean(
+                overlap, target_valid
+            ),
+            "state_grounding_separation_satisfied_fraction": _valid_mean(
+                (
+                    overlap <= self.transition_state_grounding_overlap_margin
+                ).to(dtype=overlap.dtype),
+                target_valid,
+            ),
+            "state_grounding_counterfactual_target_retrieval_acc": (
+                prototype_bank.retrieval_accuracy(
+                    task_ids=counterfactual_task_ids,
+                    visual_features=counterfactual_visual,
+                    attention=counterfactual_attention,
+                    valid_mask=target_valid,
+                )
+            ),
+        }
+        metrics.update(teacher_metrics)
+        metrics.update(target_metrics)
+        return loss, metrics
+
     def _forward_counterfactual_action_positive_train(
         self,
         *,
@@ -1138,7 +1504,7 @@ class FastWAM(torch.nn.Module):
             raise RuntimeError(
                 "Counterfactual action positive supervision is disabled."
             )
-        # The protected Video/MoT policy is frozen in v5.  This second
+        # The protected Video/MoT policy is frozen in v5+. This second
         # language-conditioned Video pass is needed for deployment fidelity,
         # but its activations never need gradients.  Gradients begin at the
         # Router query consumed by the frozen Action Expert.
@@ -1173,6 +1539,7 @@ class FastWAM(torch.nn.Module):
             context=context,
             full_context_mask=full_context_mask,
             route_scale=1.0,
+            grounding_video_tokens=video_pre["tokens"],
         )
         base_queries = self.action_expert.transition_queries.expand(
             routed_queries.shape[0], -1, -1
@@ -1246,6 +1613,10 @@ class FastWAM(torch.nn.Module):
             # Contract supervision always sees the full Router output once its
             # configured warm-up begins. Only the policy output is blended.
             route_scale=1.0,
+            # Grounding must be learned from language-neutral current-state
+            # patch embeddings, while the Router still reads semantic final
+            # Video-Expert hidden states.
+            grounding_video_tokens=video_pre["tokens"],
         )
         base_queries = self.action_expert.transition_queries.expand(
             routed_full.shape[0], -1, -1
@@ -1645,7 +2016,7 @@ class FastWAM(torch.nn.Module):
             counterfactual_task_id is None
         ):
             raise ValueError(
-                "TC-Full v5 training requires `counterfactual_task_id`."
+                "TC-Full v5+ training requires `counterfactual_task_id`."
             )
         if (negative_context is None) != (negative_context_mask is None):
             raise ValueError(
@@ -2173,6 +2544,8 @@ class FastWAM(torch.nn.Module):
             if z_language is None:
                 raise RuntimeError("TC-C failed to produce z_language.")
             z_negative = None
+            positive_grounding_state: dict[str, torch.Tensor] = {}
+            counterfactual_grounding_state: dict[str, torch.Tensor] = {}
             if self.transition_contract_version >= 4:
                 # TC-Full contracts must not identify the positive instruction
                 # through the Video Expert's direct T1 text path.  Re-encode
@@ -2180,30 +2553,66 @@ class FastWAM(torch.nn.Module):
                 # current patch tokens; the deployment policy continues using
                 # final-Video-hidden routing protected by M1 distillation.
                 contract_visual_tokens = video_pre["tokens"].detach()
-                _, z_language, _ = self.encode_intended_transition(
-                    video_tokens=contract_visual_tokens,
-                    video_tokens_per_frame=int(
-                        video_pre["meta"]["tokens_per_frame"]
-                    ),
-                    context=context,
-                    full_context_mask=full_context_mask,
-                    route_scale=1.0,
-                )
+                if self.transition_use_state_conditioned_grounding:
+                    (
+                        _,
+                        z_language,
+                        _,
+                        positive_grounding_state,
+                    ) = self.encode_intended_transition(
+                        video_tokens=contract_visual_tokens,
+                        video_tokens_per_frame=int(
+                            video_pre["meta"]["tokens_per_frame"]
+                        ),
+                        context=context,
+                        full_context_mask=full_context_mask,
+                        route_scale=1.0,
+                        grounding_video_tokens=contract_visual_tokens,
+                        return_grounding_state=True,
+                    )
+                else:
+                    _, z_language, _ = self.encode_intended_transition(
+                        video_tokens=contract_visual_tokens,
+                        video_tokens_per_frame=int(
+                            video_pre["meta"]["tokens_per_frame"]
+                        ),
+                        context=context,
+                        full_context_mask=full_context_mask,
+                        route_scale=1.0,
+                    )
                 negative_context = inputs["negative_context"]
                 negative_context_mask = inputs["negative_context_mask"]
                 if negative_context is None or negative_context_mask is None:
                     raise RuntimeError(
                         "TC-Full failed to receive counterfactual text context."
                     )
-                _, z_negative, _ = self.encode_intended_transition(
-                    video_tokens=contract_visual_tokens,
-                    video_tokens_per_frame=int(
-                        video_pre["meta"]["tokens_per_frame"]
-                    ),
-                    context=negative_context,
-                    full_context_mask=negative_context_mask,
-                    route_scale=1.0,
-                )
+                if self.transition_use_state_conditioned_grounding:
+                    (
+                        _,
+                        z_negative,
+                        _,
+                        counterfactual_grounding_state,
+                    ) = self.encode_intended_transition(
+                        video_tokens=contract_visual_tokens,
+                        video_tokens_per_frame=int(
+                            video_pre["meta"]["tokens_per_frame"]
+                        ),
+                        context=negative_context,
+                        full_context_mask=negative_context_mask,
+                        route_scale=1.0,
+                        grounding_video_tokens=contract_visual_tokens,
+                        return_grounding_state=True,
+                    )
+                else:
+                    _, z_negative, _ = self.encode_intended_transition(
+                        video_tokens=contract_visual_tokens,
+                        video_tokens_per_frame=int(
+                            video_pre["meta"]["tokens_per_frame"]
+                        ),
+                        context=negative_context,
+                        full_context_mask=negative_context_mask,
+                        route_scale=1.0,
+                    )
             z_future = self.encode_realized_transition(
                 clean_input_latents=input_latents,
                 context=context,
@@ -2311,15 +2720,62 @@ class FastWAM(torch.nn.Module):
                     }
                 )
                 loss_dict.update(detached_metrics(counterfactual_metrics))
+            if self.transition_use_state_conditioned_grounding:
+                transition_task_id = inputs["transition_task_id"]
+                counterfactual_task_id = inputs["counterfactual_task_id"]
+                negative_valid = inputs["negative_valid"]
+                if (
+                    transition_task_id is None
+                    or counterfactual_task_id is None
+                    or negative_valid is None
+                ):
+                    raise RuntimeError(
+                        "TC-Full v6 requires source/target task IDs and a "
+                        "valid counterfactual mask."
+                    )
+                loss_state_grounding, state_grounding_metrics = (
+                    self.compute_state_conditioned_grounding_loss(
+                        clean_input_latents=input_latents,
+                        tokens_per_frame=int(
+                            video_pre["meta"]["tokens_per_frame"]
+                        ),
+                        positive_state=positive_grounding_state,
+                        counterfactual_state=(
+                            counterfactual_grounding_state
+                        ),
+                        transition_task_ids=transition_task_id,
+                        counterfactual_task_ids=counterfactual_task_id,
+                        counterfactual_valid_mask=negative_valid,
+                    )
+                )
+                effective_state_grounding_weight = (
+                    self.transition_state_grounding_weight * contract_scale
+                )
+                loss_total = (
+                    loss_total
+                    + effective_state_grounding_weight * loss_state_grounding
+                )
+                loss_dict.update(
+                    {
+                        "loss_state_grounding": float(
+                            loss_state_grounding.detach().item()
+                        ),
+                        "state_grounding_scale": float(contract_scale),
+                        "state_grounding_effective_weight": float(
+                            effective_state_grounding_weight
+                        ),
+                    }
+                )
+                loss_dict.update(detached_metrics(state_grounding_metrics))
             if self.transition_use_counterfactual_action_positive:
                 if z_action is None:
                     raise RuntimeError(
-                        "TC-Full v5 requires an action-effect embedding."
+                        "TC-Full v5+ requires an action-effect embedding."
                     )
                 counterfactual_task_id = inputs["counterfactual_task_id"]
                 if counterfactual_task_id is None:
                     raise RuntimeError(
-                        "TC-Full v5 did not receive counterfactual task IDs."
+                        "TC-Full v5+ did not receive counterfactual task IDs."
                     )
                 prototype_bank = self.transition_contract_modules[
                     "counterfactual_action_prototypes"
@@ -2339,6 +2795,7 @@ class FastWAM(torch.nn.Module):
                         context=context,
                         full_context_mask=full_context_mask,
                         route_scale=1.0,
+                        grounding_video_tokens=contract_visual_tokens,
                     )
                 positive_query_residual = positive_queries - base_queries
                 prototype_bank.update(
@@ -2360,7 +2817,7 @@ class FastWAM(torch.nn.Module):
                         or negative_context_mask is None
                     ):
                         raise RuntimeError(
-                            "TC-Full v5 requires alternate language context."
+                            "TC-Full v5+ requires alternate language context."
                         )
                     (
                         negative_full_context_mask,
@@ -3208,8 +3665,15 @@ class FastWAM(torch.nn.Module):
             "use_cf_action_positive": bool(
                 self.transition_use_counterfactual_action_positive
             ),
+            "use_state_conditioned_grounding": bool(
+                self.transition_use_state_conditioned_grounding
+            ),
             "action_conditioned_video": False,
-            "router_visual_source": "video_expert_final_hidden",
+            "router_visual_source": (
+                "video_expert_final_hidden_with_current_state_target_bias"
+                if self.transition_use_state_conditioned_grounding
+                else "video_expert_final_hidden"
+            ),
             "contract_visual_source": (
                 "language_neutral_video_patch_tokens"
                 if self.transition_contract_version >= 4
@@ -3232,6 +3696,30 @@ class FastWAM(torch.nn.Module):
             ),
             "counterfactual_action_separation_margin": (
                 self.transition_counterfactual_action_separation_margin
+            ),
+            "state_grounding_weight": self.transition_state_grounding_weight,
+            "state_grounding_correct_weight": (
+                self.transition_state_grounding_correct_weight
+            ),
+            "state_grounding_counterfactual_weight": (
+                self.transition_state_grounding_counterfactual_weight
+            ),
+            "state_grounding_separation_weight": (
+                self.transition_state_grounding_separation_weight
+            ),
+            "state_grounding_overlap_margin": (
+                self.transition_state_grounding_overlap_margin
+            ),
+            "state_grounding_router_bias": (
+                self.transition_state_grounding_router_bias
+            ),
+            "state_grounding_teacher": (
+                "clean_latent_local_interaction_change"
+                if self.transition_use_state_conditioned_grounding
+                else None
+            ),
+            "state_grounding_hidden_dim": (
+                self.transition_state_grounding_hidden_dim
             ),
             "policy_recovery_ratio": self.transition_policy_recovery_ratio,
             "router_ramp_ratio": self.transition_router_ramp_ratio,
@@ -3354,6 +3842,10 @@ class FastWAM(torch.nn.Module):
         # migrates exactly.
         if self.transition_contract_version == 5 and saved_version == 4:
             return saved_version
+        # v6 adds a small deployment grounder plus a training-only appearance
+        # prototype bank.  All protected v5 policy tensors remain compatible.
+        if self.transition_contract_version == 6 and saved_version == 5:
+            return saved_version
         raise ValueError(
             "TC checkpoint version mismatch: "
             f"checkpoint={saved_version}, model={self.transition_contract_version}."
@@ -3378,6 +3870,28 @@ class FastWAM(torch.nn.Module):
             logger.info(
                 "Migrated TC checkpoint v4 -> v5; initialized the empty "
                 "training-only counterfactual action prototype bank."
+            )
+            return
+        if self.transition_contract_version == 6 and saved_version == 5:
+            incompatible = self.transition_contract_modules.load_state_dict(
+                transition_state, strict=False
+            )
+            unexpected = list(incompatible.unexpected_keys)
+            disallowed_missing = [
+                key
+                for key in incompatible.missing_keys
+                if not key.startswith("state_target_grounder.")
+            ]
+            if unexpected or disallowed_missing:
+                raise ValueError(
+                    "Invalid TC v5 -> v6 state-grounding migration: "
+                    f"missing={disallowed_missing}, unexpected={unexpected}."
+                )
+            logger.info(
+                "Migrated TC checkpoint v5 -> v6; initialized %d new "
+                "StateConditionedTargetGrounder tensors and an empty "
+                "training-only appearance prototype bank.",
+                len(incompatible.missing_keys),
             )
             return
         incompatible = self.transition_contract_modules.load_state_dict(
