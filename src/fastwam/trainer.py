@@ -384,17 +384,30 @@ class Wan22Trainer:
             policy_parameter_entries,
             router_parameter_entries,
         )
-        if bool(
-            getattr(
-                self.accelerator.unwrap_model(self.model),
-                "transition_contract_enabled",
-                False,
-            )
-        ) and (
-            policy_parameter_entries <= 0 or router_parameter_entries <= 0
-        ):
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if not bool(getattr(unwrapped, "transition_contract_enabled", False)):
+            return
+        freeze_m1_policy = bool(
+            getattr(unwrapped, "transition_freeze_m1_policy", False)
+        )
+        if router_parameter_entries <= 0:
             raise RuntimeError(
-                "TC-C v2 requires separate non-empty policy and Router optimizer groups."
+                "TC-C requires a non-empty Router optimizer group."
+            )
+        if freeze_m1_policy:
+            if policy_parameter_entries != 0:
+                raise RuntimeError(
+                    "TC-C v3 policy protection requires zero trainable M1 "
+                    "policy tensors."
+                )
+            logger.info(
+                "TC-C v3 policy protection active: frozen M1 teacher, "
+                "Router-only optimizer."
+            )
+        elif policy_parameter_entries <= 0:
+            raise RuntimeError(
+                "TC-C v2 requires separate non-empty policy and Router "
+                "optimizer groups."
             )
 
     def _apply_transition_recovery_learning_rates(self):
@@ -447,8 +460,8 @@ class Wan22Trainer:
                 self._tc_recovery_base_lrs[index] = float(group.get("lr", 0.0))
 
     def _set_dit_only_train_mode(self):
-        # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
-        logger.info("Setting DiT to train mode and freezing other model components.")
+        # FastWAM decides whether the DiT policy or only TC modules should train.
+        logger.info("Preparing model trainability and module modes.")
         model = self.accelerator.unwrap_model(self.model)
         self._apply_dit_only_train_mode(model)
 
@@ -557,6 +570,10 @@ class Wan22Trainer:
 
         model = self.accelerator.unwrap_model(self.model)
         was_dit_training = model.dit.training
+        transition_modules = getattr(model, "transition_contract_modules", None)
+        was_transition_training = bool(
+            transition_modules is not None and transition_modules.training
+        )
         model.eval()
 
         # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
@@ -722,7 +739,7 @@ class Wan22Trainer:
         action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
         action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
 
-        if was_dit_training:
+        if was_dit_training or was_transition_training:
             self._set_dit_only_train_mode()
 
         result = {

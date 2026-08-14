@@ -100,6 +100,12 @@ transition_contract:
   policy_recovery_ratio: 0.10
   router_ramp_ratio: 0.20
   freeze_m1_during_recovery: true
+  # TC-C v3 policy protection. Version 3 freezes the loaded M1 adapter and
+  # distills the pure-Router action velocity from its joint-MoT posterior
+  # output while the LF contract continues to optimize Router representations.
+  policy_distillation_enabled: false
+  policy_distillation_weight: 1.0
+  freeze_m1_policy: false
 
 # Parameter-efficient fine-tuning. Disabled by default so released full
 # checkpoints retain their original behavior; LoRA adapters auto-enable when

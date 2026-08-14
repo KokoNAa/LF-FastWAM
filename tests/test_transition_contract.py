@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 
@@ -131,7 +132,7 @@ class TransitionContractTest(unittest.TestCase):
         noisy_action = torch.randn(2, 3, 3)
         timestep_action = torch.tensor([0.4, 0.6])
 
-        recovered, final_hidden, _, metrics = self.model._forward_tc_v2_train(
+        recovered, final_hidden, _, _, metrics = self.model._forward_tc_v2_train(
             video_pre=video_pre,
             action_tokens=noisy_action,
             timestep_action=timestep_action,
@@ -217,7 +218,7 @@ class TransitionContractTest(unittest.TestCase):
         state_mask = torch.zeros_like(full_mask)
 
         rng_state = torch.random.get_rng_state()
-        recovered, final_hidden, _, _ = self.model._forward_tc_v2_train(
+        recovered, final_hidden, _, _, _ = self.model._forward_tc_v2_train(
             video_pre=video_pre,
             action_tokens=noisy_action,
             timestep_action=timestep_action,
@@ -250,7 +251,7 @@ class TransitionContractTest(unittest.TestCase):
             action=torch.randn(2, 3, 3),
             fuse_vae_embedding_in_latents=True,
         )
-        _, _, _, metrics = self.model._forward_tc_v2_train(
+        _, _, _, _, metrics = self.model._forward_tc_v2_train(
             video_pre=video_pre,
             action_tokens=torch.randn(2, 3, 3),
             timestep_action=torch.tensor([0.4, 0.6]),
@@ -259,7 +260,10 @@ class TransitionContractTest(unittest.TestCase):
             state_only_context_mask=torch.zeros(2, 4, dtype=torch.bool),
         )
         self.assertAlmostEqual(float(metrics["router_route_scale"]), 0.5)
-        self.assertGreater(float(metrics["policy_recovery_output_gap"]), 0.0)
+        self.assertGreater(
+            float(metrics["policy_recovery_output_gap"].detach()),
+            0.0,
+        )
 
     def test_policy_recovery_and_router_schedule(self):
         self.model.train()
@@ -275,6 +279,152 @@ class TransitionContractTest(unittest.TestCase):
         self.assertEqual(self.model._transition_contract_scale(), 1.0)
         evaluation_model = tiny_fastwam(transition_contract=True).eval()
         self.assertEqual(evaluation_model._transition_router_scale(), 1.0)
+
+    def test_v3_freezes_m1_policy_and_exposes_only_contract_parameters(self):
+        model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=3,
+        )
+        model.configure_lora(LORA_CONFIG)
+        report = model.prepare_trainable_parameters()
+        trainable = {
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertGreater(report["trainable"], 0)
+        self.assertTrue(trainable)
+        self.assertTrue(
+            all(
+                name.startswith("transition_contract_modules.")
+                for name in trainable
+            )
+        )
+        self.assertFalse(model.mot.training)
+        self.assertTrue(model.transition_contract_modules.training)
+        metadata = model._transition_contract_metadata()
+        self.assertEqual(metadata["transition_contract_version"], 3)
+        self.assertEqual(
+            metadata["student_policy_path"],
+            "pure_router_from_step_zero",
+        )
+        self.assertEqual(
+            metadata["policy_protection"],
+            "requires_grad_false_and_optimizer_exclusion",
+        )
+
+    def test_v3_distills_frozen_joint_m1_and_trains_lf_representation(self):
+        model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=3,
+        )
+        model.configure_lora(LORA_CONFIG)
+        model.prepare_trainable_parameters()
+        policy_before = {
+            name: parameter.detach().clone()
+            for name, parameter in model.mot.named_parameters()
+        }
+        router_before = {
+            name: parameter.detach().clone()
+            for name, parameter in model.transition_contract_modules[
+                "router"
+            ].named_parameters()
+        }
+        optimizer = torch.optim.SGD(
+            [
+                parameter
+                for parameter in model.parameters()
+                if parameter.requires_grad
+            ],
+            lr=1.0e-2,
+        )
+        # The v2 recovery schedule is still at zero, but v3 must train the
+        # pure Router student from the first optimizer step.
+        model.set_training_progress(0, 100)
+
+        context = torch.randn(2, 4, 10)
+        full_mask = torch.ones(2, 4, dtype=torch.bool)
+        state_mask = torch.zeros_like(full_mask)
+        action = torch.randn(2, 3, 3)
+        video_pre = model.video_expert.pre_dit(
+            x=torch.randn(2, 2, 2, 2, 2),
+            timestep=torch.tensor([0.2, 0.3]),
+            context=context,
+            context_mask=full_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=True,
+        )
+        student, _, z_language, teacher, metrics = model._forward_tc_v2_train(
+            video_pre=video_pre,
+            action_tokens=torch.randn(2, 3, 3),
+            timestep_action=torch.tensor([0.4, 0.6]),
+            context=context,
+            full_context_mask=full_mask,
+            state_only_context_mask=state_mask,
+        )
+        self.assertIsNotNone(teacher)
+        self.assertFalse(teacher.requires_grad)
+        self.assertTrue(student.requires_grad)
+        self.assertTrue(z_language.requires_grad)
+        self.assertEqual(
+            float(metrics["policy_recovery_joint_m1"].detach()),
+            1.0,
+        )
+        self.assertEqual(
+            float(metrics["router_recovery_schedule_scale"].detach()),
+            0.0,
+        )
+        self.assertEqual(float(metrics["router_route_scale"].detach()), 1.0)
+        self.assertGreater(
+            float(metrics["policy_recovery_output_gap"].detach()),
+            0.0,
+        )
+
+        z_future = model.encode_realized_transition(
+            clean_input_latents=torch.randn(2, 2, 2, 2, 2),
+            context=context,
+            full_context_mask=full_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=True,
+        )
+        loss_contract, _ = model.compute_transition_contract_loss(
+            z_language, z_future
+        )
+        loss = torch.nn.functional.mse_loss(student.float(), teacher.float())
+        loss = loss + loss_contract
+        loss.backward()
+
+        router_grads = [
+            parameter.grad
+            for parameter in model.transition_contract_modules["router"].parameters()
+        ]
+        outcome_grads = [
+            parameter.grad
+            for parameter in model.transition_contract_modules[
+                "outcome_encoder"
+            ].parameters()
+        ]
+        self.assertTrue(any(grad is not None for grad in router_grads))
+        self.assertTrue(any(grad is not None for grad in outcome_grads))
+        self.assertTrue(
+            all(parameter.grad is None for parameter in model.mot.parameters())
+        )
+        optimizer.step()
+        for name, parameter in model.mot.named_parameters():
+            torch.testing.assert_close(
+                parameter,
+                policy_before[name],
+                rtol=0,
+                atol=0,
+            )
+        self.assertTrue(
+            any(
+                not torch.equal(parameter, router_before[name])
+                for name, parameter in model.transition_contract_modules[
+                    "router"
+                ].named_parameters()
+            )
+        )
 
     def test_contract_loss_batch_one_is_finite(self):
         z_l = torch.randn(1, 8, requires_grad=True)
@@ -366,15 +516,24 @@ class TransitionContractTest(unittest.TestCase):
             legacy.load_checkpoint(base_path)
             legacy.save_checkpoint(path)
             self.model.load_checkpoint(path)
-            self.assertEqual(self.model.transition_policy_init_checkpoint, path)
-            self.assertEqual(self.model.lora_base_checkpoint, base_path)
+            self.assertEqual(
+                os.path.realpath(self.model.transition_policy_init_checkpoint),
+                os.path.realpath(path),
+            )
+            self.assertEqual(
+                os.path.realpath(self.model.lora_base_checkpoint),
+                os.path.realpath(base_path),
+            )
             tc_path = f"{tmpdir}/tc_v2.pt"
             self.model.save_checkpoint(tc_path)
             tc_payload = torch.load(tc_path, map_location="cpu")
-            self.assertEqual(tc_payload["base_checkpoint"], base_path)
+            self.assertEqual(
+                os.path.realpath(tc_payload["base_checkpoint"]),
+                os.path.realpath(base_path),
+            )
             self.assertEqual(
                 tc_payload["architecture_metadata"]["policy_init_checkpoint"],
-                path,
+                self.model.transition_policy_init_checkpoint,
             )
         torch.testing.assert_close(
             self.model.action_expert.latent_action_queries,

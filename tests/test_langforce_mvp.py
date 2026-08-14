@@ -37,7 +37,11 @@ def mask_only_model() -> FastWAM:
     return model
 
 
-def tiny_fastwam(*, transition_contract: bool = False) -> FastWAM:
+def tiny_fastwam(
+    *,
+    transition_contract: bool = False,
+    transition_contract_version: int = 2,
+) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
         in_dim=2,
@@ -94,7 +98,7 @@ def tiny_fastwam(*, transition_contract: bool = False) -> FastWAM:
         },
         transition_contract_config={
             "enabled": transition_contract,
-            "version": 2,
+            "version": transition_contract_version,
             "projection_dim": 8,
             "temperature": 0.07,
             "contract_weight": 0.05,
@@ -112,6 +116,13 @@ def tiny_fastwam(*, transition_contract: bool = False) -> FastWAM:
             "policy_recovery_ratio": 0.10,
             "router_ramp_ratio": 0.20,
             "freeze_m1_during_recovery": True,
+            "policy_distillation_enabled": bool(
+                transition_contract and transition_contract_version == 3
+            ),
+            "policy_distillation_weight": 1.0,
+            "freeze_m1_policy": bool(
+                transition_contract and transition_contract_version == 3
+            ),
         },
     )
 

@@ -190,6 +190,15 @@ class FastWAM(torch.nn.Module):
         self.transition_freeze_m1_during_recovery = bool(
             contract_config.get("freeze_m1_during_recovery", True)
         )
+        self.transition_policy_distillation_enabled = bool(
+            contract_config.get("policy_distillation_enabled", False)
+        )
+        self.transition_policy_distillation_weight = float(
+            contract_config.get("policy_distillation_weight", 1.0)
+        )
+        self.transition_freeze_m1_policy = bool(
+            contract_config.get("freeze_m1_policy", False)
+        )
         self.outcome_stop_gradient = bool(
             contract_config.get("outcome_stop_gradient", True)
         )
@@ -204,10 +213,10 @@ class FastWAM(torch.nn.Module):
         self.transition_policy_init_checkpoint: Optional[str] = None
 
         if self.transition_contract_enabled:
-            if self.transition_contract_version != 2:
+            if self.transition_contract_version not in {2, 3}:
                 raise ValueError(
-                    "The current TC-C implementation requires "
-                    "`transition_contract.version=2`."
+                    "The current TC-C implementation supports "
+                    "`transition_contract.version` 2 or 3."
                 )
             if not bool(
                 getattr(self.action_expert, "use_latent_action_queries", False)
@@ -246,6 +255,10 @@ class FastWAM(torch.nn.Module):
                 )
             if self.transition_contract_weight < 0:
                 raise ValueError("`contract_weight` must be non-negative.")
+            if self.transition_policy_distillation_weight < 0:
+                raise ValueError(
+                    "`policy_distillation_weight` must be non-negative."
+                )
             if not 0.0 <= self.transition_contract_warmup_ratio < 1.0:
                 raise ValueError("`warmup_ratio` must be in [0,1).")
             if not 0.0 <= self.transition_contract_ramp_ratio < 1.0:
@@ -262,6 +275,29 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     "`policy_recovery_ratio + router_ramp_ratio` must be <= 1."
                 )
+            if self.transition_contract_version == 2 and (
+                self.transition_policy_distillation_enabled
+                or self.transition_freeze_m1_policy
+            ):
+                raise ValueError(
+                    "M1 policy distillation/protection requires "
+                    "`transition_contract.version=3`."
+                )
+            if self.transition_contract_version == 3:
+                if not self.transition_policy_distillation_enabled:
+                    raise ValueError(
+                        "TC-C v3 requires `policy_distillation_enabled=true`."
+                    )
+                if self.transition_policy_distillation_weight <= 0:
+                    raise ValueError(
+                        "TC-C v3 requires a positive "
+                        "`policy_distillation_weight`."
+                    )
+                if not self.transition_freeze_m1_policy:
+                    raise ValueError(
+                        "TC-C v3 requires `freeze_m1_policy=true` so the "
+                        "joint-MoT teacher cannot drift."
+                    )
 
             projection_dim = int(contract_config.get("projection_dim", 512))
             router_num_heads = int(contract_config.get("router_num_heads", 8))
@@ -423,19 +459,31 @@ class FastWAM(torch.nn.Module):
             or matches_any_pattern(name, extra_patterns)
         }
 
+    def _transition_parameter_ids(self) -> set[int]:
+        if not self.transition_contract_enabled:
+            return set()
+        return {
+            id(parameter)
+            for parameter in self.transition_contract_modules.parameters()
+        }
+
     def prepare_trainable_parameters(self) -> dict[str, int]:
         """Freeze the base model and expose only configured adapter parameters."""
         self.eval()
         self.requires_grad_(False)
-        self.dit.train()
+        if not self.transition_freeze_m1_policy:
+            self.dit.train()
 
         if self.lora_enabled:
             adapter_ids = self._adapter_parameter_ids()
+            if self.transition_freeze_m1_policy:
+                adapter_ids &= self._transition_parameter_ids()
             for parameter in self.parameters():
                 if id(parameter) in adapter_ids:
                     parameter.requires_grad_(True)
         else:
-            self.dit.requires_grad_(True)
+            if not self.transition_freeze_m1_policy:
+                self.dit.requires_grad_(True)
             if self.transition_contract_enabled:
                 self.transition_contract_modules.train()
                 self.transition_contract_modules.requires_grad_(True)
@@ -874,7 +922,15 @@ class FastWAM(torch.nn.Module):
         read current-frame Video K/V and T5 context at every Action-Expert
         layer, so query-only interpolation would remove those paths abruptly.
         """
-        route_scale = self._transition_router_scale()
+        scheduled_route_scale = self._transition_router_scale()
+        # TC-C v3 separates policy protection from student optimization.  The
+        # frozen joint-MoT path is the teacher at every step, while the pure
+        # Router student is optimized from step one.  Reusing the v2 recovery
+        # blend here would make the first recovery window teacher-only and
+        # therefore give the Router no action/distillation gradient.
+        route_scale = (
+            1.0 if self.transition_freeze_m1_policy else scheduled_route_scale
+        )
         routed_full, z_language, router_metrics = self.encode_intended_transition(
             video_tokens=final_video_hidden,
             video_tokens_per_frame=int(
@@ -890,6 +946,9 @@ class FastWAM(torch.nn.Module):
             routed_full.shape[0], -1, -1
         )
         router_metrics["router_route_scale"] = routed_full.new_tensor(route_scale)
+        router_metrics["router_recovery_schedule_scale"] = (
+            routed_full.new_tensor(scheduled_route_scale)
+        )
         router_metrics["router_policy_residual_norm"] = (
             (routed_full - base_queries).float().norm(dim=-1).mean()
         )
@@ -958,7 +1017,19 @@ class FastWAM(torch.nn.Module):
                 routed_full,
                 m1_posterior_interface=False,
             )
-            router_metrics["policy_recovery_output_gap"] = pred_action.new_zeros(())
+            if pred_action_m1 is None:
+                output_gap = pred_action.new_zeros(())
+            else:
+                output_gap = (
+                    (pred_action - pred_action_m1)
+                    .float()
+                    .norm(dim=-1)
+                    .mean()
+                )
+                router_metrics["policy_recovery_joint_m1"] = (
+                    pred_action_m1.new_ones(())
+                )
+            router_metrics["policy_recovery_output_gap"] = output_gap
             return pred_action, z_language, router_metrics
 
         # Both branches share the same Video cache. This linear flow-velocity
@@ -1069,23 +1140,52 @@ class FastWAM(torch.nn.Module):
         context: torch.Tensor,
         full_context_mask: torch.Tensor,
         state_only_context_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        """Run exact-M1 recovery or the final pure-Router training path."""
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        dict[str, torch.Tensor],
+    ]:
+        """Run TC recovery/student policy and return an optional M1 teacher.
+
+        TC-C v2 only evaluates the joint M1 path during recovery. TC-C v3
+        freezes that path and evaluates it at every step, so the pure Router
+        policy can be distilled without allocating a second 6.8B model.
+        """
         route_scale = self._transition_router_scale()
         pred_action_m1 = None
-        if route_scale < 1.0:
-            (
-                pred_action_m1,
-                video_kv_cache,
-                final_video_hidden,
-            ) = self._run_joint_m1_policy_with_video_cache(
-                video_pre=video_pre,
-                action_tokens=action_tokens,
-                timestep_action=timestep_action,
-                context=context,
-                full_context_mask=full_context_mask,
-                state_only_context_mask=state_only_context_mask,
-            )
+        teacher_required = bool(
+            route_scale < 1.0 or self.transition_policy_distillation_enabled
+        )
+        if teacher_required:
+            if self.transition_freeze_m1_policy:
+                with torch.no_grad():
+                    (
+                        pred_action_m1,
+                        video_kv_cache,
+                        final_video_hidden,
+                    ) = self._run_joint_m1_policy_with_video_cache(
+                        video_pre=video_pre,
+                        action_tokens=action_tokens,
+                        timestep_action=timestep_action,
+                        context=context,
+                        full_context_mask=full_context_mask,
+                        state_only_context_mask=state_only_context_mask,
+                    )
+            else:
+                (
+                    pred_action_m1,
+                    video_kv_cache,
+                    final_video_hidden,
+                ) = self._run_joint_m1_policy_with_video_cache(
+                    video_pre=video_pre,
+                    action_tokens=action_tokens,
+                    timestep_action=timestep_action,
+                    context=context,
+                    full_context_mask=full_context_mask,
+                    state_only_context_mask=state_only_context_mask,
+                )
         else:
             (
                 video_kv_cache,
@@ -1105,7 +1205,13 @@ class FastWAM(torch.nn.Module):
                 state_only_context_mask=state_only_context_mask,
             )
         )
-        return pred_action, final_video_hidden, z_language, router_metrics
+        return (
+            pred_action,
+            final_video_hidden,
+            z_language,
+            pred_action_m1,
+            router_metrics,
+        )
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
@@ -1506,12 +1612,14 @@ class FastWAM(torch.nn.Module):
         )
 
         z_language = None
+        pred_action_teacher = None
         router_metrics: dict[str, torch.Tensor] = {}
         if self.transition_contract_enabled:
             (
                 pred_action_post,
                 final_video_hidden,
                 z_language,
+                pred_action_teacher,
                 router_metrics,
             ) = self._forward_tc_v2_train(
                 video_pre=video_pre,
@@ -1615,6 +1723,47 @@ class FastWAM(torch.nn.Module):
         }
 
         if self.transition_contract_enabled:
+            if self.transition_policy_distillation_enabled:
+                if pred_action_teacher is None:
+                    raise RuntimeError(
+                        "TC-C policy distillation did not produce an M1 teacher."
+                    )
+                teacher_action = pred_action_teacher.detach()
+                e_distill = self._compute_action_loss_per_sample(
+                    pred_action=pred_action_post,
+                    target_action=teacher_action,
+                    action_is_pad=action_is_pad,
+                )
+                loss_policy_distillation = (
+                    e_distill * action_weight
+                ).mean()
+                loss_total = (
+                    loss_total
+                    + self.transition_policy_distillation_weight
+                    * loss_policy_distillation
+                )
+                loss_dict.update(
+                    {
+                        "loss_policy_distillation": float(
+                            loss_policy_distillation.detach().item()
+                        ),
+                        "policy_distillation_effective_weight": float(
+                            self.transition_policy_distillation_weight
+                        ),
+                        "policy_student_teacher_mse": float(
+                            e_distill.detach().mean().item()
+                        ),
+                        "policy_teacher_action_norm": float(
+                            teacher_action.float()
+                            .norm(dim=-1)
+                            .mean()
+                            .item()
+                        ),
+                        "policy_teacher_frozen": float(
+                            self.transition_freeze_m1_policy
+                        ),
+                    }
+                )
             if z_language is None:
                 raise RuntimeError("TC-C failed to produce z_language.")
             z_future = self.encode_realized_transition(
@@ -2380,10 +2529,32 @@ class FastWAM(torch.nn.Module):
             "router_visual_source": "video_expert_final_hidden",
             "policy_recovery_ratio": self.transition_policy_recovery_ratio,
             "router_ramp_ratio": self.transition_router_ramp_ratio,
-            "policy_recovery_blend": "action_flow_velocity",
+            "policy_recovery_blend": (
+                "disabled_frozen_teacher_distillation"
+                if self.transition_contract_version == 3
+                else "action_flow_velocity"
+            ),
             "policy_recovery_source": "joint_mot_posterior",
             "freeze_m1_during_recovery": (
                 self.transition_freeze_m1_during_recovery
+            ),
+            "policy_distillation_enabled": (
+                self.transition_policy_distillation_enabled
+            ),
+            "policy_distillation_weight": (
+                self.transition_policy_distillation_weight
+            ),
+            "policy_teacher_source": "frozen_joint_mot_posterior",
+            "freeze_m1_policy": self.transition_freeze_m1_policy,
+            "student_policy_path": (
+                "pure_router_from_step_zero"
+                if self.transition_contract_version == 3
+                else "scheduled_m1_to_router_recovery"
+            ),
+            "policy_protection": (
+                "requires_grad_false_and_optimizer_exclusion"
+                if self.transition_freeze_m1_policy
+                else "recovery_window_only"
             ),
             "policy_init_checkpoint": self.transition_policy_init_checkpoint,
         }
