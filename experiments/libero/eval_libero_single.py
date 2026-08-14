@@ -659,6 +659,20 @@ def _get_max_steps(task_suite_name: str) -> int:
     return suite_steps[task_suite_name]
 
 
+def _resolve_max_steps(cfg: DictConfig) -> int:
+    max_steps_cfg = cfg.EVALUATION.get("max_steps", None)
+    max_steps = (
+        _get_max_steps(cfg.EVALUATION.task_suite_name)
+        if max_steps_cfg is None
+        else int(max_steps_cfg)
+    )
+    if max_steps <= 0:
+        raise ValueError(
+            f"EVALUATION.max_steps must be positive, got {max_steps}."
+        )
+    return max_steps
+
+
 def run_single_episode(
     env,
     initial_state,
@@ -674,8 +688,16 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[bool, list, list[dict[str, Any]], Optional[float], list[float]]:
-    max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
+) -> tuple[
+    bool,
+    list,
+    list[dict[str, Any]],
+    Optional[float],
+    list[float],
+    int,
+    bool,
+]:
+    max_steps = _resolve_max_steps(cfg)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
@@ -698,6 +720,7 @@ def run_single_episode(
     inference_latencies_ms: list[float] = []
 
     t = 0
+    policy_steps_executed = 0
     done = False
     pbar = tqdm(total=max_steps + num_steps_wait, desc=f"Episode {episode_idx + 1}")
     while t < max_steps + num_steps_wait:
@@ -750,6 +773,7 @@ def run_single_episode(
             replay_images.append(imgs.copy())
 
         obs, _, done, _ = env.step(pending_actions.pop(0))
+        policy_steps_executed += 1
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
@@ -818,6 +842,8 @@ def run_single_episode(
         predicted_future_video_clips,
         episode_mean_psnr,
         inference_latencies_ms,
+        int(policy_steps_executed),
+        bool(not done and policy_steps_executed >= max_steps),
     )
 
 
@@ -858,6 +884,9 @@ def run_single_task(
         "successes": 0,
         "failure_episodes": [],
         "success_episodes": [],
+        "episode_policy_steps": [],
+        "horizon_timeout_episodes": [],
+        "max_policy_steps": _resolve_max_steps(cfg),
         "task_description": task_description,
         "instruction_condition": instruction_condition,
         "policy_instruction": policy_instruction,
@@ -884,6 +913,8 @@ def run_single_task(
             predicted_future_video_clips,
             episode_mean_psnr,
             inference_latencies_ms,
+            policy_steps_executed,
+            horizon_timeout,
         ) = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
@@ -900,6 +931,9 @@ def run_single_task(
             model_device=model_device,
         )
         results["inference_latencies_ms"].extend(inference_latencies_ms)
+        results["episode_policy_steps"].append(policy_steps_executed)
+        if horizon_timeout:
+            results["horizon_timeout_episodes"].append(trial_idx)
         if success:
             results["successes"] += 1
             results["success_episodes"].append(trial_idx)

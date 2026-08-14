@@ -22,6 +22,9 @@ EVALUATION:
   # Runtime behavior
   env_num: 1
   num_steps_wait: 30
+  # Number of policy-controlled environment steps. Null uses the standard
+  # LIBERO suite horizon (400 for Object/Spatial/Goal, 700 for 10/90).
+  max_steps: null
   replan_steps: 10
   binarize_gripper: true
   use_action_ensembler: false
