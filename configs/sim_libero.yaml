@@ -46,6 +46,11 @@ EVALUATION:
   instruction_condition: correct
   language_intervention_manifest: null
   instruction_override: null
+  # Opt-in behavior-level CIS diagnostics. This records source/alternate goal
+  # predicates plus per-object grasp and >=4 cm lift events without changing
+  # the policy inputs or simulator success predicate.
+  counterfactual_diagnostics: false
+  counterfactual_lift_threshold_m: 0.04
 
   # Optional external inputs
   dataset_stats_path: null

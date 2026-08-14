@@ -2,6 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from experiments.libero.counterfactual_diagnostics import (
+    classify_counterfactual_behavior,
+    goal_subjects,
+)
 from experiments.libero.language_interventions import (
     load_language_intervention_manifest,
     select_language_intervention_record,
@@ -82,6 +86,75 @@ class CounterfactualGoalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different LIBERO environment"):
             validate_counterfactual_problem(source, alternate)
 
+
+class CounterfactualBehaviorTest(unittest.TestCase):
+    def test_goal_subjects_extract_manipulated_entity(self):
+        self.assertEqual(
+            goal_subjects(
+                [["in", "cream_cheese_1", "basket_1_contain_region"]]
+            ),
+            {"cream_cheese_1"},
+        )
+
+    def test_behavior_classification_priority(self):
+        common = {
+            "counterfactual_target_objects": {"cream_cheese_1"},
+            "source_target_objects": {"alphabet_soup_1"},
+        }
+        self.assertEqual(
+            classify_counterfactual_behavior(
+                counterfactual_goal_achieved=True,
+                source_goal_achieved=True,
+                manipulated_objects={"alphabet_soup_1", "cream_cheese_1"},
+                **common,
+            ),
+            "counterfactual_goal_success",
+        )
+        self.assertEqual(
+            classify_counterfactual_behavior(
+                counterfactual_goal_achieved=False,
+                source_goal_achieved=True,
+                manipulated_objects={"alphabet_soup_1"},
+                **common,
+            ),
+            "source_goal_success",
+        )
+        self.assertEqual(
+            classify_counterfactual_behavior(
+                counterfactual_goal_achieved=False,
+                source_goal_achieved=False,
+                manipulated_objects={"cream_cheese_1"},
+                **common,
+            ),
+            "target_object_manipulated_placement_failure",
+        )
+        self.assertEqual(
+            classify_counterfactual_behavior(
+                counterfactual_goal_achieved=False,
+                source_goal_achieved=False,
+                manipulated_objects={"alphabet_soup_1"},
+                **common,
+            ),
+            "source_object_manipulated_no_completion",
+        )
+        self.assertEqual(
+            classify_counterfactual_behavior(
+                counterfactual_goal_achieved=False,
+                source_goal_achieved=False,
+                manipulated_objects={"salad_dressing_1"},
+                **common,
+            ),
+            "other_object_manipulated",
+        )
+        self.assertEqual(
+            classify_counterfactual_behavior(
+                counterfactual_goal_achieved=False,
+                source_goal_achieved=False,
+                manipulated_objects=set(),
+                **common,
+            ),
+            "no_object_manipulated",
+        )
 
 if __name__ == "__main__":
     unittest.main()

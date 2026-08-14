@@ -36,6 +36,10 @@ from experiments.libero.libero_utils import (
     save_rollout_video,
 )
 from experiments.libero.init_state_utils import load_libero_task_init_states
+from experiments.libero.counterfactual_diagnostics import (
+    CounterfactualEpisodeTracker,
+    empty_behavior_counts,
+)
 from experiments.libero.language_condition import normalize_instruction_condition
 from experiments.libero.language_interventions import (
     load_language_intervention_manifest,
@@ -688,6 +692,7 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
+    counterfactual_metadata: Optional[dict[str, Any]] = None,
 ) -> tuple[
     bool,
     list,
@@ -696,6 +701,7 @@ def run_single_episode(
     list[float],
     int,
     bool,
+    Optional[dict[str, Any]],
 ]:
     max_steps = _resolve_max_steps(cfg)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
@@ -706,6 +712,22 @@ def run_single_episode(
 
     env.reset()
     obs = env.set_init_state(initial_state)
+    counterfactual_tracker = None
+    if counterfactual_metadata is not None:
+        counterfactual_tracker = CounterfactualEpisodeTracker(
+            env,
+            source_goal_state=counterfactual_metadata["source_goal_state"],
+            counterfactual_goal_state=counterfactual_metadata[
+                "counterfactual_goal_state"
+            ],
+            lift_threshold_m=float(
+                cfg.EVALUATION.get(
+                    "counterfactual_lift_threshold_m",
+                    0.04,
+                )
+            ),
+        )
+        counterfactual_tracker.observe(policy_step=0)
     if use_action_ensembler:
         ensembler = ActionEnsembler()
         ensembler.reset()
@@ -774,6 +796,8 @@ def run_single_episode(
 
         obs, _, done, _ = env.step(pending_actions.pop(0))
         policy_steps_executed += 1
+        if counterfactual_tracker is not None:
+            counterfactual_tracker.observe(policy_step=policy_steps_executed)
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
@@ -836,6 +860,11 @@ def run_single_episode(
         if len(episode_future_clip_psnr) > 0
         else None
     )
+    counterfactual_diagnostics = (
+        None
+        if counterfactual_tracker is None
+        else counterfactual_tracker.result(episode_idx=episode_idx)
+    )
     return (
         bool(done),
         replay_images,
@@ -844,6 +873,7 @@ def run_single_episode(
         inference_latencies_ms,
         int(policy_steps_executed),
         bool(not done and policy_steps_executed >= max_steps),
+        counterfactual_diagnostics,
     )
 
 
@@ -879,6 +909,14 @@ def run_single_task(
             intervention_record,
             policy_instruction,
         )
+    counterfactual_diagnostics_enabled = bool(
+        cfg.EVALUATION.get("counterfactual_diagnostics", False)
+    )
+    if counterfactual_diagnostics_enabled and counterfactual_metadata is None:
+        raise ValueError(
+            "EVALUATION.counterfactual_diagnostics=true requires "
+            "instruction_condition=counterfactual."
+        )
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     results = {
         "successes": 0,
@@ -902,6 +940,9 @@ def run_single_task(
         results["pair_id"] = intervention_record.get("pair_id")
     if counterfactual_metadata is not None:
         results.update(counterfactual_metadata)
+    if counterfactual_diagnostics_enabled:
+        results["counterfactual_episode_diagnostics"] = []
+        results["counterfactual_behavior_counts"] = empty_behavior_counts()
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
@@ -915,6 +956,7 @@ def run_single_task(
             inference_latencies_ms,
             policy_steps_executed,
             horizon_timeout,
+            counterfactual_diagnostics,
         ) = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
@@ -929,6 +971,11 @@ def run_single_task(
             input_w=input_w,
             input_h=input_h,
             model_device=model_device,
+            counterfactual_metadata=(
+                counterfactual_metadata
+                if counterfactual_diagnostics_enabled
+                else None
+            ),
         )
         results["inference_latencies_ms"].extend(inference_latencies_ms)
         results["episode_policy_steps"].append(policy_steps_executed)
@@ -939,6 +986,23 @@ def run_single_task(
             results["success_episodes"].append(trial_idx)
         else:
             results["failure_episodes"].append(trial_idx)
+        if counterfactual_diagnostics_enabled:
+            if counterfactual_diagnostics is None:
+                raise RuntimeError(
+                    "Counterfactual diagnostics were enabled but no episode "
+                    "diagnostics were returned."
+                )
+            counterfactual_diagnostics["policy_steps"] = int(
+                policy_steps_executed
+            )
+            counterfactual_diagnostics["horizon_timeout"] = bool(
+                horizon_timeout
+            )
+            results["counterfactual_episode_diagnostics"].append(
+                counterfactual_diagnostics
+            )
+            category = str(counterfactual_diagnostics["category"])
+            results["counterfactual_behavior_counts"][category] += 1
         if visualize_future_video:
             results["episode_future_video_psnr"].append(episode_mean_psnr)
 
