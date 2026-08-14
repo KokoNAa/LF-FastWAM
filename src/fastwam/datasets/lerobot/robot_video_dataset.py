@@ -12,6 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from hydra.utils import instantiate
 from .base_lerobot_dataset import BaseLerobotDataset
+from ..counterfactual import load_counterfactual_instruction_map
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
@@ -42,6 +43,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        counterfactual_manifest_path: Optional[str] = None,
+        counterfactual_negative_probability: float = 0.0,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -72,6 +75,28 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.counterfactual_negative_probability = float(
+            counterfactual_negative_probability
+        )
+        if not 0.0 <= self.counterfactual_negative_probability <= 1.0:
+            raise ValueError(
+                "`counterfactual_negative_probability` must be in [0,1]."
+            )
+        if self.override_instruction is not None and counterfactual_manifest_path:
+            raise ValueError(
+                "Counterfactual ranking cannot be combined with override_instruction."
+            )
+        if self.counterfactual_negative_probability > 0 and (
+            not counterfactual_manifest_path
+        ):
+            raise ValueError(
+                "A counterfactual manifest is required when negative sampling is enabled."
+            )
+        self.counterfactual_instruction_map = (
+            load_counterfactual_instruction_map(counterfactual_manifest_path)
+            if counterfactual_manifest_path
+            else None
+        )
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -219,6 +244,32 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         # NOTE: to keep consistent with wan2.2's behavior
         context[~context_mask] = 0.0
         context_mask = torch.ones_like(context_mask)
+
+        negative_prompt = None
+        negative_context = None
+        negative_context_mask = None
+        negative_valid = False
+        if self.counterfactual_instruction_map is not None:
+            task_key = str(task).strip().casefold()
+            if task_key not in self.counterfactual_instruction_map:
+                raise KeyError(
+                    f"No audited counterfactual instruction for dataset task {task!r}."
+                )
+            negative_task = self.counterfactual_instruction_map[task_key]
+            negative_prompt = DEFAULT_PROMPT.format(task=negative_task)
+            negative_context, negative_context_mask = self._get_cached_text_context(
+                negative_prompt
+            )
+            negative_context[~negative_context_mask] = 0.0
+            negative_context_mask = torch.ones_like(negative_context_mask)
+            has_realized_transition = not bool(image_is_pad[1:].all().item())
+            has_action = not bool(sample["action_is_pad"].all().item())
+            negative_valid = bool(
+                has_realized_transition
+                and has_action
+                and np.random.random()
+                < self.counterfactual_negative_probability
+            )
         
         data = {
             "video": video,
@@ -231,6 +282,28 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if negative_context is not None:
+            task_digest = int.from_bytes(
+                hashlib.sha256(str(task).strip().casefold().encode("utf-8")).digest()[
+                    :8
+                ],
+                byteorder="big",
+                signed=False,
+            ) & ((1 << 63) - 1)
+            data.update(
+                {
+                    "negative_prompt": negative_prompt,
+                    "negative_context": negative_context,
+                    "negative_context_mask": negative_context_mask,
+                    "negative_valid": torch.tensor(
+                        negative_valid, dtype=torch.bool
+                    ),
+                    "negative_type": "cross_task",
+                    "transition_task_id": torch.tensor(
+                        task_digest, dtype=torch.long
+                    ),
+                }
+            )
         return data
 
     def _get_cached_text_context(self, prompt: str):

@@ -19,7 +19,9 @@ from .lora import (
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .transition_contract import (
+    ActionEffectEncoder,
     ContrastiveContractLoss,
+    CounterfactualRankingLoss,
     OutcomeTransitionEncoder,
     TransitionProjectionHead,
     TransitionVisualRouter,
@@ -172,6 +174,15 @@ class FastWAM(torch.nn.Module):
         self.transition_contract_weight = float(
             contract_config.get("contract_weight", 0.05)
         )
+        self.transition_action_future_weight = float(
+            contract_config.get("action_future_weight", 1.0)
+        )
+        self.transition_counterfactual_weight = float(
+            contract_config.get("counterfactual_weight", 0.05)
+        )
+        self.transition_counterfactual_margin = float(
+            contract_config.get("counterfactual_margin", 0.2)
+        )
         self.transition_contract_temperature = float(
             contract_config.get("temperature", 0.07)
         )
@@ -205,18 +216,25 @@ class FastWAM(torch.nn.Module):
         self.use_transition_router = bool(
             contract_config.get("use_transition_router", True)
         )
+        self.transition_use_action_effect = bool(
+            contract_config.get("use_action_effect", False)
+        )
+        self.transition_use_counterfactual_ranking = bool(
+            contract_config.get("use_counterfactual_ranking", False)
+        )
         self.transition_contract_modules = nn.ModuleDict()
         self.transition_contract_loss = None
+        self.transition_counterfactual_loss = None
         self._transition_training_step = 0
         self._transition_training_max_steps = 1
         self._transition_training_progress_active = False
         self.transition_policy_init_checkpoint: Optional[str] = None
 
         if self.transition_contract_enabled:
-            if self.transition_contract_version not in {2, 3}:
+            if self.transition_contract_version not in {2, 3, 4}:
                 raise ValueError(
-                    "The current TC-C implementation supports "
-                    "`transition_contract.version` 2 or 3."
+                    "The current TC implementation supports "
+                    "`transition_contract.version` 2, 3, or 4."
                 )
             if not bool(
                 getattr(self.action_expert, "use_latent_action_queries", False)
@@ -226,35 +244,46 @@ class FastWAM(torch.nn.Module):
                     "`use_latent_action_queries=True`."
                 )
             if not self.use_transition_router:
-                raise ValueError("TC-C Stage 1 requires `use_transition_router=true`.")
+                raise ValueError("TC-FastWAM requires `use_transition_router=true`.")
             if bool(contract_config.get("direct_action_video_access", False)):
                 raise ValueError(
-                    "TC-C forbids `direct_action_video_access=true`; the Action "
+                    "TC-FastWAM forbids `direct_action_video_access=true`; the Action "
                     "Expert must consume routed transition tokens only."
                 )
             if bool(contract_config.get("direct_action_text_access", False)):
                 raise ValueError(
-                    "TC-C forbids `direct_action_text_access=true`; language must "
+                    "TC-FastWAM forbids `direct_action_text_access=true`; language must "
                     "reach actions through the Transition Router."
                 )
             if not bool(contract_config.get("direct_video_text_access", True)):
                 raise ValueError(
-                    "Stage 1 is Phase T1 and requires `direct_video_text_access=true`."
+                    "TC-C/TC-Full use Phase T1 and require "
+                    "`direct_video_text_access=true`."
                 )
             if bool(contract_config.get("action_conditioned_video", False)):
                 raise ValueError(
-                    "`action_conditioned_video` belongs to Stage 3, not TC-C Stage 1."
+                    "`action_conditioned_video` belongs to Stage 3 / TC-Dyn."
                 )
-            if bool(contract_config.get("use_action_effect", False)):
-                raise ValueError("`use_action_effect` belongs to Stage 2.")
-            if bool(contract_config.get("use_counterfactual_ranking", False)):
-                raise ValueError("Counterfactual ranking belongs to Stage 2.")
+            if self.transition_contract_version < 4 and (
+                self.transition_use_action_effect
+                or self.transition_use_counterfactual_ranking
+            ):
+                raise ValueError(
+                    "Action-effect and counterfactual ranking require "
+                    "TC-Full `transition_contract.version=4`."
+                )
             if self.langforce_prior_enabled or self.langforce_advantage_enabled:
                 raise ValueError(
-                    "TC-C mainline requires LangForce prior/advantage ablations off."
+                    "TC mainline requires LangForce prior/advantage ablations off."
                 )
             if self.transition_contract_weight < 0:
                 raise ValueError("`contract_weight` must be non-negative.")
+            if self.transition_action_future_weight < 0:
+                raise ValueError("`action_future_weight` must be non-negative.")
+            if self.transition_counterfactual_weight < 0:
+                raise ValueError("`counterfactual_weight` must be non-negative.")
+            if self.transition_counterfactual_margin < 0:
+                raise ValueError("`counterfactual_margin` must be non-negative.")
             if self.transition_policy_distillation_weight < 0:
                 raise ValueError(
                     "`policy_distillation_weight` must be non-negative."
@@ -281,22 +310,30 @@ class FastWAM(torch.nn.Module):
             ):
                 raise ValueError(
                     "M1 policy distillation/protection requires "
-                    "`transition_contract.version=3`."
+                    "`transition_contract.version>=3`."
                 )
-            if self.transition_contract_version == 3:
+            if self.transition_contract_version >= 3:
                 if not self.transition_policy_distillation_enabled:
                     raise ValueError(
-                        "TC-C v3 requires `policy_distillation_enabled=true`."
+                        "Protected TC v3+ requires "
+                        "`policy_distillation_enabled=true`."
                     )
                 if self.transition_policy_distillation_weight <= 0:
                     raise ValueError(
-                        "TC-C v3 requires a positive "
+                        "Protected TC v3+ requires a positive "
                         "`policy_distillation_weight`."
                     )
                 if not self.transition_freeze_m1_policy:
                     raise ValueError(
-                        "TC-C v3 requires `freeze_m1_policy=true` so the "
+                        "Protected TC v3+ requires `freeze_m1_policy=true` so the "
                         "joint-MoT teacher cannot drift."
+                    )
+            if self.transition_contract_version == 4:
+                if not self.transition_use_action_effect:
+                    raise ValueError("TC-Full v4 requires `use_action_effect=true`.")
+                if not self.transition_use_counterfactual_ranking:
+                    raise ValueError(
+                        "TC-Full v4 requires `use_counterfactual_ranking=true`."
                     )
 
             projection_dim = int(contract_config.get("projection_dim", 512))
@@ -318,10 +355,34 @@ class FastWAM(torch.nn.Module):
                     ),
                 }
             )
+            if self.transition_use_action_effect:
+                self.transition_contract_modules["action_effect_encoder"] = (
+                    ActionEffectEncoder(
+                        action_dim=int(self.action_expert.action_dim),
+                        video_dim=video_hidden_dim,
+                        projection_dim=projection_dim,
+                        proprio_dim=self.proprio_dim,
+                        hidden_dim=int(
+                            contract_config.get(
+                                "action_effect_hidden_dim", projection_dim
+                            )
+                        ),
+                        num_heads=int(
+                            contract_config.get("action_effect_num_heads", 8)
+                        ),
+                        num_layers=int(
+                            contract_config.get("action_effect_num_layers", 2)
+                        ),
+                    )
+                )
             self.transition_contract_modules.to(dtype=self.torch_dtype)
             self.transition_contract_loss = ContrastiveContractLoss(
                 temperature=self.transition_contract_temperature
             )
+            if self.transition_use_counterfactual_ranking:
+                self.transition_counterfactual_loss = CounterfactualRankingLoss(
+                    margin=self.transition_counterfactual_margin
+                )
 
         self.uses_transition_queries = bool(
             self.langforce_mvp_enabled or self.transition_contract_enabled
@@ -337,7 +398,7 @@ class FastWAM(torch.nn.Module):
         self.to(self.device)
 
     def set_training_progress(self, step: int, max_steps: int) -> None:
-        """Set optimizer-step progress used by Stage-1 contract warm-up."""
+        """Set optimizer-step progress used by TC contract warm-up."""
         self._transition_training_step = max(0, int(step))
         self._transition_training_max_steps = max(1, int(max_steps))
         self._transition_training_progress_active = True
@@ -868,11 +929,72 @@ class FastWAM(torch.nn.Module):
         )
 
     def compute_transition_contract_loss(
-        self, z_language: torch.Tensor, z_future: torch.Tensor
+        self,
+        z_language: torch.Tensor,
+        z_future: torch.Tensor,
+        *,
+        group_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.transition_contract_loss is None:
             raise RuntimeError("Transition Contract loss is unavailable.")
-        return self.transition_contract_loss(z_language, z_future)
+        return self.transition_contract_loss(
+            z_language,
+            z_future,
+            metric_prefix="LF",
+            group_ids=group_ids,
+        )
+
+    def encode_action_effect_transition(
+        self,
+        *,
+        current_video_hidden: torch.Tensor,
+        action: torch.Tensor,
+        proprio: Optional[torch.Tensor],
+        action_is_pad: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if not self.transition_use_action_effect:
+            raise RuntimeError("Action-effect transition encoding is disabled.")
+        return self.transition_contract_modules["action_effect_encoder"](
+            current_video_hidden=current_video_hidden,
+            action=action,
+            proprio=proprio,
+            action_is_pad=action_is_pad,
+        )
+
+    def compute_action_future_contract_loss(
+        self,
+        z_action: torch.Tensor,
+        z_future: torch.Tensor,
+        *,
+        group_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.transition_contract_loss is None:
+            raise RuntimeError("Transition Contract loss is unavailable.")
+        if not self.transition_use_action_effect:
+            raise RuntimeError("Action-Future Contract is disabled.")
+        return self.transition_contract_loss(
+            z_action,
+            z_future,
+            metric_prefix="AF",
+            group_ids=group_ids,
+        )
+
+    def compute_counterfactual_ranking_loss(
+        self,
+        z_positive: torch.Tensor,
+        z_negative: torch.Tensor,
+        z_future: torch.Tensor,
+        *,
+        valid_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.transition_counterfactual_loss is None:
+            raise RuntimeError("Counterfactual ranking loss is unavailable.")
+        return self.transition_counterfactual_loss(
+            z_positive,
+            z_negative,
+            z_future,
+            valid_mask=valid_mask,
+        )
 
     def _run_video_expert_to_final_hidden(
         self,
@@ -923,7 +1045,7 @@ class FastWAM(torch.nn.Module):
         layer, so query-only interpolation would remove those paths abruptly.
         """
         scheduled_route_scale = self._transition_router_scale()
-        # TC-C v3 separates policy protection from student optimization.  The
+        # Protected TC v3+ separates policy protection from student optimization. The
         # frozen joint-MoT path is the teacher at every step, while the pure
         # Router student is optimized from step one.  Reusing the v2 recovery
         # blend here would make the first recovery window teacher-only and
@@ -1149,7 +1271,7 @@ class FastWAM(torch.nn.Module):
     ]:
         """Run TC recovery/student policy and return an optional M1 teacher.
 
-        TC-C v2 only evaluates the joint M1 path during recovery. TC-C v3
+        TC-C v2 only evaluates the joint M1 path during recovery. TC v3+
         freezes that path and evaluates it at every step, so the pure Router
         policy can be distilled without allocating a second 6.8B model.
         """
@@ -1256,6 +1378,10 @@ class FastWAM(torch.nn.Module):
             )
         context = sample["context"]
         context_mask = sample["context_mask"]
+        negative_context = sample.get("negative_context")
+        negative_context_mask = sample.get("negative_context_mask")
+        negative_valid = sample.get("negative_valid")
+        transition_task_id = sample.get("transition_task_id")
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
             raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
@@ -1321,10 +1447,68 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
             )
+        if self.transition_use_counterfactual_ranking:
+            if negative_context is None or negative_context_mask is None:
+                raise ValueError(
+                    "TC-Full training requires `negative_context` and "
+                    "`negative_context_mask` from the audited intervention manifest."
+                )
+            if negative_valid is None:
+                raise ValueError("TC-Full training requires `negative_valid`.")
+            if transition_task_id is None:
+                raise ValueError("TC-Full training requires `transition_task_id`.")
+        if (negative_context is None) != (negative_context_mask is None):
+            raise ValueError(
+                "`negative_context` and `negative_context_mask` must appear together."
+            )
+        if negative_context is not None:
+            if negative_context.ndim != 3 or negative_context_mask.ndim != 2:
+                raise ValueError(
+                    "`negative_context/negative_context_mask` must be "
+                    "[B,L,D]/[B,L]."
+                )
+            if negative_context.shape != context.shape or (
+                negative_context_mask.shape != context_mask.shape
+            ):
+                raise ValueError(
+                    "Positive and negative text-cache tensor shapes must match, got "
+                    f"{tuple(context.shape)}/{tuple(context_mask.shape)} and "
+                    f"{tuple(negative_context.shape)}/"
+                    f"{tuple(negative_context_mask.shape)}."
+                )
         context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if negative_context is not None:
+            negative_context = negative_context.to(
+                device=self.device, dtype=self.torch_dtype, non_blocking=True
+            )
+            negative_context_mask = negative_context_mask.to(
+                device=self.device, dtype=torch.bool, non_blocking=True
+            )
+        if negative_valid is not None:
+            negative_valid = torch.as_tensor(
+                negative_valid, device=self.device, dtype=torch.bool
+            )
+            if negative_valid.ndim == 0:
+                negative_valid = negative_valid.expand(batch_size)
+            if negative_valid.shape != (batch_size,):
+                raise ValueError(
+                    f"`negative_valid` must be [B], got {tuple(negative_valid.shape)}."
+                )
+        if transition_task_id is not None:
+            transition_task_id = torch.as_tensor(
+                transition_task_id, device=self.device, dtype=torch.long
+            )
+            if transition_task_id.ndim == 0:
+                transition_task_id = transition_task_id.expand(batch_size)
+            if transition_task_id.shape != (batch_size,):
+                raise ValueError(
+                    "`transition_task_id` must be [B], got "
+                    f"{tuple(transition_task_id.shape)}."
+                )
         language_context_len = int(context.shape[1])
         has_proprio = False
+        proprio_current = None
         if self.proprio_encoder is not None:
             if proprio is None:
                 raise ValueError("`sample['proprio']` is required when `proprio_dim` is enabled.")
@@ -1335,11 +1519,22 @@ class FastWAM(torch.nn.Module):
                     f"`sample['proprio']` last dim must be {self.proprio_dim}, got {proprio.shape[2]}"
                 )
             proprio = proprio[:, 0, :] # [B, D]
+            proprio_current = proprio.to(
+                device=self.device, dtype=self.torch_dtype, non_blocking=True
+            )
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
-                proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
+                proprio=proprio_current,
             )
+            if negative_context is not None:
+                negative_context, negative_context_mask = (
+                    self._append_proprio_to_context(
+                        context=negative_context,
+                        context_mask=negative_context_mask,
+                        proprio=proprio_current,
+                    )
+                )
             has_proprio = True
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
@@ -1351,8 +1546,13 @@ class FastWAM(torch.nn.Module):
         return {
             "context": context,
             "context_mask": context_mask,
+            "negative_context": negative_context,
+            "negative_context_mask": negative_context_mask,
+            "negative_valid": negative_valid,
+            "transition_task_id": transition_task_id,
             "language_context_len": language_context_len,
             "has_proprio": has_proprio,
+            "proprio_current": proprio_current,
             "input_latents": input_latents,
             "first_frame_latents": first_frame_latents,
             "fuse_vae_embedding_in_latents": fuse_flag,
@@ -1766,6 +1966,38 @@ class FastWAM(torch.nn.Module):
                 )
             if z_language is None:
                 raise RuntimeError("TC-C failed to produce z_language.")
+            z_negative = None
+            if self.transition_contract_version == 4:
+                # TC-Full contracts must not identify the positive instruction
+                # through the Video Expert's direct T1 text path.  Re-encode
+                # positive and negative intents from the same language-neutral
+                # current patch tokens; the deployment policy continues using
+                # final-Video-hidden routing protected by M1 distillation.
+                contract_visual_tokens = video_pre["tokens"].detach()
+                _, z_language, _ = self.encode_intended_transition(
+                    video_tokens=contract_visual_tokens,
+                    video_tokens_per_frame=int(
+                        video_pre["meta"]["tokens_per_frame"]
+                    ),
+                    context=context,
+                    full_context_mask=full_context_mask,
+                    route_scale=1.0,
+                )
+                negative_context = inputs["negative_context"]
+                negative_context_mask = inputs["negative_context_mask"]
+                if negative_context is None or negative_context_mask is None:
+                    raise RuntimeError(
+                        "TC-Full failed to receive counterfactual text context."
+                    )
+                _, z_negative, _ = self.encode_intended_transition(
+                    video_tokens=contract_visual_tokens,
+                    video_tokens_per_frame=int(
+                        video_pre["meta"]["tokens_per_frame"]
+                    ),
+                    context=negative_context,
+                    full_context_mask=negative_context_mask,
+                    route_scale=1.0,
+                )
             z_future = self.encode_realized_transition(
                 clean_input_latents=input_latents,
                 context=context,
@@ -1775,8 +2007,37 @@ class FastWAM(torch.nn.Module):
                     "fuse_vae_embedding_in_latents"
                 ],
             )
-            loss_contract, contract_metrics = (
-                self.compute_transition_contract_loss(z_language, z_future)
+            loss_language_future, contract_metrics = (
+                self.compute_transition_contract_loss(
+                    z_language,
+                    z_future,
+                    group_ids=inputs["transition_task_id"],
+                )
+            )
+            loss_action_future = z_language.sum() * 0.0
+            if self.transition_use_action_effect:
+                z_action = self.encode_action_effect_transition(
+                    current_video_hidden=video_pre["tokens"][:, : int(
+                        video_pre["meta"]["tokens_per_frame"]
+                    )].detach(),
+                    action=action,
+                    proprio=inputs["proprio_current"],
+                    action_is_pad=action_is_pad,
+                )
+                loss_action_future, action_future_metrics = (
+                    self.compute_action_future_contract_loss(
+                        z_action,
+                        z_future,
+                        group_ids=inputs["transition_task_id"],
+                    )
+                )
+                contract_metrics.update(action_future_metrics)
+                loss_dict["action_transition_embedding_norm"] = float(
+                    z_action.detach().float().norm(dim=-1).mean().item()
+                )
+            loss_contract = (
+                loss_language_future
+                + self.transition_action_future_weight * loss_action_future
             )
             contract_scale = self._transition_contract_scale()
             effective_contract_weight = (
@@ -1789,7 +2050,13 @@ class FastWAM(torch.nn.Module):
                         loss_contract.detach().item()
                     ),
                     "loss_language_future_contract": float(
-                        loss_contract.detach().item()
+                        loss_language_future.detach().item()
+                    ),
+                    "loss_action_future_contract": float(
+                        loss_action_future.detach().item()
+                    ),
+                    "action_future_contract_weight": float(
+                        self.transition_action_future_weight
                     ),
                     "transition_contract_scale": float(contract_scale),
                     "transition_contract_effective_weight": float(
@@ -1802,6 +2069,41 @@ class FastWAM(torch.nn.Module):
             )
             loss_dict.update(detached_metrics(contract_metrics))
             loss_dict.update(detached_metrics(router_metrics))
+            if self.transition_use_counterfactual_ranking:
+                if z_negative is None:
+                    raise RuntimeError(
+                        "TC-Full counterfactual branch did not produce z_negative."
+                    )
+                loss_counterfactual, counterfactual_metrics = (
+                    self.compute_counterfactual_ranking_loss(
+                        z_language,
+                        z_negative,
+                        z_future,
+                        valid_mask=inputs["negative_valid"],
+                    )
+                )
+                effective_counterfactual_weight = (
+                    self.transition_counterfactual_weight * contract_scale
+                )
+                loss_total = (
+                    loss_total
+                    + effective_counterfactual_weight * loss_counterfactual
+                )
+                loss_dict.update(
+                    {
+                        "loss_counterfactual_ranking": float(
+                            loss_counterfactual.detach().item()
+                        ),
+                        "counterfactual_scale": float(contract_scale),
+                        "counterfactual_effective_weight": float(
+                            effective_counterfactual_weight
+                        ),
+                        "counterfactual_transition_embedding_norm": float(
+                            z_negative.detach().float().norm(dim=-1).mean().item()
+                        ),
+                    }
+                )
+                loss_dict.update(detached_metrics(counterfactual_metrics))
 
         if self.langforce_prior_enabled:
             pred_action_prior = self._forward_prior_action_train(
@@ -2523,15 +2825,25 @@ class FastWAM(torch.nn.Module):
             ),
             "use_router": bool(self.use_transition_router),
             "use_contract": bool(self.transition_contract_enabled),
-            "use_cf_ranking": False,
-            "use_action_effect": False,
+            "use_cf_ranking": bool(
+                self.transition_use_counterfactual_ranking
+            ),
+            "use_action_effect": bool(self.transition_use_action_effect),
             "action_conditioned_video": False,
             "router_visual_source": "video_expert_final_hidden",
+            "contract_visual_source": (
+                "language_neutral_video_patch_tokens"
+                if self.transition_contract_version == 4
+                else "video_expert_final_hidden"
+            ),
+            "action_future_weight": self.transition_action_future_weight,
+            "counterfactual_weight": self.transition_counterfactual_weight,
+            "counterfactual_margin": self.transition_counterfactual_margin,
             "policy_recovery_ratio": self.transition_policy_recovery_ratio,
             "router_ramp_ratio": self.transition_router_ramp_ratio,
             "policy_recovery_blend": (
                 "disabled_frozen_teacher_distillation"
-                if self.transition_contract_version == 3
+                if self.transition_contract_version >= 3
                 else "action_flow_velocity"
             ),
             "policy_recovery_source": "joint_mot_posterior",
@@ -2548,7 +2860,7 @@ class FastWAM(torch.nn.Module):
             "freeze_m1_policy": self.transition_freeze_m1_policy,
             "student_policy_path": (
                 "pure_router_from_step_zero"
-                if self.transition_contract_version == 3
+                if self.transition_contract_version >= 3
                 else "scheduled_m1_to_router_recovery"
             ),
             "policy_protection": (
@@ -2626,6 +2938,61 @@ class FastWAM(torch.nn.Module):
             )
         return str(candidate)
 
+    def _validate_transition_checkpoint_version(
+        self, saved_version: Any
+    ) -> int:
+        try:
+            saved_version = int(saved_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"TC checkpoint has invalid version: {saved_version!r}."
+            ) from exc
+        if saved_version == self.transition_contract_version:
+            return saved_version
+        # Stage 2 is initialized from the policy-protected Stage-1 v3
+        # checkpoint.  Only the new training-time ActionEffectEncoder is
+        # absent; Router, intent/outcome projections, LoRA, and M1 policy are
+        # restored exactly.
+        if self.transition_contract_version == 4 and saved_version == 3:
+            return saved_version
+        raise ValueError(
+            "TC checkpoint version mismatch: "
+            f"checkpoint={saved_version}, model={self.transition_contract_version}."
+        )
+
+    def _load_transition_contract_checkpoint_state(
+        self,
+        transition_state: dict[str, torch.Tensor],
+        *,
+        saved_version: int,
+    ) -> None:
+        if saved_version == self.transition_contract_version:
+            self.transition_contract_modules.load_state_dict(
+                transition_state, strict=True
+            )
+            return
+        incompatible = self.transition_contract_modules.load_state_dict(
+            transition_state, strict=False
+        )
+        unexpected = list(incompatible.unexpected_keys)
+        disallowed_missing = [
+            key
+            for key in incompatible.missing_keys
+            if not key.startswith("action_effect_encoder.")
+        ]
+        if unexpected or disallowed_missing:
+            raise ValueError(
+                "Invalid TC v3 -> TC-Full v4 migration state: "
+                f"missing={disallowed_missing}, unexpected={unexpected}."
+            )
+        logger.info(
+            "Migrated TC checkpoint v%d -> v%d; initialized %d new "
+            "ActionEffectEncoder tensors.",
+            saved_version,
+            self.transition_contract_version,
+            len(incompatible.missing_keys),
+        )
+
     def _load_lora_adapter(self, path: str, payload: dict, optimizer=None):
         adapter_source_path = str(Path(path).expanduser().resolve())
         transition_state = payload.get("transition_contract")
@@ -2634,15 +3001,13 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     "This adapter contains TC-FastWAM weights, but the current "
                     "model has `transition_contract.enabled=false`. Enable the "
-                    "matching Stage-1 config before loading it."
+                    "matching TC config before loading it."
                 )
             metadata = payload.get("architecture_metadata") or {}
             saved_version = metadata.get("transition_contract_version")
-            if saved_version != self.transition_contract_version:
-                raise ValueError(
-                    "TC checkpoint version mismatch: "
-                    f"checkpoint={saved_version}, model={self.transition_contract_version}."
-                )
+            saved_version = self._validate_transition_checkpoint_version(
+                saved_version
+            )
 
         base_checkpoint = payload.get("base_checkpoint")
         if base_checkpoint:
@@ -2677,8 +3042,9 @@ class FastWAM(torch.nn.Module):
         self.mot.load_state_dict(adapter_state, strict=False)
 
         if transition_state is not None:
-            self.transition_contract_modules.load_state_dict(
-                transition_state, strict=True
+            self._load_transition_contract_checkpoint_state(
+                transition_state,
+                saved_version=saved_version,
             )
         elif self.transition_contract_enabled:
             logger.info(
@@ -2690,6 +3056,11 @@ class FastWAM(torch.nn.Module):
             # TC adapter must remain self-contained with respect to the
             # official FastWAM base rather than recursively depending on M1.
             self.transition_policy_init_checkpoint = adapter_source_path
+        elif transition_state is not None:
+            metadata = payload.get("architecture_metadata") or {}
+            self.transition_policy_init_checkpoint = metadata.get(
+                "policy_init_checkpoint"
+            )
         else:
             self.transition_policy_init_checkpoint = None
 
@@ -2754,13 +3125,12 @@ class FastWAM(torch.nn.Module):
                 )
             metadata = payload.get("architecture_metadata") or {}
             saved_version = metadata.get("transition_contract_version")
-            if saved_version != self.transition_contract_version:
-                raise ValueError(
-                    "TC checkpoint version mismatch: "
-                    f"checkpoint={saved_version}, model={self.transition_contract_version}."
-                )
-            self.transition_contract_modules.load_state_dict(
-                transition_state, strict=True
+            saved_version = self._validate_transition_checkpoint_version(
+                saved_version
+            )
+            self._load_transition_contract_checkpoint_state(
+                transition_state,
+                saved_version=saved_version,
             )
         elif self.transition_contract_enabled:
             logger.info(

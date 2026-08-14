@@ -1,10 +1,17 @@
+import json
 import os
 import tempfile
 import unittest
 
 import torch
 
-from fastwam.models.wan22.transition_contract import ContrastiveContractLoss
+from fastwam.datasets.counterfactual import (
+    load_counterfactual_instruction_map,
+)
+from fastwam.models.wan22.transition_contract import (
+    ContrastiveContractLoss,
+    CounterfactualRankingLoss,
+)
 from test_langforce_mvp import tiny_fastwam
 
 
@@ -456,6 +463,229 @@ class TransitionContractTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(float(metrics["contract_retrieval_acc"]), 1.0)
         self.assertGreater(float(metrics["sim_LF_margin"]), 0.0)
+
+    def test_contract_masks_same_task_false_negatives(self):
+        embeddings = torch.eye(3)
+        loss, metrics = ContrastiveContractLoss(temperature=0.07)(
+            embeddings,
+            embeddings,
+            group_ids=torch.tensor([5, 5, 9]),
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertAlmostEqual(
+            float(metrics["contract_same_task_negative_fraction_LF"]),
+            1.0 / 3.0,
+        )
+        self.assertAlmostEqual(
+            float(metrics["contract_effective_negative_count_LF"]),
+            4.0 / 3.0,
+        )
+
+    def test_tc_full_action_future_contract_is_finite_and_trainable(self):
+        model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=4,
+        )
+        z_action = model.encode_action_effect_transition(
+            current_video_hidden=torch.randn(3, 4, 16),
+            action=torch.randn(3, 5, 3),
+            proprio=None,
+            action_is_pad=torch.tensor(
+                [
+                    [False, False, False, False, False],
+                    [False, False, False, True, True],
+                    [False, False, False, False, True],
+                ]
+            ),
+        )
+        z_future = torch.nn.functional.normalize(torch.randn(3, 8), dim=-1)
+        loss, metrics = model.compute_action_future_contract_loss(
+            z_action, z_future
+        )
+        self.assertEqual(tuple(z_action.shape), (3, 8))
+        torch.testing.assert_close(z_action.norm(dim=-1), torch.ones(3))
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("sim_AF_positive", metrics)
+        self.assertIn("contract_retrieval_acc_AF", metrics)
+        loss.backward()
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                for parameter in model.transition_contract_modules[
+                    "action_effect_encoder"
+                ].parameters()
+            )
+        )
+
+    def test_counterfactual_ranking_uses_only_valid_examples(self):
+        z_future = torch.eye(3)
+        z_positive = torch.eye(3)
+        z_negative = -torch.eye(3)
+        loss, metrics = CounterfactualRankingLoss(margin=0.2)(
+            z_positive,
+            z_negative,
+            z_future,
+            valid_mask=torch.tensor([True, False, True]),
+        )
+        self.assertEqual(float(loss), 0.0)
+        self.assertEqual(
+            float(metrics["counterfactual_margin_satisfied_fraction"]),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            float(metrics["counterfactual_valid_fraction"]), 2.0 / 3.0
+        )
+
+        violated, _ = CounterfactualRankingLoss(margin=0.2)(
+            -z_future,
+            z_future,
+            z_future,
+            valid_mask=torch.ones(3, dtype=torch.bool),
+        )
+        self.assertGreater(float(violated), 0.0)
+
+    def test_tc_full_build_inputs_requires_and_preserves_negative_context(self):
+        model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=4,
+        )
+        model._encode_video_latents = lambda *_args, **_kwargs: torch.randn(
+            2, 2, 2, 2, 2
+        )
+        sample = {
+            "video": torch.randn(2, 3, 5, 16, 16),
+            "action": torch.randn(2, 4, 3),
+            "context": torch.randn(2, 4, 10),
+            "context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_context": torch.randn(2, 4, 10),
+            "negative_context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_valid": torch.tensor([True, False]),
+            "transition_task_id": torch.tensor([10, 11]),
+        }
+        inputs = model.build_inputs(sample)
+        self.assertEqual(tuple(inputs["negative_context"].shape), (2, 4, 10))
+        self.assertEqual(inputs["negative_valid"].tolist(), [True, False])
+
+        sample.pop("negative_context")
+        with self.assertRaisesRegex(ValueError, "negative_context"):
+            model.build_inputs(sample)
+
+    def test_tc_full_training_loss_updates_only_transition_modules(self):
+        model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=4,
+        )
+        model.configure_lora(LORA_CONFIG)
+        model.prepare_trainable_parameters()
+        model._encode_video_latents = lambda *_args, **_kwargs: torch.randn(
+            2, 2, 2, 2, 2
+        )
+        model.set_training_progress(10, 100)
+        sample = {
+            "video": torch.randn(2, 3, 5, 16, 16),
+            "action": torch.randn(2, 4, 3),
+            "context": torch.randn(2, 4, 10),
+            "context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_context": torch.randn(2, 4, 10),
+            "negative_context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_valid": torch.tensor([True, False]),
+            "transition_task_id": torch.tensor([10, 11]),
+        }
+        loss, metrics = model.training_loss(sample)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("loss_action_future_contract", metrics)
+        self.assertIn("loss_counterfactual_ranking", metrics)
+        self.assertIn("sim_AF_margin", metrics)
+        self.assertIn("sim_CF_margin", metrics)
+        loss.backward()
+        self.assertTrue(
+            all(parameter.grad is None for parameter in model.mot.parameters())
+        )
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                for parameter in model.transition_contract_modules.parameters()
+            )
+        )
+
+    def test_counterfactual_manifest_loader_rejects_unsafe_pairs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "manifest.jsonl")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "correct_instruction": "pick up soup",
+                            "counterfactual_instruction": "pick up milk",
+                            "counterfactual_is_executable": True,
+                        }
+                    )
+                    + "\n"
+                )
+            mapping = load_counterfactual_instruction_map(path)
+            self.assertEqual(mapping["pick up soup"], "pick up milk")
+
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "correct_instruction": "same",
+                            "counterfactual_instruction": "same",
+                            "counterfactual_is_executable": True,
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "positive instruction"):
+                load_counterfactual_instruction_map(path)
+
+    def test_tc_v3_checkpoint_migrates_to_tc_full_v4(self):
+        source = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=3,
+        )
+        source.configure_lora(LORA_CONFIG)
+        with torch.no_grad():
+            expected = next(
+                source.transition_contract_modules["router"].parameters()
+            )
+            expected.add_(0.321)
+            expected = expected.detach().clone()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "tc_v3.pt")
+            source.save_checkpoint(path, step=4000)
+            restored = tiny_fastwam(
+                transition_contract=True,
+                transition_contract_version=4,
+            )
+            restored.load_checkpoint(path)
+            actual = next(
+                restored.transition_contract_modules["router"].parameters()
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            self.assertIn(
+                "action_effect_encoder", restored.transition_contract_modules
+            )
+            metadata = restored._transition_contract_metadata()
+            self.assertTrue(metadata["use_action_effect"])
+            self.assertTrue(metadata["use_cf_ranking"])
+            self.assertEqual(
+                metadata["contract_visual_source"],
+                "language_neutral_video_patch_tokens",
+            )
+            restored.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in restored.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith("transition_contract_modules.")
+                    for name in trainable
+                )
+            )
 
     def test_lora_exposes_and_round_trips_transition_modules(self):
         self.model.configure_lora(LORA_CONFIG)

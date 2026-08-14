@@ -397,12 +397,12 @@ class Wan22Trainer:
         if freeze_m1_policy:
             if policy_parameter_entries != 0:
                 raise RuntimeError(
-                    "TC-C v3 policy protection requires zero trainable M1 "
+                    "Protected TC v3+ requires zero trainable M1 "
                     "policy tensors."
                 )
             logger.info(
-                "TC-C v3 policy protection active: frozen M1 teacher, "
-                "Router-only optimizer."
+                "Protected TC policy active: frozen M1 teacher, "
+                "transition-module-only optimizer."
             )
         elif policy_parameter_entries <= 0:
             raise RuntimeError(

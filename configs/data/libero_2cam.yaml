@@ -65,3 +65,7 @@ train:
         size: [224, 224]
   text_embedding_cache_dir: ./data/text_embeds_cache/libero
   context_len: 128
+  # TC-Full only. The manifest maps each source task to an audited executable
+  # same-scene instruction; disabled for all baseline and TC-C runs.
+  counterfactual_manifest_path: null
+  counterfactual_negative_probability: 0.0

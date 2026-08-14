@@ -1,8 +1,7 @@
-"""Stage-1 latent transition contract modules for TC-FastWAM.
+"""Latent transition contract modules for TC-FastWAM.
 
-The deployment path contains only the intent/router branch.  The outcome
-encoder and contrastive loss are training-time teachers built from the clean
-current/future video tokens.
+The deployment path contains only the intent/router branch.  The outcome and
+action-effect encoders plus their contract losses are training-time teachers.
 """
 
 from __future__ import annotations
@@ -246,6 +245,156 @@ class OutcomeTransitionEncoder(nn.Module):
         return self.projection(future - current)
 
 
+class ActionEffectEncoder(nn.Module):
+    """Encode the transition induced by a clean action chunk.
+
+    The encoder is deliberately small and training-only.  It combines a
+    language-neutral current-view token with the ordered action sequence and
+    optional current proprioception, then projects the result into the shared
+    transition space.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        video_dim: int,
+        projection_dim: int,
+        proprio_dim: int | None = None,
+        hidden_dim: int | None = None,
+        num_heads: int = 8,
+        num_layers: int = 2,
+    ):
+        super().__init__()
+        hidden_dim = int(hidden_dim or projection_dim)
+        if hidden_dim <= 0:
+            raise ValueError("`hidden_dim` must be positive.")
+        if num_heads <= 0 or hidden_dim % int(num_heads) != 0:
+            raise ValueError(
+                f"Action-effect hidden_dim={hidden_dim} must divide "
+                f"num_heads={num_heads}."
+            )
+        if int(num_layers) <= 0:
+            raise ValueError("`num_layers` must be positive.")
+
+        self.action_dim = int(action_dim)
+        self.video_dim = int(video_dim)
+        self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
+        self.hidden_dim = hidden_dim
+        self.action_projection = nn.Linear(self.action_dim, hidden_dim)
+        self.visual_projection = nn.Sequential(
+            nn.LayerNorm(self.video_dim),
+            nn.Linear(self.video_dim, hidden_dim),
+        )
+        self.proprio_projection = (
+            nn.Linear(self.proprio_dim, hidden_dim)
+            if self.proprio_dim is not None
+            else None
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=int(num_heads),
+            dim_feedforward=hidden_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=int(num_layers))
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.projection = TransitionProjectionHead(hidden_dim, projection_dim)
+
+    @staticmethod
+    def _position_embedding(
+        length: int,
+        dim: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        positions = torch.arange(length, device=device, dtype=torch.float32)[:, None]
+        half_dim = max(1, (dim + 1) // 2)
+        frequencies = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half_dim, device=device, dtype=torch.float32)
+            / max(1, half_dim - 1)
+        )[None, :]
+        angles = positions * frequencies
+        embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)[:, :dim]
+        return embedding.to(dtype=dtype)
+
+    def forward(
+        self,
+        *,
+        current_video_hidden: torch.Tensor,
+        action: torch.Tensor,
+        proprio: torch.Tensor | None = None,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if current_video_hidden.ndim != 3:
+            raise ValueError("`current_video_hidden` must be [B,N,D_video].")
+        if action.ndim != 3 or action.shape[-1] != self.action_dim:
+            raise ValueError(
+                "`action` must be [B,T,action_dim], got "
+                f"{tuple(action.shape)} with action_dim={self.action_dim}."
+            )
+        batch_size, horizon, _ = action.shape
+        if current_video_hidden.shape[0] != batch_size or (
+            current_video_hidden.shape[-1] != self.video_dim
+        ):
+            raise ValueError("Action-effect video batch/feature dimensions mismatch.")
+        if horizon <= 0:
+            raise ValueError("Action-effect encoding requires a non-empty action chunk.")
+
+        if action_is_pad is None:
+            action_is_pad = torch.zeros(
+                (batch_size, horizon), dtype=torch.bool, device=action.device
+            )
+        else:
+            if action_is_pad.shape != (batch_size, horizon):
+                raise ValueError(
+                    "`action_is_pad` must match [B,T], got "
+                    f"{tuple(action_is_pad.shape)}."
+                )
+            action_is_pad = action_is_pad.to(device=action.device, dtype=torch.bool)
+
+        context_token = self.visual_projection(current_video_hidden.mean(dim=1))
+        if self.proprio_projection is not None:
+            if proprio is None or proprio.shape != (batch_size, self.proprio_dim):
+                raise ValueError(
+                    "Action-effect proprio must be [B,proprio_dim], got "
+                    f"{None if proprio is None else tuple(proprio.shape)}."
+                )
+            context_token = context_token + self.proprio_projection(proprio)
+        elif proprio is not None:
+            raise ValueError("Received proprio but ActionEffectEncoder has no proprio_dim.")
+
+        action_hidden = self.action_projection(action)
+        action_hidden = action_hidden + self._position_embedding(
+            horizon,
+            self.hidden_dim,
+            device=action.device,
+            dtype=action_hidden.dtype,
+        )[None, :, :]
+        sequence = torch.cat([context_token[:, None, :], action_hidden], dim=1)
+        padding_mask = torch.cat(
+            [
+                torch.zeros(
+                    (batch_size, 1), dtype=torch.bool, device=action.device
+                ),
+                action_is_pad,
+            ],
+            dim=1,
+        )
+        encoded = self.encoder(sequence, src_key_padding_mask=padding_mask)
+        valid = (~action_is_pad).to(dtype=encoded.dtype)
+        action_pool = (
+            encoded[:, 1:] * valid[:, :, None]
+        ).sum(dim=1) / valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+        effect_hidden = self.output_norm(encoded[:, 0] + action_pool)
+        return self.projection(effect_hidden)
+
+
 def _gather_with_grad(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
     if not dist.is_available() or not dist.is_initialized():
         return tensor, 0
@@ -275,8 +424,16 @@ def _gather_with_grad(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
         return torch.cat(gathered, dim=0), dist.get_rank()
 
 
+def _gather_without_grad(tensor: torch.Tensor) -> torch.Tensor:
+    if not dist.is_available() or not dist.is_initialized():
+        return tensor
+    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, tensor)
+    return torch.cat(gathered, dim=0)
+
+
 class ContrastiveContractLoss(nn.Module):
-    """Symmetric Language/Future InfoNCE with distributed in-batch negatives."""
+    """Symmetric transition InfoNCE with distributed in-batch negatives."""
 
     def __init__(self, temperature: float = 0.07):
         super().__init__()
@@ -285,51 +442,169 @@ class ContrastiveContractLoss(nn.Module):
         self.temperature = float(temperature)
 
     def forward(
-        self, z_language: torch.Tensor, z_future: torch.Tensor
+        self,
+        z_source: torch.Tensor,
+        z_future: torch.Tensor,
+        *,
+        metric_prefix: str = "LF",
+        group_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if z_language.shape != z_future.shape or z_language.ndim != 2:
+        if z_source.shape != z_future.shape or z_source.ndim != 2:
             raise ValueError(
                 "Transition embeddings must have equal [B,D] shapes, got "
-                f"{tuple(z_language.shape)} and {tuple(z_future.shape)}."
+                f"{tuple(z_source.shape)} and {tuple(z_future.shape)}."
             )
-        z_language = F.normalize(z_language.float(), dim=-1, eps=1e-6)
+        if metric_prefix not in {"LF", "AF"}:
+            raise ValueError(
+                f"`metric_prefix` must be LF or AF, got {metric_prefix!r}."
+            )
+        z_source = F.normalize(z_source.float(), dim=-1, eps=1e-6)
         z_future = F.normalize(z_future.float(), dim=-1, eps=1e-6)
-        all_language, rank = _gather_with_grad(z_language)
+        all_source, rank = _gather_with_grad(z_source)
         all_future, future_rank = _gather_with_grad(z_future)
         if rank != future_rank:
             raise RuntimeError("Distributed transition gather rank mismatch.")
 
-        batch_size = z_language.shape[0]
-        candidate_count = all_language.shape[0]
+        batch_size = z_source.shape[0]
+        candidate_count = all_source.shape[0]
         labels = rank * batch_size + torch.arange(
-            batch_size, device=z_language.device
+            batch_size, device=z_source.device
         )
-        logits_lf = torch.matmul(z_language, all_future.transpose(0, 1))
-        logits_fl = torch.matmul(z_future, all_language.transpose(0, 1))
+        logits_sf = torch.matmul(z_source, all_future.transpose(0, 1))
+        logits_fs = torch.matmul(z_future, all_source.transpose(0, 1))
+        positive_mask = torch.zeros_like(logits_sf, dtype=torch.bool)
+        positive_mask.scatter_(1, labels[:, None], True)
+        same_group_negative = torch.zeros_like(logits_sf, dtype=torch.bool)
+        if group_ids is not None:
+            if group_ids.shape != (batch_size,):
+                raise ValueError(
+                    f"`group_ids` must be [B], got {tuple(group_ids.shape)}."
+                )
+            group_ids = group_ids.to(device=z_source.device, dtype=torch.long)
+            all_group_ids = _gather_without_grad(group_ids)
+            same_group_negative = (
+                group_ids[:, None] == all_group_ids[None, :]
+            ) & ~positive_mask
+            mask_value = torch.finfo(logits_sf.dtype).min
+            logits_sf = logits_sf.masked_fill(same_group_negative, mask_value)
+            logits_fs = logits_fs.masked_fill(same_group_negative, mask_value)
         if candidate_count > 1:
             loss = 0.5 * (
-                F.cross_entropy(logits_lf / self.temperature, labels)
-                + F.cross_entropy(logits_fl / self.temperature, labels)
+                F.cross_entropy(logits_sf / self.temperature, labels)
+                + F.cross_entropy(logits_fs / self.temperature, labels)
             )
-            negative_mask = torch.ones_like(logits_lf, dtype=torch.bool)
-            negative_mask.scatter_(1, labels[:, None], False)
-            negative = logits_lf.masked_fill(~negative_mask, -1.0).max(dim=1).values
+            negative_mask = ~positive_mask & ~same_group_negative
+            negative_values = logits_sf.masked_fill(~negative_mask, -1.0)
+            negative = negative_values.max(dim=1).values
+            negative = torch.where(
+                negative_mask.any(dim=1), negative, torch.zeros_like(negative)
+            )
         else:
             # Keep a differentiable scalar for single-card unit/smoke batches.
-            loss = (z_language.sum() + z_future.sum()) * 0.0
-            negative = logits_lf.new_zeros((batch_size,))
+            loss = (z_source.sum() + z_future.sum()) * 0.0
+            negative = logits_sf.new_zeros((batch_size,))
 
-        positive = logits_lf.gather(1, labels[:, None]).squeeze(1)
+        positive = logits_sf.gather(1, labels[:, None]).squeeze(1)
+        retrieval_key = (
+            "contract_retrieval_acc"
+            if metric_prefix == "LF"
+            else "contract_retrieval_acc_AF"
+        )
+        candidate_key = (
+            "contract_candidate_count"
+            if metric_prefix == "LF"
+            else "contract_candidate_count_AF"
+        )
         metrics = {
-            "sim_LF_positive": positive.mean(),
-            "sim_LF_negative": negative.mean(),
-            "sim_LF_margin": (positive - negative).mean(),
-            "contract_retrieval_acc": (logits_lf.argmax(dim=1) == labels)
+            f"sim_{metric_prefix}_positive": positive.mean(),
+            f"sim_{metric_prefix}_negative": negative.mean(),
+            f"sim_{metric_prefix}_margin": (positive - negative).mean(),
+            retrieval_key: (logits_sf.argmax(dim=1) == labels)
             .float()
             .mean(),
-            "contract_candidate_count": logits_lf.new_tensor(
+            candidate_key: logits_sf.new_tensor(
                 float(candidate_count)
             ),
+            f"contract_effective_negative_count_{metric_prefix}": (
+                (~positive_mask & ~same_group_negative)
+                .sum(dim=1)
+                .float()
+                .mean()
+            ),
+            f"contract_same_task_negative_fraction_{metric_prefix}": (
+                same_group_negative.float().sum()
+                / max(1, batch_size * max(1, candidate_count - 1))
+            ),
+        }
+        return loss, metrics
+
+
+class CounterfactualRankingLoss(nn.Module):
+    """Rank the realized future above an executable same-scene instruction."""
+
+    def __init__(self, margin: float = 0.2):
+        super().__init__()
+        if margin < 0:
+            raise ValueError("`margin` must be non-negative.")
+        self.margin = float(margin)
+
+    def forward(
+        self,
+        z_positive: torch.Tensor,
+        z_negative: torch.Tensor,
+        z_future: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if (
+            z_positive.shape != z_negative.shape
+            or z_positive.shape != z_future.shape
+            or z_positive.ndim != 2
+        ):
+            raise ValueError(
+                "Counterfactual embeddings must share [B,D] shape, got "
+                f"{tuple(z_positive.shape)}, {tuple(z_negative.shape)}, "
+                f"{tuple(z_future.shape)}."
+            )
+        batch_size = z_positive.shape[0]
+        if valid_mask is None:
+            valid_mask = torch.ones(
+                batch_size, dtype=torch.bool, device=z_positive.device
+            )
+        elif valid_mask.shape != (batch_size,):
+            raise ValueError(
+                f"`valid_mask` must be [B], got {tuple(valid_mask.shape)}."
+            )
+        valid_mask = valid_mask.to(device=z_positive.device, dtype=torch.bool)
+
+        positive = F.cosine_similarity(
+            z_positive.float(), z_future.float(), dim=-1, eps=1e-6
+        )
+        negative = F.cosine_similarity(
+            z_negative.float(), z_future.float(), dim=-1, eps=1e-6
+        )
+        margin = positive - negative
+        per_sample = torch.relu(self.margin - margin)
+        valid = valid_mask.to(per_sample.dtype)
+        valid_count = valid.sum()
+        loss = (per_sample * valid).sum() / valid_count.clamp_min(1.0)
+        # Retain a differentiable zero when a stochastic batch has no explicit
+        # negative examples.
+        if not bool(valid_mask.any()):
+            loss = (z_positive.sum() + z_negative.sum() + z_future.sum()) * 0.0
+
+        def _valid_mean(value: torch.Tensor) -> torch.Tensor:
+            return (value * valid).sum() / valid_count.clamp_min(1.0)
+
+        metrics = {
+            "sim_CF_positive": _valid_mean(positive),
+            "sim_CF_negative": _valid_mean(negative),
+            "sim_CF_margin": _valid_mean(margin),
+            "counterfactual_margin_satisfied_fraction": _valid_mean(
+                (margin >= self.margin).to(valid.dtype)
+            ),
+            "counterfactual_valid_fraction": valid.mean(),
+            "counterfactual_valid_count": valid_count,
         }
         return loss, metrics
 

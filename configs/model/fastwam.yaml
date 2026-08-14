@@ -75,15 +75,18 @@ langforce_mvp:
   posterior_advantage_margin_ratio: 0.05
   detach_prior_video_cache: true
 
-# Stage-1 TC-C is opt-in. It reuses the legacy latent-query checkpoint key but
-# changes its semantics to intended-transition queries. Prior/advantage must be
-# disabled when this block is enabled.
+# TC-FastWAM is opt-in. v2/v3 implement TC-C; v4 adds the training-only
+# Action-Future contract and same-scene counterfactual ranking for TC-Full.
+# Prior/advantage remain disabled on the mainline.
 transition_contract:
   enabled: false
   version: 2
   projection_dim: 512
   temperature: 0.07
   contract_weight: 0.05
+  action_future_weight: 1.0
+  counterfactual_weight: 0.05
+  counterfactual_margin: 0.2
   outcome_stop_gradient: true
   use_transition_router: true
   router_num_heads: 8
@@ -93,6 +96,9 @@ transition_contract:
   action_conditioned_video: false
   use_action_effect: false
   use_counterfactual_ranking: false
+  action_effect_hidden_dim: 512
+  action_effect_num_heads: 8
+  action_effect_num_layers: 2
   warmup_ratio: 0.05
   ramp_ratio: 0.05
   # v2 keeps the pretrained/M1 posterior-query policy during early recovery,
@@ -100,9 +106,9 @@ transition_contract:
   policy_recovery_ratio: 0.10
   router_ramp_ratio: 0.20
   freeze_m1_during_recovery: true
-  # TC-C v3 policy protection. Version 3 freezes the loaded M1 adapter and
-  # distills the pure-Router action velocity from its joint-MoT posterior
-  # output while the LF contract continues to optimize Router representations.
+  # TC v3+ policy protection freezes the loaded M1 adapter and distills the
+  # pure-Router action velocity from its joint-MoT posterior output while the
+  # transition contracts continue optimizing Router representations.
   policy_distillation_enabled: false
   policy_distillation_weight: 1.0
   freeze_m1_policy: false

@@ -109,19 +109,29 @@ def tiny_fastwam(
             "direct_action_text_access": False,
             "direct_video_text_access": True,
             "action_conditioned_video": False,
-            "use_action_effect": False,
-            "use_counterfactual_ranking": False,
+            "use_action_effect": bool(
+                transition_contract and transition_contract_version == 4
+            ),
+            "use_counterfactual_ranking": bool(
+                transition_contract and transition_contract_version == 4
+            ),
+            "action_future_weight": 1.0,
+            "counterfactual_weight": 0.05,
+            "counterfactual_margin": 0.2,
+            "action_effect_hidden_dim": 8,
+            "action_effect_num_heads": 2,
+            "action_effect_num_layers": 1,
             "warmup_ratio": 0.05,
             "ramp_ratio": 0.05,
             "policy_recovery_ratio": 0.10,
             "router_ramp_ratio": 0.20,
             "freeze_m1_during_recovery": True,
             "policy_distillation_enabled": bool(
-                transition_contract and transition_contract_version == 3
+                transition_contract and transition_contract_version >= 3
             ),
             "policy_distillation_weight": 1.0,
             "freeze_m1_policy": bool(
-                transition_contract and transition_contract_version == 3
+                transition_contract and transition_contract_version >= 3
             ),
         },
     )
