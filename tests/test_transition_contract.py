@@ -7,9 +7,11 @@ import torch
 
 from fastwam.datasets.counterfactual import (
     load_counterfactual_instruction_map,
+    stable_instruction_id,
 )
 from fastwam.models.wan22.transition_contract import (
     ContrastiveContractLoss,
+    CounterfactualActionPrototypeBank,
     CounterfactualRankingLoss,
 )
 from test_langforce_mvp import tiny_fastwam
@@ -517,6 +519,71 @@ class TransitionContractTest(unittest.TestCase):
             )
         )
 
+    def test_counterfactual_action_bank_uses_target_task_positives(self):
+        bank = CounterfactualActionPrototypeBank(
+            num_slots=4,
+            num_queries=2,
+            query_dim=3,
+            action_effect_dim=3,
+            momentum=0.0,
+        )
+        queries = torch.tensor(
+            [
+                [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            ]
+        )
+        actions = torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        )
+        bank.update(
+            task_ids=torch.tensor([10, 20]),
+            query_residuals=queries,
+            action_effects=actions,
+        )
+        loss, metrics = bank.positive_loss(
+            counterfactual_task_ids=torch.tensor([20, 10]),
+            query_residuals=queries.flip(0),
+            action_intents=actions.flip(0),
+            valid_mask=torch.ones(2, dtype=torch.bool),
+        )
+        self.assertAlmostEqual(float(loss), 0.0, places=6)
+        self.assertEqual(
+            float(metrics["counterfactual_action_prototype_retrieval_acc"]),
+            1.0,
+        )
+        self.assertEqual(
+            float(metrics["counterfactual_action_prototype_count"]), 2.0
+        )
+
+        mismatched, _ = bank.positive_loss(
+            counterfactual_task_ids=torch.tensor([20, 10]),
+            query_residuals=queries,
+            action_intents=actions,
+            valid_mask=torch.ones(2, dtype=torch.bool),
+        )
+        self.assertGreater(float(mismatched), 0.0)
+
+    def test_counterfactual_action_separation_is_bounded(self):
+        model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=5,
+        )
+        loss, metrics = model.compute_counterfactual_action_separation_loss(
+            positive_error=torch.tensor([0.10, 0.20]),
+            counterfactual_source_error=torch.tensor([0.20, 0.21]),
+            valid_mask=torch.ones(2, dtype=torch.bool),
+        )
+        self.assertAlmostEqual(float(loss), 0.02, places=6)
+        self.assertAlmostEqual(
+            float(
+                metrics[
+                    "counterfactual_action_separation_satisfied_fraction"
+                ]
+            ),
+            0.5,
+        )
+
     def test_counterfactual_ranking_uses_only_valid_examples(self):
         z_future = torch.eye(3)
         z_positive = torch.eye(3)
@@ -570,6 +637,33 @@ class TransitionContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "negative_context"):
             model.build_inputs(sample)
 
+    def test_tc_v5_build_inputs_requires_counterfactual_task_id(self):
+        model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=5,
+        )
+        model._encode_video_latents = lambda *_args, **_kwargs: torch.randn(
+            2, 2, 2, 2, 2
+        )
+        sample = {
+            "video": torch.randn(2, 3, 5, 16, 16),
+            "action": torch.randn(2, 4, 3),
+            "context": torch.randn(2, 4, 10),
+            "context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_context": torch.randn(2, 4, 10),
+            "negative_context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_valid": torch.ones(2, dtype=torch.bool),
+            "transition_task_id": torch.tensor([10, 20]),
+        }
+        with self.assertRaisesRegex(ValueError, "counterfactual_task_id"):
+            model.build_inputs(sample)
+
+        sample["counterfactual_task_id"] = torch.tensor([20, 10])
+        inputs = model.build_inputs(sample)
+        self.assertEqual(
+            inputs["counterfactual_task_id"].tolist(), [20, 10]
+        )
+
     def test_tc_full_training_loss_updates_only_transition_modules(self):
         model = tiny_fastwam(
             transition_contract=True,
@@ -608,6 +702,52 @@ class TransitionContractTest(unittest.TestCase):
             )
         )
 
+    def test_tc_v5_action_positive_supervision_reaches_policy_queries(self):
+        model = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=5,
+        )
+        model.configure_lora(LORA_CONFIG)
+        model.prepare_trainable_parameters()
+        model._encode_video_latents = lambda *_args, **_kwargs: torch.randn(
+            2, 2, 2, 2, 2
+        )
+        model.set_training_progress(10, 100)
+        sample = {
+            "video": torch.randn(2, 3, 5, 16, 16),
+            "action": torch.randn(2, 4, 3),
+            "context": torch.randn(2, 4, 10),
+            "context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_context": torch.randn(2, 4, 10),
+            "negative_context_mask": torch.ones(2, 4, dtype=torch.bool),
+            "negative_valid": torch.ones(2, dtype=torch.bool),
+            "transition_task_id": torch.tensor([10, 20]),
+            "counterfactual_task_id": torch.tensor([20, 10]),
+        }
+        loss, metrics = model.training_loss(sample)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(
+            metrics["counterfactual_action_policy_branch_active"], 1.0
+        )
+        self.assertIn("loss_counterfactual_action_positive", metrics)
+        self.assertIn("loss_counterfactual_action_separation", metrics)
+        self.assertIn("sim_CAP_query_positive", metrics)
+        self.assertIn(
+            "counterfactual_action_prototype_retrieval_acc", metrics
+        )
+        loss.backward()
+        self.assertTrue(
+            all(parameter.grad is None for parameter in model.mot.parameters())
+        )
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                for parameter in model.transition_contract_modules[
+                    "router"
+                ].parameters()
+            )
+        )
+
     def test_counterfactual_manifest_loader_rejects_unsafe_pairs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "manifest.jsonl")
@@ -624,6 +764,10 @@ class TransitionContractTest(unittest.TestCase):
                 )
             mapping = load_counterfactual_instruction_map(path)
             self.assertEqual(mapping["pick up soup"], "pick up milk")
+            self.assertEqual(
+                stable_instruction_id(" Pick Up Soup "),
+                stable_instruction_id("pick up soup"),
+            )
 
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(
@@ -686,6 +830,34 @@ class TransitionContractTest(unittest.TestCase):
                     for name in trainable
                 )
             )
+
+    def test_tc_v4_checkpoint_migrates_to_action_positive_v5(self):
+        source = tiny_fastwam(
+            transition_contract=True,
+            transition_contract_version=4,
+        )
+        source.configure_lora(LORA_CONFIG)
+        with torch.no_grad():
+            expected = next(
+                source.transition_contract_modules["router"].parameters()
+            )
+            expected.add_(0.456)
+            expected = expected.detach().clone()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "tc_v4.pt")
+            source.save_checkpoint(path, step=4000)
+            restored = tiny_fastwam(
+                transition_contract=True,
+                transition_contract_version=5,
+            )
+            restored.load_checkpoint(path)
+        actual = next(
+            restored.transition_contract_modules["router"].parameters()
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        metadata = restored._transition_contract_metadata()
+        self.assertEqual(metadata["transition_contract_version"], 5)
+        self.assertTrue(metadata["use_cf_action_positive"])
 
     def test_lora_exposes_and_round_trips_transition_modules(self):
         self.model.configure_lora(LORA_CONFIG)

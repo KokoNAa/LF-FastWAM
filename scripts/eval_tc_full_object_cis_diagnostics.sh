@@ -13,7 +13,7 @@ cd "${RUN_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 PYTHON_BIN="$(command -v "${PYTHON_BIN}")"
-TC_CHECKPOINT="${TC_CHECKPOINT:?Set TC_CHECKPOINT to a TC-Full v4 adapter}"
+TC_CHECKPOINT="${TC_CHECKPOINT:?Set TC_CHECKPOINT to a TC-Full v4/v5 adapter}"
 STATS_PATH="${STATS_PATH:-${DIFFSYNTH_MODEL_BASE_PATH:-${RUN_ROOT}/checkpoints}/fastwam_release/libero_uncond_2cam224_dataset_stats.json}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${RUN_ROOT}/evaluate_results/tc_v4_object_cis_diagnostics_seed${EVAL_SEED}_trials${NUM_TRIALS}_h${MAX_POLICY_STEPS}}"
 MANIFEST_PATH="${MANIFEST_PATH:-${OUTPUT_ROOT}/libero_object_dtl_cis.jsonl}"
@@ -38,7 +38,7 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
-"${PYTHON_BIN}" - "${TC_CHECKPOINT}" <<'PY'
+TC_VERSION="$("${PYTHON_BIN}" - "${TC_CHECKPOINT}" <<'PY'
 import sys
 import torch
 
@@ -48,18 +48,24 @@ if payload.get("format") != "fastwam_lora_adapter_v1":
     raise SystemExit("CIS diagnostics require a FastWAM LoRA adapter")
 if int(payload.get("step", -1)) <= 0:
     raise SystemExit("Checkpoint has no positive training step")
-if int(metadata.get("transition_contract_version", -1)) != 4:
-    raise SystemExit("CIS diagnostics require TC-Full v4")
+version = int(metadata.get("transition_contract_version", -1))
+if version not in {4, 5}:
+    raise SystemExit("CIS diagnostics require TC-Full v4/v5")
 if not metadata.get("use_action_effect") or not metadata.get("use_cf_ranking"):
     raise SystemExit("Checkpoint does not contain the complete TC-Full method")
+if version == 5 and not metadata.get("use_cf_action_positive"):
+    raise SystemExit("TC-Full v5 checkpoint has no action-positive supervision")
 if not metadata.get("freeze_m1_policy"):
     raise SystemExit("Checkpoint does not protect the M1 policy")
-print(
-    "Validated TC-Full checkpoint:",
-    sys.argv[1],
-    "step=", payload.get("step"),
-)
+print(version)
 PY
+)"
+if [[ "${TC_VERSION}" == "5" ]]; then
+  USE_CF_ACTION_POSITIVE=true
+else
+  USE_CF_ACTION_POSITIVE=false
+fi
+echo "Validated TC-Full v${TC_VERSION} checkpoint: ${TC_CHECKPOINT}"
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   GPU_LIST=""
@@ -88,7 +94,7 @@ echo "  checkpoint=${TC_CHECKPOINT}"
 echo "  trials=${NUM_TRIALS} horizon=${MAX_POLICY_STEPS}"
 echo "  output=${OUTPUT_ROOT}"
 
-EXP_NAME="tc-v4-cis-diagnostics" \
+EXP_NAME="tc-v${TC_VERSION}-cis-diagnostics" \
 "${PYTHON_BIN}" experiments/libero/run_libero_manager.py \
   task=libero_object_lf_lora_2cam224 \
   "ckpt=${TC_CHECKPOINT}" \
@@ -109,9 +115,10 @@ EXP_NAME="tc-v4-cis-diagnostics" \
   model.langforce_mvp.enable_prior=false \
   model.langforce_mvp.enable_posterior_advantage=false \
   model.transition_contract.enabled=true \
-  model.transition_contract.version=4 \
+  "model.transition_contract.version=${TC_VERSION}" \
   model.transition_contract.use_action_effect=true \
   model.transition_contract.use_counterfactual_ranking=true \
+  "model.transition_contract.use_counterfactual_action_positive=${USE_CF_ACTION_POSITIVE}" \
   model.transition_contract.policy_distillation_enabled=true \
   model.transition_contract.policy_distillation_weight=1.0 \
   model.transition_contract.freeze_m1_policy=true

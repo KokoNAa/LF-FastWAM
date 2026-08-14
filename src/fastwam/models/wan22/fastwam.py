@@ -21,6 +21,7 @@ from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .transition_contract import (
     ActionEffectEncoder,
     ContrastiveContractLoss,
+    CounterfactualActionPrototypeBank,
     CounterfactualRankingLoss,
     OutcomeTransitionEncoder,
     TransitionProjectionHead,
@@ -183,6 +184,21 @@ class FastWAM(torch.nn.Module):
         self.transition_counterfactual_margin = float(
             contract_config.get("counterfactual_margin", 0.2)
         )
+        self.transition_counterfactual_action_positive_weight = float(
+            contract_config.get("counterfactual_action_positive_weight", 0.10)
+        )
+        self.transition_counterfactual_action_query_weight = float(
+            contract_config.get("counterfactual_action_query_weight", 1.0)
+        )
+        self.transition_counterfactual_action_effect_weight = float(
+            contract_config.get("counterfactual_action_effect_weight", 1.0)
+        )
+        self.transition_counterfactual_action_separation_weight = float(
+            contract_config.get("counterfactual_action_separation_weight", 0.05)
+        )
+        self.transition_counterfactual_action_separation_margin = float(
+            contract_config.get("counterfactual_action_separation_margin", 0.05)
+        )
         self.transition_contract_temperature = float(
             contract_config.get("temperature", 0.07)
         )
@@ -222,6 +238,9 @@ class FastWAM(torch.nn.Module):
         self.transition_use_counterfactual_ranking = bool(
             contract_config.get("use_counterfactual_ranking", False)
         )
+        self.transition_use_counterfactual_action_positive = bool(
+            contract_config.get("use_counterfactual_action_positive", False)
+        )
         self.transition_contract_modules = nn.ModuleDict()
         self.transition_contract_loss = None
         self.transition_counterfactual_loss = None
@@ -231,10 +250,10 @@ class FastWAM(torch.nn.Module):
         self.transition_policy_init_checkpoint: Optional[str] = None
 
         if self.transition_contract_enabled:
-            if self.transition_contract_version not in {2, 3, 4}:
+            if self.transition_contract_version not in {2, 3, 4, 5}:
                 raise ValueError(
                     "The current TC implementation supports "
-                    "`transition_contract.version` 2, 3, or 4."
+                    "`transition_contract.version` 2, 3, 4, or 5."
                 )
             if not bool(
                 getattr(self.action_expert, "use_latent_action_queries", False)
@@ -270,7 +289,14 @@ class FastWAM(torch.nn.Module):
             ):
                 raise ValueError(
                     "Action-effect and counterfactual ranking require "
-                    "TC-Full `transition_contract.version=4`."
+                    "TC-Full `transition_contract.version>=4`."
+                )
+            if self.transition_contract_version < 5 and (
+                self.transition_use_counterfactual_action_positive
+            ):
+                raise ValueError(
+                    "Counterfactual action positive supervision requires "
+                    "`transition_contract.version=5`."
                 )
             if self.langforce_prior_enabled or self.langforce_advantage_enabled:
                 raise ValueError(
@@ -284,6 +310,26 @@ class FastWAM(torch.nn.Module):
                 raise ValueError("`counterfactual_weight` must be non-negative.")
             if self.transition_counterfactual_margin < 0:
                 raise ValueError("`counterfactual_margin` must be non-negative.")
+            if self.transition_counterfactual_action_positive_weight < 0:
+                raise ValueError(
+                    "`counterfactual_action_positive_weight` must be non-negative."
+                )
+            if self.transition_counterfactual_action_query_weight < 0:
+                raise ValueError(
+                    "`counterfactual_action_query_weight` must be non-negative."
+                )
+            if self.transition_counterfactual_action_effect_weight < 0:
+                raise ValueError(
+                    "`counterfactual_action_effect_weight` must be non-negative."
+                )
+            if self.transition_counterfactual_action_separation_weight < 0:
+                raise ValueError(
+                    "`counterfactual_action_separation_weight` must be non-negative."
+                )
+            if self.transition_counterfactual_action_separation_margin < 0:
+                raise ValueError(
+                    "`counterfactual_action_separation_margin` must be non-negative."
+                )
             if self.transition_policy_distillation_weight < 0:
                 raise ValueError(
                     "`policy_distillation_weight` must be non-negative."
@@ -328,13 +374,20 @@ class FastWAM(torch.nn.Module):
                         "Protected TC v3+ requires `freeze_m1_policy=true` so the "
                         "joint-MoT teacher cannot drift."
                     )
-            if self.transition_contract_version == 4:
+            if self.transition_contract_version >= 4:
                 if not self.transition_use_action_effect:
-                    raise ValueError("TC-Full v4 requires `use_action_effect=true`.")
+                    raise ValueError("TC-Full v4+ requires `use_action_effect=true`.")
                 if not self.transition_use_counterfactual_ranking:
                     raise ValueError(
-                        "TC-Full v4 requires `use_counterfactual_ranking=true`."
+                        "TC-Full v4+ requires `use_counterfactual_ranking=true`."
                     )
+            if self.transition_contract_version == 5 and (
+                not self.transition_use_counterfactual_action_positive
+            ):
+                raise ValueError(
+                    "TC-Full v5 requires "
+                    "`use_counterfactual_action_positive=true`."
+                )
 
             projection_dim = int(contract_config.get("projection_dim", 512))
             router_num_heads = int(contract_config.get("router_num_heads", 8))
@@ -374,6 +427,24 @@ class FastWAM(torch.nn.Module):
                             contract_config.get("action_effect_num_layers", 2)
                         ),
                     )
+                )
+            if self.transition_use_counterfactual_action_positive:
+                self.transition_contract_modules[
+                    "counterfactual_action_prototypes"
+                ] = CounterfactualActionPrototypeBank(
+                    num_slots=int(
+                        contract_config.get(
+                            "counterfactual_action_prototype_slots", 64
+                        )
+                    ),
+                    num_queries=int(self.action_expert.num_latent_queries),
+                    query_dim=action_hidden_dim,
+                    action_effect_dim=projection_dim,
+                    momentum=float(
+                        contract_config.get(
+                            "counterfactual_action_prototype_momentum", 0.95
+                        )
+                    ),
                 )
             self.transition_contract_modules.to(dtype=self.torch_dtype)
             self.transition_contract_loss = ContrastiveContractLoss(
@@ -996,6 +1067,118 @@ class FastWAM(torch.nn.Module):
             valid_mask=valid_mask,
         )
 
+    def compute_counterfactual_action_separation_loss(
+        self,
+        *,
+        positive_error: torch.Tensor,
+        counterfactual_source_error: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Prevent alternate language from reproducing the source action.
+
+        The hinge is bounded: once the counterfactual branch is sufficiently
+        worse on the source target, it receives no incentive to diverge
+        further.  Direction comes from the positive task prototype loss.
+        """
+        if positive_error.shape != counterfactual_source_error.shape or (
+            positive_error.ndim != 1
+        ):
+            raise ValueError("Counterfactual action errors must share [B] shape.")
+        if valid_mask.shape != positive_error.shape:
+            raise ValueError("Counterfactual action valid mask must be [B].")
+        valid_mask = valid_mask.to(
+            device=positive_error.device,
+            dtype=torch.bool,
+        )
+        source_gap = counterfactual_source_error - positive_error.detach()
+        per_sample = torch.relu(
+            self.transition_counterfactual_action_separation_margin - source_gap
+        )
+        valid = valid_mask.to(dtype=per_sample.dtype)
+        valid_count = valid.sum()
+        loss = (per_sample * valid).sum() / valid_count.clamp_min(1.0)
+        if not bool(valid_mask.any()):
+            loss = (
+                positive_error.sum() + counterfactual_source_error.sum()
+            ) * 0.0
+
+        def _valid_mean(value: torch.Tensor) -> torch.Tensor:
+            return (value * valid).sum() / valid_count.clamp_min(1.0)
+
+        return loss, {
+            "counterfactual_action_source_mse": _valid_mean(
+                counterfactual_source_error
+            ),
+            "counterfactual_action_source_gap": _valid_mean(source_gap),
+            "counterfactual_action_separation_satisfied_fraction": (
+                _valid_mean(
+                    (
+                        source_gap
+                        >= self.transition_counterfactual_action_separation_margin
+                    ).to(valid.dtype)
+                )
+            ),
+        }
+
+    def _forward_counterfactual_action_positive_train(
+        self,
+        *,
+        latents: torch.Tensor,
+        timestep_video: torch.Tensor,
+        action: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+        context: torch.Tensor,
+        full_context_mask: torch.Tensor,
+        state_only_context_mask: torch.Tensor,
+        noisy_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the deployment policy under alternate language on the same state."""
+        if not self.transition_use_counterfactual_action_positive:
+            raise RuntimeError(
+                "Counterfactual action positive supervision is disabled."
+            )
+        # The protected Video/MoT policy is frozen in v5.  This second
+        # language-conditioned Video pass is needed for deployment fidelity,
+        # but its activations never need gradients.  Gradients begin at the
+        # Router query consumed by the frozen Action Expert.
+        with torch.no_grad():
+            video_pre = self.video_expert.pre_dit(
+                x=latents.detach(),
+                timestep=timestep_video,
+                context=context,
+                context_mask=full_context_mask,
+                action=action,
+                fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            )
+            video_kv_cache, final_video_hidden = (
+                self._run_video_expert_to_final_hidden(video_pre)
+            )
+        pred_action, z_action_intent, _ = (
+            self._forward_tc_v2_action_from_video_hidden(
+                video_pre=video_pre,
+                final_video_hidden=final_video_hidden,
+                video_kv_cache=video_kv_cache,
+                pred_action_m1=None,
+                action_tokens=noisy_action,
+                timestep_action=timestep_action,
+                context=context,
+                full_context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
+            )
+        )
+        routed_queries, _, _ = self.encode_intended_transition(
+            video_tokens=final_video_hidden,
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            context=context,
+            full_context_mask=full_context_mask,
+            route_scale=1.0,
+        )
+        base_queries = self.action_expert.transition_queries.expand(
+            routed_queries.shape[0], -1, -1
+        )
+        return pred_action, routed_queries - base_queries, z_action_intent
+
     def _run_video_expert_to_final_hidden(
         self,
         video_pre: dict[str, Any],
@@ -1382,6 +1565,7 @@ class FastWAM(torch.nn.Module):
         negative_context_mask = sample.get("negative_context_mask")
         negative_valid = sample.get("negative_valid")
         transition_task_id = sample.get("transition_task_id")
+        counterfactual_task_id = sample.get("counterfactual_task_id")
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
             raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
@@ -1457,6 +1641,12 @@ class FastWAM(torch.nn.Module):
                 raise ValueError("TC-Full training requires `negative_valid`.")
             if transition_task_id is None:
                 raise ValueError("TC-Full training requires `transition_task_id`.")
+        if self.transition_use_counterfactual_action_positive and (
+            counterfactual_task_id is None
+        ):
+            raise ValueError(
+                "TC-Full v5 training requires `counterfactual_task_id`."
+            )
         if (negative_context is None) != (negative_context_mask is None):
             raise ValueError(
                 "`negative_context` and `negative_context_mask` must appear together."
@@ -1506,6 +1696,21 @@ class FastWAM(torch.nn.Module):
                     "`transition_task_id` must be [B], got "
                     f"{tuple(transition_task_id.shape)}."
                 )
+        if counterfactual_task_id is not None:
+            counterfactual_task_id = torch.as_tensor(
+                counterfactual_task_id,
+                device=self.device,
+                dtype=torch.long,
+            )
+            if counterfactual_task_id.ndim == 0:
+                counterfactual_task_id = counterfactual_task_id.expand(
+                    batch_size
+                )
+            if counterfactual_task_id.shape != (batch_size,):
+                raise ValueError(
+                    "`counterfactual_task_id` must be [B], got "
+                    f"{tuple(counterfactual_task_id.shape)}."
+                )
         language_context_len = int(context.shape[1])
         has_proprio = False
         proprio_current = None
@@ -1550,6 +1755,7 @@ class FastWAM(torch.nn.Module):
             "negative_context_mask": negative_context_mask,
             "negative_valid": negative_valid,
             "transition_task_id": transition_task_id,
+            "counterfactual_task_id": counterfactual_task_id,
             "language_context_len": language_context_len,
             "has_proprio": has_proprio,
             "proprio_current": proprio_current,
@@ -1967,7 +2173,7 @@ class FastWAM(torch.nn.Module):
             if z_language is None:
                 raise RuntimeError("TC-C failed to produce z_language.")
             z_negative = None
-            if self.transition_contract_version == 4:
+            if self.transition_contract_version >= 4:
                 # TC-Full contracts must not identify the positive instruction
                 # through the Video Expert's direct T1 text path.  Re-encode
                 # positive and negative intents from the same language-neutral
@@ -2015,6 +2221,7 @@ class FastWAM(torch.nn.Module):
                 )
             )
             loss_action_future = z_language.sum() * 0.0
+            z_action = None
             if self.transition_use_action_effect:
                 z_action = self.encode_action_effect_transition(
                     current_video_hidden=video_pre["tokens"][:, : int(
@@ -2104,6 +2311,175 @@ class FastWAM(torch.nn.Module):
                     }
                 )
                 loss_dict.update(detached_metrics(counterfactual_metrics))
+            if self.transition_use_counterfactual_action_positive:
+                if z_action is None:
+                    raise RuntimeError(
+                        "TC-Full v5 requires an action-effect embedding."
+                    )
+                counterfactual_task_id = inputs["counterfactual_task_id"]
+                if counterfactual_task_id is None:
+                    raise RuntimeError(
+                        "TC-Full v5 did not receive counterfactual task IDs."
+                    )
+                prototype_bank = self.transition_contract_modules[
+                    "counterfactual_action_prototypes"
+                ]
+                base_queries = self.action_expert.transition_queries.expand(
+                    batch_size, -1, -1
+                )
+                # The correct-policy query is already grounded by L_action and
+                # M1 distillation.  Store its detached task-level residual as a
+                # positive policy target for other same-scene instructions.
+                with torch.no_grad():
+                    positive_queries, _, _ = self.encode_intended_transition(
+                        video_tokens=final_video_hidden.detach(),
+                        video_tokens_per_frame=int(
+                            video_pre["meta"]["tokens_per_frame"]
+                        ),
+                        context=context,
+                        full_context_mask=full_context_mask,
+                        route_scale=1.0,
+                    )
+                positive_query_residual = positive_queries - base_queries
+                prototype_bank.update(
+                    task_ids=inputs["transition_task_id"],
+                    query_residuals=positive_query_residual,
+                    action_effects=z_action,
+                )
+                positive_valid = inputs["negative_valid"] & (
+                    prototype_bank.available_mask(counterfactual_task_id)
+                )
+                run_counterfactual_policy = bool(
+                    contract_scale > 0.0 and positive_valid.any()
+                )
+                if run_counterfactual_policy:
+                    negative_context = inputs["negative_context"]
+                    negative_context_mask = inputs["negative_context_mask"]
+                    if (
+                        negative_context is None
+                        or negative_context_mask is None
+                    ):
+                        raise RuntimeError(
+                            "TC-Full v5 requires alternate language context."
+                        )
+                    (
+                        negative_full_context_mask,
+                        negative_state_only_context_mask,
+                    ) = self._build_context_masks(
+                        full_context_mask=negative_context_mask,
+                        language_context_len=inputs["language_context_len"],
+                        has_proprio=inputs["has_proprio"],
+                    )
+                    (
+                        pred_action_counterfactual,
+                        counterfactual_query_residual,
+                        counterfactual_action_intent,
+                    ) = self._forward_counterfactual_action_positive_train(
+                        latents=latents,
+                        timestep_video=timestep_video,
+                        action=action,
+                        fuse_vae_embedding_in_latents=inputs[
+                            "fuse_vae_embedding_in_latents"
+                        ],
+                        context=negative_context,
+                        full_context_mask=negative_full_context_mask,
+                        state_only_context_mask=(
+                            negative_state_only_context_mask
+                        ),
+                        noisy_action=noisy_action,
+                        timestep_action=timestep_action,
+                    )
+                    loss_counterfactual_action_positive, cap_metrics = (
+                        prototype_bank.positive_loss(
+                            counterfactual_task_ids=counterfactual_task_id,
+                            query_residuals=counterfactual_query_residual,
+                            action_intents=counterfactual_action_intent,
+                            valid_mask=positive_valid,
+                            query_weight=(
+                                self.transition_counterfactual_action_query_weight
+                            ),
+                            action_effect_weight=(
+                                self.transition_counterfactual_action_effect_weight
+                            ),
+                        )
+                    )
+                    e_counterfactual_source = (
+                        self._compute_action_loss_per_sample(
+                            pred_action=pred_action_counterfactual,
+                            target_action=target_action,
+                            action_is_pad=action_is_pad,
+                        )
+                    )
+                    (
+                        loss_counterfactual_action_separation,
+                        separation_metrics,
+                    ) = self.compute_counterfactual_action_separation_loss(
+                        positive_error=e_post,
+                        counterfactual_source_error=e_counterfactual_source,
+                        valid_mask=positive_valid,
+                    )
+                else:
+                    no_positive = torch.zeros_like(positive_valid)
+                    (
+                        loss_counterfactual_action_positive,
+                        cap_metrics,
+                    ) = prototype_bank.positive_loss(
+                        counterfactual_task_ids=counterfactual_task_id,
+                        query_residuals=positive_query_residual,
+                        action_intents=z_action,
+                        valid_mask=no_positive,
+                        query_weight=(
+                            self.transition_counterfactual_action_query_weight
+                        ),
+                        action_effect_weight=(
+                            self.transition_counterfactual_action_effect_weight
+                        ),
+                    )
+                    (
+                        loss_counterfactual_action_separation,
+                        separation_metrics,
+                    ) = self.compute_counterfactual_action_separation_loss(
+                        positive_error=e_post,
+                        counterfactual_source_error=e_post,
+                        valid_mask=no_positive,
+                    )
+
+                effective_cap_weight = (
+                    self.transition_counterfactual_action_positive_weight
+                    * contract_scale
+                )
+                effective_separation_weight = (
+                    self.transition_counterfactual_action_separation_weight
+                    * contract_scale
+                )
+                loss_total = (
+                    loss_total
+                    + effective_cap_weight
+                    * loss_counterfactual_action_positive
+                    + effective_separation_weight
+                    * loss_counterfactual_action_separation
+                )
+                loss_dict.update(
+                    {
+                        "loss_counterfactual_action_positive": float(
+                            loss_counterfactual_action_positive.detach().item()
+                        ),
+                        "loss_counterfactual_action_separation": float(
+                            loss_counterfactual_action_separation.detach().item()
+                        ),
+                        "counterfactual_action_positive_effective_weight": float(
+                            effective_cap_weight
+                        ),
+                        "counterfactual_action_separation_effective_weight": float(
+                            effective_separation_weight
+                        ),
+                        "counterfactual_action_policy_branch_active": float(
+                            run_counterfactual_policy
+                        ),
+                    }
+                )
+                loss_dict.update(detached_metrics(cap_metrics))
+                loss_dict.update(detached_metrics(separation_metrics))
 
         if self.langforce_prior_enabled:
             pred_action_prior = self._forward_prior_action_train(
@@ -2829,16 +3205,34 @@ class FastWAM(torch.nn.Module):
                 self.transition_use_counterfactual_ranking
             ),
             "use_action_effect": bool(self.transition_use_action_effect),
+            "use_cf_action_positive": bool(
+                self.transition_use_counterfactual_action_positive
+            ),
             "action_conditioned_video": False,
             "router_visual_source": "video_expert_final_hidden",
             "contract_visual_source": (
                 "language_neutral_video_patch_tokens"
-                if self.transition_contract_version == 4
+                if self.transition_contract_version >= 4
                 else "video_expert_final_hidden"
             ),
             "action_future_weight": self.transition_action_future_weight,
             "counterfactual_weight": self.transition_counterfactual_weight,
             "counterfactual_margin": self.transition_counterfactual_margin,
+            "counterfactual_action_positive_weight": (
+                self.transition_counterfactual_action_positive_weight
+            ),
+            "counterfactual_action_query_weight": (
+                self.transition_counterfactual_action_query_weight
+            ),
+            "counterfactual_action_effect_weight": (
+                self.transition_counterfactual_action_effect_weight
+            ),
+            "counterfactual_action_separation_weight": (
+                self.transition_counterfactual_action_separation_weight
+            ),
+            "counterfactual_action_separation_margin": (
+                self.transition_counterfactual_action_separation_margin
+            ),
             "policy_recovery_ratio": self.transition_policy_recovery_ratio,
             "router_ramp_ratio": self.transition_router_ramp_ratio,
             "policy_recovery_blend": (
@@ -2955,6 +3349,11 @@ class FastWAM(torch.nn.Module):
         # restored exactly.
         if self.transition_contract_version == 4 and saved_version == 3:
             return saved_version
+        # v5 adds a training-only online prototype bank and new losses, but no
+        # persistent deployment parameters.  A protected v4 adapter therefore
+        # migrates exactly.
+        if self.transition_contract_version == 5 and saved_version == 4:
+            return saved_version
         raise ValueError(
             "TC checkpoint version mismatch: "
             f"checkpoint={saved_version}, model={self.transition_contract_version}."
@@ -2969,6 +3368,16 @@ class FastWAM(torch.nn.Module):
         if saved_version == self.transition_contract_version:
             self.transition_contract_modules.load_state_dict(
                 transition_state, strict=True
+            )
+            return
+        if self.transition_contract_version == 5 and saved_version == 4:
+            self.transition_contract_modules.load_state_dict(
+                transition_state,
+                strict=True,
+            )
+            logger.info(
+                "Migrated TC checkpoint v4 -> v5; initialized the empty "
+                "training-only counterfactual action prototype bank."
             )
             return
         incompatible = self.transition_contract_modules.load_state_dict(

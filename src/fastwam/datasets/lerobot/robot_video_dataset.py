@@ -1,4 +1,3 @@
-import hashlib
 import os
 from typing import Optional
 import time
@@ -12,7 +11,10 @@ from omegaconf import DictConfig, OmegaConf
 
 from hydra.utils import instantiate
 from .base_lerobot_dataset import BaseLerobotDataset
-from ..counterfactual import load_counterfactual_instruction_map
+from ..counterfactual import (
+    load_counterfactual_instruction_map,
+    stable_instruction_id,
+)
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
@@ -283,13 +285,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "proprio_is_pad": sample["proprio_is_pad"],
         }
         if negative_context is not None:
-            task_digest = int.from_bytes(
-                hashlib.sha256(str(task).strip().casefold().encode("utf-8")).digest()[
-                    :8
-                ],
-                byteorder="big",
-                signed=False,
-            ) & ((1 << 63) - 1)
             data.update(
                 {
                     "negative_prompt": negative_prompt,
@@ -300,7 +295,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     ),
                     "negative_type": "cross_task",
                     "transition_task_id": torch.tensor(
-                        task_digest, dtype=torch.long
+                        stable_instruction_id(task), dtype=torch.long
+                    ),
+                    "counterfactual_task_id": torch.tensor(
+                        stable_instruction_id(negative_task), dtype=torch.long
                     ),
                 }
             )

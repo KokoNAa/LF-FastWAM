@@ -110,14 +110,24 @@ def tiny_fastwam(
             "direct_video_text_access": True,
             "action_conditioned_video": False,
             "use_action_effect": bool(
-                transition_contract and transition_contract_version == 4
+                transition_contract and transition_contract_version >= 4
             ),
             "use_counterfactual_ranking": bool(
-                transition_contract and transition_contract_version == 4
+                transition_contract and transition_contract_version >= 4
+            ),
+            "use_counterfactual_action_positive": bool(
+                transition_contract and transition_contract_version >= 5
             ),
             "action_future_weight": 1.0,
             "counterfactual_weight": 0.05,
             "counterfactual_margin": 0.2,
+            "counterfactual_action_positive_weight": 0.10,
+            "counterfactual_action_query_weight": 1.0,
+            "counterfactual_action_effect_weight": 1.0,
+            "counterfactual_action_separation_weight": 0.05,
+            "counterfactual_action_separation_margin": 0.05,
+            "counterfactual_action_prototype_slots": 16,
+            "counterfactual_action_prototype_momentum": 0.9,
             "action_effect_hidden_dim": 8,
             "action_effect_num_heads": 2,
             "action_effect_num_layers": 1,

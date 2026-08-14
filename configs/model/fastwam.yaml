@@ -75,8 +75,8 @@ langforce_mvp:
   posterior_advantage_margin_ratio: 0.05
   detach_prior_video_cache: true
 
-# TC-FastWAM is opt-in. v2/v3 implement TC-C; v4 adds the training-only
-# Action-Future contract and same-scene counterfactual ranking for TC-Full.
+# TC-FastWAM is opt-in. v2/v3 implement TC-C; v4 adds Action-Future and
+# same-scene counterfactual ranking; v5 adds counterfactual action positives.
 # Prior/advantage remain disabled on the mainline.
 transition_contract:
   enabled: false
@@ -87,6 +87,13 @@ transition_contract:
   action_future_weight: 1.0
   counterfactual_weight: 0.05
   counterfactual_margin: 0.2
+  counterfactual_action_positive_weight: 0.10
+  counterfactual_action_query_weight: 1.0
+  counterfactual_action_effect_weight: 1.0
+  counterfactual_action_separation_weight: 0.05
+  counterfactual_action_separation_margin: 0.05
+  counterfactual_action_prototype_slots: 64
+  counterfactual_action_prototype_momentum: 0.95
   outcome_stop_gradient: true
   use_transition_router: true
   router_num_heads: 8
@@ -96,6 +103,7 @@ transition_contract:
   action_conditioned_video: false
   use_action_effect: false
   use_counterfactual_ranking: false
+  use_counterfactual_action_positive: false
   action_effect_hidden_dim: 512
   action_effect_num_heads: 8
   action_effect_num_layers: 2

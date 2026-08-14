@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
+
+
+def stable_instruction_id(instruction: str) -> int:
+    """Return a deterministic signed-int64-safe ID for a task instruction."""
+    normalized = str(instruction).strip().casefold()
+    if not normalized:
+        raise ValueError("Cannot build a task ID from an empty instruction.")
+    return int.from_bytes(
+        hashlib.sha256(normalized.encode("utf-8")).digest()[:8],
+        byteorder="big",
+        signed=False,
+    ) & ((1 << 63) - 1)
 
 
 def load_counterfactual_instruction_map(path: str | os.PathLike) -> dict[str, str]:

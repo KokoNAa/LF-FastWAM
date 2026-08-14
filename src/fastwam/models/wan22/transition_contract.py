@@ -395,6 +395,273 @@ class ActionEffectEncoder(nn.Module):
         return self.projection(effect_hidden)
 
 
+class CounterfactualActionPrototypeBank(nn.Module):
+    """EMA task prototypes grounded by deployed queries and demonstrated actions.
+
+    The bank is training-only.  It gives an executable alternate instruction a
+    positive target without copying a raw action chunk from a different robot
+    state into the source state.  Query prototypes act directly in the policy
+    interface, while action-effect prototypes ground them in demonstrated
+    behavior.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_slots: int,
+        num_queries: int,
+        query_dim: int,
+        action_effect_dim: int,
+        momentum: float = 0.95,
+    ) -> None:
+        super().__init__()
+        if num_slots <= 0 or num_queries <= 0:
+            raise ValueError("Prototype slots and query count must be positive.")
+        if query_dim <= 0 or action_effect_dim <= 0:
+            raise ValueError("Prototype feature dimensions must be positive.")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError("Prototype momentum must be in [0, 1).")
+        self.num_slots = int(num_slots)
+        self.num_queries = int(num_queries)
+        self.query_dim = int(query_dim)
+        self.action_effect_dim = int(action_effect_dim)
+        self.momentum = float(momentum)
+        # These buffers are deliberately excluded from adapter checkpoints.
+        # They are online training targets, not deployment parameters.
+        self.register_buffer(
+            "task_ids",
+            torch.full((self.num_slots,), -1, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "counts",
+            torch.zeros((self.num_slots,), dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "query_prototypes",
+            torch.zeros(
+                self.num_slots,
+                self.num_queries,
+                self.query_dim,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_effect_prototypes",
+            torch.zeros(
+                self.num_slots,
+                self.action_effect_dim,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+
+    def _validate_embeddings(
+        self,
+        task_ids: torch.Tensor,
+        query_residuals: torch.Tensor,
+        action_effects: torch.Tensor,
+    ) -> None:
+        batch_size = task_ids.shape[0]
+        if task_ids.ndim != 1:
+            raise ValueError("Prototype task IDs must be [B].")
+        if query_residuals.shape != (
+            batch_size,
+            self.num_queries,
+            self.query_dim,
+        ):
+            raise ValueError(
+                "Query prototype input shape mismatch: got "
+                f"{tuple(query_residuals.shape)}."
+            )
+        if action_effects.shape != (batch_size, self.action_effect_dim):
+            raise ValueError(
+                "Action-effect prototype input shape mismatch: got "
+                f"{tuple(action_effects.shape)}."
+            )
+
+    def _slots_for(self, task_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        task_ids = task_ids.to(device=self.task_ids.device, dtype=torch.long)
+        matches = task_ids[:, None] == self.task_ids[None, :]
+        available = matches.any(dim=1)
+        slots = matches.to(dtype=torch.long).argmax(dim=1)
+        return slots, available
+
+    @torch.no_grad()
+    def update(
+        self,
+        *,
+        task_ids: torch.Tensor,
+        query_residuals: torch.Tensor,
+        action_effects: torch.Tensor,
+    ) -> None:
+        self._validate_embeddings(task_ids, query_residuals, action_effects)
+        task_ids = _gather_without_grad(
+            task_ids.detach().to(device=self.task_ids.device, dtype=torch.long)
+        )
+        query_residuals = _gather_without_grad(
+            F.normalize(query_residuals.detach().float(), dim=-1, eps=1e-6)
+        )
+        action_effects = _gather_without_grad(
+            F.normalize(action_effects.detach().float(), dim=-1, eps=1e-6)
+        )
+        for task_id, query_value, action_value in zip(
+            task_ids,
+            query_residuals,
+            action_effects,
+            strict=True,
+        ):
+            task_id_value = int(task_id.item())
+            existing = torch.nonzero(
+                self.task_ids == task_id_value,
+                as_tuple=False,
+            ).flatten()
+            if existing.numel() > 0:
+                slot = int(existing[0].item())
+            else:
+                empty = torch.nonzero(self.task_ids < 0, as_tuple=False).flatten()
+                if empty.numel() == 0:
+                    raise RuntimeError(
+                        "Counterfactual action prototype bank is full; increase "
+                        "`counterfactual_action_prototype_slots`."
+                    )
+                slot = int(empty[0].item())
+                self.task_ids[slot] = task_id_value
+
+            if int(self.counts[slot].item()) == 0:
+                updated_query = query_value
+                updated_action = action_value
+            else:
+                updated_query = torch.lerp(
+                    query_value,
+                    self.query_prototypes[slot].float(),
+                    self.momentum,
+                )
+                updated_action = torch.lerp(
+                    action_value,
+                    self.action_effect_prototypes[slot].float(),
+                    self.momentum,
+                )
+            self.query_prototypes[slot].copy_(
+                F.normalize(updated_query, dim=-1, eps=1e-6).to(
+                    dtype=self.query_prototypes.dtype
+                )
+            )
+            self.action_effect_prototypes[slot].copy_(
+                F.normalize(updated_action, dim=-1, eps=1e-6).to(
+                    dtype=self.action_effect_prototypes.dtype
+                )
+            )
+            self.counts[slot] += 1
+
+    def available_mask(self, task_ids: torch.Tensor) -> torch.Tensor:
+        return self._slots_for(task_ids)[1].to(device=task_ids.device)
+
+    def positive_loss(
+        self,
+        *,
+        counterfactual_task_ids: torch.Tensor,
+        query_residuals: torch.Tensor,
+        action_intents: torch.Tensor,
+        valid_mask: torch.Tensor,
+        query_weight: float = 1.0,
+        action_effect_weight: float = 1.0,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self._validate_embeddings(
+            counterfactual_task_ids,
+            query_residuals,
+            action_intents,
+        )
+        if valid_mask.shape != counterfactual_task_ids.shape:
+            raise ValueError("Counterfactual prototype valid mask must be [B].")
+        if query_weight < 0 or action_effect_weight < 0:
+            raise ValueError("Counterfactual positive weights must be non-negative.")
+
+        slots, available = self._slots_for(counterfactual_task_ids)
+        available = available.to(device=query_residuals.device)
+        valid_mask = valid_mask.to(
+            device=query_residuals.device,
+            dtype=torch.bool,
+        ) & available
+        target_queries = self.query_prototypes[slots].to(
+            device=query_residuals.device,
+            dtype=torch.float32,
+        )
+        target_actions = self.action_effect_prototypes[slots].to(
+            device=action_intents.device,
+            dtype=torch.float32,
+        )
+        normalized_queries = F.normalize(
+            query_residuals.float(), dim=-1, eps=1e-6
+        )
+        normalized_actions = F.normalize(
+            action_intents.float(), dim=-1, eps=1e-6
+        )
+        query_similarity = (
+            normalized_queries * target_queries
+        ).sum(dim=-1).mean(dim=-1)
+        action_similarity = (
+            normalized_actions * target_actions
+        ).sum(dim=-1)
+        valid = valid_mask.to(dtype=query_similarity.dtype)
+        valid_count = valid.sum()
+        query_loss = ((1.0 - query_similarity) * valid).sum() / (
+            valid_count.clamp_min(1.0)
+        )
+        action_loss = ((1.0 - action_similarity) * valid).sum() / (
+            valid_count.clamp_min(1.0)
+        )
+        loss = query_weight * query_loss + action_effect_weight * action_loss
+        if not bool(valid_mask.any()):
+            loss = (query_residuals.sum() + action_intents.sum()) * 0.0
+
+        active_slots = torch.nonzero(self.task_ids >= 0, as_tuple=False).flatten()
+        retrieval_accuracy = query_similarity.new_zeros(())
+        if active_slots.numel() > 0 and bool(valid_mask.any()):
+            active_queries = self.query_prototypes[active_slots].to(
+                device=query_residuals.device,
+                dtype=torch.float32,
+            )
+            active_actions = self.action_effect_prototypes[active_slots].to(
+                device=action_intents.device,
+                dtype=torch.float32,
+            )
+            query_logits = torch.einsum(
+                "bkd,skd->bs",
+                normalized_queries,
+                active_queries,
+            ) / self.num_queries
+            action_logits = torch.matmul(
+                normalized_actions,
+                active_actions.transpose(0, 1),
+            )
+            predicted_slots = active_slots.to(query_logits.device)[
+                (query_logits + action_logits).argmax(dim=1)
+            ]
+            retrieval_accuracy = (
+                (predicted_slots == slots.to(predicted_slots.device)).float()
+                * valid
+            ).sum() / valid_count.clamp_min(1.0)
+
+        def _valid_mean(value: torch.Tensor) -> torch.Tensor:
+            return (value * valid).sum() / valid_count.clamp_min(1.0)
+
+        return loss, {
+            "loss_counterfactual_action_query_positive": query_loss,
+            "loss_counterfactual_action_effect_positive": action_loss,
+            "sim_CAP_query_positive": _valid_mean(query_similarity),
+            "sim_CAP_action_positive": _valid_mean(action_similarity),
+            "counterfactual_action_positive_valid_fraction": valid.mean(),
+            "counterfactual_action_positive_valid_count": valid_count,
+            "counterfactual_action_prototype_retrieval_acc": retrieval_accuracy,
+            "counterfactual_action_prototype_count": (
+                (self.task_ids >= 0).sum().to(dtype=query_similarity.dtype)
+            ),
+        }
+
+
 def _gather_with_grad(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
     if not dist.is_available() or not dist.is_initialized():
         return tensor, 0
