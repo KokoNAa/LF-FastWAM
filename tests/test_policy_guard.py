@@ -11,6 +11,7 @@ from fastwam.models.wan22.fastwam import FastWAM
 from fastwam.models.wan22.mot import MoT
 from fastwam.models.wan22.policy_guard import (
     ActionOutcomeVerifier,
+    BoundedActionVelocityResidual,
     GoalActionAlignmentLoss,
     GoalGraphEncoder,
     GoalResidualAdapter,
@@ -88,6 +89,11 @@ def tiny_pgc_fastwam(
             "verifier_hidden_dim": 8,
             "counterfactual_action_weight": 1.0,
             "native_distillation_weight": 1.0,
+            "residual_regularization_weight": 0.01,
+            "residual_smoothness_weight": 0.01,
+            "velocity_residual_max_abs": 1.0,
+            "verifier_start_step": 10,
+            "verifier_ramp_steps": 5,
             "goal_residual_scale": 1.0,
             "verifier_weight": 0.25,
             "goal_action_alignment_weight": 0.1,
@@ -96,7 +102,7 @@ def tiny_pgc_fastwam(
             "min_counterfactual_score": 0.6,
         },
     )
-    if configure_lora:
+    if configure_lora and version <= 2:
         model.configure_lora(
             {
                 "enabled": True,
@@ -144,6 +150,29 @@ class PolicyGuardModuleTest(unittest.TestCase):
         self.assertTrue(torch.equal(output, action))
         self.assertEqual(float(metrics["pgc_goal_residual_norm"]), 0.0)
         self.assertEqual(float(metrics["pgc_goal_residual_max_abs"]), 0.0)
+
+    def test_bounded_velocity_residual_is_zero_initialized_and_capped(self):
+        adapter = BoundedActionVelocityResidual(
+            action_hidden_dim=12,
+            action_dim=3,
+            num_heads=2,
+            max_abs=[0.25, 0.5, 0.75],
+        )
+        action_hidden = torch.randn(2, 4, 12)
+        goal = torch.randn(2, 3, 12)
+        residual, metrics = adapter(action_hidden, goal)
+        self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
+        self.assertEqual(float(metrics["pgc_velocity_residual_norm"]), 0.0)
+
+        with torch.no_grad():
+            adapter.output_projection.bias.fill_(100.0)
+        residual, metrics = adapter(action_hidden, goal)
+        cap = torch.tensor([0.25, 0.5, 0.75]).view(1, 1, 3)
+        self.assertTrue(torch.all(residual.abs() <= cap))
+        self.assertAlmostEqual(
+            float(metrics["pgc_velocity_residual_saturation_fraction"]),
+            1.0,
+        )
 
     def test_verifier_and_alignment_shapes(self):
         verifier = ActionOutcomeVerifier(
@@ -625,6 +654,231 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
                     restored.policy_guard_action_expert.latent_action_queries,
                     expected_queries,
                 )
+            )
+
+
+class PolicyGuardV3IntegrationTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(31)
+        self.model = tiny_pgc_fastwam(version=3)
+
+    def test_v3_trains_only_guard_modules_and_rejects_lora(self):
+        self.assertIsNone(self.model.policy_guard_action_expert)
+        with self.assertRaisesRegex(ValueError, "does not permit LoRA"):
+            self.model.configure_lora(
+                {
+                    "enabled": True,
+                    "rank": 2,
+                    "alpha": 4,
+                    "dropout": 0.0,
+                    "experts": ["action"],
+                    "extra_trainable_patterns": [],
+                }
+            )
+
+        report = self.model.prepare_trainable_parameters()
+        self.assertGreater(report["trainable"], 0)
+        trainable = {
+            name
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(trainable)
+        self.assertTrue(
+            all(name.startswith("policy_guard_modules.") for name in trainable)
+        )
+        self.assertFalse(any(p.requires_grad for p in self.model.mot.parameters()))
+        self.assertFalse(self.model.mot.training)
+
+    def test_v3_zero_init_is_exact_base_and_gradients_stop_at_base(self):
+        self.model.prepare_trainable_parameters()
+        frozen_base = {
+            name: value.detach().clone()
+            for name, value in self.model.mot.state_dict().items()
+        }
+        base_hidden = torch.randn(2, 4, 12, requires_grad=True)
+        base_velocity = torch.randn(2, 4, 3, requires_grad=True)
+        goal_queries = torch.randn(2, 2, 12, requires_grad=True)
+        output, residual, _ = (
+            self.model._apply_policy_guard_v3_velocity_residual(
+                base_action_hidden=base_hidden,
+                base_action_velocity=base_velocity,
+                routed_goal_queries=goal_queries,
+            )
+        )
+        self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
+        self.assertTrue(torch.equal(output, base_velocity.detach()))
+        (output - 1.0).square().mean().backward()
+        self.assertIsNone(base_hidden.grad)
+        self.assertIsNone(base_velocity.grad)
+        self.assertIsNotNone(
+            self.model.policy_guard_modules[
+                "action_velocity_residual"
+            ].output_projection.weight.grad
+        )
+        optimizer = torch.optim.AdamW(
+            [
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            ],
+            lr=1.0e-3,
+        )
+        optimizer.step()
+        for name, value in frozen_base.items():
+            self.assertTrue(
+                torch.equal(self.model.mot.state_dict()[name], value), name
+            )
+
+    def test_v3_forward_cache_starts_equal_to_frozen_base(self):
+        self.model.eval()
+        batch_size = 2
+        video_seq_len = 5
+        action_horizon = 4
+        context = torch.randn(batch_size, 4, 10)
+        context_mask = torch.ones(batch_size, 4, dtype=torch.bool)
+        state_only = torch.zeros_like(context_mask)
+        current_video = torch.randn(batch_size, video_seq_len, 16)
+        routed, _, _ = self.model._encode_policy_guard_goal(
+            final_video_hidden=current_video,
+            video_tokens_per_frame=video_seq_len,
+            context=context,
+            context_mask=context_mask,
+        )
+        video_cache = [
+            {
+                "k": torch.randn(batch_size, video_seq_len, 8),
+                "v": torch.randn(batch_size, video_seq_len, 8),
+            }
+            for _ in range(2)
+        ]
+        noisy_action = torch.randn(batch_size, action_horizon, 3)
+        timestep = torch.tensor([0.3, 0.7])
+        base_pre = self.model.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep,
+            context=context,
+            context_mask=context_mask,
+            use_queries=False,
+        )
+        attention_mask = self.model._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=action_horizon,
+            video_tokens_per_frame=video_seq_len,
+            device=noisy_action.device,
+            num_queries=0,
+            action_reads_raw_video=True,
+        )
+        base_hidden = self.model.mot.forward_action_with_video_cache(
+            action_tokens=base_pre["tokens"],
+            action_freqs=base_pre["freqs"],
+            action_t_mod=base_pre["t_mod"],
+            action_context_payload={
+                "context": base_pre["context"],
+                "mask": base_pre["context_mask"],
+            },
+            video_kv_cache=video_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        base_output = self.model.action_expert.post_dit(base_hidden, base_pre)
+        counterfactual_output = (
+            self.model._forward_policy_guard_action_from_cache(
+                action_tokens=noisy_action,
+                timestep_action=timestep,
+                context=context,
+                full_context_mask=context_mask,
+                state_only_context_mask=state_only,
+                video_kv_cache=video_cache,
+                video_seq_len=video_seq_len,
+                video_tokens_per_frame=video_seq_len,
+                routed_goal_queries=routed,
+            )
+        )
+        self.assertTrue(torch.equal(counterfactual_output, base_output))
+
+    def test_v3_residual_losses_separate_native_and_counterfactual(self):
+        residual = torch.tensor(
+            [[[1.0, 0.0, 0.0]], [[2.0, 0.0, 0.0]]]
+        )
+        base = torch.tensor(
+            [[[10.0, 0.0, 0.0]], [[10.0, 0.0, 0.0]]]
+        )
+        target = torch.tensor(
+            [[[100.0, 0.0, 0.0]], [[11.0, 0.0, 0.0]]]
+        )
+        cf_loss, native_loss, regularization, smoothness, metrics = (
+            self.model._compute_policy_guard_v3_action_losses(
+                predicted_residual=residual,
+                base_action_teacher=base,
+                target_action=target,
+                action_weight=torch.ones(2),
+                action_is_pad=None,
+                is_counterfactual=torch.tensor([False, True]),
+                direct_action_valid=torch.tensor([True, True]),
+            )
+        )
+        self.assertAlmostEqual(float(native_loss), 1.0 / 3.0, places=6)
+        self.assertAlmostEqual(float(cf_loss), 1.0 / 3.0, places=6)
+        self.assertAlmostEqual(float(regularization), 4.0 / 3.0, places=6)
+        self.assertEqual(float(smoothness), 0.0)
+        self.assertAlmostEqual(float(metrics["pgc_native_fraction"]), 0.5)
+
+    def test_v3_verifier_schedule_is_delayed_and_exact(self):
+        self.model.set_training_progress(10, 100)
+        self.assertEqual(self.model._policy_guard_verifier_scale(), 0.0)
+        self.model.set_training_progress(11, 100)
+        self.assertAlmostEqual(self.model._policy_guard_verifier_scale(), 0.2)
+        self.model.set_training_progress(15, 100)
+        self.assertEqual(self.model._policy_guard_verifier_scale(), 1.0)
+
+    def test_v3_checkpoint_round_trip_has_no_action_adapter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.pt"
+            pgc_path = Path(tmpdir) / "pgc_v3.pt"
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": self.model.mot.state_dict()},
+                base_path,
+            )
+            self.model.load_checkpoint(base_path)
+            with torch.no_grad():
+                self.model.policy_guard_modules[
+                    "action_velocity_residual"
+                ].output_projection.bias.add_(0.25)
+            expected = {
+                key: value.detach().clone()
+                for key, value in self.model.policy_guard_modules.state_dict().items()
+            }
+            self.model.save_checkpoint(pgc_path, step=23)
+            payload = torch.load(pgc_path, map_location="cpu", weights_only=False)
+            self.assertEqual(payload["format"], "fastwam_policy_guard_v3")
+            self.assertEqual(payload["step"], 23)
+            self.assertNotIn("mot", payload)
+            self.assertNotIn("counterfactual_action_adapter", payload)
+            self.assertNotIn("counterfactual_lora_config", payload)
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(
+                metadata["counterfactual_tuning"],
+                "bounded_velocity_residual",
+            )
+            self.assertEqual(
+                metadata["policy_protection"],
+                "single_immutable_base_plus_conservative_hard_gate",
+            )
+
+            restored = tiny_pgc_fastwam(version=3)
+            restored.load_checkpoint(pgc_path)
+            for key, value in expected.items():
+                self.assertTrue(
+                    torch.equal(
+                        restored.policy_guard_modules.state_dict()[key],
+                        value,
+                    ),
+                    key,
+                )
+            self.assertEqual(
+                restored.policy_guard_base_checkpoint,
+                str(base_path.resolve()),
             )
 
 

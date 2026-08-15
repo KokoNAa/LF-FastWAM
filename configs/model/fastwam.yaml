@@ -142,10 +142,10 @@ transition_contract:
   freeze_m1_policy: false
 
 # Policy-Guarded Counterfactual FastWAM. PGC is mutually exclusive with the
-# LangForce/TC mainlines. It freezes the released query-free FastWAM policy,
-# adapts an independent goal-conditioned Action Expert with action-only LoRA
-# and latent queries, and deploys a conservative verifier gate that falls back
-# to the immutable base action.
+# LangForce/TC mainlines. v1/v2 retain their historical independent Action
+# Expert for checkpoint compatibility. v3 shares one immutable released Base
+# Action Expert and learns only a bounded goal-conditioned flow-velocity
+# residual, then deploys a conservative verifier gate that falls back to Base.
 policy_guard:
   enabled: false
   version: 2
@@ -160,6 +160,15 @@ policy_guard:
   # v2 anchors native samples to the frozen Base velocity at the same noisy
   # action/timestep, while direct CF samples receive flow-matching supervision.
   native_distillation_weight: 1.0
+  # v3 penalizes residual energy/jitter and hard-bounds every action velocity
+  # dimension. A scalar cap is broadcast over action dimensions.
+  residual_regularization_weight: 0.01
+  residual_smoothness_weight: 0.01
+  velocity_residual_max_abs: 1.0
+  # First learn the directly supervised residual. Only then train the moving
+  # Verifier/alignment objectives, with a linear optimizer-step ramp.
+  verifier_start_step: 1000
+  verifier_ramp_steps: 500
   # Goal information is injected into the query-free/raw-visual Action Expert
   # through a final-projection-zero residual adapter.
   goal_residual_scale: 1.0

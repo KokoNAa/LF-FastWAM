@@ -59,24 +59,42 @@ if [[ "${CONDITION}" == "shuffled" || "${CONDITION}" == "counterfactual" ]]; the
   "${PYTHON_BIN}" scripts/validate_language_intervention_manifest.py "${MANIFEST_PATH}"
 fi
 
-"${PYTHON_BIN}" - "${PGC_CHECKPOINT}" <<'PY'
+PGC_CHECKPOINT_VERSION="$("${PYTHON_BIN}" - "${PGC_CHECKPOINT}" <<'PY'
 import sys
 import torch
 
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
-if payload.get("format") != "fastwam_policy_guard_v2":
-    raise SystemExit("Evaluation requires a fastwam_policy_guard_v2 checkpoint")
 if metadata.get("architecture") != "pgc_fastwam":
     raise SystemExit("Checkpoint is missing PGC architecture metadata")
-if int(metadata.get("policy_guard_version", -1)) != 2:
-    raise SystemExit("Only PGC version 2 is supported by this launcher")
-if metadata.get("policy_protection") != "immutable_base_plus_conservative_hard_gate":
+version = int(metadata.get("policy_guard_version", -1))
+if version not in {2, 3}:
+    raise SystemExit(f"Only PGC versions 2 and 3 are supported, got {version}")
+if payload.get("format") != f"fastwam_policy_guard_v{version}":
+    raise SystemExit("PGC checkpoint format/version mismatch")
+expected_protection = (
+    "single_immutable_base_plus_conservative_hard_gate"
+    if version == 3
+    else "immutable_base_plus_conservative_hard_gate"
+)
+if metadata.get("policy_protection") != expected_protection:
     raise SystemExit("Checkpoint does not declare the protected hard-gate path")
-if metadata.get("counterfactual_tuning") != "lora":
-    raise SystemExit("Evaluation requires a PGC action-only LoRA checkpoint")
-print(f"Validated PGC checkpoint: step={payload.get('step')} base={payload.get('base_checkpoint')}")
+expected_tuning = "bounded_velocity_residual" if version == 3 else "lora"
+if metadata.get("counterfactual_tuning") != expected_tuning:
+    raise SystemExit(f"PGC v{version} tuning metadata is incompatible")
+if version == 3 and any(
+    key in payload
+    for key in (
+        "counterfactual_action_adapter",
+        "counterfactual_action_expert",
+        "counterfactual_lora_config",
+    )
+):
+    raise SystemExit("PGC v3 must not contain an Action-Expert copy or LoRA")
+print(version)
 PY
+)"
+echo "Validated PGC v${PGC_CHECKPOINT_VERSION} checkpoint: ${PGC_CHECKPOINT}"
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   GPU_LIST=""
@@ -105,12 +123,12 @@ EXTRA_OVERRIDES=(
   "model.langforce_mvp.enable_posterior_advantage=false"
   "model.transition_contract.enabled=false"
   "model.policy_guard.enabled=true"
-  "model.policy_guard.version=2"
+  "model.policy_guard.version=${PGC_CHECKPOINT_VERSION}"
   "model.policy_guard.gate_mode=${GATE_MODE}"
   "model.policy_guard.gate_threshold=${GATE_THRESHOLD}"
   "model.policy_guard.min_counterfactual_score=${MIN_COUNTERFACTUAL_SCORE}"
-  # Keep construction adapter-free; checkpoint loading injects its exact saved
-  # rank/alpha/targets before restoring the lightweight PGC adapter.
+  # Keep construction adapter-free. v2 loading injects its saved LoRA; v3
+  # strictly restores only Goal Graph, bounded residual, and Verifier tensors.
   "model.lora.enabled=false"
 )
 if [[ -n "${MANIFEST_PATH}" ]]; then

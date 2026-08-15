@@ -31,7 +31,9 @@ trap cleanup EXIT
 printf '%s\n' "${COUNTERFACTUAL_DATASET}" >"${LIST_FILE}"
 
 export PGC_TRAIN_SUITE="${SUITE}"
-export RUN_TAG="${RUN_TAG:-${SUITE}-visual-residual-lora-r${PGC_LORA_RANK:-16}-${MAX_STEPS}-seed${TRAIN_SEED}-v2}"
+PGC_VERSION="${PGC_VERSION:-2}"
+export PGC_VERSION
+export RUN_TAG="${RUN_TAG:-${SUITE}-pgc-v${PGC_VERSION}-${MAX_STEPS}-seed${TRAIN_SEED}}"
 
 bash scripts/train_pgc_libero.sh \
   "${NPROC_PER_NODE}" \

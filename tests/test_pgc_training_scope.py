@@ -39,7 +39,9 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn(
             "data.train.pgc_balance_native_counterfactual=", source
         )
-        self.assertIn("model.policy_guard.version=2", source)
+        self.assertIn('model.policy_guard.version=${PGC_VERSION}', source)
+        self.assertIn('PGC_VERSION="${PGC_VERSION:-2}"', source)
+        self.assertIn("model.policy_guard.velocity_residual_max_abs=", source)
 
     def test_common_launcher_supports_explicit_weight_only_continuation(self):
         source = (REPO_ROOT / "scripts/train_pgc_libero.sh").read_text(
@@ -48,6 +50,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("PGC_INIT_CHECKPOINT", source)
         self.assertIn("PGC_CONTINUE_FROM_STEP", source)
         self.assertIn("fastwam_policy_guard_v2", source)
+        self.assertIn('expected_format = f"fastwam_policy_guard_v{expected_version}"', source)
         self.assertIn("PGC continuation step mismatch", source)
         self.assertIn(
             '"weight_only_start_step=${WEIGHT_ONLY_START_STEP}"',
@@ -71,6 +74,15 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         )
         self.assertIn("PGC_MAX_POLICY_STEPS", source)
         self.assertIn("EVALUATION.max_steps=${MAX_POLICY_STEPS}", source)
+
+    def test_v3_launcher_selects_residual_only_training(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v3_libero_suite.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("export PGC_VERSION=3", source)
+        self.assertIn("PGC_LEARNING_RATE", source)
+        self.assertIn("PGC_VELOCITY_RESIDUAL_MAX_ABS", source)
+        self.assertIn("PGC_VERIFIER_START_STEP", source)
 
 
 if __name__ == "__main__":

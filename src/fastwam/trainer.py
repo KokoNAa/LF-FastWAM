@@ -123,7 +123,7 @@ class Wan22Trainer:
                 )
             ):
                 raise ValueError(
-                    "PGC v2 requires explicit 1:1 native/counterfactual "
+                    "PGC v2/v3 requires explicit 1:1 native/counterfactual "
                     "sampling. Set "
                     "`data.train.pgc_balance_native_counterfactual=true`."
                 )

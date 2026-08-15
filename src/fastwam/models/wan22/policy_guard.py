@@ -1,17 +1,17 @@
 """Policy-Guarded Counterfactual (PGC) modules for FastWAM.
 
 PGC deliberately keeps the released FastWAM policy outside the optimization
-graph.  A separate goal-conditioned Action Expert proposes an alternative
-action chunk and :class:`ActionOutcomeVerifier` decides whether that proposal
-is sufficiently more compatible with the requested goal to override the base
-policy.  The modules in this file are small; the independent Action Expert is
-constructed by :class:`fastwam.models.wan22.fastwam.FastWAM`.
+graph. Historical v1/v2 checkpoints use a separate goal-conditioned Action
+Expert. v3 instead evaluates the same frozen Base Expert and learns only a
+bounded goal-conditioned correction in flow-velocity space. An
+:class:`ActionOutcomeVerifier` decides whether that proposal is sufficiently
+more compatible with the requested goal to override the exact Base candidate.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -311,6 +311,127 @@ class GoalResidualAdapter(nn.Module):
             "pgc_goal_residual_scale": output.new_tensor(self.residual_scale),
         }
         return output, metrics
+
+
+class BoundedActionVelocityResidual(nn.Module):
+    """Predict a bounded goal-conditioned correction to frozen Base velocity.
+
+    PGC v3 never adapts or duplicates the released Action Expert. The frozen
+    expert first produces its normal hidden action tokens and velocity; this
+    module reads those tokens plus state-grounded goal queries and predicts a
+    small correction in flow-velocity space. The final projection is exactly
+    zero initialized and the output is bounded with ``tanh`` so a new v3 model
+    is numerically identical to Base and cannot produce an unbounded policy
+    perturbation during training.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_hidden_dim: int,
+        action_dim: int,
+        num_heads: int = 8,
+        max_abs: float | Sequence[float] = 1.0,
+    ):
+        super().__init__()
+        if action_hidden_dim <= 0 or action_dim <= 0:
+            raise ValueError("PGC velocity-residual dimensions must be positive.")
+        if num_heads <= 0 or action_hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"PGC velocity-residual hidden_dim={action_hidden_dim} must "
+                f"divide num_heads={num_heads}."
+            )
+        if isinstance(max_abs, Sequence) and not isinstance(max_abs, (str, bytes)):
+            cap_values = [float(value) for value in max_abs]
+            if len(cap_values) != int(action_dim):
+                raise ValueError(
+                    "Per-dimension PGC residual caps must match action_dim: "
+                    f"{len(cap_values)} vs {action_dim}."
+                )
+        else:
+            cap_values = [float(max_abs)] * int(action_dim)
+        if any(value <= 0 for value in cap_values):
+            raise ValueError("PGC velocity-residual caps must be positive.")
+
+        self.action_hidden_dim = int(action_hidden_dim)
+        self.action_dim = int(action_dim)
+        self.num_heads = int(num_heads)
+        self.action_norm = nn.LayerNorm(action_hidden_dim)
+        self.goal_norm = nn.LayerNorm(action_hidden_dim)
+        self.goal_attention = nn.MultiheadAttention(
+            action_hidden_dim, num_heads, batch_first=True
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(action_hidden_dim * 2, action_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.LayerNorm(action_hidden_dim),
+        )
+        self.output_projection = nn.Linear(action_hidden_dim, action_dim)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+        self.register_buffer(
+            "max_abs",
+            torch.tensor(cap_values, dtype=torch.float32).view(1, 1, action_dim),
+            persistent=True,
+        )
+
+    def forward(
+        self,
+        action_hidden: torch.Tensor,
+        goal_queries: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if action_hidden.ndim != 3 or goal_queries.ndim != 3:
+            raise ValueError("PGC v3 residual inputs must be [B,S,D] tensors.")
+        if action_hidden.shape[0] != goal_queries.shape[0]:
+            raise ValueError("PGC v3 residual inputs must share a batch dimension.")
+        if action_hidden.shape[-1] != self.action_hidden_dim or (
+            goal_queries.shape[-1] != self.action_hidden_dim
+        ):
+            raise ValueError("PGC v3 residual hidden dimensions do not match.")
+        if goal_queries.shape[1] <= 0:
+            raise ValueError("PGC v3 residual requires at least one goal query.")
+
+        normalized_action = self.action_norm(action_hidden)
+        normalized_goal = self.goal_norm(goal_queries)
+        goal_delta, attention = self.goal_attention(
+            query=normalized_action,
+            key=normalized_goal,
+            value=normalized_goal,
+            need_weights=True,
+        )
+        residual_hidden = self.fusion(
+            torch.cat([normalized_action, goal_delta], dim=-1)
+        )
+        raw_residual = self.output_projection(residual_hidden)
+        cap = self.max_abs.to(
+            device=raw_residual.device, dtype=raw_residual.dtype
+        )
+        residual = torch.tanh(raw_residual) * cap
+
+        probabilities = attention.float().clamp_min(1.0e-8)
+        entropy = -(probabilities * probabilities.log()).sum(dim=-1)
+        entropy = entropy / math.log(max(2, probabilities.shape[-1]))
+        saturation = residual.float().abs() >= (
+            cap.float() * 0.95
+        )
+        metrics = {
+            "pgc_velocity_residual_hidden_norm": (
+                residual_hidden.float().norm(dim=-1).mean()
+            ),
+            "pgc_velocity_residual_raw_norm": (
+                raw_residual.float().norm(dim=-1).mean()
+            ),
+            "pgc_velocity_residual_norm": (
+                residual.float().norm(dim=-1).mean()
+            ),
+            "pgc_velocity_residual_max_abs": residual.float().abs().max(),
+            "pgc_velocity_residual_cap_mean": cap.float().mean(),
+            "pgc_velocity_residual_saturation_fraction": (
+                saturation.float().mean()
+            ),
+            "pgc_velocity_residual_attention_entropy": entropy.mean(),
+        }
+        return residual, metrics
 
 
 class ActionOutcomeVerifier(nn.Module):

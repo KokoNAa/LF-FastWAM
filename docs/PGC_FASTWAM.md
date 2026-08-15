@@ -1,31 +1,32 @@
-# PGC-FastWAM v2
+# PGC-FastWAM v3
 
 PGC（Policy-Guarded Counterfactual FastWAM）用于在不破坏原始 FastWAM 策略的前提下提升语言遵守，尤其针对 CIS 中“仍执行原指令 / 改变行为但抓错物体 / 什么也不抓”三类失败。
 
 ## 架构
 
-PGC 包含两条物理隔离的动作路径：
+PGC v3 保留两个候选，但只存在一份 Action Expert：
 
 1. **Base Policy**：官方 query-free FastWAM Video Expert + Action Expert。加载 release checkpoint 后全部冻结，不进入优化器。
-2. **Counterfactual Policy**：从 Base Action Expert 初始化的一份独立、query-free Action Expert。它保留 Base 对当前帧原始视觉 token 和完整 context 的读取方式，主干永久冻结，只训练该分支自己的 action-only LoRA；不会在 Base Policy 上注入 LoRA。
-3. **Goal Graph Encoder + Zero-init Goal Residual**：少量 goal slots 先读取语言，再读取当前帧视觉 token，产生状态相关的目标表示。32 个 Goal Queries 不再作为动作序列前缀替换原视觉路径，而是通过末层严格零初始化的 cross-attention residual 注入普通 action token。加载 Base 后、训练前 Counterfactual velocity 与 Base 数值一致。
+2. **Counterfactual Candidate**：在自己的 diffusion latent 上再次调用同一份冻结 Base Action Expert，得到 Base flow velocity 与隐藏 action token；模型不再复制或微调第二个 Action Expert，也不再给动作主干注入 LoRA。
+3. **Goal Graph + Bounded Velocity Residual**：少量 goal slots 先读取语言，再读取当前帧视觉 token；32 个 Goal Queries 与冻结 action hidden cross-attend 后，只输出 `Δv`。最终候选为 `v_cf = stopgrad(v_base) + tanh(raw_Δv) × cap`。输出层严格零初始化，因此新建 v3 在训练前逐元素等于 Base；每维硬上限阻止动作速度无限漂移。
 4. **Action–Outcome Verifier**：在当前状态和目标表示下分别给 Base/Counterfactual action chunk 打分。
 5. **Conservative Hard Gate**：只有当反事实候选分数达到绝对阈值，且比 Base 高出安全 margin 时才覆盖；否则逐元素原样返回 Base action。
 
-`policy_guard.enabled=false` 时不会构建或执行 PGC 路径，旧 FastWAM/TC/LangForce 行为保持不变。PGC v2 与 TC、LangForce、Base LoRA 互斥；这里的 LoRA 只属于物理隔离的 Counterfactual Action Expert。
+`policy_guard.enabled=false` 时不会构建或执行 PGC 路径，旧 FastWAM/TC/LangForce 行为保持不变。PGC v3 与 TC、LangForce、任何 Base LoRA 互斥。v1/v2 的独立专家与 LoRA 代码只为历史 checkpoint 兼容，不用于 v3 正式训练。
 
-训练优化器的严格白名单是：Counterfactual Action Expert 的 `lora_A`、`lora_B`，以及 Goal Graph、Goal Query Seeds、Zero-init Residual Adapter 和 Verifier。Base Video/Action Expert 与 Counterfactual Action Expert 的原始 backbone weight/bias 都设置为 `requires_grad=false`；代码会拒绝未启用 LoRA 的 PGC 训练，避免误触发全量微调。
+v3 训练优化器的严格白名单只有 Goal Graph、Goal Query Seeds、Bounded Velocity Residual 和 Verifier。整套 Base Video/Action Expert 全部 `requires_grad=false` 且保持 eval mode；代码会反向拒绝 v3 启用 LoRA，checkpoint 也不能含独立 Action Expert 或 LoRA tensor。
 
 ## 监督信号
 
-- `loss_pgc_action`：仅在直接反事实样本上，独立 Counterfactual Action Expert 对真实 action chunk 的 flow-matching 正监督。
-- `loss_pgc_native_policy_distillation`：仅在 Native 样本上，对同一 noisy action、同一 timestep 下的冻结 Base velocity 做教师蒸馏。它不施加在反事实样本上，因此不会与目标切换监督冲突。
+- `loss_pgc_action`：仅在直接反事实样本上监督 `Δv_target = v_flow_target − stopgrad(v_base)`，使受限残差真正学习状态对齐的替代动作，而不是只学视觉语义。
+- `loss_pgc_native_residual_zero`：仅在 Native 样本上要求 `Δv=0`。这比让另一套专家蒸馏 Base 更直接：Native 候选从结构上保持原始速度。
+- `loss_pgc_residual_regularization`：限制反事实残差能量；`loss_pgc_residual_smoothness` 限制相邻 action step 的修正抖动；`tanh × cap` 再提供逐维硬边界。
 - `loss_pgc_verifier`：用真实 action 作为正样本，并根据 Base/Counterfactual 候选到真实 action 的距离生成连续质量标签。这样不会把“其实正确的 Base 候选”强行标成负样本。
 - `loss_pgc_verifier_ranking`：仅在直接反事实样本中、且 Counterfactual 候选确实比 Base 更接近真实 action 时，要求其**概率评分**超过 Base；训练 margin 与部署 Gate 使用同一概率尺度。
-- `loss_pgc_goal_action_alignment`：Goal-State representation 与真实 action outcome 的跨卡对称对比对齐；同指令样本不会互相作为负样本。该损失使用带梯度的 distributed gather，因此四卡、每卡 micro-batch 1 时仍有最多 4 个候选，梯度累积不被误当成对比 batch。
+- `loss_pgc_goal_action_alignment`：Goal-State representation 与真实 action outcome 的跨卡对称对比对齐；同指令样本不会互相作为负样本。v3 默认前 1000 optimizer steps 将 Verifier 与该对齐项完全移出反向传播，随后 500 steps 线性接入，避免 Residual 与 Verifier 同时从随机状态追逐移动目标。
 - `loss_video` 与 `loss_pgc_base_action_monitor`：只用于监控，不参与优化。
 
-训练日志还会记录 `pgc_native_student_teacher_mse`、`pgc_goal_residual_norm`、候选质量目标、Verifier 分数、预测覆盖率、Goal Query 多样性及原策略冻结标记。`pgc_goal_action_candidate_count` 和 `pgc_goal_action_effective_negative_count` 分别用于确认跨卡候选聚合已经生效，以及去除同目标样本后每个样本仍有多少有效负样本。
+训练日志还会记录 `pgc_velocity_residual_norm/max_abs/saturation_fraction`、`pgc_native_residual_zero_mse`、`pgc_counterfactual_residual_target_mse`、`pgc_counterfactual_target_outside_cap_fraction`、`pgc_verifier_training_scale`、候选质量目标、预测覆盖率、Goal Query 多样性及原策略冻结标记。若 `target_outside_cap_fraction` 长期很高而残差饱和，才依据诊断调大 cap，不能直接解除边界。
 
 ## 为什么必须准备新数据
 
@@ -270,7 +271,7 @@ export LIBERO_DATA_ROOT=/path/to/FastWAM/data/libero_mujoco3.3.2
 BASE="$DIFFSYNTH_MODEL_BASE_PATH/fastwam_release/libero_uncond_2cam224.pt"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-bash scripts/train_pgc_libero_suite.sh \
+bash scripts/train_pgc_v3_libero_suite.sh \
   libero_object \
   4 \
   "$BASE" \
@@ -282,17 +283,20 @@ bash scripts/train_pgc_libero_suite.sh \
 其余三条线仅替换 suite 名和对应数据目录，不能把多个目录放入同一次训练：
 
 ```bash
-bash scripts/train_pgc_libero_suite.sh libero_spatial 4 "$BASE" /path/to/pgc/libero_spatial_pgc_counterfactual_lerobot 42 4000
-bash scripts/train_pgc_libero_suite.sh libero_goal    4 "$BASE" /path/to/pgc/libero_goal_pgc_counterfactual_lerobot    42 4000
-bash scripts/train_pgc_libero_suite.sh libero_10      4 "$BASE" /path/to/pgc/libero_10_pgc_counterfactual_lerobot      42 4000
+bash scripts/train_pgc_v3_libero_suite.sh libero_spatial 4 "$BASE" /path/to/pgc/libero_spatial_pgc_counterfactual_lerobot 42 4000
+bash scripts/train_pgc_v3_libero_suite.sh libero_goal    4 "$BASE" /path/to/pgc/libero_goal_pgc_counterfactual_lerobot    42 4000
+bash scripts/train_pgc_v3_libero_suite.sh libero_10      4 "$BASE" /path/to/pgc/libero_10_pgc_counterfactual_lerobot      42 4000
 ```
 
 `train_pgc_libero_suite.sh` 会同时把原始数据和直接反事实数据限制到指定 suite，
 并检查 `meta/pgc_provenance.json`。任何跨 suite 数据都会在创建训练进程前报错。
-默认按 frame index 把 Native 与 Counterfactual 数据构造成严格 1:1 采样，使用
-Action Expert LoRA `rank=16, alpha=32, dropout=0.05`，学习率为 `1e-5`，每卡 micro-batch 为 1、
+默认按 frame index 把 Native 与 Counterfactual 数据构造成严格 1:1 采样。v3 不使用
+LoRA，默认 residual cap 为 `1.0`、能量/平滑权重均为 `0.01`，这些从零初始化的
+小模块使用学习率 `1e-4`，每卡 micro-batch 为 1、
 梯度累积为 4（四卡有效 batch 16），每 500 steps 保存权重。可通过
-`PGC_LORA_RANK`、`PGC_LORA_ALPHA`、`PGC_LORA_DROPOUT` 修改适配器参数。默认
+`PGC_VELOCITY_RESIDUAL_MAX_ABS`、`PGC_RESIDUAL_REGULARIZATION_WEIGHT`、
+`PGC_RESIDUAL_SMOOTHNESS_WEIGHT`、`PGC_VERIFIER_START_STEP` 和
+`PGC_VERIFIER_RAMP_STEPS` 修改 v3 超参。默认
 不保存 DeepSpeed state，以避免磁盘空间不足导致最后一步保存失败。
 
 每条线必须依次通过以下门控，才进入下一条：
@@ -314,6 +318,7 @@ Action Expert LoRA `rank=16, alpha=32, dropout=0.05`，学习率为 `1e-5`，每
 ```bash
 PGC_TRAIN_SUITE=all \
 PGC_ALLOW_JOINT_TRAINING=true \
+PGC_VERSION=3 \
 bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.txt 42 4000
 ```
 
@@ -323,11 +328,10 @@ bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.
 bash scripts/validate_pgc_server.sh
 ```
 
-输出 checkpoint 格式为 `fastwam_policy_guard_v2`，只保存 Counterfactual Action
-Expert 的 LoRA A/B、Goal Query Seeds、Zero-init Residual Adapter、Goal Graph、
-Verifier、LoRA 配置和外部 Base checkpoint 路径；既不复制 6.8B Base 权重，也不
-保存 Counterfactual Action Expert 的冻结主干。加载时会先恢复外部 Base，再按
-checkpoint 中记录的 rank/alpha/targets 注入并恢复适配器。
+输出 checkpoint 格式为 `fastwam_policy_guard_v3`，只保存 Goal Query Seeds、
+Bounded Velocity Residual、Goal Graph、Verifier、架构元数据和外部 Base checkpoint
+路径；既不复制 6.8B Base 权重，也不存在第二套 Action Expert 或 LoRA。加载时先
+恢复外部 Base，再严格恢复小型 PGC 模块。v1/v2 checkpoint 仍按旧格式加载。
 
 ### 未保存 ZeRO 状态时续训
 
@@ -340,11 +344,12 @@ export PGC_INIT_CHECKPOINT=/path/to/step_000500.pt
 export PGC_CONTINUE_FROM_STEP=500
 
 # 最后一个参数 1500 是绝对目标 step，因此本次实际再训练 1000 steps。
-bash scripts/train_pgc_libero_suite.sh \
+bash scripts/train_pgc_v3_libero_suite.sh \
   libero_object 4 "$BASE" "$PGC_CF_OBJECT" 42 1500
 ```
 
-启动器会校验 PGC v2 格式、保存步数、外部 Base 路径和 LoRA 配置。Trainer 会把
+启动器会校验匹配的 PGC v3 格式、保存步数、外部 Base 路径和 bounded-residual
+架构。Trainer 会把
 `global_step` 恢复为 500，跳过同一随机序列中已经消费的数据，并为剩余 1000
 steps 新建带短 warmup 的 scheduler。由于原运行没有保存 ZeRO state，优化器
 动量无法恢复；日志会明确标记这是 fresh-optimizer weight-only continuation。

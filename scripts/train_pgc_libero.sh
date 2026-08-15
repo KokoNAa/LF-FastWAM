@@ -10,6 +10,7 @@ TRAIN_SUITE="${PGC_TRAIN_SUITE:-all}"
 ALLOW_JOINT_TRAINING="${PGC_ALLOW_JOINT_TRAINING:-false}"
 INIT_CHECKPOINT="${PGC_INIT_CHECKPOINT:-${BASE_CHECKPOINT}}"
 CONTINUE_FROM_STEP="${PGC_CONTINUE_FROM_STEP:-}"
+PGC_VERSION="${PGC_VERSION:-2}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-data/libero_mujoco3.3.2}"
@@ -23,7 +24,20 @@ SAVE_TRAINING_STATE="${PGC_SAVE_TRAINING_STATE:-false}"
 LORA_RANK="${PGC_LORA_RANK:-16}"
 LORA_ALPHA="${PGC_LORA_ALPHA:-32}"
 LORA_DROPOUT="${PGC_LORA_DROPOUT:-0.05}"
-RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-visual-residual-lora-r${LORA_RANK}-${MAX_STEPS}-seed${TRAIN_SEED}-v2}"
+RESIDUAL_REG_WEIGHT="${PGC_RESIDUAL_REGULARIZATION_WEIGHT:-0.01}"
+RESIDUAL_SMOOTHNESS_WEIGHT="${PGC_RESIDUAL_SMOOTHNESS_WEIGHT:-0.01}"
+RESIDUAL_MAX_ABS="${PGC_VELOCITY_RESIDUAL_MAX_ABS:-1.0}"
+VERIFIER_START_STEP="${PGC_VERIFIER_START_STEP:-1000}"
+VERIFIER_RAMP_STEPS="${PGC_VERIFIER_RAMP_STEPS:-500}"
+RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-pgc-v${PGC_VERSION}-${MAX_STEPS}-seed${TRAIN_SEED}}"
+
+case "${PGC_VERSION}" in
+  2|3) ;;
+  *)
+    echo "PGC_VERSION must be 2 or 3; got ${PGC_VERSION}." >&2
+    exit 1
+    ;;
+esac
 
 ALL_SUITES=(libero_spatial libero_object libero_goal libero_10)
 case "${TRAIN_SUITE}" in
@@ -44,10 +58,21 @@ case "${TRAIN_SUITE}" in
     ;;
 esac
 
-for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY LORA_RANK; do
+for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${value_name} must be a positive integer, got ${value}." >&2
+    exit 1
+  fi
+done
+if [[ "${PGC_VERSION}" == "2" ]] && ! [[ "${LORA_RANK}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "LORA_RANK must be a positive integer for PGC v2, got ${LORA_RANK}." >&2
+  exit 1
+fi
+for value_name in VERIFIER_START_STEP VERIFIER_RAMP_STEPS; do
+  value="${!value_name}"
+  if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${value_name} must be a non-negative integer, got ${value}." >&2
     exit 1
   fi
 done
@@ -69,18 +94,33 @@ case "${BALANCE_NATIVE_COUNTERFACTUAL}" in
     ;;
 esac
 if [[ "${BALANCE_NATIVE_COUNTERFACTUAL}" == "true" && "${OVERSAMPLE_FACTOR}" != "1" ]]; then
-  echo "PGC v2 exact 1:1 balancing requires PGC_COUNTERFACTUAL_OVERSAMPLE_FACTOR=1." >&2
+  echo "PGC exact 1:1 balancing requires PGC_COUNTERFACTUAL_OVERSAMPLE_FACTOR=1." >&2
   exit 1
 fi
-"${PYTHON_BIN}" - "${LORA_ALPHA}" "${LORA_DROPOUT}" <<'PY'
+"${PYTHON_BIN}" - \
+  "${PGC_VERSION}" \
+  "${LORA_ALPHA}" \
+  "${LORA_DROPOUT}" \
+  "${RESIDUAL_REG_WEIGHT}" \
+  "${RESIDUAL_SMOOTHNESS_WEIGHT}" \
+  "${RESIDUAL_MAX_ABS}" <<'PY'
 import sys
 
-alpha = float(sys.argv[1])
-dropout = float(sys.argv[2])
-if alpha <= 0:
-    raise SystemExit(f"PGC_LORA_ALPHA must be positive, got {alpha}")
-if not 0 <= dropout < 1:
-    raise SystemExit(f"PGC_LORA_DROPOUT must be in [0, 1), got {dropout}")
+version = int(sys.argv[1])
+alpha = float(sys.argv[2])
+dropout = float(sys.argv[3])
+regularization = float(sys.argv[4])
+smoothness = float(sys.argv[5])
+cap = float(sys.argv[6])
+if version == 2:
+    if alpha <= 0:
+        raise SystemExit(f"PGC_LORA_ALPHA must be positive, got {alpha}")
+    if not 0 <= dropout < 1:
+        raise SystemExit(f"PGC_LORA_DROPOUT must be in [0, 1), got {dropout}")
+if regularization < 0 or smoothness < 0:
+    raise SystemExit("PGC v3 residual regularization weights must be non-negative")
+if cap <= 0:
+    raise SystemExit("PGC v3 velocity residual cap must be positive")
 PY
 if [[ ! -f "${BASE_CHECKPOINT}" ]]; then
   echo "Base checkpoint not found: ${BASE_CHECKPOINT}" >&2
@@ -193,6 +233,7 @@ if payload.get("format") in {
     "fastwam_lora_adapter_v1",
     "fastwam_policy_guard_v1",
     "fastwam_policy_guard_v2",
+    "fastwam_policy_guard_v3",
 }:
     raise SystemExit("PGC base must be the immutable full FastWAM release, not an adapter")
 print(f"Validated protected base: format={payload.get('format', 'legacy_full')} tensors={len(payload['mot'])}")
@@ -204,9 +245,15 @@ if [[ -n "${CONTINUE_FROM_STEP}" ]]; then
     "${INIT_CHECKPOINT}" \
     "${BASE_CHECKPOINT}" \
     "${CONTINUE_FROM_STEP}" \
+    "${PGC_VERSION}" \
     "${LORA_RANK}" \
     "${LORA_ALPHA}" \
-    "${LORA_DROPOUT}" <<'PY'
+    "${LORA_DROPOUT}" \
+    "${RESIDUAL_REG_WEIGHT}" \
+    "${RESIDUAL_SMOOTHNESS_WEIGHT}" \
+    "${RESIDUAL_MAX_ABS}" \
+    "${VERIFIER_START_STEP}" \
+    "${VERIFIER_RAMP_STEPS}" <<'PY'
 import math
 import sys
 from pathlib import Path
@@ -216,19 +263,26 @@ import torch
 init_path = Path(sys.argv[1]).expanduser().resolve()
 base_path = Path(sys.argv[2]).expanduser().resolve()
 expected_step = int(sys.argv[3])
-expected_rank = int(sys.argv[4])
-expected_alpha = float(sys.argv[5])
-expected_dropout = float(sys.argv[6])
+expected_version = int(sys.argv[4])
+expected_rank = int(sys.argv[5])
+expected_alpha = float(sys.argv[6])
+expected_dropout = float(sys.argv[7])
+expected_residual_regularization = float(sys.argv[8])
+expected_residual_smoothness = float(sys.argv[9])
+expected_residual_cap = float(sys.argv[10])
+expected_verifier_start = int(sys.argv[11])
+expected_verifier_ramp = int(sys.argv[12])
 payload = torch.load(init_path, map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
-if payload.get("format") != "fastwam_policy_guard_v2":
+expected_format = f"fastwam_policy_guard_v{expected_version}"
+if payload.get("format") != expected_format:
     raise SystemExit(
-        "PGC weight-only continuation requires a fastwam_policy_guard_v2 "
+        f"PGC weight-only continuation requires a {expected_format} "
         f"checkpoint, got {payload.get('format')!r}"
     )
 if metadata.get("architecture") != "pgc_fastwam" or int(
     metadata.get("policy_guard_version", -1)
-) != 2:
+) != expected_version:
     raise SystemExit("PGC continuation checkpoint has incompatible architecture metadata")
 if int(payload.get("step", -1)) != expected_step:
     raise SystemExit(
@@ -244,25 +298,54 @@ if recorded_base != base_path:
         "PGC continuation base mismatch: "
         f"checkpoint={recorded_base} requested={base_path}"
     )
-lora = payload.get("counterfactual_lora_config") or {}
-if int(lora.get("rank", -1)) != expected_rank:
-    raise SystemExit(
-        f"PGC continuation LoRA rank mismatch: checkpoint={lora.get('rank')} "
-        f"requested={expected_rank}"
-    )
-for name, expected in (
-    ("alpha", expected_alpha),
-    ("dropout", expected_dropout),
-):
-    try:
-        actual = float(lora[name])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SystemExit(f"PGC continuation checkpoint has invalid LoRA {name}") from exc
-    if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
+if expected_version == 2:
+    lora = payload.get("counterfactual_lora_config") or {}
+    if int(lora.get("rank", -1)) != expected_rank:
         raise SystemExit(
-            f"PGC continuation LoRA {name} mismatch: "
-            f"checkpoint={actual} requested={expected}"
+            f"PGC continuation LoRA rank mismatch: checkpoint={lora.get('rank')} "
+            f"requested={expected_rank}"
         )
+    for name, expected in (
+        ("alpha", expected_alpha),
+        ("dropout", expected_dropout),
+    ):
+        try:
+            actual = float(lora[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SystemExit(f"PGC continuation checkpoint has invalid LoRA {name}") from exc
+        if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
+            raise SystemExit(
+                f"PGC continuation LoRA {name} mismatch: "
+                f"checkpoint={actual} requested={expected}"
+            )
+else:
+    if metadata.get("counterfactual_tuning") != "bounded_velocity_residual":
+        raise SystemExit("PGC v3 continuation lacks bounded residual metadata")
+    if payload.get("counterfactual_action_adapter") is not None:
+        raise SystemExit("PGC v3 continuation unexpectedly contains Action-Expert LoRA")
+    for name, expected in (
+        ("residual_regularization_weight", expected_residual_regularization),
+        ("residual_smoothness_weight", expected_residual_smoothness),
+    ):
+        actual = float(metadata.get(name, float("nan")))
+        if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
+            raise SystemExit(
+                f"PGC v3 continuation {name} mismatch: "
+                f"checkpoint={actual} requested={expected}"
+            )
+    caps = [float(value) for value in metadata.get("velocity_residual_max_abs", [])]
+    if not caps or any(
+        not math.isclose(value, expected_residual_cap, rel_tol=0.0, abs_tol=1.0e-6)
+        for value in caps
+    ):
+        raise SystemExit(
+            "PGC v3 continuation residual cap mismatch: "
+            f"checkpoint={caps} requested={expected_residual_cap}"
+        )
+    if int(metadata.get("verifier_start_step", -1)) != expected_verifier_start:
+        raise SystemExit("PGC v3 continuation verifier_start_step mismatch")
+    if int(metadata.get("verifier_ramp_steps", -1)) != expected_verifier_ramp:
+        raise SystemExit("PGC v3 continuation verifier_ramp_steps mismatch")
 print(
     "Validated PGC weight-only continuation: "
     f"step={expected_step} base={base_path}"
@@ -313,7 +396,7 @@ if (( VISIBLE_GPU_COUNT < NPROC_PER_NODE )); then
   exit 1
 fi
 
-echo "[PGC-FastWAM] action-only LoRA training"
+echo "[PGC-FastWAM] version=${PGC_VERSION} scope-aware training"
 echo "  training_scope=${TRAIN_SUITE}"
 echo "  protected_base=${BASE_CHECKPOINT}"
 echo "  initialization_checkpoint=${INIT_CHECKPOINT} weight_only_start_step=${WEIGHT_ONLY_START_STEP}"
@@ -321,7 +404,14 @@ echo "  native_datasets=${NATIVE_JSON}"
 echo "  direct_counterfactual_datasets=${CF_JSON}"
 echo "  counterfactual_oversample=${OVERSAMPLE_FACTOR} balanced_1to1=${BALANCE_NATIVE_COUNTERFACTUAL}"
 echo "  seed=${TRAIN_SEED} max_steps=${MAX_STEPS} lr=${LEARNING_RATE}"
-echo "  lora=action-only rank=${LORA_RANK} alpha=${LORA_ALPHA} dropout=${LORA_DROPOUT}"
+if [[ "${PGC_VERSION}" == "2" ]]; then
+  echo "  tuning=action-only-lora rank=${LORA_RANK} alpha=${LORA_ALPHA} dropout=${LORA_DROPOUT}"
+  LORA_ENABLED=true
+else
+  echo "  tuning=bounded-velocity-residual cap=${RESIDUAL_MAX_ABS} regularization=${RESIDUAL_REG_WEIGHT} smoothness=${RESIDUAL_SMOOTHNESS_WEIGHT}"
+  echo "  verifier_schedule=start:${VERIFIER_START_STEP} ramp:${VERIFIER_RAMP_STEPS}"
+  LORA_ENABLED=false
+fi
 echo "  save_training_state=${SAVE_TRAINING_STATE}"
 
 RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
@@ -346,9 +436,14 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   model.langforce_mvp.enable_posterior_advantage=false \
   model.transition_contract.enabled=false \
   model.policy_guard.enabled=true \
-  model.policy_guard.version=2 \
+  "model.policy_guard.version=${PGC_VERSION}" \
   model.policy_guard.require_direct_counterfactual_actions=true \
-  model.lora.enabled=true \
+  "model.policy_guard.residual_regularization_weight=${RESIDUAL_REG_WEIGHT}" \
+  "model.policy_guard.residual_smoothness_weight=${RESIDUAL_SMOOTHNESS_WEIGHT}" \
+  "model.policy_guard.velocity_residual_max_abs=${RESIDUAL_MAX_ABS}" \
+  "model.policy_guard.verifier_start_step=${VERIFIER_START_STEP}" \
+  "model.policy_guard.verifier_ramp_steps=${VERIFIER_RAMP_STEPS}" \
+  "model.lora.enabled=${LORA_ENABLED}" \
   "model.lora.rank=${LORA_RANK}" \
   "model.lora.alpha=${LORA_ALPHA}" \
   "model.lora.dropout=${LORA_DROPOUT}" \
