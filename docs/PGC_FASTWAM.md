@@ -21,10 +21,10 @@ PGC 包含两条物理隔离的动作路径：
 - `loss_pgc_action`：独立 Counterfactual Action Expert 对当前指令对应真实 action chunk 的 flow-matching 正监督。
 - `loss_pgc_verifier`：用真实 action 作为正样本，并根据 Base/Counterfactual 候选到真实 action 的距离生成连续质量标签。这样不会把“其实正确的 Base 候选”强行标成负样本。
 - `loss_pgc_verifier_ranking`：仅在直接反事实样本中、且 Counterfactual 候选确实比 Base 更接近真实 action 时，要求其评分超过 Base。
-- `loss_pgc_goal_action_alignment`：Goal-State representation 与真实 action outcome 的对称对比对齐；同指令样本不会互相作为负样本。
+- `loss_pgc_goal_action_alignment`：Goal-State representation 与真实 action outcome 的跨卡对称对比对齐；同指令样本不会互相作为负样本。该损失使用带梯度的 distributed gather，因此四卡、每卡 micro-batch 1 时仍有最多 4 个候选，梯度累积不被误当成对比 batch。
 - `loss_video` 与 `loss_pgc_base_action_monitor`：只用于监控，不参与优化。
 
-训练日志还会记录候选质量目标、Verifier 分数、预测覆盖率、Goal Query 多样性及原策略冻结标记。
+训练日志还会记录候选质量目标、Verifier 分数、预测覆盖率、Goal Query 多样性及原策略冻结标记。`pgc_goal_action_candidate_count` 和 `pgc_goal_action_effective_negative_count` 分别用于确认跨卡候选聚合已经生效，以及去除同目标样本后每个样本仍有多少有效负样本。
 
 ## 为什么必须准备新数据
 

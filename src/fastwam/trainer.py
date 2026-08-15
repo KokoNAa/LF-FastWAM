@@ -274,7 +274,10 @@ class Wan22Trainer:
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
             drop_last=bool(
-                getattr(self.model, "transition_contract_enabled", False)
+                (
+                    getattr(self.model, "transition_contract_enabled", False)
+                    or getattr(self.model, "policy_guard_enabled", False)
+                )
                 and self.accelerator.num_processes > 1
             ),
         )

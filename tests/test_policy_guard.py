@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -148,6 +149,60 @@ class PolicyGuardModuleTest(unittest.TestCase):
         self.assertEqual(loss.ndim, 0)
         self.assertTrue(torch.isfinite(loss))
         self.assertIn("pgc_goal_action_retrieval_acc", metrics)
+        self.assertEqual(float(metrics["pgc_goal_action_candidate_count"]), 3.0)
+        self.assertGreater(
+            float(metrics["pgc_goal_action_effective_negative_count"]), 0.0
+        )
+
+    def test_alignment_uses_cross_rank_negatives_for_local_batch_one(self):
+        goal_state = torch.tensor([[1.0, 0.0]], requires_grad=True)
+        action_embedding = torch.tensor([[1.0, 0.0]], requires_grad=True)
+        remote_goal = torch.tensor([[0.0, 1.0]])
+        remote_action = torch.tensor([[1.0, 0.0]])
+        gathered_goal = torch.cat([goal_state, remote_goal], dim=0)
+        gathered_action = torch.cat([action_embedding, remote_action], dim=0)
+
+        with (
+            patch(
+                "fastwam.models.wan22.policy_guard._gather_with_grad",
+                side_effect=[(gathered_goal, 0), (gathered_action, 0)],
+            ),
+            patch(
+                "fastwam.models.wan22.policy_guard._gather_without_grad",
+                return_value=torch.tensor([10, 20]),
+            ),
+        ):
+            loss, metrics = GoalActionAlignmentLoss(temperature=0.1)(
+                goal_state,
+                action_embedding,
+                group_ids=torch.tensor([10]),
+            )
+
+        self.assertGreater(float(loss.detach()), 0.0)
+        self.assertEqual(float(metrics["pgc_goal_action_candidate_count"]), 2.0)
+        self.assertEqual(
+            float(metrics["pgc_goal_action_effective_negative_count"]), 1.0
+        )
+        loss.backward()
+        self.assertIsNotNone(goal_state.grad)
+        self.assertIsNotNone(action_embedding.grad)
+
+    def test_alignment_single_candidate_is_a_differentiable_noop(self):
+        goal_state = torch.randn(1, 8, requires_grad=True)
+        action_embedding = torch.randn(1, 8, requires_grad=True)
+        loss, metrics = GoalActionAlignmentLoss(temperature=0.1)(
+            goal_state,
+            action_embedding,
+            group_ids=torch.tensor([3]),
+        )
+        self.assertEqual(float(loss.detach()), 0.0)
+        self.assertEqual(float(metrics["pgc_goal_action_candidate_count"]), 1.0)
+        self.assertEqual(
+            float(metrics["pgc_goal_action_effective_negative_count"]), 0.0
+        )
+        loss.backward()
+        self.assertIsNotNone(goal_state.grad)
+        self.assertIsNotNone(action_embedding.grad)
 
 
 class PolicyGuardIntegrationTest(unittest.TestCase):

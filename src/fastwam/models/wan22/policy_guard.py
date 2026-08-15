@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .transition_contract import _gather_with_grad, _gather_without_grad
+
 
 def _safe_key_padding_mask(
     values: torch.Tensor, valid_mask: torch.Tensor
@@ -357,7 +359,7 @@ class ActionOutcomeVerifier(nn.Module):
 
 
 class GoalActionAlignmentLoss(nn.Module):
-    """Local symmetric InfoNCE for goal-state and demonstrated action chunks."""
+    """Distributed symmetric InfoNCE for goals and demonstrated action chunks."""
 
     def __init__(self, temperature: float = 0.07):
         super().__init__()
@@ -379,39 +381,79 @@ class GoalActionAlignmentLoss(nn.Module):
         action_embedding = F.normalize(
             action_embedding.float(), dim=-1, eps=1.0e-6
         )
-        similarities = torch.matmul(goal_state, action_embedding.transpose(0, 1))
-        labels = torch.arange(batch_size, device=similarities.device)
-        positive_mask = torch.eye(
-            batch_size, dtype=torch.bool, device=similarities.device
+        all_goal_state, rank = _gather_with_grad(goal_state)
+        all_action_embedding, action_rank = _gather_with_grad(action_embedding)
+        if rank != action_rank:
+            raise RuntimeError("Distributed PGC alignment gather rank mismatch.")
+
+        candidate_count = int(all_action_embedding.shape[0])
+        if int(all_goal_state.shape[0]) != candidate_count:
+            raise RuntimeError(
+                "Distributed PGC alignment candidate count mismatch: "
+                f"{int(all_goal_state.shape[0])} vs {candidate_count}."
+            )
+        labels = rank * batch_size + torch.arange(
+            batch_size, device=goal_state.device
         )
+        similarities_ga = torch.matmul(
+            goal_state, all_action_embedding.transpose(0, 1)
+        )
+        similarities_ag = torch.matmul(
+            action_embedding, all_goal_state.transpose(0, 1)
+        )
+        positive_mask = torch.zeros_like(similarities_ga, dtype=torch.bool)
+        positive_mask.scatter_(1, labels[:, None], True)
         same_goal = torch.zeros_like(positive_mask)
         if group_ids is not None:
             if group_ids.shape != (batch_size,):
                 raise ValueError("PGC `group_ids` must be [B].")
-            group_ids = group_ids.to(device=similarities.device, dtype=torch.long)
-            same_goal = (group_ids[:, None] == group_ids[None, :]) & ~positive_mask
-        masked = similarities.masked_fill(
-            same_goal, torch.finfo(similarities.dtype).min
-        )
-        if batch_size > 1 and bool((~positive_mask & ~same_goal).any()):
+            group_ids = group_ids.to(device=goal_state.device, dtype=torch.long)
+            all_group_ids = _gather_without_grad(group_ids)
+            if int(all_group_ids.shape[0]) != candidate_count:
+                raise RuntimeError(
+                    "Distributed PGC alignment group count mismatch: "
+                    f"{int(all_group_ids.shape[0])} vs {candidate_count}."
+                )
+            same_goal = (
+                group_ids[:, None] == all_group_ids[None, :]
+            ) & ~positive_mask
+        mask_value = torch.finfo(similarities_ga.dtype).min
+        masked_ga = similarities_ga.masked_fill(same_goal, mask_value)
+        masked_ag = similarities_ag.masked_fill(same_goal, mask_value)
+        negative_mask = ~positive_mask & ~same_goal
+        if candidate_count > 1 and bool(negative_mask.any()):
             loss = 0.5 * (
-                F.cross_entropy(masked / self.temperature, labels)
-                + F.cross_entropy(masked.transpose(0, 1) / self.temperature, labels)
+                F.cross_entropy(masked_ga / self.temperature, labels)
+                + F.cross_entropy(masked_ag / self.temperature, labels)
             )
-            negative = similarities.masked_fill(
-                positive_mask | same_goal, -1.0
-            ).max(dim=1).values
+            negative_values = similarities_ga.masked_fill(~negative_mask, -1.0)
+            negative = negative_values.max(dim=1).values
+            negative = torch.where(
+                negative_mask.any(dim=1), negative, torch.zeros_like(negative)
+            )
         else:
+            # Keep a differentiable scalar for single-process smoke tests and
+            # batches where every gathered sample represents the same goal.
             loss = (goal_state.sum() + action_embedding.sum()) * 0.0
-            negative = similarities.new_zeros((batch_size,))
-        positive = similarities.diagonal()
+            negative = similarities_ga.new_zeros((batch_size,))
+        positive = similarities_ga.gather(1, labels[:, None]).squeeze(1)
+        denominator = max(1, batch_size * max(1, candidate_count - 1))
         return loss, {
             "pgc_goal_action_positive_similarity": positive.mean(),
             "pgc_goal_action_negative_similarity": negative.mean(),
             "pgc_goal_action_margin": (positive - negative).mean(),
             "pgc_goal_action_retrieval_acc": (
-                masked.argmax(dim=1) == labels
+                masked_ga.argmax(dim=1) == labels
             ).float().mean(),
+            "pgc_goal_action_candidate_count": similarities_ga.new_tensor(
+                float(candidate_count)
+            ),
+            "pgc_goal_action_effective_negative_count": (
+                negative_mask.sum(dim=1).float().mean()
+            ),
+            "pgc_goal_action_same_goal_negative_fraction": (
+                same_goal.float().sum() / denominator
+            ),
         }
 
 
