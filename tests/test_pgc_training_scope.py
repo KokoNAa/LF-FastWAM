@@ -41,6 +41,19 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         )
         self.assertIn("model.policy_guard.version=2", source)
 
+    def test_common_launcher_supports_explicit_weight_only_continuation(self):
+        source = (REPO_ROOT / "scripts/train_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PGC_INIT_CHECKPOINT", source)
+        self.assertIn("PGC_CONTINUE_FROM_STEP", source)
+        self.assertIn("fastwam_policy_guard_v2", source)
+        self.assertIn("PGC continuation step mismatch", source)
+        self.assertIn(
+            '"weight_only_start_step=${WEIGHT_ONLY_START_STEP}"',
+            source,
+        )
+
     def test_data_builder_can_be_restricted_to_one_suite(self):
         source = (REPO_ROOT / "scripts/build_pgc_libero_datasets.sh").read_text(
             encoding="utf-8"

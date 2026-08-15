@@ -8,6 +8,8 @@ TRAIN_SEED="${4:-42}"
 MAX_STEPS="${5:-4000}"
 TRAIN_SUITE="${PGC_TRAIN_SUITE:-all}"
 ALLOW_JOINT_TRAINING="${PGC_ALLOW_JOINT_TRAINING:-false}"
+INIT_CHECKPOINT="${PGC_INIT_CHECKPOINT:-${BASE_CHECKPOINT}}"
+CONTINUE_FROM_STEP="${PGC_CONTINUE_FROM_STEP:-}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-data/libero_mujoco3.3.2}"
@@ -49,6 +51,16 @@ for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY LORA_RAN
     exit 1
   fi
 done
+if [[ -n "${CONTINUE_FROM_STEP}" ]]; then
+  if ! [[ "${CONTINUE_FROM_STEP}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PGC_CONTINUE_FROM_STEP must be a positive integer when set." >&2
+    exit 1
+  fi
+  if (( CONTINUE_FROM_STEP >= MAX_STEPS )); then
+    echo "PGC continuation requires MAX_STEPS > PGC_CONTINUE_FROM_STEP; got ${MAX_STEPS} <= ${CONTINUE_FROM_STEP}." >&2
+    exit 1
+  fi
+fi
 case "${BALANCE_NATIVE_COUNTERFACTUAL}" in
   true|false) ;;
   *)
@@ -72,6 +84,10 @@ if not 0 <= dropout < 1:
 PY
 if [[ ! -f "${BASE_CHECKPOINT}" ]]; then
   echo "Base checkpoint not found: ${BASE_CHECKPOINT}" >&2
+  exit 1
+fi
+if [[ ! -f "${INIT_CHECKPOINT}" ]]; then
+  echo "PGC initialization checkpoint not found: ${INIT_CHECKPOINT}" >&2
   exit 1
 fi
 if [[ ! -f "${COUNTERFACTUAL_LIST}" ]]; then
@@ -182,6 +198,82 @@ if payload.get("format") in {
 print(f"Validated protected base: format={payload.get('format', 'legacy_full')} tensors={len(payload['mot'])}")
 PY
 
+WEIGHT_ONLY_START_STEP=null
+if [[ -n "${CONTINUE_FROM_STEP}" ]]; then
+  "${PYTHON_BIN}" - \
+    "${INIT_CHECKPOINT}" \
+    "${BASE_CHECKPOINT}" \
+    "${CONTINUE_FROM_STEP}" \
+    "${LORA_RANK}" \
+    "${LORA_ALPHA}" \
+    "${LORA_DROPOUT}" <<'PY'
+import math
+import sys
+from pathlib import Path
+
+import torch
+
+init_path = Path(sys.argv[1]).expanduser().resolve()
+base_path = Path(sys.argv[2]).expanduser().resolve()
+expected_step = int(sys.argv[3])
+expected_rank = int(sys.argv[4])
+expected_alpha = float(sys.argv[5])
+expected_dropout = float(sys.argv[6])
+payload = torch.load(init_path, map_location="cpu", weights_only=False)
+metadata = payload.get("architecture_metadata") or {}
+if payload.get("format") != "fastwam_policy_guard_v2":
+    raise SystemExit(
+        "PGC weight-only continuation requires a fastwam_policy_guard_v2 "
+        f"checkpoint, got {payload.get('format')!r}"
+    )
+if metadata.get("architecture") != "pgc_fastwam" or int(
+    metadata.get("policy_guard_version", -1)
+) != 2:
+    raise SystemExit("PGC continuation checkpoint has incompatible architecture metadata")
+if int(payload.get("step", -1)) != expected_step:
+    raise SystemExit(
+        "PGC continuation step mismatch: "
+        f"checkpoint={payload.get('step')} requested={expected_step}"
+    )
+recorded_base = Path(str(payload.get("base_checkpoint", ""))).expanduser()
+if not recorded_base.is_absolute():
+    recorded_base = init_path.parent / recorded_base
+recorded_base = recorded_base.resolve()
+if recorded_base != base_path:
+    raise SystemExit(
+        "PGC continuation base mismatch: "
+        f"checkpoint={recorded_base} requested={base_path}"
+    )
+lora = payload.get("counterfactual_lora_config") or {}
+if int(lora.get("rank", -1)) != expected_rank:
+    raise SystemExit(
+        f"PGC continuation LoRA rank mismatch: checkpoint={lora.get('rank')} "
+        f"requested={expected_rank}"
+    )
+for name, expected in (
+    ("alpha", expected_alpha),
+    ("dropout", expected_dropout),
+):
+    try:
+        actual = float(lora[name])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(f"PGC continuation checkpoint has invalid LoRA {name}") from exc
+    if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
+        raise SystemExit(
+            f"PGC continuation LoRA {name} mismatch: "
+            f"checkpoint={actual} requested={expected}"
+        )
+print(
+    "Validated PGC weight-only continuation: "
+    f"step={expected_step} base={base_path}"
+)
+PY
+  WEIGHT_ONLY_START_STEP="${CONTINUE_FROM_STEP}"
+elif [[ "$(cd -- "$(dirname -- "${INIT_CHECKPOINT}")" && pwd -P)/$(basename -- "${INIT_CHECKPOINT}")" != "$(cd -- "$(dirname -- "${BASE_CHECKPOINT}")" && pwd -P)/$(basename -- "${BASE_CHECKPOINT}")" ]]; then
+  echo "PGC_INIT_CHECKPOINT differs from BASE_CHECKPOINT but PGC_CONTINUE_FROM_STEP is unset." >&2
+  exit 1
+fi
+
 MISSING_CACHE_COUNT="$(${PYTHON_BIN} - "${NATIVE_JSON}" "${CF_JSON}" "${CACHE_DIR}" <<'PY'
 import hashlib
 import json
@@ -224,6 +316,7 @@ fi
 echo "[PGC-FastWAM] action-only LoRA training"
 echo "  training_scope=${TRAIN_SUITE}"
 echo "  protected_base=${BASE_CHECKPOINT}"
+echo "  initialization_checkpoint=${INIT_CHECKPOINT} weight_only_start_step=${WEIGHT_ONLY_START_STEP}"
 echo "  native_datasets=${NATIVE_JSON}"
 echo "  direct_counterfactual_datasets=${CF_JSON}"
 echo "  counterfactual_oversample=${OVERSAMPLE_FACTOR} balanced_1to1=${BALANCE_NATIVE_COUNTERFACTUAL}"
@@ -233,7 +326,8 @@ echo "  save_training_state=${SAVE_TRAINING_STATE}"
 
 RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   task=libero_pgc_2cam224 \
-  "resume=${BASE_CHECKPOINT}" \
+  "resume=${INIT_CHECKPOINT}" \
+  "weight_only_start_step=${WEIGHT_ONLY_START_STEP}" \
   "data.train.dataset_dirs=${NATIVE_JSON}" \
   "data.train.pgc_counterfactual_dataset_dirs=${CF_JSON}" \
   "data.train.pgc_counterfactual_oversample_factor=${OVERSAMPLE_FACTOR}" \

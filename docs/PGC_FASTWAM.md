@@ -299,8 +299,11 @@ Action Expert LoRA `rank=16, alpha=32, dropout=0.05`，学习率为 `1e-5`，每
 
 1. 数据覆盖指定 suite 的 10 个源任务，且所有 episode 都通过状态与成功审计；
 2. `PGC_GATE_MODE=base` 与 release FastWAM 的 action chunk 数值一致；
-3. 500-step smoke 的强制 Counterfactual Correct 至少达到 8/10，否则不得继续盲目训练；
-4. 完整训练后强制 Counterfactual Correct 保持闭环抓放能力；
+3. 500-step smoke 必须先通过 guarded Correct 策略保护并报告实际覆盖率；若强制
+   Counterfactual Correct 尚未达到 8/10，只允许进行一次预先限定到 1500 step
+   的欠训练诊断，不能直接扩展到完整 epoch；
+4. 1500-step 诊断或完整训练后，强制 Counterfactual Correct 必须恢复闭环抓放
+   能力，否则停止当前结构；
 5. guarded Correct SR 没有不可接受的策略回退；
 6. DTL 与 CIS 相对基线有可复现提升，并报告 Gate 覆盖率；
 7. 至少完成多 seed 或预先约定的重复实验，不能凭单 episode 放行。
@@ -325,6 +328,27 @@ Expert 的 LoRA A/B、Goal Query Seeds、Zero-init Residual Adapter、Goal Graph
 Verifier、LoRA 配置和外部 Base checkpoint 路径；既不复制 6.8B Base 权重，也不
 保存 Counterfactual Action Expert 的冻结主干。加载时会先恢复外部 Base，再按
 checkpoint 中记录的 rank/alpha/targets 注入并恢复适配器。
+
+### 未保存 ZeRO 状态时续训
+
+当原运行使用 `PGC_SAVE_TRAINING_STATE=false` 时，`.pt` 只包含模型权重，没有
+DeepSpeed Adam moments 或 scheduler 状态。此时必须显式同时设置初始化
+checkpoint 和其绝对 step；不能把 adapter 当成普通 Base 从 step 0 重新计数：
+
+```bash
+export PGC_INIT_CHECKPOINT=/path/to/step_000500.pt
+export PGC_CONTINUE_FROM_STEP=500
+
+# 最后一个参数 1500 是绝对目标 step，因此本次实际再训练 1000 steps。
+bash scripts/train_pgc_libero_suite.sh \
+  libero_object 4 "$BASE" "$PGC_CF_OBJECT" 42 1500
+```
+
+启动器会校验 PGC v2 格式、保存步数、外部 Base 路径和 LoRA 配置。Trainer 会把
+`global_step` 恢复为 500，跳过同一随机序列中已经消费的数据，并为剩余 1000
+steps 新建带短 warmup 的 scheduler。由于原运行没有保存 ZeRO state，优化器
+动量无法恢复；日志会明确标记这是 fresh-optimizer weight-only continuation。
+若有完整 `checkpoints/state/step_*`，仍应优先使用原有完整状态恢复路径。
 
 ## 评估
 

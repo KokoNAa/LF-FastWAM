@@ -19,6 +19,7 @@ from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
+from .training_progress import optimizer_step_to_sampler_position
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
@@ -49,6 +50,22 @@ class Wan22Trainer:
         self.save_training_state = bool(cfg.get("save_training_state", True))
         
         self.resume = cfg.resume
+        raw_weight_only_start_step = cfg.get("weight_only_start_step", None)
+        self.weight_only_start_step = (
+            None
+            if raw_weight_only_start_step in (None, "", "null")
+            else int(raw_weight_only_start_step)
+        )
+        if (
+            self.weight_only_start_step is not None
+            and self.weight_only_start_step < 0
+        ):
+            raise ValueError("`weight_only_start_step` must be non-negative.")
+        if self.weight_only_start_step is not None and not self.resume:
+            raise ValueError(
+                "`weight_only_start_step` requires a weight checkpoint in "
+                "`resume`."
+            )
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
         if self.mixed_precision not in {"no", "fp16", "bf16"}:
             raise ValueError(
@@ -184,10 +201,26 @@ class Wan22Trainer:
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
-        warmup_steps = int(total_train_steps * 0.05)
+        scheduler_train_steps = total_train_steps
+        if self.weight_only_start_step is not None:
+            if self.weight_only_start_step >= total_train_steps:
+                raise ValueError(
+                    "Weight-only continuation must end after its start: "
+                    f"start={self.weight_only_start_step}, "
+                    f"max_steps={total_train_steps}."
+                )
+            scheduler_train_steps -= self.weight_only_start_step
+            logger.info(
+                "Weight-only continuation schedule: absolute_step=%d->%d "
+                "fresh_optimizer_steps=%d.",
+                self.weight_only_start_step,
+                total_train_steps,
+                scheduler_train_steps,
+            )
+        warmup_steps = int(scheduler_train_steps * 0.05)
         self.scheduler = self._build_scheduler(
             scheduler_type=cfg.lr_scheduler_type,
-            total_train_steps=total_train_steps,
+            total_train_steps=scheduler_train_steps,
             warmup_steps=warmup_steps,
         )
         self.global_step = 0
@@ -383,15 +416,77 @@ class Wan22Trainer:
             return
         resume_path = Path(str(resume))
         if resume_path.is_dir():
+            if self.weight_only_start_step is not None:
+                raise ValueError(
+                    "`weight_only_start_step` is only valid for a weight "
+                    "checkpoint file, not a full training-state directory."
+                )
             logger.info("Resuming full training state from directory: %s", resume)
             self.load_training_state(str(resume_path))
             return
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
         logger.info("Loading weight checkpoint only: %s", resume)
-        self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
+        payload = self.accelerator.unwrap_model(self.model).load_checkpoint(
+            str(resume_path), optimizer=None
+        )
         self._sync_optimizer_recovery_parameter_groups()
-        logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
+        if self.weight_only_start_step is None:
+            logger.warning(
+                "Loaded .pt weights only; optimizer/scheduler/step were not "
+                "restored under ZeRO2."
+            )
+            return
+
+        saved_step = payload.get("step") if isinstance(payload, dict) else None
+        try:
+            saved_step = int(saved_step)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Weight-only continuation requires a checkpoint with an "
+                f"integer `step`, got {saved_step!r}."
+            ) from exc
+        if saved_step != self.weight_only_start_step:
+            raise ValueError(
+                "Weight-only continuation step mismatch: "
+                f"checkpoint={saved_step}, "
+                f"configured={self.weight_only_start_step}."
+            )
+        self._restore_weight_only_progress(saved_step)
+        logger.warning(
+            "Continued weights from absolute step=%d with a fresh optimizer "
+            "and a fresh remaining-segment scheduler; Adam moments were not "
+            "available under ZeRO2.",
+            saved_step,
+        )
+
+    def _restore_weight_only_progress(self, start_step: int) -> None:
+        """Restore absolute step and deterministic dataloader position."""
+        position = optimizer_step_to_sampler_position(
+            dataset_size=len(self.train_dataset),
+            batch_size=self.batch_size,
+            num_processes=self.accelerator.num_processes,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            optimizer_step=start_step,
+        )
+        self.global_step = int(start_step)
+        self.epoch = position["epoch"]
+        self.batch_in_epoch = position["batch_in_epoch"]
+        self.train_sampler.set_epoch_offset(self.epoch)
+        self.train_sampler.set_resume_batch_offset(self.batch_in_epoch)
+        logger.info(
+            "Restored weight-only progress: global_step=%d epoch=%d "
+            "optimizer_step_in_epoch=%d batch_in_epoch=%d sample_offset=%d "
+            "optimizer_steps_per_epoch=%d.",
+            self.global_step,
+            self.epoch,
+            position["optimizer_step_in_epoch"],
+            self.batch_in_epoch,
+            self.batch_in_epoch
+            * self.batch_size
+            * self.accelerator.num_processes,
+            position["optimizer_steps_per_epoch"],
+        )
 
     def _sync_optimizer_recovery_parameter_groups(self):
         """Initialize post-checkpoint learning-rate masks for recovery.

@@ -31,6 +31,10 @@ seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
+# Explicit absolute optimizer step for a weights-only continuation. This is
+# intentionally opt-in because ordinary adapter initialization must still
+# start a new run at step zero. Full Accelerate state resumes leave this null.
+weight_only_start_step: null
 
 # wandb
 wandb:
