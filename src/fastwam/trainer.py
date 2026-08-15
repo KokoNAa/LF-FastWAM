@@ -96,6 +96,20 @@ class Wan22Trainer:
                     "counterfactual LeRobot dataset. Set "
                     "`data.train.pgc_counterfactual_dataset_dirs`."
                 )
+            if int(getattr(self.model, "policy_guard_version", 1)) >= 2 and (
+                not bool(
+                    getattr(
+                        self.train_dataset,
+                        "pgc_balance_native_counterfactual",
+                        False,
+                    )
+                )
+            ):
+                raise ValueError(
+                    "PGC v2 requires explicit 1:1 native/counterfactual "
+                    "sampling. Set "
+                    "`data.train.pgc_balance_native_counterfactual=true`."
+                )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # In LoRA mode only adapters plus explicitly selected small modules are

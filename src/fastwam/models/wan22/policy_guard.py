@@ -227,6 +227,92 @@ class GoalGraphEncoder(nn.Module):
         return routed_queries, goal_embedding, metrics
 
 
+class GoalResidualAdapter(nn.Module):
+    """Inject goal information without replacing the pretrained visual path.
+
+    PGC v2 keeps the counterfactual Action Expert query-free, exactly like the
+    released FastWAM policy.  This adapter lets each action token attend to the
+    state-grounded goal queries and adds the resulting language residual to the
+    normal action-token stream.  The final projection is initialized to zero,
+    so a freshly constructed v2 branch is numerically identical to the frozen
+    base policy even though Goal Graph representations are already available.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        num_heads: int = 8,
+        residual_scale: float = 1.0,
+    ):
+        super().__init__()
+        if action_dim <= 0:
+            raise ValueError("`action_dim` must be positive.")
+        if num_heads <= 0 or action_dim % num_heads != 0:
+            raise ValueError(
+                f"PGC residual action_dim={action_dim} must divide "
+                f"num_heads={num_heads}."
+            )
+        if residual_scale < 0:
+            raise ValueError("`residual_scale` must be non-negative.")
+
+        self.action_dim = int(action_dim)
+        self.num_heads = int(num_heads)
+        self.residual_scale = float(residual_scale)
+        self.action_norm = nn.LayerNorm(action_dim)
+        self.goal_norm = nn.LayerNorm(action_dim)
+        self.goal_attention = nn.MultiheadAttention(
+            action_dim, num_heads, batch_first=True
+        )
+        self.output_projection = nn.Linear(action_dim, action_dim)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(
+        self,
+        action_tokens: torch.Tensor,
+        goal_queries: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if action_tokens.ndim != 3 or goal_queries.ndim != 3:
+            raise ValueError("PGC residual inputs must be [B,S,D] tensors.")
+        if action_tokens.shape[0] != goal_queries.shape[0]:
+            raise ValueError("PGC residual inputs must share a batch dimension.")
+        if action_tokens.shape[-1] != self.action_dim or (
+            goal_queries.shape[-1] != self.action_dim
+        ):
+            raise ValueError(
+                "PGC residual inputs do not match the configured action dimension."
+            )
+        if goal_queries.shape[1] <= 0:
+            raise ValueError("PGC residual requires at least one goal query.")
+
+        residual_hidden, attention = self.goal_attention(
+            query=self.action_norm(action_tokens),
+            key=self.goal_norm(goal_queries),
+            value=self.goal_norm(goal_queries),
+            need_weights=True,
+        )
+        residual = self.output_projection(residual_hidden)
+        applied_residual = residual * self.residual_scale
+        output = action_tokens + applied_residual
+
+        probabilities = attention.float().clamp_min(1.0e-8)
+        entropy = -(probabilities * probabilities.log()).sum(dim=-1)
+        entropy = entropy / math.log(max(2, probabilities.shape[-1]))
+        metrics = {
+            "pgc_goal_residual_hidden_norm": (
+                residual_hidden.float().norm(dim=-1).mean()
+            ),
+            "pgc_goal_residual_norm": (
+                applied_residual.float().norm(dim=-1).mean()
+            ),
+            "pgc_goal_residual_max_abs": applied_residual.float().abs().max(),
+            "pgc_goal_residual_attention_entropy": entropy.mean(),
+            "pgc_goal_residual_scale": output.new_tensor(self.residual_scale),
+        }
+        return output, metrics
+
+
 class ActionOutcomeVerifier(nn.Module):
     """Score action chunks against the current state and requested goal."""
 

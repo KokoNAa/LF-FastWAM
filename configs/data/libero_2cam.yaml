@@ -71,6 +71,9 @@ train:
   counterfactual_negative_probability: 0.0
   # PGC only: successful state-aligned demonstrations collected under the
   # alternate instruction. These directories are provenance-marked and may be
-  # oversampled without changing native LIBERO normalization statistics.
+  # balanced/oversampled without changing native normalization statistics.
   pgc_counterfactual_dataset_dirs: []
   pgc_counterfactual_oversample_factor: 1
+  # PGC v2 uses an exact native/counterfactual 1:1 index mix. Disabled for
+  # every non-PGC task and enabled by libero_pgc_2cam224.
+  pgc_balance_native_counterfactual: false

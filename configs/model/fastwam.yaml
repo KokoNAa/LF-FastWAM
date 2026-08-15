@@ -148,7 +148,7 @@ transition_contract:
 # to the immutable base action.
 policy_guard:
   enabled: false
-  version: 1
+  version: 2
   num_action_queries: 32
   query_rope_offset: 512
   num_goal_tokens: 4
@@ -157,6 +157,12 @@ policy_guard:
   num_heads: 8
   verifier_hidden_dim: 256
   counterfactual_action_weight: 1.0
+  # v2 anchors native samples to the frozen Base velocity at the same noisy
+  # action/timestep, while direct CF samples receive flow-matching supervision.
+  native_distillation_weight: 1.0
+  # Goal information is injected into the query-free/raw-visual Action Expert
+  # through a final-projection-zero residual adapter.
+  goal_residual_scale: 1.0
   verifier_weight: 0.25
   verifier_margin: 0.20
   verifier_action_mse_temperature: 0.25

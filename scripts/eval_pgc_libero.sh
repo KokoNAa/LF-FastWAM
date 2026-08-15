@@ -60,12 +60,12 @@ import torch
 
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
-if payload.get("format") != "fastwam_policy_guard_v1":
-    raise SystemExit("Evaluation requires a fastwam_policy_guard_v1 checkpoint")
+if payload.get("format") != "fastwam_policy_guard_v2":
+    raise SystemExit("Evaluation requires a fastwam_policy_guard_v2 checkpoint")
 if metadata.get("architecture") != "pgc_fastwam":
     raise SystemExit("Checkpoint is missing PGC architecture metadata")
-if int(metadata.get("policy_guard_version", -1)) != 1:
-    raise SystemExit("Only PGC version 1 is supported")
+if int(metadata.get("policy_guard_version", -1)) != 2:
+    raise SystemExit("Only PGC version 2 is supported by this launcher")
 if metadata.get("policy_protection") != "immutable_base_plus_conservative_hard_gate":
     raise SystemExit("Checkpoint does not declare the protected hard-gate path")
 if metadata.get("counterfactual_tuning") != "lora":
@@ -100,7 +100,7 @@ EXTRA_OVERRIDES=(
   "model.langforce_mvp.enable_posterior_advantage=false"
   "model.transition_contract.enabled=false"
   "model.policy_guard.enabled=true"
-  "model.policy_guard.version=1"
+  "model.policy_guard.version=2"
   "model.policy_guard.gate_mode=${GATE_MODE}"
   "model.policy_guard.gate_threshold=${GATE_THRESHOLD}"
   "model.policy_guard.min_counterfactual_score=${MIN_COUNTERFACTUAL_SCORE}"

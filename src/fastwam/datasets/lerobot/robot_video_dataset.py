@@ -26,6 +26,51 @@ logger = get_logger(__name__)
 
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
+
+def build_pgc_sample_indices(
+    *,
+    native_frame_count: int,
+    total_frame_count: int,
+    counterfactual_oversample_factor: int = 1,
+    balance_native_counterfactual: bool = False,
+) -> list[int]:
+    """Build deterministic native/CF indices with an optional exact 1:1 mix."""
+    native_frame_count = int(native_frame_count)
+    total_frame_count = int(total_frame_count)
+    counterfactual_oversample_factor = int(
+        counterfactual_oversample_factor
+    )
+    if not 0 <= native_frame_count <= total_frame_count:
+        raise ValueError("PGC native/total frame counts are inconsistent.")
+    if counterfactual_oversample_factor < 1:
+        raise ValueError("`counterfactual_oversample_factor` must be >= 1.")
+
+    native = list(range(native_frame_count))
+    counterfactual = list(range(native_frame_count, total_frame_count))
+    if not counterfactual:
+        return native
+    if not native:
+        raise ValueError("PGC counterfactual data requires native policy data.")
+    if balance_native_counterfactual:
+        if counterfactual_oversample_factor != 1:
+            raise ValueError(
+                "Exact PGC 1:1 balancing is mutually exclusive with a manual "
+                "counterfactual oversample factor."
+            )
+
+        target_count = max(len(native), len(counterfactual))
+
+        def _repeat_to(values: list[int], count: int) -> list[int]:
+            repeats = (count + len(values) - 1) // len(values)
+            return (values * repeats)[:count]
+
+        return _repeat_to(native, target_count) + _repeat_to(
+            counterfactual, target_count
+        )
+
+    return native + counterfactual * counterfactual_oversample_factor
+
+
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -50,6 +95,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         counterfactual_negative_probability: float = 0.0,
         pgc_counterfactual_dataset_dirs: Optional[list[str]] = None,
         pgc_counterfactual_oversample_factor: int = 1,
+        pgc_balance_native_counterfactual: bool = False,
     ):
         native_dataset_dirs = [str(path) for path in dataset_dirs]
         pgc_counterfactual_dataset_dirs = [
@@ -73,6 +119,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.pgc_has_counterfactual_data = bool(
             self.pgc_counterfactual_dataset_dirs
         )
+        self.pgc_balance_native_counterfactual = bool(
+            pgc_balance_native_counterfactual
+        )
         combined_dataset_dirs = (
             native_dataset_dirs + self.pgc_counterfactual_dataset_dirs
         )
@@ -91,13 +140,31 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             for dataset in underlying[: self.pgc_native_dataset_count]
         )
         total_frame_count = sum(int(dataset.num_frames) for dataset in underlying)
-        self._sample_indices = list(range(total_frame_count))
+        self._sample_indices = build_pgc_sample_indices(
+            native_frame_count=self.pgc_native_frame_count,
+            total_frame_count=total_frame_count,
+            counterfactual_oversample_factor=(
+                self.pgc_counterfactual_oversample_factor
+            ),
+            balance_native_counterfactual=(
+                self.pgc_balance_native_counterfactual
+            ),
+        )
+        self.pgc_effective_native_sample_count = sum(
+            int(index < self.pgc_native_frame_count)
+            for index in self._sample_indices
+        )
+        self.pgc_effective_counterfactual_sample_count = (
+            len(self._sample_indices)
+            - self.pgc_effective_native_sample_count
+        )
         if self.pgc_has_counterfactual_data:
-            counterfactual_indices = list(
-                range(self.pgc_native_frame_count, total_frame_count)
+            logger.info(
+                "PGC sampling: native=%d counterfactual=%d balanced=%s",
+                self.pgc_effective_native_sample_count,
+                self.pgc_effective_counterfactual_sample_count,
+                self.pgc_balance_native_counterfactual,
             )
-            for _ in range(self.pgc_counterfactual_oversample_factor - 1):
-                self._sample_indices.extend(counterfactual_indices)
     
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio

@@ -23,6 +23,7 @@ from .policy_guard import (
     ActionOutcomeVerifier,
     GoalActionAlignmentLoss,
     GoalGraphEncoder,
+    GoalResidualAdapter,
     detached_policy_guard_metrics,
 )
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -591,9 +592,15 @@ class FastWAM(torch.nn.Module):
 
         guard_config = dict(policy_guard_config or {})
         self.policy_guard_enabled = bool(guard_config.get("enabled", False))
-        self.policy_guard_version = int(guard_config.get("version", 1))
+        self.policy_guard_version = int(guard_config.get("version", 2))
         self.policy_guard_action_weight = float(
             guard_config.get("counterfactual_action_weight", 1.0)
+        )
+        self.policy_guard_native_distillation_weight = float(
+            guard_config.get("native_distillation_weight", 1.0)
+        )
+        self.policy_guard_goal_residual_scale = float(
+            guard_config.get("goal_residual_scale", 1.0)
         )
         self.policy_guard_verifier_weight = float(
             guard_config.get("verifier_weight", 0.25)
@@ -626,8 +633,10 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_legacy_full_loaded = False
 
         if self.policy_guard_enabled:
-            if self.policy_guard_version != 1:
-                raise ValueError("The current PGC implementation supports version=1.")
+            if self.policy_guard_version not in {1, 2}:
+                raise ValueError(
+                    "The current PGC implementation supports version=1 or 2."
+                )
             if self.langforce_mvp_enabled or self.transition_contract_enabled:
                 raise ValueError(
                     "PGC is an independent policy-protection mainline; disable "
@@ -643,6 +652,8 @@ class FastWAM(torch.nn.Module):
                 )
             if min(
                 self.policy_guard_action_weight,
+                self.policy_guard_native_distillation_weight,
+                self.policy_guard_goal_residual_scale,
                 self.policy_guard_verifier_weight,
                 self.policy_guard_alignment_weight,
                 self.policy_guard_verifier_margin,
@@ -673,34 +684,47 @@ class FastWAM(torch.nn.Module):
             query_rope_offset = int(
                 guard_config.get("query_rope_offset", 512)
             )
+            self.policy_guard_num_action_queries = num_action_queries
+            self.policy_guard_query_rope_offset = query_rope_offset
             if num_action_queries <= 0 or query_rope_offset < 0:
                 raise ValueError("PGC action-query count/offset are invalid.")
-            if query_rope_offset + num_action_queries > int(
-                self.action_expert.freqs.shape[0]
+            if self.policy_guard_version == 1 and (
+                query_rope_offset + num_action_queries
+                > int(self.action_expert.freqs.shape[0])
             ):
-                raise ValueError("PGC action queries exceed the ActionDiT RoPE cache.")
+                raise ValueError(
+                    "PGC action queries exceed the ActionDiT RoPE cache."
+                )
 
             # This is a physically independent Action Expert.  Only its common
             # backbone is initialized from the base; the base module itself is
             # never put in the optimizer or mutated by PGC training.
             counterfactual_action_expert = copy.deepcopy(self.action_expert)
-            counterfactual_action_expert.use_latent_action_queries = True
-            counterfactual_action_expert.num_latent_queries = num_action_queries
-            counterfactual_action_expert.query_rope_offset = query_rope_offset
-            reference_parameter = next(counterfactual_action_expert.parameters())
-            counterfactual_action_expert.register_parameter(
-                "latent_action_queries",
-                nn.Parameter(
-                    torch.randn(
-                        1,
-                        num_action_queries,
-                        int(counterfactual_action_expert.hidden_dim),
-                        device=reference_parameter.device,
-                        dtype=reference_parameter.dtype,
-                    )
-                    / math.sqrt(int(counterfactual_action_expert.hidden_dim))
-                ),
-            )
+            if self.policy_guard_version == 1:
+                counterfactual_action_expert.use_latent_action_queries = True
+                counterfactual_action_expert.num_latent_queries = num_action_queries
+                counterfactual_action_expert.query_rope_offset = query_rope_offset
+                reference_parameter = next(
+                    counterfactual_action_expert.parameters()
+                )
+                counterfactual_action_expert.register_parameter(
+                    "latent_action_queries",
+                    nn.Parameter(
+                        torch.randn(
+                            1,
+                            num_action_queries,
+                            int(counterfactual_action_expert.hidden_dim),
+                            device=reference_parameter.device,
+                            dtype=reference_parameter.dtype,
+                        )
+                        / math.sqrt(int(counterfactual_action_expert.hidden_dim))
+                    ),
+                )
+            else:
+                # PGC v2 preserves the released query-free Action Expert
+                # interface. Goal tokens are injected by a strictly zero-init
+                # residual adapter, so the untrained branch equals Base.
+                counterfactual_action_expert.use_latent_action_queries = False
             self.policy_guard_action_expert = counterfactual_action_expert
 
             hidden_dim = int(guard_config.get("hidden_dim", 512))
@@ -729,6 +753,34 @@ class FastWAM(torch.nn.Module):
                     ),
                 }
             )
+            if self.policy_guard_version >= 2:
+                goal_query_seeds = nn.Embedding(
+                    num_action_queries,
+                    int(counterfactual_action_expert.hidden_dim),
+                )
+                nn.init.normal_(
+                    goal_query_seeds.weight,
+                    std=(
+                        1.0
+                        / math.sqrt(
+                            int(counterfactual_action_expert.hidden_dim)
+                        )
+                    ),
+                )
+                self.policy_guard_modules.update(
+                    {
+                        "goal_query_seeds": goal_query_seeds,
+                        "goal_residual_adapter": GoalResidualAdapter(
+                            action_dim=int(
+                                counterfactual_action_expert.hidden_dim
+                            ),
+                            num_heads=int(guard_config.get("num_heads", 8)),
+                            residual_scale=(
+                                self.policy_guard_goal_residual_scale
+                            ),
+                        ),
+                    }
+                )
             self.policy_guard_modules.to(dtype=self.torch_dtype)
             self.policy_guard_alignment_loss = GoalActionAlignmentLoss(
                 temperature=float(
@@ -807,8 +859,12 @@ class FastWAM(torch.nn.Module):
             if normalized["extra_trainable_patterns"]:
                 raise ValueError(
                     "PGC does not accept `lora.extra_trainable_patterns`; its "
-                    "only trainable Action-Expert tensors are LoRA A/B and "
-                    "`latent_action_queries`."
+                    "only trainable Action-Expert tensors are LoRA A/B"
+                    + (
+                        " and `latent_action_queries`."
+                        if self.policy_guard_version == 1
+                        else "."
+                    )
                 )
         if not normalized["enabled"]:
             if self.lora_enabled:
@@ -904,7 +960,10 @@ class FastWAM(torch.nn.Module):
         return {
             id(parameter)
             for name, parameter in self.policy_guard_action_expert.named_parameters()
-            if name == "latent_action_queries"
+            if (
+                self.policy_guard_version == 1
+                and name == "latent_action_queries"
+            )
             or is_lora_parameter_name(name)
         }
 
@@ -1299,9 +1358,17 @@ class FastWAM(torch.nn.Module):
         )
         if current_token_count <= 0:
             raise ValueError("PGC requires at least one current visual token.")
-        base_queries = self.policy_guard_action_expert.transition_queries.expand(
-            final_video_hidden.shape[0], -1, -1
-        )
+        if self.policy_guard_version >= 2:
+            seed_module = self.policy_guard_modules["goal_query_seeds"]
+            base_queries = seed_module.weight.unsqueeze(0).expand(
+                final_video_hidden.shape[0], -1, -1
+            )
+        else:
+            base_queries = (
+                self.policy_guard_action_expert.transition_queries.expand(
+                    final_video_hidden.shape[0], -1, -1
+                )
+            )
         return self.policy_guard_modules["goal_graph"](
             base_queries=base_queries,
             language_hidden=context,
@@ -1315,11 +1382,30 @@ class FastWAM(torch.nn.Module):
         action_tokens: torch.Tensor,
         timestep: torch.Tensor,
         context: torch.Tensor,
+        full_context_mask: torch.Tensor,
         state_only_context_mask: torch.Tensor,
         routed_goal_queries: torch.Tensor,
     ) -> dict[str, Any]:
         if not self.policy_guard_enabled or self.policy_guard_action_expert is None:
             raise RuntimeError("PGC action preparation requires an initialized branch.")
+        if self.policy_guard_version >= 2:
+            action_pre = self.policy_guard_action_expert.pre_dit(
+                action_tokens=action_tokens,
+                timestep=timestep,
+                context=context,
+                context_mask=full_context_mask,
+                use_queries=False,
+            )
+            residual_tokens, residual_metrics = self.policy_guard_modules[
+                "goal_residual_adapter"
+            ](
+                action_pre["tokens"],
+                routed_goal_queries,
+            )
+            action_pre["tokens"] = residual_tokens
+            action_pre["policy_guard_residual_metrics"] = residual_metrics
+            return action_pre
+
         num_queries = int(self.policy_guard_action_expert.num_latent_queries)
         query_context_mask = state_only_context_mask[:, None, :].expand(
             -1, num_queries, -1
@@ -1344,28 +1430,32 @@ class FastWAM(torch.nn.Module):
         action_tokens: torch.Tensor,
         timestep_action: torch.Tensor,
         context: torch.Tensor,
+        full_context_mask: torch.Tensor,
         state_only_context_mask: torch.Tensor,
         video_kv_cache: list[dict[str, torch.Tensor]],
         video_seq_len: int,
         video_tokens_per_frame: int,
         routed_goal_queries: torch.Tensor,
-    ) -> torch.Tensor:
+        return_metrics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.policy_guard_action_expert is None:
             raise RuntimeError("PGC Action Expert is unavailable.")
         action_pre = self._prepare_policy_guard_action_tokens(
             action_tokens=action_tokens,
             timestep=timestep_action,
             context=context,
+            full_context_mask=full_context_mask,
             state_only_context_mask=state_only_context_mask,
             routed_goal_queries=routed_goal_queries,
         )
+        num_queries = int(action_pre["meta"]["num_queries"])
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,
             action_seq_len=int(action_pre["tokens"].shape[1]),
             video_tokens_per_frame=video_tokens_per_frame,
             device=action_pre["tokens"].device,
-            num_queries=int(action_pre["meta"]["num_queries"]),
-            action_reads_raw_video=False,
+            num_queries=num_queries,
+            action_reads_raw_video=(self.policy_guard_version >= 2),
             queries_read_raw_video=False,
         )
         output_tokens = self.mot.forward_action_with_video_cache(
@@ -1381,7 +1471,14 @@ class FastWAM(torch.nn.Module):
             video_seq_len=video_seq_len,
             action_expert=self.policy_guard_action_expert,
         )
-        return self.policy_guard_action_expert.post_dit(output_tokens, action_pre)
+        output = self.policy_guard_action_expert.post_dit(
+            output_tokens, action_pre
+        )
+        if return_metrics:
+            return output, dict(
+                action_pre.get("policy_guard_residual_metrics", {})
+            )
+        return output
 
     def _policy_guard_clean_action_from_velocity(
         self,
@@ -1405,6 +1502,75 @@ class FastWAM(torch.nn.Module):
         if not bool(valid_mask.any()):
             result = values.sum() * 0.0
         return result
+
+    def _compute_policy_guard_v2_action_losses(
+        self,
+        *,
+        predicted_action: torch.Tensor,
+        base_action_teacher: torch.Tensor,
+        target_action: torch.Tensor,
+        action_weight: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+        is_counterfactual: torch.Tensor,
+        direct_action_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Separate native policy anchoring from counterfactual supervision."""
+        if self.policy_guard_version < 2:
+            raise RuntimeError("PGC v2 action losses require version >= 2.")
+        is_counterfactual = is_counterfactual.to(
+            device=predicted_action.device, dtype=torch.bool
+        )
+        direct_action_valid = direct_action_valid.to(
+            device=predicted_action.device, dtype=torch.bool
+        )
+        if is_counterfactual.shape != direct_action_valid.shape or (
+            is_counterfactual.ndim != 1
+        ):
+            raise ValueError("PGC v2 sample masks must share [B] shape.")
+        if action_weight.shape != is_counterfactual.shape:
+            raise ValueError("PGC v2 action weights must have [B] shape.")
+
+        native_valid = direct_action_valid & ~is_counterfactual
+        counterfactual_valid = direct_action_valid & is_counterfactual
+        flow_error = self._compute_action_loss_per_sample(
+            pred_action=predicted_action,
+            target_action=target_action,
+            action_is_pad=action_is_pad,
+        )
+        distillation_error = self._compute_action_loss_per_sample(
+            pred_action=predicted_action,
+            target_action=base_action_teacher.detach(),
+            action_is_pad=action_is_pad,
+        )
+        counterfactual_action_loss = self._masked_policy_guard_mean(
+            flow_error * action_weight,
+            counterfactual_valid,
+        )
+        native_distillation_loss = self._masked_policy_guard_mean(
+            distillation_error * action_weight,
+            native_valid,
+        )
+        metrics = {
+            "pgc_native_fraction": (~is_counterfactual).float().mean(),
+            "pgc_counterfactual_fraction": is_counterfactual.float().mean(),
+            "pgc_native_valid_fraction": native_valid.float().mean(),
+            "pgc_counterfactual_valid_fraction": (
+                counterfactual_valid.float().mean()
+            ),
+            "pgc_native_student_teacher_mse": (
+                self._masked_policy_guard_mean(
+                    distillation_error,
+                    native_valid,
+                ).detach()
+            ),
+            "pgc_counterfactual_flow_mse": (
+                self._masked_policy_guard_mean(
+                    flow_error,
+                    counterfactual_valid,
+                ).detach()
+            ),
+        }
+        return counterfactual_action_loss, native_distillation_loss, metrics
 
     def _compute_policy_guard_verifier_loss(
         self,
@@ -1494,9 +1660,16 @@ class FastWAM(torch.nn.Module):
         ranking_valid = counterfactual_valid & (
             counterfactual_target > base_target
         )
+        base_score = torch.sigmoid(base_logits)
+        counterfactual_score = torch.sigmoid(counterfactual_logits)
+        ranking_margin = (
+            counterfactual_score - base_score
+            if self.policy_guard_version >= 2
+            else counterfactual_logits - base_logits
+        )
         ranking = torch.relu(
             self.policy_guard_verifier_margin
-            - (counterfactual_logits - base_logits)
+            - ranking_margin
         )
         loss_ranking = self._masked_policy_guard_mean(
             ranking, ranking_valid
@@ -1514,8 +1687,6 @@ class FastWAM(torch.nn.Module):
             demonstrated_embedding,
             group_ids=goal_ids,
         )
-        base_score = torch.sigmoid(base_logits)
-        counterfactual_score = torch.sigmoid(counterfactual_logits)
         predicted_override = (
             (counterfactual_score >= self.policy_guard_min_counterfactual_score)
             & (
@@ -1544,6 +1715,9 @@ class FastWAM(torch.nn.Module):
             "pgc_direct_counterfactual_fraction": is_counterfactual.float().mean(),
             "pgc_direct_action_valid_fraction": valid.float().mean(),
             "pgc_verifier_ranking_valid_fraction": ranking_valid.float().mean(),
+            "pgc_verifier_probability_margin_training": (
+                base_score.new_tensor(float(self.policy_guard_version >= 2))
+            ),
             "pgc_predicted_override_rate": predicted_override.float().mean(),
             "pgc_predicted_override_rate_on_counterfactual": (
                 self._masked_policy_guard_mean(
@@ -3081,10 +3255,14 @@ class FastWAM(torch.nn.Module):
             policy_guard_current_video_hidden = base_tokens_out["video"][:, : int(
                 video_pre["meta"]["tokens_per_frame"]
             )].detach()
-            pred_action_post = self._forward_policy_guard_action_from_cache(
+            (
+                pred_action_post,
+                policy_guard_residual_metrics,
+            ) = self._forward_policy_guard_action_from_cache(
                 action_tokens=noisy_action,
                 timestep_action=timestep_action,
                 context=context,
+                full_context_mask=full_context_mask,
                 state_only_context_mask=state_only_context_mask,
                 video_kv_cache=video_kv_cache,
                 video_seq_len=int(video_tokens.shape[1]),
@@ -3092,7 +3270,9 @@ class FastWAM(torch.nn.Module):
                     video_pre["meta"]["tokens_per_frame"]
                 ),
                 routed_goal_queries=routed_goal_queries,
+                return_metrics=True,
             )
+            policy_guard_metrics.update(policy_guard_residual_metrics)
         else:
             action_pre = self._prepare_action_tokens(
                 action_tokens=noisy_action,
@@ -3223,20 +3403,52 @@ class FastWAM(torch.nn.Module):
                     goal_ids=inputs["pgc_goal_id"],
                 )
             )
+            policy_action_metrics: dict[str, torch.Tensor] = {}
+            if self.policy_guard_version >= 2:
+                (
+                    counterfactual_action_loss,
+                    native_distillation_loss,
+                    policy_action_metrics,
+                ) = self._compute_policy_guard_v2_action_losses(
+                    predicted_action=pred_action_post,
+                    base_action_teacher=pred_action_base,
+                    target_action=target_action,
+                    action_weight=action_weight,
+                    action_is_pad=action_is_pad,
+                    is_counterfactual=inputs["pgc_is_counterfactual"],
+                    direct_action_valid=inputs["pgc_direct_action_valid"],
+                )
+                policy_action_objective = (
+                    self.policy_guard_action_weight
+                    * counterfactual_action_loss
+                    + self.policy_guard_native_distillation_weight
+                    * native_distillation_loss
+                )
+            else:
+                counterfactual_action_loss = loss_action_post
+                native_distillation_loss = loss_action_post.detach() * 0.0
+                policy_action_objective = (
+                    self.policy_guard_action_weight * loss_action_post
+                )
             loss_total = (
-                self.policy_guard_action_weight * loss_action_post
+                policy_action_objective
                 + self.policy_guard_verifier_weight * verifier_loss
                 + self.policy_guard_alignment_weight * alignment_loss
             )
             loss_dict.update(
                 {
                     "loss_action": float(
-                        (
-                            self.policy_guard_action_weight
-                            * loss_action_post.detach()
-                        ).item()
+                        policy_action_objective.detach().item()
                     ),
-                    "loss_pgc_action": float(loss_action_post.detach().item()),
+                    "loss_pgc_action": float(
+                        counterfactual_action_loss.detach().item()
+                    ),
+                    "loss_pgc_all_action_monitor": float(
+                        loss_action_post.detach().item()
+                    ),
+                    "loss_pgc_native_policy_distillation": float(
+                        native_distillation_loss.detach().item()
+                    ),
                     "loss_pgc_base_action_monitor": float(
                         loss_action_base.detach().item()
                     ),
@@ -3246,6 +3458,9 @@ class FastWAM(torch.nn.Module):
                     ),
                     "pgc_action_effective_weight": float(
                         self.policy_guard_action_weight
+                    ),
+                    "pgc_native_distillation_effective_weight": float(
+                        self.policy_guard_native_distillation_weight
                     ),
                     "pgc_verifier_effective_weight": float(
                         self.policy_guard_verifier_weight
@@ -3259,6 +3474,7 @@ class FastWAM(torch.nn.Module):
             )
             loss_dict.update(detached_policy_guard_metrics(policy_guard_metrics))
             loss_dict.update(detached_policy_guard_metrics(verifier_metrics))
+            loss_dict.update(detached_policy_guard_metrics(policy_action_metrics))
 
         if self.transition_contract_enabled:
             if self.transition_policy_distillation_enabled:
@@ -4413,6 +4629,7 @@ class FastWAM(torch.nn.Module):
                         action_tokens=policy_guard_latents_action,
                         timestep_action=timestep_action,
                         context=context,
+                        full_context_mask=context_mask,
                         state_only_context_mask=state_only_context_mask,
                         video_kv_cache=video_kv_cache,
                         video_seq_len=video_seq_len,
@@ -4653,22 +4870,46 @@ class FastWAM(torch.nn.Module):
     def _policy_guard_metadata(self) -> dict[str, Any]:
         if not self.policy_guard_enabled or self.policy_guard_action_expert is None:
             raise RuntimeError("PGC metadata requested while policy guard is disabled.")
+        is_v2 = self.policy_guard_version >= 2
         return {
             "architecture": "pgc_fastwam",
             "policy_guard_version": self.policy_guard_version,
             "base_policy": "frozen_released_fastwam",
             "base_action_interface": "query_free_joint_mot",
-            "counterfactual_policy": "independent_action_expert_lora",
+            "counterfactual_policy": (
+                "base_equivalent_visual_residual_action_expert_lora"
+                if is_v2
+                else "independent_action_expert_lora"
+            ),
             "counterfactual_tuning": "lora",
+            "counterfactual_action_interface": (
+                "query_free_raw_current_visual"
+                if is_v2
+                else "latent_query_goal_bottleneck"
+            ),
+            "goal_injection": (
+                "zero_initialized_action_token_residual"
+                if is_v2
+                else "latent_action_query_replacement"
+            ),
+            "native_policy_teacher": (
+                "frozen_base_velocity_same_noise_timestep"
+                if is_v2
+                else None
+            ),
+            "native_distillation_weight": (
+                self.policy_guard_native_distillation_weight
+            ),
+            "goal_residual_scale": self.policy_guard_goal_residual_scale,
             "lora_rank": int(self.lora_config["rank"]),
             "lora_alpha": float(self.lora_config["alpha"]),
             "lora_dropout": float(self.lora_config["dropout"]),
             "lora_target_modules": list(self.lora_config["target_modules"]),
-            "num_action_queries": int(
-                self.policy_guard_action_expert.num_latent_queries
-            ),
-            "query_rope_offset": int(
-                self.policy_guard_action_expert.query_rope_offset
+            "num_action_queries": int(self.policy_guard_num_action_queries),
+            "query_rope_offset": (
+                int(self.policy_guard_query_rope_offset)
+                if not is_v2
+                else None
             ),
             "goal_graph_tokens": int(
                 self.policy_guard_modules["goal_graph"].num_goal_tokens
@@ -4686,6 +4927,7 @@ class FastWAM(torch.nn.Module):
             ),
             "policy_protection": "immutable_base_plus_conservative_hard_gate",
             "representation_supervision": "direct_goal_action_alignment",
+            "verifier_margin_space": "probability" if is_v2 else "logit",
         }
 
     @staticmethod
@@ -4759,7 +5001,7 @@ class FastWAM(torch.nn.Module):
             if not action_adapter:
                 raise ValueError("PGC checkpoint has no Action-Expert adapter tensors.")
             payload = {
-                "format": "fastwam_policy_guard_v1",
+                "format": f"fastwam_policy_guard_v{self.policy_guard_version}",
                 "base_checkpoint": self.policy_guard_base_checkpoint,
                 "counterfactual_action_adapter": action_adapter,
                 "counterfactual_lora_config": dict(self.lora_config),
@@ -5025,13 +5267,20 @@ class FastWAM(torch.nn.Module):
                 "`policy_guard` model config before loading it."
             )
         metadata = payload.get("architecture_metadata") or {}
-        if int(metadata.get("policy_guard_version", -1)) != int(
-            self.policy_guard_version
-        ):
+        saved_policy_guard_version = int(
+            metadata.get("policy_guard_version", -1)
+        )
+        if saved_policy_guard_version != int(self.policy_guard_version):
             raise ValueError(
                 "PGC checkpoint version mismatch: "
                 f"checkpoint={metadata.get('policy_guard_version')}, "
                 f"model={self.policy_guard_version}."
+            )
+        expected_format = f"fastwam_policy_guard_v{saved_policy_guard_version}"
+        if payload.get("format") != expected_format:
+            raise ValueError(
+                "PGC checkpoint format/version mismatch: "
+                f"format={payload.get('format')!r}, expected={expected_format!r}."
             )
         base_checkpoint = payload.get("base_checkpoint")
         if not base_checkpoint:
@@ -5059,7 +5308,10 @@ class FastWAM(torch.nn.Module):
             )
 
         base_payload = self.load_checkpoint(resolved_base, optimizer=None)
-        if base_payload.get("format") == "fastwam_policy_guard_v1":
+        if base_payload.get("format") in {
+            "fastwam_policy_guard_v1",
+            "fastwam_policy_guard_v2",
+        }:
             raise ValueError("Nested PGC checkpoints are not supported as bases.")
 
         guard_state = payload.get("policy_guard")
@@ -5145,7 +5397,10 @@ class FastWAM(torch.nn.Module):
 
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
-        if payload.get("format") == "fastwam_policy_guard_v1":
+        if payload.get("format") in {
+            "fastwam_policy_guard_v1",
+            "fastwam_policy_guard_v2",
+        }:
             return self._load_policy_guard_checkpoint(
                 str(path), payload, optimizer=optimizer
             )

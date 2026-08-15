@@ -13,14 +13,15 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-data/libero_mujoco3.3.2}"
 STATS_PATH="${STATS_PATH:-${DIFFSYNTH_MODEL_BASE_PATH:-./checkpoints}/fastwam_release/libero_uncond_2cam224_dataset_stats.json}"
 CACHE_DIR="${TEXT_CACHE_DIR:-data/text_embeds_cache/libero}"
-OVERSAMPLE_FACTOR="${PGC_COUNTERFACTUAL_OVERSAMPLE_FACTOR:-2}"
+OVERSAMPLE_FACTOR="${PGC_COUNTERFACTUAL_OVERSAMPLE_FACTOR:-1}"
+BALANCE_NATIVE_COUNTERFACTUAL="${PGC_BALANCE_NATIVE_COUNTERFACTUAL:-true}"
 LEARNING_RATE="${PGC_LEARNING_RATE:-1.0e-5}"
 SAVE_EVERY="${PGC_SAVE_EVERY:-500}"
 SAVE_TRAINING_STATE="${PGC_SAVE_TRAINING_STATE:-false}"
 LORA_RANK="${PGC_LORA_RANK:-16}"
 LORA_ALPHA="${PGC_LORA_ALPHA:-32}"
 LORA_DROPOUT="${PGC_LORA_DROPOUT:-0.05}"
-RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-action-lora-r${LORA_RANK}-${MAX_STEPS}-seed${TRAIN_SEED}-v1}"
+RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-visual-residual-lora-r${LORA_RANK}-${MAX_STEPS}-seed${TRAIN_SEED}-v2}"
 
 ALL_SUITES=(libero_spatial libero_object libero_goal libero_10)
 case "${TRAIN_SUITE}" in
@@ -48,6 +49,17 @@ for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY LORA_RAN
     exit 1
   fi
 done
+case "${BALANCE_NATIVE_COUNTERFACTUAL}" in
+  true|false) ;;
+  *)
+    echo "PGC_BALANCE_NATIVE_COUNTERFACTUAL must be true or false." >&2
+    exit 1
+    ;;
+esac
+if [[ "${BALANCE_NATIVE_COUNTERFACTUAL}" == "true" && "${OVERSAMPLE_FACTOR}" != "1" ]]; then
+  echo "PGC v2 exact 1:1 balancing requires PGC_COUNTERFACTUAL_OVERSAMPLE_FACTOR=1." >&2
+  exit 1
+fi
 "${PYTHON_BIN}" - "${LORA_ALPHA}" "${LORA_DROPOUT}" <<'PY'
 import sys
 
@@ -161,7 +173,11 @@ import torch
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 if "mot" not in payload:
     raise SystemExit("PGC must initialize from a full released FastWAM checkpoint with `mot` weights")
-if payload.get("format") in {"fastwam_lora_adapter_v1", "fastwam_policy_guard_v1"}:
+if payload.get("format") in {
+    "fastwam_lora_adapter_v1",
+    "fastwam_policy_guard_v1",
+    "fastwam_policy_guard_v2",
+}:
     raise SystemExit("PGC base must be the immutable full FastWAM release, not an adapter")
 print(f"Validated protected base: format={payload.get('format', 'legacy_full')} tensors={len(payload['mot'])}")
 PY
@@ -210,7 +226,7 @@ echo "  training_scope=${TRAIN_SUITE}"
 echo "  protected_base=${BASE_CHECKPOINT}"
 echo "  native_datasets=${NATIVE_JSON}"
 echo "  direct_counterfactual_datasets=${CF_JSON}"
-echo "  counterfactual_oversample=${OVERSAMPLE_FACTOR}"
+echo "  counterfactual_oversample=${OVERSAMPLE_FACTOR} balanced_1to1=${BALANCE_NATIVE_COUNTERFACTUAL}"
 echo "  seed=${TRAIN_SEED} max_steps=${MAX_STEPS} lr=${LEARNING_RATE}"
 echo "  lora=action-only rank=${LORA_RANK} alpha=${LORA_ALPHA} dropout=${LORA_DROPOUT}"
 echo "  save_training_state=${SAVE_TRAINING_STATE}"
@@ -221,6 +237,7 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "data.train.dataset_dirs=${NATIVE_JSON}" \
   "data.train.pgc_counterfactual_dataset_dirs=${CF_JSON}" \
   "data.train.pgc_counterfactual_oversample_factor=${OVERSAMPLE_FACTOR}" \
+  "data.train.pgc_balance_native_counterfactual=${BALANCE_NATIVE_COUNTERFACTUAL}" \
   "++data.train.pretrained_norm_stats=${STATS_PATH}" \
   "data.train.text_embedding_cache_dir=${CACHE_DIR}" \
   "seed=${TRAIN_SEED}" \
@@ -235,7 +252,7 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   model.langforce_mvp.enable_posterior_advantage=false \
   model.transition_contract.enabled=false \
   model.policy_guard.enabled=true \
-  model.policy_guard.version=1 \
+  model.policy_guard.version=2 \
   model.policy_guard.require_direct_counterfactual_actions=true \
   model.lora.enabled=true \
   "model.lora.rank=${LORA_RANK}" \

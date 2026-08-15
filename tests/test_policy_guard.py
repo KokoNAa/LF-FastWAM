@@ -13,6 +13,7 @@ from fastwam.models.wan22.policy_guard import (
     ActionOutcomeVerifier,
     GoalActionAlignmentLoss,
     GoalGraphEncoder,
+    GoalResidualAdapter,
 )
 from fastwam.models.wan22.wan_video_dit import WanVideoDiT
 
@@ -26,7 +27,9 @@ class TinyVAE(nn.Module):
         self.anchor = nn.Parameter(torch.zeros(()), requires_grad=False)
 
 
-def tiny_pgc_fastwam(*, configure_lora: bool = True) -> FastWAM:
+def tiny_pgc_fastwam(
+    *, configure_lora: bool = True, version: int = 2
+) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
         in_dim=2,
@@ -75,7 +78,7 @@ def tiny_pgc_fastwam(*, configure_lora: bool = True) -> FastWAM:
         transition_contract_config={"enabled": False},
         policy_guard_config={
             "enabled": True,
-            "version": 1,
+            "version": version,
             "num_action_queries": 2,
             "query_rope_offset": 16,
             "num_goal_tokens": 3,
@@ -84,6 +87,8 @@ def tiny_pgc_fastwam(*, configure_lora: bool = True) -> FastWAM:
             "num_heads": 2,
             "verifier_hidden_dim": 8,
             "counterfactual_action_weight": 1.0,
+            "native_distillation_weight": 1.0,
+            "goal_residual_scale": 1.0,
             "verifier_weight": 0.25,
             "goal_action_alignment_weight": 0.1,
             "verifier_margin": 0.2,
@@ -127,6 +132,18 @@ class PolicyGuardModuleTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(routed).all())
         self.assertTrue(torch.isfinite(goal).all())
         self.assertIn("pgc_query_pairwise_cosine", metrics)
+
+    def test_goal_residual_is_exactly_zero_initialized(self):
+        adapter = GoalResidualAdapter(
+            action_dim=12,
+            num_heads=2,
+            residual_scale=1.0,
+        )
+        action = torch.randn(2, 4, 12)
+        output, metrics = adapter(action, torch.randn(2, 3, 12))
+        self.assertTrue(torch.equal(output, action))
+        self.assertEqual(float(metrics["pgc_goal_residual_norm"]), 0.0)
+        self.assertEqual(float(metrics["pgc_goal_residual_max_abs"]), 0.0)
 
     def test_verifier_and_alignment_shapes(self):
         verifier = ActionOutcomeVerifier(
@@ -234,11 +251,13 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
         self.assertTrue(action_trainable)
         self.assertTrue(
             all(
-                name == "latent_action_queries"
-                or name.endswith(".lora_A")
+                name.endswith(".lora_A")
                 or name.endswith(".lora_B")
                 for name in action_trainable
             )
+        )
+        self.assertFalse(
+            self.model.policy_guard_action_expert.use_latent_action_queries
         )
         self.assertFalse(any(p.requires_grad for p in self.model.mot.parameters()))
         self.assertFalse(self.model.mot.training)
@@ -330,6 +349,7 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
             action_tokens=torch.randn(batch_size, 4, 3),
             timestep_action=torch.tensor([0.3, 0.7]),
             context=context,
+            full_context_mask=context_mask,
             state_only_context_mask=state_only,
             video_kv_cache=video_cache,
             video_seq_len=5,
@@ -345,6 +365,112 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
             )
         )
         self.assertFalse(any(p.grad is not None for p in self.model.mot.parameters()))
+
+    def test_v2_counterfactual_branch_starts_equal_to_base(self):
+        self.model.eval()
+        batch_size = 2
+        video_seq_len = 5
+        action_horizon = 4
+        context = torch.randn(batch_size, 4, 10)
+        full_context_mask = torch.ones(batch_size, 4, dtype=torch.bool)
+        state_only_context_mask = torch.zeros_like(full_context_mask)
+        current_video = torch.randn(batch_size, video_seq_len, 16)
+        routed, _, _ = self.model._encode_policy_guard_goal(
+            final_video_hidden=current_video,
+            video_tokens_per_frame=video_seq_len,
+            context=context,
+            context_mask=full_context_mask,
+        )
+        video_cache = [
+            {
+                "k": torch.randn(batch_size, video_seq_len, 8),
+                "v": torch.randn(batch_size, video_seq_len, 8),
+            }
+            for _ in range(2)
+        ]
+        noisy_action = torch.randn(batch_size, action_horizon, 3)
+        timestep = torch.tensor([0.3, 0.7])
+        base_pre = self.model.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep,
+            context=context,
+            context_mask=full_context_mask,
+            use_queries=False,
+        )
+        attention_mask = self.model._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=action_horizon,
+            video_tokens_per_frame=video_seq_len,
+            device=noisy_action.device,
+            num_queries=0,
+            action_reads_raw_video=True,
+        )
+        base_hidden = self.model.mot.forward_action_with_video_cache(
+            action_tokens=base_pre["tokens"],
+            action_freqs=base_pre["freqs"],
+            action_t_mod=base_pre["t_mod"],
+            action_context_payload={
+                "context": base_pre["context"],
+                "mask": base_pre["context_mask"],
+            },
+            video_kv_cache=video_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        base_output = self.model.action_expert.post_dit(
+            base_hidden, base_pre
+        )
+        counterfactual_output = (
+            self.model._forward_policy_guard_action_from_cache(
+                action_tokens=noisy_action,
+                timestep_action=timestep,
+                context=context,
+                full_context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
+                video_kv_cache=video_cache,
+                video_seq_len=video_seq_len,
+                video_tokens_per_frame=video_seq_len,
+                routed_goal_queries=routed,
+            )
+        )
+        self.assertTrue(torch.equal(counterfactual_output, base_output))
+
+    def test_v2_native_distillation_and_cf_action_masks_are_disjoint(self):
+        predicted = torch.tensor(
+            [
+                [[2.0, 0.0, 0.0]],
+                [[3.0, 0.0, 0.0]],
+            ]
+        )
+        teacher = torch.tensor(
+            [
+                [[1.0, 0.0, 0.0]],
+                [[100.0, 0.0, 0.0]],
+            ]
+        )
+        target = torch.tensor(
+            [
+                [[100.0, 0.0, 0.0]],
+                [[1.0, 0.0, 0.0]],
+            ]
+        )
+        cf_loss, native_loss, metrics = (
+            self.model._compute_policy_guard_v2_action_losses(
+                predicted_action=predicted,
+                base_action_teacher=teacher,
+                target_action=target,
+                action_weight=torch.ones(2),
+                action_is_pad=None,
+                is_counterfactual=torch.tensor([False, True]),
+                direct_action_valid=torch.tensor([True, True]),
+            )
+        )
+        self.assertAlmostEqual(float(native_loss), 1.0 / 3.0, places=6)
+        self.assertAlmostEqual(float(cf_loss), 4.0 / 3.0, places=6)
+        self.assertAlmostEqual(float(metrics["pgc_native_fraction"]), 0.5)
+        self.assertAlmostEqual(
+            float(metrics["pgc_counterfactual_fraction"]), 0.5
+        )
 
     def test_conservative_gate_preserves_base_exactly(self):
         base = torch.randn(2, 4, 3)
@@ -380,7 +506,6 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
             self.model.load_checkpoint(base_path)
             with torch.no_grad():
                 next(self.model.policy_guard_modules.parameters()).add_(0.25)
-                self.model.policy_guard_action_expert.latent_action_queries.add_(0.5)
                 for name, parameter in (
                     self.model.policy_guard_action_expert.named_parameters()
                 ):
@@ -397,7 +522,7 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
             self.model.save_checkpoint(pgc_path, step=17)
 
             payload = torch.load(pgc_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["format"], "fastwam_policy_guard_v1")
+            self.assertEqual(payload["format"], "fastwam_policy_guard_v2")
             self.assertEqual(payload["step"], 17)
             self.assertNotIn("mot", payload)
             self.assertNotIn("counterfactual_action_expert", payload)
@@ -405,11 +530,20 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
             self.assertIn("counterfactual_lora_config", payload)
             self.assertTrue(
                 all(
-                    name == "latent_action_queries"
-                    or name.endswith(".lora_A")
+                    name.endswith(".lora_A")
                     or name.endswith(".lora_B")
                     for name in payload["counterfactual_action_adapter"]
                 )
+            )
+            self.assertEqual(
+                payload["architecture_metadata"]["policy_guard_version"],
+                2,
+            )
+            self.assertEqual(
+                payload["architecture_metadata"][
+                    "counterfactual_action_interface"
+                ],
+                "query_free_raw_current_visual",
             )
             self.assertEqual(
                 payload["architecture_metadata"]["policy_protection"],
@@ -436,6 +570,45 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 restored.policy_guard_base_checkpoint,
                 str(base_path.resolve()),
+            )
+
+    def test_v1_checkpoint_remains_loadable_for_legacy_evaluation(self):
+        legacy = tiny_pgc_fastwam(version=1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.pt"
+            pgc_path = Path(tmpdir) / "pgc_v1.pt"
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": legacy.mot.state_dict()},
+                base_path,
+            )
+            legacy.load_checkpoint(base_path)
+            with torch.no_grad():
+                legacy.policy_guard_action_expert.latent_action_queries.add_(
+                    0.5
+                )
+            expected_queries = (
+                legacy.policy_guard_action_expert.latent_action_queries
+                .detach()
+                .clone()
+            )
+            legacy.save_checkpoint(pgc_path, step=9)
+
+            payload = torch.load(
+                pgc_path, map_location="cpu", weights_only=False
+            )
+            self.assertEqual(payload["format"], "fastwam_policy_guard_v1")
+            self.assertIn(
+                "latent_action_queries",
+                payload["counterfactual_action_adapter"],
+            )
+
+            restored = tiny_pgc_fastwam(version=1)
+            restored.load_checkpoint(pgc_path)
+            self.assertTrue(
+                torch.equal(
+                    restored.policy_guard_action_expert.latent_action_queries,
+                    expected_queries,
+                )
             )
 
 

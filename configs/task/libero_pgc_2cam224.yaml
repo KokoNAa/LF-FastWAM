@@ -29,7 +29,7 @@ model:
     enabled: false
   policy_guard:
     enabled: true
-    version: 1
+    version: 2
   lora:
     enabled: true
     rank: 16
@@ -42,7 +42,8 @@ data:
   train:
     pretrained_norm_stats: ./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json
     pgc_counterfactual_dataset_dirs: []
-    pgc_counterfactual_oversample_factor: 2
+    pgc_counterfactual_oversample_factor: 1
+    pgc_balance_native_counterfactual: true
     counterfactual_manifest_path: null
     counterfactual_negative_probability: 0.0
 
