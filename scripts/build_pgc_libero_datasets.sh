@@ -13,8 +13,23 @@ PLAN_ONLY="${PGC_PLAN_ONLY:-false}"
 RESUME="${PGC_RESUME:-false}"
 ALLOW_PARTIAL="${PGC_ALLOW_PARTIAL:-false}"
 RELAXED_SCENE_MATCH="${PGC_RELAXED_SCENE_MATCH:-false}"
+BUILD_SUITE="${PGC_BUILD_SUITE:-all}"
 MANIFEST_ROOT="${OUTPUT_ROOT}/manifests"
 LOG_ROOT="${OUTPUT_ROOT}/logs"
+
+ALL_SUITES=(libero_spatial libero_object libero_goal libero_10)
+case "${BUILD_SUITE}" in
+  libero_spatial|libero_object|libero_goal|libero_10)
+    suites=("${BUILD_SUITE}")
+    ;;
+  all)
+    suites=("${ALL_SUITES[@]}")
+    ;;
+  *)
+    echo "PGC_BUILD_SUITE must be one of: ${ALL_SUITES[*]}, all; got ${BUILD_SUITE}." >&2
+    exit 1
+    ;;
+esac
 
 if [[ ! -d "${DEMO_ROOT}" ]]; then
   echo "LIBERO HDF5 demonstration root not found: ${DEMO_ROOT}" >&2
@@ -28,6 +43,9 @@ fi
 mkdir -p "${MANIFEST_ROOT}" "${LOG_ROOT}"
 
 manifest_args=(--output-dir "${MANIFEST_ROOT}")
+for suite in "${suites[@]}"; do
+  manifest_args+=(--source-suite "${suite}")
+done
 if [[ "${ALLOW_PARTIAL}" == "true" ]]; then
   manifest_args+=(--allow-incomplete)
 fi
@@ -36,7 +54,6 @@ if [[ "${RELAXED_SCENE_MATCH}" == "true" ]]; then
 fi
 "${PYTHON_BIN}" scripts/prepare_pgc_libero_manifests.py "${manifest_args[@]}"
 
-suites=(libero_spatial libero_object libero_goal libero_10)
 pids=()
 
 for index in "${!suites[@]}"; do
@@ -89,23 +106,26 @@ if [[ "${failed}" -ne 0 ]]; then
   exit 1
 fi
 if [[ "${PLAN_ONLY}" == "true" ]]; then
-  echo "PGC four-suite plan validation passed."
+  echo "PGC ${BUILD_SUITE} plan validation passed."
   exit 0
 fi
 
-DATASET_LIST="${OUTPUT_ROOT}/pgc_counterfactual_datasets.txt"
+if [[ "${BUILD_SUITE}" == "all" ]]; then
+  DATASET_LIST="${OUTPUT_ROOT}/pgc_counterfactual_datasets.txt"
+else
+  DATASET_LIST="${OUTPUT_ROOT}/pgc_counterfactual_datasets.${BUILD_SUITE}.txt"
+fi
 : >"${DATASET_LIST}"
 for suite in "${suites[@]}"; do
   printf '%s\n' "${OUTPUT_ROOT}/${suite}_pgc_counterfactual_lerobot" \
     >>"${DATASET_LIST}"
 done
 
+validator_args=(--list "${DATASET_LIST}" --require-complete-task-coverage)
+for suite in "${suites[@]}"; do
+  validator_args+=(--require-suite "${suite}")
+done
 "${PYTHON_BIN}" scripts/validate_pgc_counterfactual_datasets.py \
-  --list "${DATASET_LIST}" \
-  --require-suite libero_spatial \
-  --require-suite libero_object \
-  --require-suite libero_goal \
-  --require-suite libero_10 \
-  --require-complete-task-coverage
+  "${validator_args[@]}"
 
-echo "PGC four-suite datasets complete: ${DATASET_LIST}"
+echo "PGC ${BUILD_SUITE} dataset(s) complete: ${DATASET_LIST}"

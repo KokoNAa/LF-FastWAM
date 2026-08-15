@@ -161,6 +161,31 @@ nohup env \
 echo $! > /root/gpufree-data/pgc_libero_data_build.pid
 ```
 
+分 suite 验证阶段只构建一个 suite。Object 使用下面的单卡命令，不会启动其他
+三个 suite：
+
+```bash
+cd /root/gpufree-data/LF-FastWAM
+
+nohup env \
+  PGC_BUILD_SUITE=libero_object \
+  PGC_VIDEO_CODEC=h264 \
+  PGC_MAX_DEMOS_PER_PAIR=50 \
+  bash scripts/build_pgc_libero_datasets.sh \
+    "$PGC_HDF5_ROOT" \
+    "$PGC_DATA_ROOT" \
+    5 \
+    42 \
+  > /root/gpufree-data/pgc_object_data_build.log 2>&1 &
+
+echo $! > /root/gpufree-data/pgc_object_data_build.pid
+```
+
+完成后只生成
+`pgc_counterfactual_datasets.libero_object.txt`，并强制检查 Object 的 10 个源
+任务。`PGC_BUILD_SUITE` 同样接受 `libero_spatial`、`libero_goal` 和
+`libero_10`；省略时才构建全部四个 suite。
+
 监控：
 
 ```bash

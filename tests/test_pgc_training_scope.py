@@ -35,6 +35,17 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("outside training scope", source)
         self.assertIn("Counterfactual scope mismatch", source)
 
+    def test_data_builder_can_be_restricted_to_one_suite(self):
+        source = (REPO_ROOT / "scripts/build_pgc_libero_datasets.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PGC_BUILD_SUITE:-all", source)
+        self.assertIn('suites=("${BUILD_SUITE}")', source)
+        self.assertIn('--source-suite "${suite}"', source)
+        self.assertIn(
+            'pgc_counterfactual_datasets.${BUILD_SUITE}.txt', source
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
