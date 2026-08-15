@@ -412,15 +412,15 @@ class Wan22Trainer:
                 router_parameter_entries += len(parameters)
             else:
                 policy_parameter_entries += len(parameters)
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if not bool(getattr(unwrapped, "transition_contract_enabled", False)):
+            return
         logger.info(
             "Initialized TC recovery optimizer groups: policy_tensors=%d "
             "router_tensors=%d.",
             policy_parameter_entries,
             router_parameter_entries,
         )
-        unwrapped = self.accelerator.unwrap_model(self.model)
-        if not bool(getattr(unwrapped, "transition_contract_enabled", False)):
-            return
         freeze_m1_policy = bool(
             getattr(unwrapped, "transition_freeze_m1_policy", False)
         )

@@ -1527,8 +1527,25 @@ class FastWAM(torch.nn.Module):
             is_counterfactual.ndim != 1
         ):
             raise ValueError("PGC v2 sample masks must share [B] shape.")
-        if action_weight.shape != is_counterfactual.shape:
-            raise ValueError("PGC v2 action weights must have [B] shape.")
+        batch_size = int(is_counterfactual.shape[0])
+        # The scheduler deliberately returns a scalar for a one-sample local
+        # micro-batch. Other scheduler implementations may retain singleton
+        # dimensions. Normalize either representation to one weight/sample
+        # before combining it with the provenance masks.
+        if action_weight.ndim == 0:
+            action_weight = action_weight.expand(batch_size)
+        elif action_weight.numel() == batch_size:
+            action_weight = action_weight.reshape(batch_size)
+        else:
+            raise ValueError(
+                "PGC v2 action weights must contain exactly one value per "
+                f"sample, got shape {tuple(action_weight.shape)} for "
+                f"batch size {batch_size}."
+            )
+        action_weight = action_weight.to(
+            device=predicted_action.device,
+            dtype=torch.float32,
+        )
 
         native_valid = direct_action_valid & ~is_counterfactual
         counterfactual_valid = direct_action_valid & is_counterfactual

@@ -459,7 +459,7 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
                 predicted_action=predicted,
                 base_action_teacher=teacher,
                 target_action=target,
-                action_weight=torch.ones(2),
+                action_weight=torch.ones(2, 1, 1),
                 action_is_pad=None,
                 is_counterfactual=torch.tensor([False, True]),
                 direct_action_valid=torch.tensor([True, True]),
@@ -471,6 +471,22 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
         self.assertAlmostEqual(
             float(metrics["pgc_counterfactual_fraction"]), 0.5
         )
+
+    def test_v2_batch_one_accepts_scalar_scheduler_weight(self):
+        cf_loss, native_loss, metrics = (
+            self.model._compute_policy_guard_v2_action_losses(
+                predicted_action=torch.tensor([[[2.0, 0.0, 0.0]]]),
+                base_action_teacher=torch.tensor([[[1.0, 0.0, 0.0]]]),
+                target_action=torch.tensor([[[100.0, 0.0, 0.0]]]),
+                action_weight=torch.tensor(2.0),
+                action_is_pad=None,
+                is_counterfactual=torch.tensor([False]),
+                direct_action_valid=torch.tensor([True]),
+            )
+        )
+        self.assertEqual(float(cf_loss), 0.0)
+        self.assertAlmostEqual(float(native_loss), 2.0 / 3.0, places=6)
+        self.assertEqual(float(metrics["pgc_native_fraction"]), 1.0)
 
     def test_conservative_gate_preserves_base_exactly(self):
         base = torch.randn(2, 4, 3)
