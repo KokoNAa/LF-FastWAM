@@ -7,12 +7,14 @@ PGC（Policy-Guarded Counterfactual FastWAM）用于在不破坏原始 FastWAM �
 PGC 包含两条物理隔离的动作路径：
 
 1. **Base Policy**：官方 query-free FastWAM Video Expert + Action Expert。加载 release checkpoint 后全部冻结，不进入优化器。
-2. **Counterfactual Policy**：从 Base Action Expert 初始化的一份独立、完整 Action Expert。该分支可以全量微调，并由 Goal Graph Queries 驱动。
+2. **Counterfactual Policy**：从 Base Action Expert 初始化的一份独立 Action Expert。它的主干永久冻结，只训练该分支自己的 action-only LoRA 与 32 个 latent Action Queries，并由 Goal Graph Queries 驱动；不会在 Base Policy 上注入 LoRA。
 3. **Goal Graph Encoder**：少量 goal slots 先读取语言，再读取当前帧视觉 token，产生状态相关的目标表示和 Action Query。它不使用 task-ID prototype，也不能读取未来帧。
 4. **Action–Outcome Verifier**：在当前状态和目标表示下分别给 Base/Counterfactual action chunk 打分。
 5. **Conservative Hard Gate**：只有当反事实候选分数达到绝对阈值，且比 Base 高出安全 margin 时才覆盖；否则逐元素原样返回 Base action。
 
-`policy_guard.enabled=false` 时不会构建或执行 PGC 路径，旧 FastWAM/TC/LangForce 行为保持不变。PGC v1 与 TC、LangForce、Base LoRA 互斥。
+`policy_guard.enabled=false` 时不会构建或执行 PGC 路径，旧 FastWAM/TC/LangForce 行为保持不变。PGC v1 与 TC、LangForce、Base LoRA 互斥；这里的 LoRA 只属于物理隔离的 Counterfactual Action Expert。
+
+训练优化器的严格白名单是：Counterfactual Action Expert 的 `lora_A`、`lora_B`、`latent_action_queries`，以及 Goal Graph 和 Verifier。Base Video/Action Expert 与 Counterfactual Action Expert 的原始 backbone weight/bias 都设置为 `requires_grad=false`；代码会拒绝未启用 LoRA 的 PGC 训练，避免误触发全量微调。
 
 ## 监督信号
 
@@ -266,9 +268,11 @@ bash scripts/train_pgc_libero_suite.sh libero_10      4 "$BASE" /path/to/pgc/lib
 
 `train_pgc_libero_suite.sh` 会同时把原始数据和直接反事实数据限制到指定 suite，
 并检查 `meta/pgc_provenance.json`。任何跨 suite 数据都会在创建训练进程前报错。
-默认对 Counterfactual 数据做 2 倍采样，学习率为 `1e-5`，每卡 micro-batch 为
-1、梯度累积为 4（四卡有效 batch 16），每 500 steps 保存权重。默认不保存
-DeepSpeed state，以避免磁盘空间不足导致最后一步保存失败。
+默认对 Counterfactual 数据做 2 倍采样，使用 Action Expert LoRA
+`rank=16, alpha=32, dropout=0.05`，学习率为 `1e-5`，每卡 micro-batch 为 1、
+梯度累积为 4（四卡有效 batch 16），每 500 steps 保存权重。可通过
+`PGC_LORA_RANK`、`PGC_LORA_ALPHA`、`PGC_LORA_DROPOUT` 修改适配器参数。默认
+不保存 DeepSpeed state，以避免磁盘空间不足导致最后一步保存失败。
 
 每条线必须依次通过以下门控，才进入下一条：
 
@@ -293,7 +297,11 @@ bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.
 bash scripts/validate_pgc_server.sh
 ```
 
-输出 checkpoint 格式为 `fastwam_policy_guard_v1`，只保存独立 Action Expert、Goal Graph、Verifier 和外部 Base checkpoint 路径，不复制 6.8B Base 权重。
+输出 checkpoint 格式为 `fastwam_policy_guard_v1`，只保存 Counterfactual Action
+Expert 的 LoRA A/B 与 latent Action Queries、Goal Graph、Verifier、LoRA 配置和
+外部 Base checkpoint 路径；既不复制 6.8B Base 权重，也不保存 Counterfactual
+Action Expert 的冻结主干。加载时会先恢复外部 Base，再按 checkpoint 中记录的
+rank/alpha/targets 注入并恢复适配器。
 
 ## 评估
 

@@ -68,6 +68,8 @@ if int(metadata.get("policy_guard_version", -1)) != 1:
     raise SystemExit("Only PGC version 1 is supported")
 if metadata.get("policy_protection") != "immutable_base_plus_conservative_hard_gate":
     raise SystemExit("Checkpoint does not declare the protected hard-gate path")
+if metadata.get("counterfactual_tuning") != "lora":
+    raise SystemExit("Evaluation requires a PGC action-only LoRA checkpoint")
 print(f"Validated PGC checkpoint: step={payload.get('step')} base={payload.get('base_checkpoint')}")
 PY
 
@@ -102,6 +104,8 @@ EXTRA_OVERRIDES=(
   "model.policy_guard.gate_mode=${GATE_MODE}"
   "model.policy_guard.gate_threshold=${GATE_THRESHOLD}"
   "model.policy_guard.min_counterfactual_score=${MIN_COUNTERFACTUAL_SCORE}"
+  # Keep construction adapter-free; checkpoint loading injects its exact saved
+  # rank/alpha/targets before restoring the lightweight PGC adapter.
   "model.lora.enabled=false"
 )
 if [[ -n "${MANIFEST_PATH}" ]]; then

@@ -25,7 +25,7 @@ class TinyVAE(nn.Module):
         self.anchor = nn.Parameter(torch.zeros(()), requires_grad=False)
 
 
-def tiny_pgc_fastwam() -> FastWAM:
+def tiny_pgc_fastwam(*, configure_lora: bool = True) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
         in_dim=2,
@@ -62,7 +62,7 @@ def tiny_pgc_fastwam() -> FastWAM:
         mixtures={"video": video, "action": action},
         mot_checkpoint_mixed_attn=False,
     )
-    return FastWAM(
+    model = FastWAM(
         video_expert=video,
         action_expert=action,
         mot=mot,
@@ -90,6 +90,18 @@ def tiny_pgc_fastwam() -> FastWAM:
             "min_counterfactual_score": 0.6,
         },
     )
+    if configure_lora:
+        model.configure_lora(
+            {
+                "enabled": True,
+                "rank": 2,
+                "alpha": 4,
+                "dropout": 0.0,
+                "experts": ["action"],
+                "extra_trainable_patterns": [],
+            }
+        )
+    return model
 
 
 class PolicyGuardModuleTest(unittest.TestCase):
@@ -159,6 +171,20 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
                 for name in trainable
             )
         )
+        action_trainable = {
+            name.removeprefix("policy_guard_action_expert.")
+            for name in trainable
+            if name.startswith("policy_guard_action_expert.")
+        }
+        self.assertTrue(action_trainable)
+        self.assertTrue(
+            all(
+                name == "latent_action_queries"
+                or name.endswith(".lora_A")
+                or name.endswith(".lora_B")
+                for name in action_trainable
+            )
+        )
         self.assertFalse(any(p.requires_grad for p in self.model.mot.parameters()))
         self.assertFalse(self.model.mot.training)
         self.assertTrue(self.model.policy_guard_action_expert.training)
@@ -169,6 +195,11 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
         before = {
             name: value.detach().clone()
             for name, value in self.model.mot.state_dict().items()
+        }
+        frozen_counterfactual = {
+            name: parameter.detach().clone()
+            for name, parameter in self.model.policy_guard_action_expert.named_parameters()
+            if not parameter.requires_grad
         }
         optimizer = torch.optim.AdamW(
             [
@@ -186,6 +217,35 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
         optimizer.step()
         for name, expected in before.items():
             self.assertTrue(torch.equal(self.model.mot.state_dict()[name], expected))
+        for name, expected in frozen_counterfactual.items():
+            actual = dict(
+                self.model.policy_guard_action_expert.named_parameters()
+            )[name]
+            self.assertTrue(torch.equal(actual, expected), name)
+
+    def test_pgc_refuses_full_action_expert_training(self):
+        model = tiny_pgc_fastwam(configure_lora=False)
+        with self.assertRaisesRegex(ValueError, "full Action-Expert fine-tuning"):
+            model.prepare_trainable_parameters()
+
+    def test_pgc_refuses_video_or_extra_lora_targets(self):
+        model = tiny_pgc_fastwam(configure_lora=False)
+        with self.assertRaisesRegex(ValueError, "target only"):
+            model.configure_lora(
+                {
+                    "enabled": True,
+                    "experts": ["video", "action"],
+                    "extra_trainable_patterns": [],
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "does not accept"):
+            model.configure_lora(
+                {
+                    "enabled": True,
+                    "experts": ["action"],
+                    "extra_trainable_patterns": ["action_expert.head.*"],
+                }
+            )
 
     def test_counterfactual_action_forward_has_gradients(self):
         self.model.prepare_trainable_parameters()
@@ -265,7 +325,12 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
             self.model.load_checkpoint(base_path)
             with torch.no_grad():
                 next(self.model.policy_guard_modules.parameters()).add_(0.25)
-                next(self.model.policy_guard_action_expert.parameters()).add_(0.5)
+                self.model.policy_guard_action_expert.latent_action_queries.add_(0.5)
+                for name, parameter in (
+                    self.model.policy_guard_action_expert.named_parameters()
+                ):
+                    if name.endswith(".lora_B"):
+                        parameter.add_(0.25)
             expected_guard = {
                 key: value.detach().clone()
                 for key, value in self.model.policy_guard_modules.state_dict().items()
@@ -280,9 +345,24 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
             self.assertEqual(payload["format"], "fastwam_policy_guard_v1")
             self.assertEqual(payload["step"], 17)
             self.assertNotIn("mot", payload)
+            self.assertNotIn("counterfactual_action_expert", payload)
+            self.assertIn("counterfactual_action_adapter", payload)
+            self.assertIn("counterfactual_lora_config", payload)
+            self.assertTrue(
+                all(
+                    name == "latent_action_queries"
+                    or name.endswith(".lora_A")
+                    or name.endswith(".lora_B")
+                    for name in payload["counterfactual_action_adapter"]
+                )
+            )
             self.assertEqual(
                 payload["architecture_metadata"]["policy_protection"],
                 "immutable_base_plus_conservative_hard_gate",
+            )
+            self.assertEqual(
+                payload["architecture_metadata"]["counterfactual_tuning"],
+                "lora",
             )
 
             restored = tiny_pgc_fastwam()
@@ -298,7 +378,10 @@ class PolicyGuardIntegrationTest(unittest.TestCase):
                         expected,
                     )
                 )
-            self.assertEqual(restored.policy_guard_base_checkpoint, str(base_path))
+            self.assertEqual(
+                restored.policy_guard_base_checkpoint,
+                str(base_path.resolve()),
+            )
 
 
 if __name__ == "__main__":

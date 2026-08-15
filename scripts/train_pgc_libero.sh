@@ -17,7 +17,10 @@ OVERSAMPLE_FACTOR="${PGC_COUNTERFACTUAL_OVERSAMPLE_FACTOR:-2}"
 LEARNING_RATE="${PGC_LEARNING_RATE:-1.0e-5}"
 SAVE_EVERY="${PGC_SAVE_EVERY:-500}"
 SAVE_TRAINING_STATE="${PGC_SAVE_TRAINING_STATE:-false}"
-RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-full-action-${MAX_STEPS}-seed${TRAIN_SEED}-v1}"
+LORA_RANK="${PGC_LORA_RANK:-16}"
+LORA_ALPHA="${PGC_LORA_ALPHA:-32}"
+LORA_DROPOUT="${PGC_LORA_DROPOUT:-0.05}"
+RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-action-lora-r${LORA_RANK}-${MAX_STEPS}-seed${TRAIN_SEED}-v1}"
 
 ALL_SUITES=(libero_spatial libero_object libero_goal libero_10)
 case "${TRAIN_SUITE}" in
@@ -38,13 +41,23 @@ case "${TRAIN_SUITE}" in
     ;;
 esac
 
-for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY; do
+for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY LORA_RANK; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${value_name} must be a positive integer, got ${value}." >&2
     exit 1
   fi
 done
+"${PYTHON_BIN}" - "${LORA_ALPHA}" "${LORA_DROPOUT}" <<'PY'
+import sys
+
+alpha = float(sys.argv[1])
+dropout = float(sys.argv[2])
+if alpha <= 0:
+    raise SystemExit(f"PGC_LORA_ALPHA must be positive, got {alpha}")
+if not 0 <= dropout < 1:
+    raise SystemExit(f"PGC_LORA_DROPOUT must be in [0, 1), got {dropout}")
+PY
 if [[ ! -f "${BASE_CHECKPOINT}" ]]; then
   echo "Base checkpoint not found: ${BASE_CHECKPOINT}" >&2
   exit 1
@@ -192,13 +205,14 @@ if (( VISIBLE_GPU_COUNT < NPROC_PER_NODE )); then
   exit 1
 fi
 
-echo "[PGC-FastWAM] full independent Action-Expert training"
+echo "[PGC-FastWAM] action-only LoRA training"
 echo "  training_scope=${TRAIN_SUITE}"
 echo "  protected_base=${BASE_CHECKPOINT}"
 echo "  native_datasets=${NATIVE_JSON}"
 echo "  direct_counterfactual_datasets=${CF_JSON}"
 echo "  counterfactual_oversample=${OVERSAMPLE_FACTOR}"
 echo "  seed=${TRAIN_SEED} max_steps=${MAX_STEPS} lr=${LEARNING_RATE}"
+echo "  lora=action-only rank=${LORA_RANK} alpha=${LORA_ALPHA} dropout=${LORA_DROPOUT}"
 echo "  save_training_state=${SAVE_TRAINING_STATE}"
 
 RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
@@ -223,6 +237,11 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   model.policy_guard.enabled=true \
   model.policy_guard.version=1 \
   model.policy_guard.require_direct_counterfactual_actions=true \
-  model.lora.enabled=false
+  model.lora.enabled=true \
+  "model.lora.rank=${LORA_RANK}" \
+  "model.lora.alpha=${LORA_ALPHA}" \
+  "model.lora.dropout=${LORA_DROPOUT}" \
+  "model.lora.experts=[action]" \
+  "model.lora.extra_trainable_patterns=[]"
 
 echo "[PGC-FastWAM] training complete."

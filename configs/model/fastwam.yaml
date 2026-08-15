@@ -143,8 +143,9 @@ transition_contract:
 
 # Policy-Guarded Counterfactual FastWAM. PGC is mutually exclusive with the
 # LangForce/TC mainlines. It freezes the released query-free FastWAM policy,
-# full-finetunes an independent goal-conditioned Action Expert, and deploys a
-# conservative verifier gate that falls back to the immutable base action.
+# adapts an independent goal-conditioned Action Expert with action-only LoRA
+# and latent queries, and deploys a conservative verifier gate that falls back
+# to the immutable base action.
 policy_guard:
   enabled: false
   version: 1

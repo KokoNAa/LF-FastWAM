@@ -623,6 +623,7 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_action_expert: Optional[ActionDiT] = None
         self.policy_guard_alignment_loss: Optional[GoalActionAlignmentLoss] = None
         self.policy_guard_base_checkpoint: Optional[str] = None
+        self.policy_guard_legacy_full_loaded = False
 
         if self.policy_guard_enabled:
             if self.policy_guard_version != 1:
@@ -798,10 +799,17 @@ class FastWAM(torch.nn.Module):
     def configure_lora(self, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         normalized = normalize_lora_config(config)
         if self.policy_guard_enabled and normalized["enabled"]:
-            raise ValueError(
-                "PGC v1 protects a full frozen base and full-finetunes only its "
-                "independent counterfactual Action Expert; base LoRA must be disabled."
-            )
+            if normalized["experts"] != ["action"]:
+                raise ValueError(
+                    "PGC LoRA must target only its independent counterfactual "
+                    "Action Expert (`lora.experts=[action]`)."
+                )
+            if normalized["extra_trainable_patterns"]:
+                raise ValueError(
+                    "PGC does not accept `lora.extra_trainable_patterns`; its "
+                    "only trainable Action-Expert tensors are LoRA A/B and "
+                    "`latent_action_queries`."
+                )
         if not normalized["enabled"]:
             if self.lora_enabled:
                 raise ValueError("Cannot disable LoRA after adapters have been injected.")
@@ -827,19 +835,35 @@ class FastWAM(torch.nn.Module):
             return self.lora_report()
 
         injected: list[str] = []
-        expert_modules = {
-            "video": self.video_expert,
-            "action": self.action_expert,
-        }
-        for expert_name in normalized["experts"]:
+        if self.policy_guard_enabled:
+            if self.policy_guard_action_expert is None:
+                raise RuntimeError("PGC Action Expert was not initialized.")
             names = inject_lora(
-                expert_modules[expert_name],
+                self.policy_guard_action_expert,
                 target_modules=normalized["target_modules"],
                 rank=normalized["rank"],
                 alpha=normalized["alpha"],
                 dropout=normalized["dropout"],
             )
-            injected.extend(f"{expert_name}_expert.{name}" for name in names)
+            injected.extend(
+                f"policy_guard_action_expert.{name}" for name in names
+            )
+        else:
+            expert_modules = {
+                "video": self.video_expert,
+                "action": self.action_expert,
+            }
+            for expert_name in normalized["experts"]:
+                names = inject_lora(
+                    expert_modules[expert_name],
+                    target_modules=normalized["target_modules"],
+                    rank=normalized["rank"],
+                    alpha=normalized["alpha"],
+                    dropout=normalized["dropout"],
+                )
+                injected.extend(
+                    f"{expert_name}_expert.{name}" for name in names
+                )
 
         self.lora_config = normalized
         self.lora_enabled = True
@@ -867,6 +891,21 @@ class FastWAM(torch.nn.Module):
             "enabled": self.lora_enabled,
             "modules": modules,
             "parameters": int(parameter_count),
+        }
+
+    def _policy_guard_action_adapter_parameter_ids(self) -> set[int]:
+        """Return the hard allowlist for the PGC Action Expert optimizer."""
+        if (
+            not self.policy_guard_enabled
+            or not self.lora_enabled
+            or self.policy_guard_action_expert is None
+        ):
+            return set()
+        return {
+            id(parameter)
+            for name, parameter in self.policy_guard_action_expert.named_parameters()
+            if name == "latent_action_queries"
+            or is_lora_parameter_name(name)
         }
 
     def _adapter_parameter_ids(self) -> set[int]:
@@ -897,8 +936,24 @@ class FastWAM(torch.nn.Module):
         if self.policy_guard_enabled:
             if self.policy_guard_action_expert is None:
                 raise RuntimeError("PGC Action Expert was not initialized.")
+            if not self.lora_enabled:
+                raise ValueError(
+                    "PGC full Action-Expert fine-tuning is disabled. Enable "
+                    "action-only LoRA before preparing trainable parameters."
+                )
+            if self.policy_guard_legacy_full_loaded:
+                raise ValueError(
+                    "Legacy full-PGC checkpoints are evaluation-only and "
+                    "cannot be resumed for LoRA training. Start from the "
+                    "released FastWAM base checkpoint."
+                )
+            adapter_ids = self._policy_guard_action_adapter_parameter_ids()
+            if not adapter_ids:
+                raise ValueError("PGC LoRA produced zero Action-Expert parameters.")
             self.policy_guard_action_expert.train()
-            self.policy_guard_action_expert.requires_grad_(True)
+            for parameter in self.policy_guard_action_expert.parameters():
+                if id(parameter) in adapter_ids:
+                    parameter.requires_grad_(True)
             self.policy_guard_modules.train()
             self.policy_guard_modules.requires_grad_(True)
             trainable = sum(
@@ -4603,7 +4658,12 @@ class FastWAM(torch.nn.Module):
             "policy_guard_version": self.policy_guard_version,
             "base_policy": "frozen_released_fastwam",
             "base_action_interface": "query_free_joint_mot",
-            "counterfactual_policy": "independent_full_action_expert",
+            "counterfactual_policy": "independent_action_expert_lora",
+            "counterfactual_tuning": "lora",
+            "lora_rank": int(self.lora_config["rank"]),
+            "lora_alpha": float(self.lora_config["alpha"]),
+            "lora_dropout": float(self.lora_config["dropout"]),
+            "lora_target_modules": list(self.lora_config["target_modules"]),
             "num_action_queries": int(
                 self.policy_guard_action_expert.num_latent_queries
             ),
@@ -4635,6 +4695,23 @@ class FastWAM(torch.nn.Module):
             for name, value in module.state_dict().items()
         }
 
+    def _policy_guard_action_adapter_state_dict(
+        self,
+    ) -> dict[str, torch.Tensor]:
+        if self.policy_guard_action_expert is None:
+            raise RuntimeError("PGC Action Expert is unavailable.")
+        adapter_ids = self._policy_guard_action_adapter_parameter_ids()
+        state = self.policy_guard_action_expert.state_dict()
+        names = {
+            name
+            for name, parameter in self.policy_guard_action_expert.named_parameters()
+            if id(parameter) in adapter_ids
+        }
+        return {
+            name: state[name].detach().to(device="cpu")
+            for name in sorted(names)
+        }
+
     def _sync_policy_guard_action_from_base(self) -> None:
         if not self.policy_guard_enabled or self.policy_guard_action_expert is None:
             return
@@ -4645,6 +4722,7 @@ class FastWAM(torch.nn.Module):
             key
             for key in incompatible.missing_keys
             if key != "latent_action_queries"
+            and not is_lora_parameter_name(key)
         ]
         if disallowed_missing or incompatible.unexpected_keys:
             raise ValueError(
@@ -4662,17 +4740,29 @@ class FastWAM(torch.nn.Module):
         if self.policy_guard_enabled:
             if self.policy_guard_action_expert is None:
                 raise RuntimeError("PGC Action Expert is unavailable for saving.")
+            if not self.lora_enabled:
+                raise ValueError(
+                    "PGC checkpoints require action-only LoRA; full "
+                    "Action-Expert checkpoints are disabled."
+                )
+            if self.policy_guard_legacy_full_loaded:
+                raise ValueError(
+                    "Cannot convert a legacy full-PGC checkpoint into a "
+                    "partial LoRA checkpoint."
+                )
             if not self.policy_guard_base_checkpoint:
                 raise ValueError(
                     "PGC checkpoint cannot be saved before a protected base "
                     "checkpoint has been loaded."
                 )
+            action_adapter = self._policy_guard_action_adapter_state_dict()
+            if not action_adapter:
+                raise ValueError("PGC checkpoint has no Action-Expert adapter tensors.")
             payload = {
                 "format": "fastwam_policy_guard_v1",
                 "base_checkpoint": self.policy_guard_base_checkpoint,
-                "counterfactual_action_expert": self._cpu_state_dict(
-                    self.policy_guard_action_expert
-                ),
+                "counterfactual_action_adapter": action_adapter,
+                "counterfactual_lora_config": dict(self.lora_config),
                 "policy_guard": self._cpu_state_dict(
                     self.policy_guard_modules
                 ),
@@ -4951,17 +5041,94 @@ class FastWAM(torch.nn.Module):
         )
         if Path(resolved_base).resolve() == Path(path).expanduser().resolve():
             raise ValueError("PGC checkpoint cannot name itself as its base.")
+
+        action_adapter = payload.get("counterfactual_action_adapter")
+        legacy_action_state = payload.get("counterfactual_action_expert")
+        if action_adapter is not None:
+            saved_lora_config = payload.get("counterfactual_lora_config")
+            if not isinstance(saved_lora_config, dict):
+                raise ValueError(
+                    "PGC LoRA checkpoint is missing "
+                    "`counterfactual_lora_config`."
+                )
+            self.configure_lora(saved_lora_config)
+        elif legacy_action_state is None:
+            raise ValueError(
+                "PGC checkpoint has neither a counterfactual Action-Expert "
+                "adapter nor a legacy full Action Expert."
+            )
+
         base_payload = self.load_checkpoint(resolved_base, optimizer=None)
         if base_payload.get("format") == "fastwam_policy_guard_v1":
             raise ValueError("Nested PGC checkpoints are not supported as bases.")
 
-        action_state = payload.get("counterfactual_action_expert")
         guard_state = payload.get("policy_guard")
-        if not isinstance(action_state, dict) or not action_state:
-            raise ValueError("PGC checkpoint has no counterfactual Action Expert.")
         if not isinstance(guard_state, dict) or not guard_state:
             raise ValueError("PGC checkpoint has no Goal-Graph/Verifier state.")
-        self.policy_guard_action_expert.load_state_dict(action_state, strict=True)
+
+        if action_adapter is not None:
+            if not isinstance(action_adapter, dict) or not action_adapter:
+                raise ValueError(
+                    "PGC checkpoint has an empty counterfactual Action-Expert "
+                    "adapter."
+                )
+            current_state = self.policy_guard_action_expert.state_dict()
+            expected_adapter = set(
+                self._policy_guard_action_adapter_state_dict()
+            )
+            saved_adapter = set(action_adapter)
+            missing = sorted(expected_adapter - saved_adapter)
+            unexpected = sorted(saved_adapter - expected_adapter)
+            if missing or unexpected:
+                raise ValueError(
+                    "PGC Action-Expert adapter key mismatch: "
+                    f"missing={missing[:20]}, unexpected={unexpected[:20]}."
+                )
+            shape_mismatches = {
+                name: (tuple(value.shape), tuple(current_state[name].shape))
+                for name, value in action_adapter.items()
+                if tuple(value.shape) != tuple(current_state[name].shape)
+            }
+            if shape_mismatches:
+                raise ValueError(
+                    "PGC Action-Expert adapter shape mismatches: "
+                    f"{shape_mismatches}"
+                )
+            incompatible = self.policy_guard_action_expert.load_state_dict(
+                action_adapter, strict=False
+            )
+            if incompatible.unexpected_keys:
+                raise ValueError(
+                    "PGC Action-Expert adapter contains unexpected tensors: "
+                    f"{list(incompatible.unexpected_keys)}"
+                )
+            action_tensor_count = len(action_adapter)
+            self.policy_guard_legacy_full_loaded = False
+        else:
+            if not isinstance(legacy_action_state, dict) or not legacy_action_state:
+                raise ValueError("Legacy PGC checkpoint has no full Action Expert.")
+            incompatible = self.policy_guard_action_expert.load_state_dict(
+                legacy_action_state, strict=not self.lora_enabled
+            )
+            if self.lora_enabled:
+                disallowed_missing = [
+                    key
+                    for key in incompatible.missing_keys
+                    if not is_lora_parameter_name(key)
+                ]
+                if disallowed_missing or incompatible.unexpected_keys:
+                    raise ValueError(
+                        "Legacy PGC Action Expert is incompatible with the "
+                        "current model: "
+                        f"missing={disallowed_missing}, "
+                        f"unexpected={list(incompatible.unexpected_keys)}."
+                    )
+            action_tensor_count = len(legacy_action_state)
+            self.policy_guard_legacy_full_loaded = True
+            logger.warning(
+                "Loaded a legacy full-PGC Action Expert. It is supported for "
+                "evaluation only; new PGC training requires action-only LoRA."
+            )
         self.policy_guard_modules.load_state_dict(guard_state, strict=True)
         self.policy_guard_base_checkpoint = resolved_base
         if optimizer is not None and "optimizer" in payload:
@@ -4971,7 +5138,7 @@ class FastWAM(torch.nn.Module):
             "guard_tensors=%d).",
             path,
             resolved_base,
-            len(action_state),
+            action_tensor_count,
             len(guard_state),
         )
         return payload
@@ -5047,6 +5214,7 @@ class FastWAM(torch.nn.Module):
         if self.policy_guard_enabled:
             self._sync_policy_guard_action_from_base()
             self.policy_guard_base_checkpoint = resolved_checkpoint
+            self.policy_guard_legacy_full_loaded = False
         return payload
 
     def forward(self, *args, **kwargs):

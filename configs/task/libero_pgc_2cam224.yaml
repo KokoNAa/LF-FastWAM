@@ -10,8 +10,10 @@ defaults:
 # same suite; the guarded launcher rejects cross-suite leakage. Four-suite joint
 # training remains an explicitly locked final experiment.
 # Four GPUs x micro-batch 1 x accumulation 4 = effective global batch 16.
-# The immutable 6.8B base and the full independent Action Expert coexist on
-# every rank, so the upstream full-training micro-batch of 16 is not safe here.
+# The immutable 6.8B base and the frozen backbone of an independent Action
+# Expert coexist on every rank. Only that expert's LoRA/queries plus the small
+# Goal Graph and Verifier are optimized, but the activation footprint still
+# makes the upstream full-training micro-batch of 16 unsafe here.
 batch_size: 1
 num_workers: 2
 
@@ -29,7 +31,12 @@ model:
     enabled: true
     version: 1
   lora:
-    enabled: false
+    enabled: true
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    experts: [action]
+    extra_trainable_patterns: []
 
 data:
   train:
