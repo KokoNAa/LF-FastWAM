@@ -13,6 +13,7 @@ PLAN_ONLY="${PGC_PLAN_ONLY:-false}"
 RESUME="${PGC_RESUME:-false}"
 ALLOW_PARTIAL="${PGC_ALLOW_PARTIAL:-false}"
 RELAXED_SCENE_MATCH="${PGC_RELAXED_SCENE_MATCH:-false}"
+CANDIDATE_RANK_OVERRIDES="${PGC_CANDIDATE_RANK_OVERRIDES:-}"
 BUILD_SUITE="${PGC_BUILD_SUITE:-all}"
 MANIFEST_ROOT="${OUTPUT_ROOT}/manifests"
 LOG_ROOT="${OUTPUT_ROOT}/logs"
@@ -51,6 +52,17 @@ if [[ "${ALLOW_PARTIAL}" == "true" ]]; then
 fi
 if [[ "${RELAXED_SCENE_MATCH}" == "true" ]]; then
   manifest_args+=(--relaxed-scene-match)
+fi
+if [[ -n "${CANDIDATE_RANK_OVERRIDES}" ]]; then
+  IFS=',' read -r -a candidate_rank_overrides \
+    <<<"${CANDIDATE_RANK_OVERRIDES}"
+  for candidate_rank_override in "${candidate_rank_overrides[@]}"; do
+    if [[ -n "${candidate_rank_override}" ]]; then
+      manifest_args+=(
+        --candidate-rank-override "${candidate_rank_override}"
+      )
+    fi
+  done
 fi
 "${PYTHON_BIN}" scripts/prepare_pgc_libero_manifests.py "${manifest_args[@]}"
 

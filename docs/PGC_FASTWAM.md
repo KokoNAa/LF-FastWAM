@@ -213,6 +213,26 @@ bash scripts/build_pgc_libero_datasets.sh \
   42
 ```
 
+若某个 pair 已把当前 donor 的全部 HDF5 demo 试完但仍为 0 条成功轨迹，单纯
+`PGC_RESUME=true` 不会重试出新结果。此时用候选排名覆盖选择下一个兼容 donor；
+多个任务用逗号分隔：
+
+```bash
+PGC_BUILD_SUITE=libero_object \
+PGC_RESUME=true \
+PGC_CANDIDATE_RANK_OVERRIDES='libero_object:5=1,libero_object:8=1' \
+bash scripts/build_pgc_libero_datasets.sh \
+  "$PGC_HDF5_ROOT" \
+  "$PGC_DATA_ROOT" \
+  5 \
+  42
+```
+
+排名 0 是默认 donor，1 是第二候选。恢复逻辑只允许替换从未产生成功 episode
+的 pair；任何已有成功轨迹的 pair 都不可变，因此不会让旧 action、语言和
+provenance 脱节。已有 episode 会保留，新 donor 从下一个 episode index 继续写。
+若第二候选仍为 0，可把相应 rank 增加到 2 后再次安全续跑。
+
 完成后会生成 `pgc_counterfactual_datasets.txt`，并自动执行四 suite、每 suite
 10 个源任务、每个配对至少一个成功 episode 的强校验。每个数据目录同时包含：
 

@@ -587,7 +587,95 @@ def _discard_episode(dataset: Any) -> None:
     dataset.episode_buffer = dataset.create_episode_buffer()
 
 
-def _dataset_create_or_resume(args: argparse.Namespace, records: list[dict[str, Any]]):
+def _pairs_by_source(
+    pairs: list[dict[str, Any]], *, label: str
+) -> dict[tuple[str, int], dict[str, Any]]:
+    indexed: dict[tuple[str, int], dict[str, Any]] = {}
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            raise ValueError(f"{label} contains a non-object pair record.")
+        source_key = (
+            str(pair.get("source_suite", "")),
+            int(pair.get("source_task_id", -1)),
+        )
+        if source_key in indexed:
+            raise ValueError(f"{label} duplicates source task {source_key}.")
+        indexed[source_key] = pair
+    return indexed
+
+
+def _merge_resume_provenance_pairs(
+    provenance: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    episode_audits: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Safely replace donor pairs that have never produced an episode.
+
+    Successful pair definitions are immutable because their audit records and
+    language/action data depend on them. A pair that exhausted every donor demo
+    with zero successes may be replaced by a later ranked candidate without
+    discarding unrelated successful episodes.
+    """
+    old_pairs = list(provenance.get("pairs") or [])
+    new_pairs = list(expected.get("pairs") or [])
+    old_by_source = _pairs_by_source(old_pairs, label="saved provenance")
+    new_by_source = _pairs_by_source(new_pairs, label="new manifest")
+    if set(old_by_source) != set(new_by_source):
+        raise ValueError(
+            "Cannot resume with a different set of source tasks: "
+            f"saved={sorted(old_by_source)}, new={sorted(new_by_source)}."
+        )
+
+    known_old_pair_ids = {
+        str(pair.get("pair_id", "")) for pair in old_pairs
+    }
+    used_pair_ids = {
+        str(audit.get("pair_id", "")) for audit in episode_audits
+    }
+    unknown_audits = sorted(used_pair_ids - known_old_pair_ids)
+    if unknown_audits:
+        raise ValueError(
+            "PGC episode audits reference pairs absent from saved provenance: "
+            f"{unknown_audits}."
+        )
+
+    replacements: list[dict[str, Any]] = []
+    for source_key in sorted(old_by_source):
+        old_pair = old_by_source[source_key]
+        new_pair = new_by_source[source_key]
+        if old_pair == new_pair:
+            continue
+        old_pair_id = str(old_pair.get("pair_id", ""))
+        if old_pair_id in used_pair_ids:
+            raise ValueError(
+                "Cannot replace a PGC donor pair that already produced "
+                f"successful episodes: source={source_key}, pair={old_pair_id}."
+            )
+        replacements.append(
+            {
+                "source_suite": source_key[0],
+                "source_task_id": source_key[1],
+                "old_pair_id": old_pair_id,
+                "new_pair_id": str(new_pair.get("pair_id", "")),
+            }
+        )
+
+    merged = dict(provenance)
+    merged["pairs"] = new_pairs
+    merged["source_suites"] = list(expected.get("source_suites") or [])
+    if replacements:
+        history = list(merged.get("unproductive_pair_replacements") or [])
+        history.extend(replacements)
+        merged["unproductive_pair_replacements"] = history
+    return merged, replacements
+
+
+def _dataset_create_or_resume(
+    args: argparse.Namespace,
+    records: list[dict[str, Any]],
+    *,
+    episode_audits: list[dict[str, Any]] | None = None,
+):
     from fastwam.datasets.lerobot.lerobot.lerobot_dataset import LeRobotDataset
 
     output = args.output.expanduser().resolve()
@@ -623,8 +711,11 @@ def _dataset_create_or_resume(args: argparse.Namespace, records: list[dict[str, 
         records,
         successful_episode_count=int(provenance.get("successful_episode_count", 0)),
     )
-    if provenance.get("pairs") != expected["pairs"]:
-        raise ValueError("Cannot resume with a different intervention manifest.")
+    provenance, replacements = _merge_resume_provenance_pairs(
+        provenance,
+        expected,
+        list(episode_audits or []),
+    )
     resume_contract = {
         "state_match_tolerance": float(args.state_atol),
         "settle_steps": int(args.settle_steps),
@@ -646,6 +737,16 @@ def _dataset_create_or_resume(args: argparse.Namespace, records: list[dict[str, 
     dataset.video_codec = args.video_codec
     dataset.is_compute_episode_stats_image = False
     dataset.episode_buffer = dataset.create_episode_buffer()
+    if replacements:
+        atomic_write_json(provenance_path, provenance)
+        for replacement in replacements:
+            LOGGER.warning(
+                "Replaced unproductive PGC pair for %s/%d: %s -> %s.",
+                replacement["source_suite"],
+                replacement["source_task_id"],
+                replacement["old_pair_id"],
+                replacement["new_pair_id"],
+            )
     return dataset, provenance
 
 
@@ -772,8 +873,12 @@ def _collect(
     output = args.output.expanduser().resolve()
     if output.exists() and args.resume:
         _recover_pending(output)
-    dataset, provenance = _dataset_create_or_resume(args, records)
     audits = _existing_audits(output)
+    dataset, provenance = _dataset_create_or_resume(
+        args,
+        records,
+        episode_audits=audits,
+    )
     if int(dataset.meta.total_episodes) != len(audits):
         raise RuntimeError(
             "LeRobot episode count and PGC audit count differ: "

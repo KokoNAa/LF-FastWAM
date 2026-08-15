@@ -7,6 +7,7 @@ import h5py
 import numpy as np
 
 from scripts.build_pgc_libero_data import (
+    _merge_resume_provenance_pairs,
     _named_joint_transfer_state,
     _prepare_source_initial_state,
 )
@@ -241,6 +242,57 @@ class PGCLiberoDataBuilderTest(unittest.TestCase):
         np.testing.assert_array_equal(filtered[0], actions[0])
         np.testing.assert_array_equal(filtered[1], actions[2])
         np.testing.assert_array_equal(filtered[2], actions[3])
+
+    @staticmethod
+    def _pair_record(source_task_id, target_task_id):
+        return {
+            "pair_id": (
+                f"libero_object_{source_task_id:02d}_to_"
+                f"libero_object_{target_task_id:02d}"
+            ),
+            "task_suite_name": "libero_object",
+            "task_id": source_task_id,
+            "correct_instruction": f"source {source_task_id}",
+            "counterfactual_instruction": f"target {target_task_id}",
+            "counterfactual_task_suite_name": "libero_object",
+            "counterfactual_task_id": target_task_id,
+            "counterfactual_bddl_file": f"/bddl/target_{target_task_id}.bddl",
+            "counterfactual_goal_state": [
+                ["in", f"object_{target_task_id}", "basket"]
+            ],
+        }
+
+    def test_resume_can_replace_only_zero_success_pairs(self):
+        productive = self._pair_record(0, 1)
+        unproductive = self._pair_record(5, 6)
+        replacement = self._pair_record(5, 2)
+        saved = build_provenance([productive, unproductive])
+        expected = build_provenance([productive, replacement])
+        audits = [{"pair_id": productive["pair_id"], "episode_index": 0}]
+
+        merged, replacements = _merge_resume_provenance_pairs(
+            saved,
+            expected,
+            audits,
+        )
+        self.assertEqual(len(replacements), 1)
+        self.assertEqual(replacements[0]["old_pair_id"], unproductive["pair_id"])
+        self.assertEqual(replacements[0]["new_pair_id"], replacement["pair_id"])
+        self.assertEqual(merged["pairs"], expected["pairs"])
+        self.assertEqual(
+            merged["unproductive_pair_replacements"],
+            replacements,
+        )
+
+    def test_resume_rejects_replacing_a_productive_pair(self):
+        productive = self._pair_record(0, 1)
+        replacement = self._pair_record(0, 2)
+        saved = build_provenance([productive])
+        expected = build_provenance([replacement])
+        audits = [{"pair_id": productive["pair_id"], "episode_index": 0}]
+
+        with self.assertRaisesRegex(ValueError, "already produced"):
+            _merge_resume_provenance_pairs(saved, expected, audits)
 
 
 if __name__ == "__main__":

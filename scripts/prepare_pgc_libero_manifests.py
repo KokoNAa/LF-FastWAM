@@ -41,6 +41,30 @@ LIBERO_SUITES = (
 LIBERO_CANDIDATE_SUITES = (*LIBERO_SUITES, "libero_90")
 
 
+def _parse_candidate_rank_override(value: str) -> tuple[tuple[str, int], int]:
+    """Parse ``suite:task_id=rank`` used to retry an unproductive donor."""
+    text = str(value).strip()
+    try:
+        source_text, rank_text = text.rsplit("=", 1)
+        suite_name, task_text = source_text.rsplit(":", 1)
+        task_id = int(task_text)
+        candidate_rank = int(rank_text)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "candidate-rank override must use suite:task_id=rank, for "
+            "example libero_object:5=1"
+        ) from exc
+    if suite_name not in LIBERO_SUITES:
+        raise argparse.ArgumentTypeError(
+            f"unsupported source suite in candidate-rank override: {suite_name!r}"
+        )
+    if not 0 <= task_id < 10:
+        raise argparse.ArgumentTypeError("candidate-rank task_id must be in [0, 9]")
+    if candidate_rank < 0:
+        raise argparse.ArgumentTypeError("candidate rank must be non-negative")
+    return (suite_name, task_id), candidate_rank
+
+
 def _task_bddl_path(task: Any) -> Path:
     return Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
 
@@ -239,7 +263,9 @@ def build_manifests(
     candidate_suites: list[str],
     *,
     relaxed_scene_match: bool = False,
+    candidate_rank_overrides: Mapping[tuple[str, int], int] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    candidate_rank_overrides = dict(candidate_rank_overrides or {})
     sources = _load_tasks(source_suites)
     candidates = _load_tasks(candidate_suites)
     manifests: dict[str, list[dict[str, Any]]] = {
@@ -262,7 +288,15 @@ def build_manifests(
                 }
             )
             continue
-        _, target, goal, transfer_mode, goal_changed = available[0]
+        source_key = (str(source["suite"]), int(source["task_id"]))
+        candidate_rank = int(candidate_rank_overrides.get(source_key, 0))
+        if candidate_rank >= len(available):
+            raise ValueError(
+                "Candidate-rank override is out of range for "
+                f"{source_key[0]}/{source_key[1]}: requested={candidate_rank}, "
+                f"available={len(available)}."
+            )
+        _, target, goal, transfer_mode, goal_changed = available[candidate_rank]
         source_task = source["task"]
         target_task = target["task"]
         pair_id = (
@@ -282,6 +316,8 @@ def build_manifests(
                 "counterfactual_task_suite_name": target["suite"],
                 "counterfactual_task_id": target["task_id"],
                 "counterfactual_task_name": target_task.language,
+                "candidate_rank": candidate_rank,
+                "candidate_count": len(available),
                 "counterfactual_is_executable": True,
                 "counterfactual_state_replay_compatible": transfer_mode
                 == "flat_exact",
@@ -333,16 +369,42 @@ def main() -> None:
             "different distractor-object inventories."
         ),
     )
+    parser.add_argument(
+        "--candidate-rank-override",
+        action="append",
+        default=[],
+        metavar="SUITE:TASK_ID=RANK",
+        help=(
+            "Select a later compatible donor for one source task. Rank 0 is "
+            "the default; use rank 1 after rank 0 exhausts all demos."
+        ),
+    )
     args = parser.parse_args()
     source_suites = args.source_suites or list(LIBERO_SUITES)
     # LIBERO-10 is the held-out part of LIBERO-100.  A state-compatible
     # alternate goal for a held-out scene may live in LIBERO-90, so use it as
     # a donor pool even though it is not a source/evaluation suite here.
     candidate_suites = args.candidate_suites or list(LIBERO_CANDIDATE_SUITES)
+    candidate_rank_overrides: dict[tuple[str, int], int] = {}
+    for raw_override in args.candidate_rank_override:
+        source_key, candidate_rank = _parse_candidate_rank_override(raw_override)
+        if source_key in candidate_rank_overrides:
+            parser.error(
+                "duplicate candidate-rank override for "
+                f"{source_key[0]}:{source_key[1]}"
+            )
+        if source_key[0] not in source_suites:
+            parser.error(
+                "candidate-rank override references a suite outside the "
+                f"requested sources: {source_key[0]}"
+            )
+        candidate_rank_overrides[source_key] = candidate_rank
+
     manifests, uncovered = build_manifests(
         source_suites,
         candidate_suites,
         relaxed_scene_match=args.relaxed_scene_match,
+        candidate_rank_overrides=candidate_rank_overrides,
     )
     combined: list[dict[str, Any]] = []
     for suite_name in source_suites:
@@ -359,6 +421,12 @@ def main() -> None:
             {
                 "source_suites": source_suites,
                 "candidate_suites": candidate_suites,
+                "candidate_rank_overrides": {
+                    f"{suite_name}:{task_id}": candidate_rank
+                    for (suite_name, task_id), candidate_rank in sorted(
+                        candidate_rank_overrides.items()
+                    )
+                },
                 "pair_count": len(combined),
                 "state_transfer_modes": {
                     mode: sum(
