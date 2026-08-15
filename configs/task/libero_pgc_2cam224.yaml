@@ -40,6 +40,7 @@ model:
 
 data:
   train:
+    pretrained_norm_stats: ./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json
     pgc_counterfactual_dataset_dirs: []
     pgc_counterfactual_oversample_factor: 2
     counterfactual_manifest_path: null
