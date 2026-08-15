@@ -16,6 +16,7 @@ MANIFEST_PATH="${PGC_MANIFEST_PATH:-}"
 GATE_MODE="${PGC_GATE_MODE:-guarded}"
 GATE_THRESHOLD="${PGC_GATE_THRESHOLD:-0.20}"
 MIN_COUNTERFACTUAL_SCORE="${PGC_MIN_COUNTERFACTUAL_SCORE:-0.60}"
+MAX_POLICY_STEPS="${PGC_MAX_POLICY_STEPS:-}"
 
 for value_name in NUM_GPUS NUM_TRIALS NUM_INFERENCE_STEPS; do
   value="${!value_name}"
@@ -24,6 +25,10 @@ for value_name in NUM_GPUS NUM_TRIALS NUM_INFERENCE_STEPS; do
     exit 1
   fi
 done
+if [[ -n "${MAX_POLICY_STEPS}" ]] && ! [[ "${MAX_POLICY_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PGC_MAX_POLICY_STEPS must be a positive integer when set." >&2
+  exit 1
+fi
 case "${CONDITION}" in
   correct|null|shuffled|counterfactual) ;;
   *)
@@ -111,6 +116,9 @@ EXTRA_OVERRIDES=(
 if [[ -n "${MANIFEST_PATH}" ]]; then
   EXTRA_OVERRIDES+=("EVALUATION.language_intervention_manifest=${MANIFEST_PATH}")
 fi
+if [[ -n "${MAX_POLICY_STEPS}" ]]; then
+  EXTRA_OVERRIDES+=("EVALUATION.max_steps=${MAX_POLICY_STEPS}")
+fi
 if [[ "${CONDITION}" == "counterfactual" ]]; then
   EXTRA_OVERRIDES+=("EVALUATION.counterfactual_diagnostics=true")
 fi
@@ -119,6 +127,7 @@ echo "[PGC-FastWAM] LIBERO ${CONDITION} evaluation"
 echo "  checkpoint=${PGC_CHECKPOINT}"
 echo "  suites=${SUITES} trials=${NUM_TRIALS}"
 echo "  gate=${GATE_MODE} margin=${GATE_THRESHOLD} min_cf=${MIN_COUNTERFACTUAL_SCORE}"
+echo "  max_policy_steps=${MAX_POLICY_STEPS:-suite_default}"
 echo "  output=${OUTPUT_ROOT}"
 
 EXP_NAME="pgc-${CONDITION}" "${PYTHON_BIN}" \

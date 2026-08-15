@@ -333,9 +333,13 @@ checkpoint 中记录的 rank/alpha/targets 注入并恢复适配器。
 ```bash
 export PGC_CHECKPOINT=/path/to/step_004000.pt
 PGC_EVAL_SUITES='[libero_object]' \
+PGC_MAX_POLICY_STEPS=600 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
 ```
+
+`PGC_MAX_POLICY_STEPS` 是可选诊断覆盖；不设置时继续使用各 suite 的标准
+horizon。Object 长条盒子实验建议使用 600，以区分策略失败和未松手超时。
 
 先用强制 Base 门控做“原策略逐 action chunk 完全一致”的保护对照：
 

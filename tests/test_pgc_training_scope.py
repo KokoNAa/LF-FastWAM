@@ -52,6 +52,13 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             'pgc_counterfactual_datasets.${BUILD_SUITE}.txt', source
         )
 
+    def test_evaluation_supports_an_explicit_policy_horizon(self):
+        source = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PGC_MAX_POLICY_STEPS", source)
+        self.assertIn("EVALUATION.max_steps=${MAX_POLICY_STEPS}", source)
+
 
 if __name__ == "__main__":
     unittest.main()
