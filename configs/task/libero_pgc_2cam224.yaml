@@ -5,9 +5,10 @@ defaults:
   - override /model: fastwam
   - _self_
 
-# PGC is trained across all four LIBERO suites. Native demonstrations preserve
-# broad task coverage; `pgc_counterfactual_dataset_dirs` must point to separate
-# successful state-aligned alternate-instruction trajectories.
+# PGC is trained one LIBERO suite at a time during staged validation. Native
+# demonstrations and `pgc_counterfactual_dataset_dirs` must cover exactly the
+# same suite; the guarded launcher rejects cross-suite leakage. Four-suite joint
+# training remains an explicitly locked final experiment.
 # Four GPUs x micro-batch 1 x accumulation 4 = effective global batch 16.
 # The immutable 6.8B base and the full independent Action Expert coexist on
 # every rank, so the upstream full-training micro-batch of 16 is not safe here.

@@ -195,57 +195,72 @@ bash scripts/build_pgc_libero_datasets.sh \
 - `meta/pgc_initial_states/`：可复验的精确初始状态；
 - `meta/pgc_collection_summary.json`：成功数、缺口和最近拒绝原因。
 
-## LIBERO 全 suite 训练
+## LIBERO 分 suite 训练
 
-创建文本文件（每行一个直接反事实数据目录）：
+正式联合训练前，固定按 `libero_object`、`libero_spatial`、`libero_goal`、
+`libero_10` 四条独立实验线验证。每条线使用自己的原始数据、直接反事实数据、
+checkpoint、日志和评估目录。suite 内的 10 个任务必须共同训练；若拆成单 task-ID
+模型，语言在该模型内成为常量，DTL/CIS 无法判断模型是否真正使用语言。
 
-```text
-/data/pgc/libero_spatial_cf_lerobot
-/data/pgc/libero_object_cf_lerobot
-/data/pgc/libero_goal_cf_lerobot
-/data/pgc/libero_10_cf_lerobot
-```
-
-先为原始与反事实指令统一生成 T5 cache（`CF_JSON` 是 Hydra 可接受的目录数组）：
+先为当前 suite 的直接反事实指令生成 T5 cache。下面以 Object 为例：
 
 ```bash
-CF_JSON=$(/opt/conda/bin/python - /path/to/pgc_counterfactual_datasets.txt <<'PY'
-import json, sys
-from pathlib import Path
-p = Path(sys.argv[1])
-items = []
-for line in p.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#"):
-        q = Path(line).expanduser()
-        items.append(str((p.parent / q).resolve() if not q.is_absolute() else q.resolve()))
-print(json.dumps(items, separators=(",", ":")))
-PY
-)
+PGC_CF_OBJECT=/path/to/pgc/libero_object_pgc_counterfactual_lerobot
 
 CUDA_VISIBLE_DEVICES=0 \
 /opt/conda/bin/python scripts/precompute_text_embeds.py \
   task=libero_pgc_2cam224 \
-  "data.train.pgc_counterfactual_dataset_dirs=${CF_JSON}" \
+  "data.train.pgc_counterfactual_dataset_dirs=[${PGC_CF_OBJECT}]" \
   +overwrite=false
 ```
 
-训练命令：
+然后只启动这一条 suite 训练：
 
 ```bash
 export DIFFSYNTH_MODEL_BASE_PATH=/path/to/FastWAM/checkpoints
 export LIBERO_DATA_ROOT=/path/to/FastWAM/data/libero_mujoco3.3.2
+BASE="$DIFFSYNTH_MODEL_BASE_PATH/fastwam_release/libero_uncond_2cam224.pt"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-bash scripts/train_pgc_libero.sh \
+bash scripts/train_pgc_libero_suite.sh \
+  libero_object \
   4 \
-  "$DIFFSYNTH_MODEL_BASE_PATH/fastwam_release/libero_uncond_2cam224.pt" \
-  /path/to/pgc_counterfactual_datasets.txt \
+  "$BASE" \
+  "$PGC_CF_OBJECT" \
   42 \
   4000
 ```
 
-该入口会硬性检查：四个原始 LIBERO suite、四个 suite 的直接反事实覆盖、逐 episode provenance、任务文本缓存、release full checkpoint 和 GPU 数量。默认对 Counterfactual 数据做 2 倍采样，学习率为 `1e-5`，每卡 micro-batch 为 1、梯度累积为 4（四卡有效 batch 16），每 500 steps 保存权重。默认不保存 DeepSpeed state，以避免再次因磁盘空间不足在最后一步失败。
+其余三条线仅替换 suite 名和对应数据目录，不能把多个目录放入同一次训练：
+
+```bash
+bash scripts/train_pgc_libero_suite.sh libero_spatial 4 "$BASE" /path/to/pgc/libero_spatial_pgc_counterfactual_lerobot 42 4000
+bash scripts/train_pgc_libero_suite.sh libero_goal    4 "$BASE" /path/to/pgc/libero_goal_pgc_counterfactual_lerobot    42 4000
+bash scripts/train_pgc_libero_suite.sh libero_10      4 "$BASE" /path/to/pgc/libero_10_pgc_counterfactual_lerobot      42 4000
+```
+
+`train_pgc_libero_suite.sh` 会同时把原始数据和直接反事实数据限制到指定 suite，
+并检查 `meta/pgc_provenance.json`。任何跨 suite 数据都会在创建训练进程前报错。
+默认对 Counterfactual 数据做 2 倍采样，学习率为 `1e-5`，每卡 micro-batch 为
+1、梯度累积为 4（四卡有效 batch 16），每 500 steps 保存权重。默认不保存
+DeepSpeed state，以避免磁盘空间不足导致最后一步保存失败。
+
+每条线必须依次通过以下门控，才进入下一条：
+
+1. 数据覆盖指定 suite 的 10 个源任务，且所有 episode 都通过状态与成功审计；
+2. `PGC_GATE_MODE=base` 与 release FastWAM 的 action chunk 数值一致；
+3. guarded Correct SR 没有不可接受的策略回退；
+4. DTL 与 CIS 相对基线有可复现提升，并报告 Gate 覆盖率；
+5. 至少完成多 seed 或预先约定的重复实验，不能凭单 episode 放行。
+
+四条线全部验收后，联合入口仍默认锁定。只有获得明确同意，才可创建包含四个
+数据目录的列表并显式设置：
+
+```bash
+PGC_TRAIN_SUITE=all \
+PGC_ALLOW_JOINT_TRAINING=true \
+bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.txt 42 4000
+```
 
 代码拉取后先在服务器执行完整回归：
 
@@ -257,10 +272,11 @@ bash scripts/validate_pgc_server.sh
 
 ## 评估
 
-Correct 全四 suite：
+训练完成后只评估该 checkpoint 对应的 suite。下面继续以 Object 为例：
 
 ```bash
 export PGC_CHECKPOINT=/path/to/step_004000.pt
+PGC_EVAL_SUITES='[libero_object]' \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
 ```
@@ -268,6 +284,7 @@ bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
 先用强制 Base 门控做“原策略逐 action chunk 完全一致”的保护对照：
 
 ```bash
+PGC_EVAL_SUITES='[libero_object]' \
 PGC_GATE_MODE=base \
 OUTPUT_ROOT=/path/to/evaluate_results/pgc_base_exact_correct \
 bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
@@ -281,11 +298,11 @@ Shuffled / CIS 必须提供经过审计且覆盖所选 suite/task 的 interventi
 
 ```bash
 export PGC_MANIFEST_PATH=/path/to/audited_libero_interventions.jsonl
-bash scripts/eval_pgc_libero.sh 4 5 shuffled 42 10
-bash scripts/eval_pgc_libero.sh 4 5 counterfactual 42 10
+PGC_EVAL_SUITES='[libero_object]' bash scripts/eval_pgc_libero.sh 4 5 shuffled 42 10
+PGC_EVAL_SUITES='[libero_object]' bash scripts/eval_pgc_libero.sh 4 5 counterfactual 42 10
 ```
 
-可用 `PGC_EVAL_SUITES='[libero_object]'` 单独测试某个 suite。每个任务结果会额外保存：
+每个任务结果会额外保存：
 
 - `policy_guard_decision_count`
 - `policy_guard_override_count`
@@ -294,7 +311,12 @@ bash scripts/eval_pgc_libero.sh 4 5 counterfactual 42 10
 - `policy_guard_counterfactual_score_mean`
 - 每个 episode、每次 replan 的选择和分数
 
-正确的验收顺序是：先确认 `PGC_GATE_MODE=base` 与 release FastWAM 的逐 action chunk 输出一致，再检查 guarded 模式下四个 suite 的 Correct SR 是否保持，然后看 Shuffled 的 DTL，最后看 CIS 和覆盖率。CIS 上覆盖率为零说明 Gate 太保守；覆盖率高但 CIS 仍低说明 Counterfactual Action Expert 或目标表示仍未学对；Correct 上覆盖率高且 SR 下降说明 Gate 校准失败。
+正确的验收顺序是：先确认 `PGC_GATE_MODE=base` 与 release FastWAM 的逐
+action chunk 输出一致，再检查 guarded 模式下当前 suite 的 Correct SR 是否
+保持，然后看 Shuffled 的 DTL，最后看 CIS 和覆盖率。CIS 上覆盖率为零说明
+Gate 太保守；覆盖率高但 CIS 仍低说明 Counterfactual Action Expert 或目标表示
+仍未学对；Correct 上覆盖率高且 SR 下降说明 Gate 校准失败。当前 suite 通过后
+才进入下一条实验线；不能用某个 suite 的结果替代其他 suite 的验证。
 
 ## RoboTwin
 

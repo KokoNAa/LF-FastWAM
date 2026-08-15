@@ -6,6 +6,8 @@ BASE_CHECKPOINT="${2:?Missing released FastWAM base checkpoint}"
 COUNTERFACTUAL_LIST="${3:?Missing direct-counterfactual dataset list file}"
 TRAIN_SEED="${4:-42}"
 MAX_STEPS="${5:-4000}"
+TRAIN_SUITE="${PGC_TRAIN_SUITE:-all}"
+ALLOW_JOINT_TRAINING="${PGC_ALLOW_JOINT_TRAINING:-false}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-data/libero_mujoco3.3.2}"
@@ -15,7 +17,26 @@ OVERSAMPLE_FACTOR="${PGC_COUNTERFACTUAL_OVERSAMPLE_FACTOR:-2}"
 LEARNING_RATE="${PGC_LEARNING_RATE:-1.0e-5}"
 SAVE_EVERY="${PGC_SAVE_EVERY:-500}"
 SAVE_TRAINING_STATE="${PGC_SAVE_TRAINING_STATE:-false}"
-RUN_TAG="${RUN_TAG:-libero-all-full-action-${MAX_STEPS}-seed${TRAIN_SEED}-v1}"
+RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-full-action-${MAX_STEPS}-seed${TRAIN_SEED}-v1}"
+
+ALL_SUITES=(libero_spatial libero_object libero_goal libero_10)
+case "${TRAIN_SUITE}" in
+  libero_spatial|libero_object|libero_goal|libero_10)
+    REQUIRED_SUITES=("${TRAIN_SUITE}")
+    ;;
+  all)
+    if [[ "${ALLOW_JOINT_TRAINING}" != "true" ]]; then
+      echo "Joint four-suite training is locked." >&2
+      echo "Run the four isolated suite experiments first; then set PGC_ALLOW_JOINT_TRAINING=true only after explicit approval." >&2
+      exit 1
+    fi
+    REQUIRED_SUITES=("${ALL_SUITES[@]}")
+    ;;
+  *)
+    echo "PGC_TRAIN_SUITE must be one of: ${ALL_SUITES[*]}, all; got ${TRAIN_SUITE}." >&2
+    exit 1
+    ;;
+esac
 
 for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY; do
   value="${!value_name}"
@@ -37,26 +58,27 @@ if [[ ! -f "${STATS_PATH}" ]]; then
   exit 1
 fi
 
+VALIDATOR_ARGS=(--list "${COUNTERFACTUAL_LIST}" --require-complete-task-coverage)
+for suite_name in "${REQUIRED_SUITES[@]}"; do
+  VALIDATOR_ARGS+=(--require-suite "${suite_name}")
+done
 "${PYTHON_BIN}" scripts/validate_pgc_counterfactual_datasets.py \
-  --list "${COUNTERFACTUAL_LIST}" \
-  --require-suite libero_spatial \
-  --require-suite libero_object \
-  --require-suite libero_goal \
-  --require-suite libero_10 \
-  --require-complete-task-coverage
+  "${VALIDATOR_ARGS[@]}"
 
-NATIVE_JSON="$(${PYTHON_BIN} - "${LIBERO_DATA_ROOT}" <<'PY'
+NATIVE_JSON="$(${PYTHON_BIN} - "${LIBERO_DATA_ROOT}" "${TRAIN_SUITE}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-names = (
-    "libero_spatial_no_noops_lerobot",
-    "libero_object_no_noops_lerobot",
-    "libero_goal_no_noops_lerobot",
-    "libero_10_no_noops_lerobot",
-)
+scope = sys.argv[2]
+mapping = {
+    "libero_spatial": "libero_spatial_no_noops_lerobot",
+    "libero_object": "libero_object_no_noops_lerobot",
+    "libero_goal": "libero_goal_no_noops_lerobot",
+    "libero_10": "libero_10_no_noops_lerobot",
+}
+names = list(mapping.values()) if scope == "all" else [mapping[scope]]
 paths = [root / name for name in names]
 missing = [str(path) for path in paths if not (path / "meta/tasks.jsonl").is_file()]
 if missing:
@@ -65,14 +87,21 @@ print(json.dumps([str(path) for path in paths], separators=(",", ":")))
 PY
 )"
 
-CF_JSON="$(${PYTHON_BIN} - "${COUNTERFACTUAL_LIST}" "${NATIVE_JSON}" <<'PY'
+CF_JSON="$(${PYTHON_BIN} - "${COUNTERFACTUAL_LIST}" "${NATIVE_JSON}" "${TRAIN_SUITE}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 list_path = Path(sys.argv[1])
 native = {str(Path(path).resolve()) for path in json.loads(sys.argv[2])}
+scope = sys.argv[3]
+expected_suites = (
+    {"libero_spatial", "libero_object", "libero_goal", "libero_10"}
+    if scope == "all"
+    else {scope}
+)
 paths = []
+covered_suites = set()
 for raw in list_path.read_text(encoding="utf-8").splitlines():
     raw = raw.strip()
     if not raw or raw.startswith("#"):
@@ -87,11 +116,27 @@ for raw in list_path.read_text(encoding="utf-8").splitlines():
     for required in ("meta/info.json", "meta/tasks.jsonl", "meta/episodes.jsonl"):
         if not (path / required).is_file():
             raise SystemExit(f"Incomplete counterfactual dataset {path}: missing {required}")
+    provenance_path = path / "meta/pgc_provenance.json"
+    if not provenance_path.is_file():
+        raise SystemExit(f"Missing PGC provenance: {provenance_path}")
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    suites = {str(item) for item in provenance.get("source_suites", [])}
+    if not suites or not suites.issubset(expected_suites):
+        raise SystemExit(
+            f"Counterfactual dataset {path} leaks suites {sorted(suites)} "
+            f"outside training scope {sorted(expected_suites)}"
+        )
+    covered_suites.update(suites)
     paths.append(str(path))
 if not paths:
     raise SystemExit("The counterfactual dataset list contains no usable paths")
 if len(set(paths)) != len(paths):
     raise SystemExit("The counterfactual dataset list contains duplicate paths")
+if covered_suites != expected_suites:
+    raise SystemExit(
+        f"Counterfactual scope mismatch: covered={sorted(covered_suites)} "
+        f"expected={sorted(expected_suites)}"
+    )
 print(json.dumps(paths, separators=(",", ":")))
 PY
 )"
@@ -148,6 +193,7 @@ if (( VISIBLE_GPU_COUNT < NPROC_PER_NODE )); then
 fi
 
 echo "[PGC-FastWAM] full independent Action-Expert training"
+echo "  training_scope=${TRAIN_SUITE}"
 echo "  protected_base=${BASE_CHECKPOINT}"
 echo "  native_datasets=${NATIVE_JSON}"
 echo "  direct_counterfactual_datasets=${CF_JSON}"
