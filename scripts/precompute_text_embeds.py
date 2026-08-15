@@ -85,6 +85,7 @@ def _collect_dataset_settings(data_cfg: DictConfig):
         raw_dirs = node.get("dataset_dirs")
         if raw_dirs is None:
             continue
+        pgc_dirs = node.get("pgc_counterfactual_dataset_dirs") or []
 
         cache_dir = node.get("text_embedding_cache_dir")
         if cache_dir is None or not str(cache_dir).strip():
@@ -93,7 +94,7 @@ def _collect_dataset_settings(data_cfg: DictConfig):
                 "(this node defines `dataset_dirs`)."
             )
 
-        for ds in raw_dirs:
+        for ds in list(raw_dirs) + list(pgc_dirs):
             ds_str = str(ds)
             if ds_str not in dataset_dirs:
                 dataset_dirs.append(ds_str)
@@ -106,7 +107,13 @@ def _collect_dataset_settings(data_cfg: DictConfig):
         if context_len is not None:
             context_lens.add(int(context_len))
 
-        logger.info("Discovered dataset node `%s` with %d dataset_dirs.", node_path, len(raw_dirs))
+        logger.info(
+            "Discovered dataset node `%s` with %d native and %d PGC "
+            "counterfactual dataset dirs.",
+            node_path,
+            len(raw_dirs),
+            len(pgc_dirs),
+        )
 
     return dataset_dirs, cache_dirs, context_lens
 

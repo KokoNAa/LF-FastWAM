@@ -1,3 +1,4 @@
+import copy
 import math
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
@@ -18,6 +19,12 @@ from .lora import (
     normalize_lora_config,
 )
 from .mot import MoT
+from .policy_guard import (
+    ActionOutcomeVerifier,
+    GoalActionAlignmentLoss,
+    GoalGraphEncoder,
+    detached_policy_guard_metrics,
+)
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .transition_contract import (
     ActionEffectEncoder,
@@ -61,6 +68,7 @@ class FastWAM(torch.nn.Module):
         loss_lambda_action: float = 1.0,
         langforce_mvp_config: Optional[dict[str, Any]] = None,
         transition_contract_config: Optional[dict[str, Any]] = None,
+        policy_guard_config: Optional[dict[str, Any]] = None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -581,6 +589,152 @@ class FastWAM(torch.nn.Module):
                     margin=self.transition_counterfactual_margin
                 )
 
+        guard_config = dict(policy_guard_config or {})
+        self.policy_guard_enabled = bool(guard_config.get("enabled", False))
+        self.policy_guard_version = int(guard_config.get("version", 1))
+        self.policy_guard_action_weight = float(
+            guard_config.get("counterfactual_action_weight", 1.0)
+        )
+        self.policy_guard_verifier_weight = float(
+            guard_config.get("verifier_weight", 0.25)
+        )
+        self.policy_guard_alignment_weight = float(
+            guard_config.get("goal_action_alignment_weight", 0.10)
+        )
+        self.policy_guard_verifier_margin = float(
+            guard_config.get("verifier_margin", 0.20)
+        )
+        self.policy_guard_verifier_action_mse_temperature = float(
+            guard_config.get("verifier_action_mse_temperature", 0.25)
+        )
+        self.policy_guard_gate_threshold = float(
+            guard_config.get("gate_threshold", 0.20)
+        )
+        self.policy_guard_min_counterfactual_score = float(
+            guard_config.get("min_counterfactual_score", 0.60)
+        )
+        self.policy_guard_gate_mode = str(
+            guard_config.get("gate_mode", "guarded")
+        ).strip().lower()
+        self.policy_guard_require_direct_counterfactual_actions = bool(
+            guard_config.get("require_direct_counterfactual_actions", True)
+        )
+        self.policy_guard_modules = nn.ModuleDict()
+        self.policy_guard_action_expert: Optional[ActionDiT] = None
+        self.policy_guard_alignment_loss: Optional[GoalActionAlignmentLoss] = None
+        self.policy_guard_base_checkpoint: Optional[str] = None
+
+        if self.policy_guard_enabled:
+            if self.policy_guard_version != 1:
+                raise ValueError("The current PGC implementation supports version=1.")
+            if self.langforce_mvp_enabled or self.transition_contract_enabled:
+                raise ValueError(
+                    "PGC is an independent policy-protection mainline; disable "
+                    "LangForce MVP and Transition Contract when it is enabled."
+                )
+            if bool(
+                getattr(self.action_expert, "use_latent_action_queries", False)
+            ):
+                raise ValueError(
+                    "PGC requires the protected base Action Expert to use the "
+                    "released query-free interface "
+                    "(`action_dit_config.use_latent_action_queries=false`)."
+                )
+            if min(
+                self.policy_guard_action_weight,
+                self.policy_guard_verifier_weight,
+                self.policy_guard_alignment_weight,
+                self.policy_guard_verifier_margin,
+                self.policy_guard_verifier_action_mse_temperature,
+                self.policy_guard_gate_threshold,
+                self.policy_guard_min_counterfactual_score,
+            ) < 0:
+                raise ValueError("PGC weights, margins, and thresholds must be non-negative.")
+            if self.policy_guard_min_counterfactual_score > 1:
+                raise ValueError("`min_counterfactual_score` must be <= 1.")
+            if self.policy_guard_verifier_action_mse_temperature <= 0:
+                raise ValueError(
+                    "`verifier_action_mse_temperature` must be positive."
+                )
+            if self.policy_guard_gate_mode not in {
+                "guarded",
+                "base",
+                "counterfactual",
+            }:
+                raise ValueError(
+                    "`policy_guard.gate_mode` must be guarded, base, or "
+                    "counterfactual."
+                )
+
+            num_action_queries = int(
+                guard_config.get("num_action_queries", 32)
+            )
+            query_rope_offset = int(
+                guard_config.get("query_rope_offset", 512)
+            )
+            if num_action_queries <= 0 or query_rope_offset < 0:
+                raise ValueError("PGC action-query count/offset are invalid.")
+            if query_rope_offset + num_action_queries > int(
+                self.action_expert.freqs.shape[0]
+            ):
+                raise ValueError("PGC action queries exceed the ActionDiT RoPE cache.")
+
+            # This is a physically independent Action Expert.  Only its common
+            # backbone is initialized from the base; the base module itself is
+            # never put in the optimizer or mutated by PGC training.
+            counterfactual_action_expert = copy.deepcopy(self.action_expert)
+            counterfactual_action_expert.use_latent_action_queries = True
+            counterfactual_action_expert.num_latent_queries = num_action_queries
+            counterfactual_action_expert.query_rope_offset = query_rope_offset
+            reference_parameter = next(counterfactual_action_expert.parameters())
+            counterfactual_action_expert.register_parameter(
+                "latent_action_queries",
+                nn.Parameter(
+                    torch.randn(
+                        1,
+                        num_action_queries,
+                        int(counterfactual_action_expert.hidden_dim),
+                        device=reference_parameter.device,
+                        dtype=reference_parameter.dtype,
+                    )
+                    / math.sqrt(int(counterfactual_action_expert.hidden_dim))
+                ),
+            )
+            self.policy_guard_action_expert = counterfactual_action_expert
+
+            hidden_dim = int(guard_config.get("hidden_dim", 512))
+            projection_dim = int(guard_config.get("projection_dim", 256))
+            verifier_hidden_dim = int(
+                guard_config.get("verifier_hidden_dim", 256)
+            )
+            self.policy_guard_modules.update(
+                {
+                    "goal_graph": GoalGraphEncoder(
+                        text_dim=self.text_dim,
+                        video_dim=int(self.video_expert.hidden_dim),
+                        action_dim=int(counterfactual_action_expert.hidden_dim),
+                        hidden_dim=hidden_dim,
+                        projection_dim=projection_dim,
+                        num_goal_tokens=int(
+                            guard_config.get("num_goal_tokens", 4)
+                        ),
+                        num_heads=int(guard_config.get("num_heads", 8)),
+                    ),
+                    "verifier": ActionOutcomeVerifier(
+                        action_dim=int(counterfactual_action_expert.action_dim),
+                        video_dim=int(self.video_expert.hidden_dim),
+                        goal_dim=projection_dim,
+                        hidden_dim=verifier_hidden_dim,
+                    ),
+                }
+            )
+            self.policy_guard_modules.to(dtype=self.torch_dtype)
+            self.policy_guard_alignment_loss = GoalActionAlignmentLoss(
+                temperature=float(
+                    guard_config.get("alignment_temperature", 0.07)
+                )
+            )
+
         self.uses_transition_queries = bool(
             self.langforce_mvp_enabled or self.transition_contract_enabled
         )
@@ -643,6 +797,11 @@ class FastWAM(torch.nn.Module):
 
     def configure_lora(self, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         normalized = normalize_lora_config(config)
+        if self.policy_guard_enabled and normalized["enabled"]:
+            raise ValueError(
+                "PGC v1 protects a full frozen base and full-finetunes only its "
+                "independent counterfactual Action Expert; base LoRA must be disabled."
+            )
         if not normalized["enabled"]:
             if self.lora_enabled:
                 raise ValueError("Cannot disable LoRA after adapters have been injected.")
@@ -735,6 +894,23 @@ class FastWAM(torch.nn.Module):
         """Freeze the base model and expose only configured adapter parameters."""
         self.eval()
         self.requires_grad_(False)
+        if self.policy_guard_enabled:
+            if self.policy_guard_action_expert is None:
+                raise RuntimeError("PGC Action Expert was not initialized.")
+            self.policy_guard_action_expert.train()
+            self.policy_guard_action_expert.requires_grad_(True)
+            self.policy_guard_modules.train()
+            self.policy_guard_modules.requires_grad_(True)
+            trainable = sum(
+                parameter.numel()
+                for parameter in self.parameters()
+                if parameter.requires_grad
+            )
+            total = sum(parameter.numel() for parameter in self.parameters())
+            if trainable <= 0:
+                raise ValueError("PGC produced zero trainable parameters.")
+            return {"trainable": int(trainable), "total": int(total)}
+
         if not self.transition_freeze_m1_policy:
             self.dit.train()
 
@@ -797,6 +973,7 @@ class FastWAM(torch.nn.Module):
         loss_lambda_action: float = 1.0,
         langforce_mvp_config: Optional[dict[str, Any]] = None,
         transition_contract_config: Optional[dict[str, Any]] = None,
+        policy_guard_config: Optional[dict[str, Any]] = None,
         lora_config: Optional[dict[str, Any]] = None,
     ):
         if video_dit_config is None:
@@ -857,6 +1034,7 @@ class FastWAM(torch.nn.Module):
             loss_lambda_action=loss_lambda_action,
             langforce_mvp_config=langforce_mvp_config,
             transition_contract_config=transition_contract_config,
+            policy_guard_config=policy_guard_config,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -1050,6 +1228,309 @@ class FastWAM(torch.nn.Module):
             action_context_mask=token_context_mask[:, num_queries:],
             transition_query_tokens=transition_query_tokens,
         )
+
+    def _encode_policy_guard_goal(
+        self,
+        *,
+        final_video_hidden: torch.Tensor,
+        video_tokens_per_frame: int,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if not self.policy_guard_enabled or self.policy_guard_action_expert is None:
+            raise RuntimeError("PGC goal encoding requires policy_guard.enabled=true.")
+        current_token_count = min(
+            int(video_tokens_per_frame), int(final_video_hidden.shape[1])
+        )
+        if current_token_count <= 0:
+            raise ValueError("PGC requires at least one current visual token.")
+        base_queries = self.policy_guard_action_expert.transition_queries.expand(
+            final_video_hidden.shape[0], -1, -1
+        )
+        return self.policy_guard_modules["goal_graph"](
+            base_queries=base_queries,
+            language_hidden=context,
+            language_mask=context_mask,
+            current_video_hidden=final_video_hidden[:, :current_token_count].detach(),
+        )
+
+    def _prepare_policy_guard_action_tokens(
+        self,
+        *,
+        action_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        state_only_context_mask: torch.Tensor,
+        routed_goal_queries: torch.Tensor,
+    ) -> dict[str, Any]:
+        if not self.policy_guard_enabled or self.policy_guard_action_expert is None:
+            raise RuntimeError("PGC action preparation requires an initialized branch.")
+        num_queries = int(self.policy_guard_action_expert.num_latent_queries)
+        query_context_mask = state_only_context_mask[:, None, :].expand(
+            -1, num_queries, -1
+        )
+        action_context_mask = state_only_context_mask[:, None, :].expand(
+            -1, int(action_tokens.shape[1]), -1
+        )
+        return self.policy_guard_action_expert.pre_dit(
+            action_tokens=action_tokens,
+            timestep=timestep,
+            context=context,
+            context_mask=state_only_context_mask,
+            use_queries=True,
+            query_context_mask=query_context_mask,
+            action_context_mask=action_context_mask,
+            transition_query_tokens=routed_goal_queries,
+        )
+
+    def _forward_policy_guard_action_from_cache(
+        self,
+        *,
+        action_tokens: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        state_only_context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        video_seq_len: int,
+        video_tokens_per_frame: int,
+        routed_goal_queries: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.policy_guard_action_expert is None:
+            raise RuntimeError("PGC Action Expert is unavailable.")
+        action_pre = self._prepare_policy_guard_action_tokens(
+            action_tokens=action_tokens,
+            timestep=timestep_action,
+            context=context,
+            state_only_context_mask=state_only_context_mask,
+            routed_goal_queries=routed_goal_queries,
+        )
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=int(action_pre["tokens"].shape[1]),
+            video_tokens_per_frame=video_tokens_per_frame,
+            device=action_pre["tokens"].device,
+            num_queries=int(action_pre["meta"]["num_queries"]),
+            action_reads_raw_video=False,
+            queries_read_raw_video=False,
+        )
+        output_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+            action_expert=self.policy_guard_action_expert,
+        )
+        return self.policy_guard_action_expert.post_dit(output_tokens, action_pre)
+
+    def _policy_guard_clean_action_from_velocity(
+        self,
+        *,
+        noisy_action: torch.Tensor,
+        predicted_velocity: torch.Tensor,
+        timestep_action: torch.Tensor,
+    ) -> torch.Tensor:
+        sigma = (
+            timestep_action / float(self.train_action_scheduler.num_train_timesteps)
+        ).to(device=noisy_action.device, dtype=noisy_action.dtype)
+        sigma = sigma.view(-1, *([1] * (noisy_action.ndim - 1)))
+        return noisy_action - sigma * predicted_velocity
+
+    @staticmethod
+    def _masked_policy_guard_mean(
+        values: torch.Tensor, valid_mask: torch.Tensor
+    ) -> torch.Tensor:
+        valid = valid_mask.to(device=values.device, dtype=values.dtype)
+        result = (values * valid).sum() / valid.sum().clamp_min(1.0)
+        if not bool(valid_mask.any()):
+            result = values.sum() * 0.0
+        return result
+
+    def _compute_policy_guard_verifier_loss(
+        self,
+        *,
+        current_video_hidden: torch.Tensor,
+        goal_embedding: torch.Tensor,
+        demonstrated_action: torch.Tensor,
+        base_candidate_action: torch.Tensor,
+        counterfactual_candidate_action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+        is_counterfactual: torch.Tensor,
+        direct_action_valid: torch.Tensor,
+        goal_ids: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        verifier = self.policy_guard_modules["verifier"]
+        goal_state = verifier.encode_goal_state(
+            current_video_hidden.detach(), goal_embedding
+        )
+        demonstrated_embedding = verifier.encode_action(
+            demonstrated_action, action_is_pad
+        )
+        base_embedding = verifier.encode_action(
+            base_candidate_action.detach(), action_is_pad
+        )
+        counterfactual_embedding = verifier.encode_action(
+            counterfactual_candidate_action.detach(), action_is_pad
+        )
+        demonstrated_logits = verifier.score_embeddings(
+            goal_state, demonstrated_embedding
+        )
+        base_logits = verifier.score_embeddings(goal_state, base_embedding)
+        counterfactual_logits = verifier.score_embeddings(
+            goal_state, counterfactual_embedding
+        )
+
+        valid = direct_action_valid.to(
+            device=demonstrated_logits.device, dtype=torch.bool
+        )
+        is_counterfactual = is_counterfactual.to(
+            device=demonstrated_logits.device, dtype=torch.bool
+        )
+        positive = torch.ones_like(demonstrated_logits)
+        loss_demonstrated = self._masked_policy_guard_mean(
+            F.binary_cross_entropy_with_logits(
+                demonstrated_logits, positive, reduction="none"
+            ),
+            valid,
+        )
+        def _candidate_quality(candidate: torch.Tensor) -> torch.Tensor:
+            per_step = F.mse_loss(
+                candidate.float(), demonstrated_action.float(), reduction="none"
+            ).mean(dim=-1)
+            if action_is_pad is None:
+                error = per_step.mean(dim=1)
+            else:
+                action_valid = (~action_is_pad).to(
+                    device=per_step.device, dtype=per_step.dtype
+                )
+                error = (per_step * action_valid).sum(dim=1) / action_valid.sum(
+                    dim=1
+                ).clamp_min(1.0)
+            return torch.exp(
+                -error / self.policy_guard_verifier_action_mse_temperature
+            ).clamp(0.0, 1.0)
+
+        base_target = _candidate_quality(base_candidate_action.detach())
+        counterfactual_target = _candidate_quality(
+            counterfactual_candidate_action.detach()
+        )
+        loss_counterfactual_candidate = self._masked_policy_guard_mean(
+            F.binary_cross_entropy_with_logits(
+                counterfactual_logits,
+                counterfactual_target.to(dtype=counterfactual_logits.dtype),
+                reduction="none",
+            ),
+            valid,
+        )
+        loss_base_candidate = self._masked_policy_guard_mean(
+            F.binary_cross_entropy_with_logits(
+                base_logits,
+                base_target.to(dtype=base_logits.dtype),
+                reduction="none",
+            ),
+            valid,
+        )
+        counterfactual_valid = valid & is_counterfactual
+        ranking_valid = counterfactual_valid & (
+            counterfactual_target > base_target
+        )
+        ranking = torch.relu(
+            self.policy_guard_verifier_margin
+            - (counterfactual_logits - base_logits)
+        )
+        loss_ranking = self._masked_policy_guard_mean(
+            ranking, ranking_valid
+        )
+        verifier_loss = (
+            loss_demonstrated
+            + loss_counterfactual_candidate
+            + loss_base_candidate
+        ) / 3.0 + loss_ranking
+
+        if self.policy_guard_alignment_loss is None:
+            raise RuntimeError("PGC alignment loss was not initialized.")
+        alignment_loss, alignment_metrics = self.policy_guard_alignment_loss(
+            goal_state,
+            demonstrated_embedding,
+            group_ids=goal_ids,
+        )
+        base_score = torch.sigmoid(base_logits)
+        counterfactual_score = torch.sigmoid(counterfactual_logits)
+        predicted_override = (
+            (counterfactual_score >= self.policy_guard_min_counterfactual_score)
+            & (
+                counterfactual_score - base_score
+                >= self.policy_guard_gate_threshold
+            )
+        )
+        metrics = {
+            "loss_pgc_verifier_demonstrated": loss_demonstrated.detach(),
+            "loss_pgc_verifier_base": loss_base_candidate.detach(),
+            "loss_pgc_verifier_counterfactual": (
+                loss_counterfactual_candidate.detach()
+            ),
+            "loss_pgc_verifier_ranking": loss_ranking.detach(),
+            "pgc_verifier_base_score": base_score.detach().mean(),
+            "pgc_verifier_counterfactual_score": (
+                counterfactual_score.detach().mean()
+            ),
+            "pgc_verifier_base_quality_target": base_target.detach().mean(),
+            "pgc_verifier_counterfactual_quality_target": (
+                counterfactual_target.detach().mean()
+            ),
+            "pgc_verifier_score_margin": (
+                counterfactual_score.detach() - base_score.detach()
+            ).mean(),
+            "pgc_direct_counterfactual_fraction": is_counterfactual.float().mean(),
+            "pgc_direct_action_valid_fraction": valid.float().mean(),
+            "pgc_verifier_ranking_valid_fraction": ranking_valid.float().mean(),
+            "pgc_predicted_override_rate": predicted_override.float().mean(),
+            "pgc_predicted_override_rate_on_counterfactual": (
+                self._masked_policy_guard_mean(
+                    predicted_override.float(), counterfactual_valid
+                ).detach()
+            ),
+            "pgc_predicted_override_rate_on_native": (
+                self._masked_policy_guard_mean(
+                    predicted_override.float(), valid & ~is_counterfactual
+                ).detach()
+            ),
+        }
+        metrics.update(detached_policy_guard_metrics(alignment_metrics))
+        return verifier_loss, alignment_loss, metrics
+
+    def _select_policy_guard_action(
+        self,
+        *,
+        base_action: torch.Tensor,
+        counterfactual_action: torch.Tensor,
+        base_score: torch.Tensor,
+        counterfactual_score: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if base_action.shape != counterfactual_action.shape:
+            raise ValueError("PGC action candidates must share shape.")
+        if base_score.shape != counterfactual_score.shape or base_score.ndim != 1:
+            raise ValueError("PGC candidate scores must share [B] shape.")
+        if self.policy_guard_gate_mode == "base":
+            selected = torch.zeros_like(base_score, dtype=torch.bool)
+        elif self.policy_guard_gate_mode == "counterfactual":
+            selected = torch.ones_like(base_score, dtype=torch.bool)
+        else:
+            selected = (
+                counterfactual_score >= self.policy_guard_min_counterfactual_score
+            ) & (
+                counterfactual_score - base_score
+                >= self.policy_guard_gate_threshold
+            )
+        while selected.ndim < base_action.ndim:
+            selected = selected.unsqueeze(-1)
+        output = torch.where(selected, counterfactual_action, base_action)
+        return output, selected.reshape(base_score.shape[0], -1)[:, 0]
 
     def encode_intended_transition(
         self,
@@ -1937,6 +2418,9 @@ class FastWAM(torch.nn.Module):
         negative_valid = sample.get("negative_valid")
         transition_task_id = sample.get("transition_task_id")
         counterfactual_task_id = sample.get("counterfactual_task_id")
+        pgc_is_counterfactual = sample.get("pgc_is_counterfactual")
+        pgc_direct_action_valid = sample.get("pgc_direct_action_valid")
+        pgc_goal_id = sample.get("pgc_goal_id")
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
             raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
@@ -1944,6 +2428,21 @@ class FastWAM(torch.nn.Module):
             raise ValueError(f"`sample['video']` channel dimension must be 3, got shape {tuple(video.shape)}")
 
         batch_size, _, num_frames, height, width = video.shape
+        if self.policy_guard_enabled:
+            missing_pgc = [
+                name
+                for name, value in (
+                    ("pgc_is_counterfactual", pgc_is_counterfactual),
+                    ("pgc_direct_action_valid", pgc_direct_action_valid),
+                    ("pgc_goal_id", pgc_goal_id),
+                )
+                if value is None
+            ]
+            if missing_pgc:
+                raise ValueError(
+                    "PGC training requires dataset provenance fields: "
+                    f"{missing_pgc}. Use RobotVideoDataset with the PGC data options."
+                )
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(
                 f"Video spatial dims must be multiples of 16, got H={height}, W={width}"
@@ -2082,6 +2581,30 @@ class FastWAM(torch.nn.Module):
                     "`counterfactual_task_id` must be [B], got "
                     f"{tuple(counterfactual_task_id.shape)}."
                 )
+        if pgc_is_counterfactual is not None:
+            pgc_is_counterfactual = torch.as_tensor(
+                pgc_is_counterfactual, device=self.device, dtype=torch.bool
+            )
+            if pgc_is_counterfactual.ndim == 0:
+                pgc_is_counterfactual = pgc_is_counterfactual.expand(batch_size)
+            if pgc_is_counterfactual.shape != (batch_size,):
+                raise ValueError("`pgc_is_counterfactual` must be [B].")
+        if pgc_direct_action_valid is not None:
+            pgc_direct_action_valid = torch.as_tensor(
+                pgc_direct_action_valid, device=self.device, dtype=torch.bool
+            )
+            if pgc_direct_action_valid.ndim == 0:
+                pgc_direct_action_valid = pgc_direct_action_valid.expand(batch_size)
+            if pgc_direct_action_valid.shape != (batch_size,):
+                raise ValueError("`pgc_direct_action_valid` must be [B].")
+        if pgc_goal_id is not None:
+            pgc_goal_id = torch.as_tensor(
+                pgc_goal_id, device=self.device, dtype=torch.long
+            )
+            if pgc_goal_id.ndim == 0:
+                pgc_goal_id = pgc_goal_id.expand(batch_size)
+            if pgc_goal_id.shape != (batch_size,):
+                raise ValueError("`pgc_goal_id` must be [B].")
         language_context_len = int(context.shape[1])
         has_proprio = False
         proprio_current = None
@@ -2127,6 +2650,9 @@ class FastWAM(torch.nn.Module):
             "negative_valid": negative_valid,
             "transition_task_id": transition_task_id,
             "counterfactual_task_id": counterfactual_task_id,
+            "pgc_is_counterfactual": pgc_is_counterfactual,
+            "pgc_direct_action_valid": pgc_direct_action_valid,
+            "pgc_goal_id": pgc_goal_id,
             "language_context_len": language_context_len,
             "has_proprio": has_proprio,
             "proprio_current": proprio_current,
@@ -2379,18 +2905,37 @@ class FastWAM(torch.nn.Module):
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
-        video_pre = self.video_expert.pre_dit(
-            x=latents,
-            timestep=timestep_video,
-            context=context,
-            context_mask=full_context_mask,
-            action=action,
-            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
-        )
+        if self.policy_guard_enabled:
+            with torch.no_grad():
+                video_pre = self.video_expert.pre_dit(
+                    x=latents,
+                    timestep=timestep_video,
+                    context=context,
+                    context_mask=full_context_mask,
+                    action=action,
+                    fuse_vae_embedding_in_latents=inputs[
+                        "fuse_vae_embedding_in_latents"
+                    ],
+                )
+        else:
+            video_pre = self.video_expert.pre_dit(
+                x=latents,
+                timestep=timestep_video,
+                context=context,
+                context_mask=full_context_mask,
+                action=action,
+                fuse_vae_embedding_in_latents=inputs[
+                    "fuse_vae_embedding_in_latents"
+                ],
+            )
 
         z_language = None
         pred_action_teacher = None
         router_metrics: dict[str, torch.Tensor] = {}
+        pred_action_base = None
+        policy_guard_goal_embedding = None
+        policy_guard_current_video_hidden = None
+        policy_guard_metrics: dict[str, torch.Tensor] = {}
         if self.transition_contract_enabled:
             (
                 pred_action_post,
@@ -2408,6 +2953,90 @@ class FastWAM(torch.nn.Module):
             )
             pred_video = self.video_expert.post_dit(
                 final_video_hidden, video_pre
+            )
+        elif self.policy_guard_enabled:
+            action_pre_base = self.action_expert.pre_dit(
+                action_tokens=noisy_action,
+                timestep=timestep_action,
+                context=context,
+                context_mask=full_context_mask,
+                use_queries=False,
+            )
+            video_tokens = video_pre["tokens"]
+            base_action_tokens = action_pre_base["tokens"]
+            base_attention_mask = self._build_mot_attention_mask(
+                video_seq_len=int(video_tokens.shape[1]),
+                action_seq_len=int(base_action_tokens.shape[1]),
+                video_tokens_per_frame=int(
+                    video_pre["meta"]["tokens_per_frame"]
+                ),
+                device=video_tokens.device,
+                num_queries=0,
+                action_reads_raw_video=True,
+            )
+            with torch.no_grad():
+                base_result = self.mot(
+                    embeds_all={
+                        "video": video_tokens,
+                        "action": base_action_tokens,
+                    },
+                    attention_mask=base_attention_mask,
+                    freqs_all={
+                        "video": video_pre["freqs"],
+                        "action": action_pre_base["freqs"],
+                    },
+                    context_all={
+                        "video": {
+                            "context": video_pre["context"],
+                            "mask": video_pre["context_mask"],
+                        },
+                        "action": {
+                            "context": action_pre_base["context"],
+                            "mask": action_pre_base["context_mask"],
+                        },
+                    },
+                    t_mod_all={
+                        "video": video_pre["t_mod"],
+                        "action": action_pre_base["t_mod"],
+                    },
+                    return_video_cache=True,
+                )
+                if not isinstance(base_result, tuple):
+                    raise RuntimeError("PGC base forward did not return Video cache.")
+                base_tokens_out, video_kv_cache = base_result
+                pred_video = self.video_expert.post_dit(
+                    base_tokens_out["video"], video_pre
+                )
+                pred_action_base = self.action_expert.post_dit(
+                    base_tokens_out["action"], action_pre_base
+                )
+
+            (
+                routed_goal_queries,
+                policy_guard_goal_embedding,
+                policy_guard_metrics,
+            ) = self._encode_policy_guard_goal(
+                final_video_hidden=base_tokens_out["video"],
+                video_tokens_per_frame=int(
+                    video_pre["meta"]["tokens_per_frame"]
+                ),
+                context=context,
+                context_mask=full_context_mask,
+            )
+            policy_guard_current_video_hidden = base_tokens_out["video"][:, : int(
+                video_pre["meta"]["tokens_per_frame"]
+            )].detach()
+            pred_action_post = self._forward_policy_guard_action_from_cache(
+                action_tokens=noisy_action,
+                timestep_action=timestep_action,
+                context=context,
+                state_only_context_mask=state_only_context_mask,
+                video_kv_cache=video_kv_cache,
+                video_seq_len=int(video_tokens.shape[1]),
+                video_tokens_per_frame=int(
+                    video_pre["meta"]["tokens_per_frame"]
+                ),
+                routed_goal_queries=routed_goal_queries,
             )
         else:
             action_pre = self._prepare_action_tokens(
@@ -2498,6 +3127,83 @@ class FastWAM(torch.nn.Module):
             * float(loss_action_post.detach().item()),
             "loss_action_post": float(loss_action_post.detach().item()),
         }
+
+        if self.policy_guard_enabled:
+            if (
+                pred_action_base is None
+                or policy_guard_goal_embedding is None
+                or policy_guard_current_video_hidden is None
+            ):
+                raise RuntimeError("PGC training branch did not produce candidates.")
+            e_base = self._compute_action_loss_per_sample(
+                pred_action=pred_action_base,
+                target_action=target_action,
+                action_is_pad=action_is_pad,
+            )
+            loss_action_base = (e_base * action_weight).mean()
+            base_clean_action = self._policy_guard_clean_action_from_velocity(
+                noisy_action=noisy_action,
+                predicted_velocity=pred_action_base,
+                timestep_action=timestep_action,
+            )
+            counterfactual_clean_action = (
+                self._policy_guard_clean_action_from_velocity(
+                    noisy_action=noisy_action,
+                    predicted_velocity=pred_action_post,
+                    timestep_action=timestep_action,
+                )
+            )
+            verifier_loss, alignment_loss, verifier_metrics = (
+                self._compute_policy_guard_verifier_loss(
+                    current_video_hidden=policy_guard_current_video_hidden,
+                    goal_embedding=policy_guard_goal_embedding,
+                    demonstrated_action=action,
+                    base_candidate_action=base_clean_action,
+                    counterfactual_candidate_action=(
+                        counterfactual_clean_action
+                    ),
+                    action_is_pad=action_is_pad,
+                    is_counterfactual=inputs["pgc_is_counterfactual"],
+                    direct_action_valid=inputs["pgc_direct_action_valid"],
+                    goal_ids=inputs["pgc_goal_id"],
+                )
+            )
+            loss_total = (
+                self.policy_guard_action_weight * loss_action_post
+                + self.policy_guard_verifier_weight * verifier_loss
+                + self.policy_guard_alignment_weight * alignment_loss
+            )
+            loss_dict.update(
+                {
+                    "loss_action": float(
+                        (
+                            self.policy_guard_action_weight
+                            * loss_action_post.detach()
+                        ).item()
+                    ),
+                    "loss_pgc_action": float(loss_action_post.detach().item()),
+                    "loss_pgc_base_action_monitor": float(
+                        loss_action_base.detach().item()
+                    ),
+                    "loss_pgc_verifier": float(verifier_loss.detach().item()),
+                    "loss_pgc_goal_action_alignment": float(
+                        alignment_loss.detach().item()
+                    ),
+                    "pgc_action_effective_weight": float(
+                        self.policy_guard_action_weight
+                    ),
+                    "pgc_verifier_effective_weight": float(
+                        self.policy_guard_verifier_weight
+                    ),
+                    "pgc_alignment_effective_weight": float(
+                        self.policy_guard_alignment_weight
+                    ),
+                    "pgc_base_policy_frozen": 1.0,
+                    "pgc_video_loss_optimization_weight": 0.0,
+                }
+            )
+            loss_dict.update(detached_policy_guard_metrics(policy_guard_metrics))
+            loss_dict.update(detached_policy_guard_metrics(verifier_metrics))
 
         if self.transition_contract_enabled:
             if self.transition_policy_distillation_enabled:
@@ -3215,10 +3921,11 @@ class FastWAM(torch.nn.Module):
         mask_language: bool = False,
     ) -> dict[str, Any]:
         self.eval()
+        action_only_pred = None
         if test_action_with_infer_action:
             if seed is None:
                 raise ValueError("`test_action_with_infer_action=True` requires non-null `seed`.")
-            action_only_out = self.infer_action(
+            action_only_pred = self.infer_action(
                 prompt=prompt,
                 input_image=input_image.clone(),
                 action_horizon=action_horizon,
@@ -3231,7 +3938,8 @@ class FastWAM(torch.nn.Module):
                 tiled=tiled,
                 proprio=proprio.clone() if proprio is not None else None,
                 mask_language=mask_language,
-            )["action"]
+            )
+            action_only_out = action_only_pred["action"]
         
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -3289,7 +3997,6 @@ class FastWAM(torch.nn.Module):
             device=rand_device,
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
-
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         latents_video[:, :, 0:1] = first_frame_latents.clone()
@@ -3375,6 +4082,8 @@ class FastWAM(torch.nn.Module):
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
         action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
+        if self.policy_guard_enabled and test_action_with_infer_action:
+            action_out = action_only_out
         if test_action_with_infer_action:
             if not torch.allclose(action_out, action_only_out, atol=1e-2, rtol=1e-2):
                 max_abs_diff = (action_out - action_only_out).abs().max().item()
@@ -3382,10 +4091,23 @@ class FastWAM(torch.nn.Module):
                     f"Action from infer_joint and infer_action differ with max abs diff {max_abs_diff:.6f}. "
                 )
 
-        return {
+        result = {
             "video": self._decode_latents(latents_video, tiled=tiled),
             "action": action_out,
         }
+        if self.policy_guard_enabled and action_only_pred is not None:
+            for key in (
+                "policy_guard_selected_counterfactual",
+                "policy_guard_base_score",
+                "policy_guard_counterfactual_score",
+                "policy_guard_score_margin",
+                "policy_guard_gate_mode",
+                "policy_guard_base_action",
+                "policy_guard_counterfactual_action",
+            ):
+                if key in action_only_pred:
+                    result[key] = action_only_pred[key]
+        return result
 
     @torch.no_grad()
     def infer_action(
@@ -3442,6 +4164,9 @@ class FastWAM(torch.nn.Module):
             device=rand_device,
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
+        policy_guard_latents_action = (
+            latents_action.clone() if self.policy_guard_enabled else None
+        )
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
@@ -3501,6 +4226,7 @@ class FastWAM(torch.nn.Module):
             fuse_vae_embedding_in_latents=fuse_flag,
         )
         routed_transition_tokens = None
+        final_video_hidden = None
         if self.transition_contract_enabled:
             prefill_result = self.mot.prefill_video_cache(
                 video_tokens=video_pre["tokens"],
@@ -3555,7 +4281,7 @@ class FastWAM(torch.nn.Module):
             queries_read_raw_video=False,
         )
         if not self.transition_contract_enabled:
-            video_kv_cache = self.mot.prefill_video_cache(
+            prefill_result = self.mot.prefill_video_cache(
                 video_tokens=video_pre["tokens"],
                 video_freqs=video_pre["freqs"],
                 video_t_mod=video_pre["t_mod"],
@@ -3566,7 +4292,36 @@ class FastWAM(torch.nn.Module):
                 video_attention_mask=attention_mask[
                     :video_seq_len, :video_seq_len
                 ],
+                return_final_hidden=self.policy_guard_enabled,
             )
+            if self.policy_guard_enabled:
+                if not isinstance(prefill_result, tuple):
+                    raise RuntimeError("PGC Video prefill did not return hidden tokens.")
+                video_kv_cache, final_video_hidden = prefill_result
+            else:
+                video_kv_cache = prefill_result
+
+        policy_guard_goal_queries = None
+        policy_guard_goal_embedding = None
+        policy_guard_current_video_hidden = None
+        if self.policy_guard_enabled:
+            if final_video_hidden is None:
+                raise RuntimeError("PGC inference requires final Video hidden tokens.")
+            (
+                policy_guard_goal_queries,
+                policy_guard_goal_embedding,
+                _,
+            ) = self._encode_policy_guard_goal(
+                final_video_hidden=final_video_hidden,
+                video_tokens_per_frame=int(
+                    video_pre["meta"]["tokens_per_frame"]
+                ),
+                context=context,
+                context_mask=context_mask,
+            )
+            policy_guard_current_video_hidden = final_video_hidden[:, : int(
+                video_pre["meta"]["tokens_per_frame"]
+            )].detach()
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -3592,8 +4347,89 @@ class FastWAM(torch.nn.Module):
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
+            if self.policy_guard_enabled:
+                if (
+                    policy_guard_latents_action is None
+                    or policy_guard_goal_queries is None
+                ):
+                    raise RuntimeError("PGC inference candidate was not initialized.")
+                pred_action_counterfactual = (
+                    self._forward_policy_guard_action_from_cache(
+                        action_tokens=policy_guard_latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        state_only_context_mask=state_only_context_mask,
+                        video_kv_cache=video_kv_cache,
+                        video_seq_len=video_seq_len,
+                        video_tokens_per_frame=int(
+                            video_pre["meta"]["tokens_per_frame"]
+                        ),
+                        routed_goal_queries=policy_guard_goal_queries,
+                    )
+                )
+                policy_guard_latents_action = self.infer_action_scheduler.step(
+                    pred_action_counterfactual,
+                    step_delta_action,
+                    policy_guard_latents_action,
+                )
+
+        if not self.policy_guard_enabled:
+            return {
+                "action": latents_action[0].detach().to(
+                    device="cpu", dtype=torch.float32
+                ),
+            }
+
+        if (
+            policy_guard_latents_action is None
+            or policy_guard_goal_embedding is None
+            or policy_guard_current_video_hidden is None
+        ):
+            raise RuntimeError("PGC inference did not produce both candidates.")
+        verifier = self.policy_guard_modules["verifier"]
+        base_logits, _, _ = verifier(
+            current_video_hidden=policy_guard_current_video_hidden,
+            goal_embedding=policy_guard_goal_embedding,
+            action=latents_action,
+        )
+        counterfactual_logits, _, _ = verifier(
+            current_video_hidden=policy_guard_current_video_hidden,
+            goal_embedding=policy_guard_goal_embedding,
+            action=policy_guard_latents_action,
+        )
+        base_score = torch.sigmoid(base_logits)
+        counterfactual_score = torch.sigmoid(counterfactual_logits)
+        selected_action, selected_counterfactual = (
+            self._select_policy_guard_action(
+                base_action=latents_action,
+                counterfactual_action=policy_guard_latents_action,
+                base_score=base_score,
+                counterfactual_score=counterfactual_score,
+            )
+        )
         return {
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action": selected_action[0].detach().to(
+                device="cpu", dtype=torch.float32
+            ),
+            "policy_guard_selected_counterfactual": bool(
+                selected_counterfactual[0].item()
+            ),
+            "policy_guard_base_score": float(base_score[0].item()),
+            "policy_guard_counterfactual_score": float(
+                counterfactual_score[0].item()
+            ),
+            "policy_guard_score_margin": float(
+                (counterfactual_score[0] - base_score[0]).item()
+            ),
+            "policy_guard_gate_mode": self.policy_guard_gate_mode,
+            "policy_guard_base_action": latents_action[0].detach().to(
+                device="cpu", dtype=torch.float32
+            ),
+            "policy_guard_counterfactual_action": (
+                policy_guard_latents_action[0]
+                .detach()
+                .to(device="cpu", dtype=torch.float32)
+            ),
         }
 
     @torch.no_grad()
@@ -3759,7 +4595,96 @@ class FastWAM(torch.nn.Module):
             for name, value in self.transition_contract_modules.state_dict().items()
         }
 
+    def _policy_guard_metadata(self) -> dict[str, Any]:
+        if not self.policy_guard_enabled or self.policy_guard_action_expert is None:
+            raise RuntimeError("PGC metadata requested while policy guard is disabled.")
+        return {
+            "architecture": "pgc_fastwam",
+            "policy_guard_version": self.policy_guard_version,
+            "base_policy": "frozen_released_fastwam",
+            "base_action_interface": "query_free_joint_mot",
+            "counterfactual_policy": "independent_full_action_expert",
+            "num_action_queries": int(
+                self.policy_guard_action_expert.num_latent_queries
+            ),
+            "query_rope_offset": int(
+                self.policy_guard_action_expert.query_rope_offset
+            ),
+            "goal_graph_tokens": int(
+                self.policy_guard_modules["goal_graph"].num_goal_tokens
+            ),
+            "gate_mode": self.policy_guard_gate_mode,
+            "gate_threshold": self.policy_guard_gate_threshold,
+            "min_counterfactual_score": (
+                self.policy_guard_min_counterfactual_score
+            ),
+            "verifier_action_mse_temperature": (
+                self.policy_guard_verifier_action_mse_temperature
+            ),
+            "require_direct_counterfactual_actions": (
+                self.policy_guard_require_direct_counterfactual_actions
+            ),
+            "policy_protection": "immutable_base_plus_conservative_hard_gate",
+            "representation_supervision": "direct_goal_action_alignment",
+        }
+
+    @staticmethod
+    def _cpu_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
+        return {
+            name: value.detach().to(device="cpu")
+            for name, value in module.state_dict().items()
+        }
+
+    def _sync_policy_guard_action_from_base(self) -> None:
+        if not self.policy_guard_enabled or self.policy_guard_action_expert is None:
+            return
+        incompatible = self.policy_guard_action_expert.load_state_dict(
+            self.action_expert.state_dict(), strict=False
+        )
+        disallowed_missing = [
+            key
+            for key in incompatible.missing_keys
+            if key != "latent_action_queries"
+        ]
+        if disallowed_missing or incompatible.unexpected_keys:
+            raise ValueError(
+                "Could not initialize the PGC Action Expert from the protected "
+                f"base: missing={disallowed_missing}, "
+                f"unexpected={list(incompatible.unexpected_keys)}."
+            )
+        logger.info(
+            "Initialized independent PGC Action Expert from frozen base "
+            "(new_query_tensors=%d).",
+            len(incompatible.missing_keys),
+        )
+
     def save_checkpoint(self, path, optimizer=None, step=None):
+        if self.policy_guard_enabled:
+            if self.policy_guard_action_expert is None:
+                raise RuntimeError("PGC Action Expert is unavailable for saving.")
+            if not self.policy_guard_base_checkpoint:
+                raise ValueError(
+                    "PGC checkpoint cannot be saved before a protected base "
+                    "checkpoint has been loaded."
+                )
+            payload = {
+                "format": "fastwam_policy_guard_v1",
+                "base_checkpoint": self.policy_guard_base_checkpoint,
+                "counterfactual_action_expert": self._cpu_state_dict(
+                    self.policy_guard_action_expert
+                ),
+                "policy_guard": self._cpu_state_dict(
+                    self.policy_guard_modules
+                ),
+                "architecture_metadata": self._policy_guard_metadata(),
+                "step": step,
+                "torch_dtype": str(self.torch_dtype),
+            }
+            if optimizer is not None:
+                payload["optimizer"] = optimizer.state_dict()
+            torch.save(payload, path)
+            return
+
         if self.lora_enabled:
             payload = {
                 "format": "fastwam_lora_adapter_v1",
@@ -4001,8 +4926,62 @@ class FastWAM(torch.nn.Module):
         )
         return payload
 
+    def _load_policy_guard_checkpoint(
+        self, path: str, payload: dict, optimizer=None
+    ):
+        if not self.policy_guard_enabled or self.policy_guard_action_expert is None:
+            raise ValueError(
+                "This checkpoint contains PGC weights; enable the matching "
+                "`policy_guard` model config before loading it."
+            )
+        metadata = payload.get("architecture_metadata") or {}
+        if int(metadata.get("policy_guard_version", -1)) != int(
+            self.policy_guard_version
+        ):
+            raise ValueError(
+                "PGC checkpoint version mismatch: "
+                f"checkpoint={metadata.get('policy_guard_version')}, "
+                f"model={self.policy_guard_version}."
+            )
+        base_checkpoint = payload.get("base_checkpoint")
+        if not base_checkpoint:
+            raise ValueError("PGC checkpoint is missing `base_checkpoint`.")
+        resolved_base = self._resolve_adapter_base_checkpoint(
+            path, str(base_checkpoint)
+        )
+        if Path(resolved_base).resolve() == Path(path).expanduser().resolve():
+            raise ValueError("PGC checkpoint cannot name itself as its base.")
+        base_payload = self.load_checkpoint(resolved_base, optimizer=None)
+        if base_payload.get("format") == "fastwam_policy_guard_v1":
+            raise ValueError("Nested PGC checkpoints are not supported as bases.")
+
+        action_state = payload.get("counterfactual_action_expert")
+        guard_state = payload.get("policy_guard")
+        if not isinstance(action_state, dict) or not action_state:
+            raise ValueError("PGC checkpoint has no counterfactual Action Expert.")
+        if not isinstance(guard_state, dict) or not guard_state:
+            raise ValueError("PGC checkpoint has no Goal-Graph/Verifier state.")
+        self.policy_guard_action_expert.load_state_dict(action_state, strict=True)
+        self.policy_guard_modules.load_state_dict(guard_state, strict=True)
+        self.policy_guard_base_checkpoint = resolved_base
+        if optimizer is not None and "optimizer" in payload:
+            optimizer.load_state_dict(payload["optimizer"])
+        logger.info(
+            "Loaded PGC checkpoint from %s (base=%s action_tensors=%d "
+            "guard_tensors=%d).",
+            path,
+            resolved_base,
+            len(action_state),
+            len(guard_state),
+        )
+        return payload
+
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
+        if payload.get("format") == "fastwam_policy_guard_v1":
+            return self._load_policy_guard_checkpoint(
+                str(path), payload, optimizer=optimizer
+            )
         if payload.get("format") == "fastwam_lora_adapter_v1":
             return self._load_lora_adapter(str(path), payload, optimizer=optimizer)
 
@@ -4063,7 +5042,11 @@ class FastWAM(torch.nn.Module):
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
-        self.lora_base_checkpoint = str(Path(path).expanduser().resolve())
+        resolved_checkpoint = str(Path(path).expanduser().resolve())
+        self.lora_base_checkpoint = resolved_checkpoint
+        if self.policy_guard_enabled:
+            self._sync_policy_guard_action_from_base()
+            self.policy_guard_base_checkpoint = resolved_checkpoint
         return payload
 
     def forward(self, *args, **kwargs):

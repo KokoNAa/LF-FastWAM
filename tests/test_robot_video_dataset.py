@@ -27,6 +27,14 @@ class RobotVideoDatasetSourceTest(unittest.TestCase):
         self.assertIn("hashlib", imported_modules)
         self.assertIn("sha256", hashlib_calls)
 
+    def test_text_precompute_scans_pgc_counterfactual_directories(self):
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts/precompute_text_embeds.py"
+        )
+        source = source_path.read_text(encoding="utf-8")
+        self.assertIn("pgc_counterfactual_dataset_dirs", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -48,9 +48,36 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         counterfactual_manifest_path: Optional[str] = None,
         counterfactual_negative_probability: float = 0.0,
+        pgc_counterfactual_dataset_dirs: Optional[list[str]] = None,
+        pgc_counterfactual_oversample_factor: int = 1,
     ):
+        native_dataset_dirs = [str(path) for path in dataset_dirs]
+        pgc_counterfactual_dataset_dirs = [
+            str(path) for path in (pgc_counterfactual_dataset_dirs or [])
+        ]
+        duplicate_dirs = set(native_dataset_dirs) & set(
+            pgc_counterfactual_dataset_dirs
+        )
+        if duplicate_dirs:
+            raise ValueError(
+                "PGC direct-counterfactual datasets must be distinct from the "
+                f"native datasets; duplicates={sorted(duplicate_dirs)}."
+            )
+        self.pgc_counterfactual_oversample_factor = int(
+            pgc_counterfactual_oversample_factor
+        )
+        if self.pgc_counterfactual_oversample_factor < 1:
+            raise ValueError("`pgc_counterfactual_oversample_factor` must be >= 1.")
+        self.pgc_native_dataset_count = len(native_dataset_dirs)
+        self.pgc_counterfactual_dataset_dirs = pgc_counterfactual_dataset_dirs
+        self.pgc_has_counterfactual_data = bool(
+            self.pgc_counterfactual_dataset_dirs
+        )
+        combined_dataset_dirs = (
+            native_dataset_dirs + self.pgc_counterfactual_dataset_dirs
+        )
         self.lerobot_dataset = BaseLerobotDataset(
-            dataset_dirs=dataset_dirs,
+            dataset_dirs=combined_dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
             obs_size=num_frames,
             action_size=num_frames - 1,
@@ -58,6 +85,19 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
         )
+        underlying = self.lerobot_dataset.multi_dataset._datasets
+        self.pgc_native_frame_count = sum(
+            int(dataset.num_frames)
+            for dataset in underlying[: self.pgc_native_dataset_count]
+        )
+        total_frame_count = sum(int(dataset.num_frames) for dataset in underlying)
+        self._sample_indices = list(range(total_frame_count))
+        if self.pgc_has_counterfactual_data:
+            counterfactual_indices = list(
+                range(self.pgc_native_frame_count, total_frame_count)
+            )
+            for _ in range(self.pgc_counterfactual_oversample_factor - 1):
+                self._sample_indices.extend(counterfactual_indices)
     
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio
@@ -78,6 +118,17 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        if self.pgc_has_counterfactual_data and self.override_instruction is not None:
+            raise ValueError(
+                "PGC direct-action datasets cannot be combined with "
+                "`override_instruction`; their recorded task text is part of "
+                "the positive supervision contract."
+            )
+        if self.pgc_has_counterfactual_data and counterfactual_manifest_path:
+            raise ValueError(
+                "PGC direct-action datasets cannot be combined with the TC "
+                "negative-only counterfactual manifest."
+            )
         self.counterfactual_negative_probability = float(
             counterfactual_negative_probability
         )
@@ -138,10 +189,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             self.lerobot_dataset.set_processor(processor)
         
     def __len__(self):
-        return len(self.lerobot_dataset)
+        return len(self._sample_indices)
 
     def _get(self, idx):
-        sample_idx = idx
+        if not 0 <= int(idx) < len(self._sample_indices):
+            raise IndexError(f"Sample index {idx} is out of bounds.")
+        sample_idx = self._sample_indices[int(idx)]
         sample = None
         for attempt in range(self.max_padding_retry + 1):
             sample = self.lerobot_dataset[sample_idx]
@@ -163,7 +216,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if not has_pad or attempt >= self.max_padding_retry:
                 break
 
-            sample_idx = np.random.randint(len(self.lerobot_dataset))
+            sample_idx = self._sample_indices[np.random.randint(len(self))]
         
         image_is_pad = sample["image_is_pad"]
 
@@ -237,6 +290,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )
 
         task = sample["instruction"]
+        dataset_index = int(
+            torch.as_tensor(sample.get("dataset_index", 0)).item()
+        )
+        pgc_is_counterfactual = (
+            dataset_index >= self.pgc_native_dataset_count
+        )
         
         # FIXME
         if self.override_instruction is not None:
@@ -284,6 +343,20 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
+            "pgc_is_counterfactual": torch.tensor(
+                pgc_is_counterfactual, dtype=torch.bool
+            ),
+            "pgc_direct_action_valid": torch.tensor(
+                (
+                    not bool(sample["action_is_pad"].all().item())
+                    and not bool(image_is_pad[1:].all().item())
+                ),
+                dtype=torch.bool,
+            ),
+            "pgc_goal_id": torch.tensor(
+                stable_instruction_id(task), dtype=torch.long
+            ),
+            "pgc_dataset_index": torch.tensor(dataset_index, dtype=torch.long),
         }
         if negative_context is not None:
             data.update(

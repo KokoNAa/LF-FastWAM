@@ -69,3 +69,8 @@ train:
   # same-scene instruction; disabled for all baseline and TC-C runs.
   counterfactual_manifest_path: null
   counterfactual_negative_probability: 0.0
+  # PGC only: successful state-aligned demonstrations collected under the
+  # alternate instruction. These directories are provenance-marked and may be
+  # oversampled without changing native LIBERO normalization statistics.
+  pgc_counterfactual_dataset_dirs: []
+  pgc_counterfactual_oversample_factor: 1

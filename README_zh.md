@@ -17,6 +17,9 @@
 受控训练、测试及语言干预评估命令见
 [`docs/LF_FASTWAM_MVP.md`](docs/LF_FASTWAM_MVP.md)。
 
+冻结原策略、使用独立反事实动作分支和保守硬门控的后续方案见
+[`docs/PGC_FASTWAM.md`](docs/PGC_FASTWAM.md)。
+
 ## 目录
 
 - [File Structure](#file-structure)

@@ -88,6 +88,7 @@ def create_fastwam(
     loss=None,
     langforce_mvp=None,
     transition_contract=None,
+    policy_guard=None,
     lora=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
@@ -157,6 +158,15 @@ def create_fastwam(
             f"{type(transition_contract)}"
         )
 
+    if isinstance(policy_guard, DictConfig):
+        policy_guard = OmegaConf.to_container(policy_guard, resolve=True)
+    if policy_guard is None:
+        policy_guard = {}
+    if not isinstance(policy_guard, dict):
+        raise ValueError(
+            f"`policy_guard` must be dict-like, got {type(policy_guard)}"
+        )
+
     if isinstance(lora, DictConfig):
         lora = OmegaConf.to_container(lora, resolve=True)
     if lora is None:
@@ -188,6 +198,7 @@ def create_fastwam(
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         langforce_mvp_config=langforce_mvp,
         transition_contract_config=transition_contract,
+        policy_guard_config=policy_guard,
         lora_config=lora,
     )
 

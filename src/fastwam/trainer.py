@@ -79,6 +79,23 @@ class Wan22Trainer:
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
+        if bool(getattr(self.model, "policy_guard_enabled", False)) and bool(
+            getattr(
+                self.model,
+                "policy_guard_require_direct_counterfactual_actions",
+                False,
+            )
+        ):
+            if not bool(
+                getattr(
+                    self.train_dataset, "pgc_has_counterfactual_data", False
+                )
+            ):
+                raise ValueError(
+                    "PGC requires at least one state-aligned direct "
+                    "counterfactual LeRobot dataset. Set "
+                    "`data.train.pgc_counterfactual_dataset_dirs`."
+                )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # In LoRA mode only adapters plus explicitly selected small modules are
@@ -574,6 +591,17 @@ class Wan22Trainer:
         was_transition_training = bool(
             transition_modules is not None and transition_modules.training
         )
+        policy_guard_action = getattr(
+            model, "policy_guard_action_expert", None
+        )
+        policy_guard_modules = getattr(model, "policy_guard_modules", None)
+        was_policy_guard_training = bool(
+            (policy_guard_action is not None and policy_guard_action.training)
+            or (
+                policy_guard_modules is not None
+                and policy_guard_modules.training
+            )
+        )
         model.eval()
 
         # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
@@ -739,7 +767,11 @@ class Wan22Trainer:
         action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
         action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
 
-        if was_dit_training or was_transition_training:
+        if (
+            was_dit_training
+            or was_transition_training
+            or was_policy_guard_training
+        ):
             self._set_dit_only_train_mode()
 
         result = {

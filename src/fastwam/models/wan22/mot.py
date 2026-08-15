@@ -113,13 +113,20 @@ class MoT(nn.Module):
         k_cat: torch.Tensor,
         v_cat: torch.Tensor,
         attention_mask: torch.Tensor,
+        *,
+        training_override: Optional[bool] = None,
     ) -> torch.Tensor:
         attn_mask = attention_mask.to(device=q_cat.device)
 
         def _forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
             return flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attn_mask)
 
-        if self.mot_checkpoint_mixed_attn and self.training:
+        is_training = (
+            self.training
+            if training_override is None
+            else bool(training_override)
+        )
+        if self.mot_checkpoint_mixed_attn and is_training:
             return torch.utils.checkpoint.checkpoint(
                 _forward,
                 q_cat,
@@ -237,6 +244,8 @@ class MoT(nn.Module):
         use_gradient_checkpointing: bool,
         mixed_slice: torch.Tensor,
         context_payload: Optional[dict],
+        *,
+        training_override: Optional[bool] = None,
     ) -> torch.Tensor:
         """Apply post-attention computations, with optional checkpointing.
 
@@ -277,7 +286,12 @@ class MoT(nn.Module):
                 context_payload=_context_payload,
             )
 
-        if use_gradient_checkpointing and self.training:
+        is_training = (
+            self.training
+            if training_override is None
+            else bool(training_override)
+        )
+        if use_gradient_checkpointing and is_training:
             return torch.utils.checkpoint.checkpoint(
                 _post_fn,
                 mixed_slice,
@@ -404,6 +418,8 @@ class MoT(nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        *,
+        action_expert: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -442,7 +458,23 @@ class MoT(nn.Module):
         # Use the action query rows from the joint [video+action] mask.
         action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
 
-        expert = self.mixtures["action"]
+        expert = (
+            self.mixtures["action"]
+            if action_expert is None
+            else action_expert
+        )
+        if len(expert.blocks) != self.num_layers:
+            raise ValueError(
+                "Override Action Expert layer count must match the Video/MoT "
+                f"cache ({len(expert.blocks)} vs {self.num_layers})."
+            )
+        if int(expert.num_heads) != int(self.num_heads) or int(
+            expert.attn_head_dim
+        ) != int(self.attn_head_dim):
+            raise ValueError(
+                "Override Action Expert attention geometry must match the "
+                "Video/MoT cache."
+            )
         x = action_tokens
         action_context_payload = self._prepare_context_payload(
             action_context_payload
@@ -488,6 +520,10 @@ class MoT(nn.Module):
                 k_cat=k_cat,
                 v_cat=v_cat,
                 attention_mask=action_attention_mask,
+                # A PGC Action Expert can train through this frozen/eval MoT
+                # cache utility. Checkpointing must follow the override expert,
+                # not the protected MoT module's mode.
+                training_override=expert.training,
             )
             x = self._apply_post_with_optional_checkpoint(
                 block=block,
@@ -499,6 +535,7 @@ class MoT(nn.Module):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
                 context_payload=action_context_payload,
+                training_override=expert.training,
             )
         return x
 

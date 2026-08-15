@@ -569,7 +569,13 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[np.ndarray, dict, Optional[list[Image.Image]], float]:
+) -> tuple[
+    np.ndarray,
+    dict,
+    Optional[list[Image.Image]],
+    float,
+    Optional[dict[str, Any]],
+]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
         num_inference_steps = int(cfg.get("eval_num_inference_steps", 20))
@@ -638,6 +644,19 @@ def _predict_action_chunk(
             torch.cuda.synchronize()
         inference_latency_ms = (time.perf_counter() - inference_start) * 1000.0
     action = pred["action"]  # [T, D]
+    policy_guard_diagnostics = None
+    if "policy_guard_selected_counterfactual" in pred:
+        policy_guard_diagnostics = {
+            "selected_counterfactual": bool(
+                pred["policy_guard_selected_counterfactual"]
+            ),
+            "base_score": float(pred["policy_guard_base_score"]),
+            "counterfactual_score": float(
+                pred["policy_guard_counterfactual_score"]
+            ),
+            "score_margin": float(pred["policy_guard_score_margin"]),
+            "gate_mode": str(pred["policy_guard_gate_mode"]),
+        }
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
@@ -647,7 +666,13 @@ def _predict_action_chunk(
     action = invert_gripper_action(action)
     if bool(cfg.EVALUATION.get("binarize_gripper", False)):
         action[..., -1] = np.sign(action[..., -1])
-    return action, imgs, predicted_future_frames, inference_latency_ms
+    return (
+        action,
+        imgs,
+        predicted_future_frames,
+        inference_latency_ms,
+        policy_guard_diagnostics,
+    )
 
 
 def _get_max_steps(task_suite_name: str) -> int:
@@ -702,6 +727,7 @@ def run_single_episode(
     int,
     bool,
     Optional[dict[str, Any]],
+    list[dict[str, Any]],
 ]:
     max_steps = _resolve_max_steps(cfg)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
@@ -740,6 +766,7 @@ def run_single_episode(
     current_replan_step = 0
     current_replan_idx = -1
     inference_latencies_ms: list[float] = []
+    policy_guard_decisions: list[dict[str, Any]] = []
 
     t = 0
     policy_steps_executed = 0
@@ -758,6 +785,7 @@ def run_single_episode(
                 imgs,
                 predicted_future_frames,
                 inference_latency_ms,
+                policy_guard_diagnostics,
             ) = _predict_action_chunk(
                 obs=obs,
                 policy_instruction=policy_instruction,
@@ -771,6 +799,8 @@ def run_single_episode(
                 model_device=model_device,
             )
             inference_latencies_ms.append(inference_latency_ms)
+            if policy_guard_diagnostics is not None:
+                policy_guard_decisions.append(policy_guard_diagnostics)
             if predicted_future_frames is not None:
                 current_replan_idx += 1
                 current_predicted_future_clip = {
@@ -874,6 +904,7 @@ def run_single_episode(
         int(policy_steps_executed),
         bool(not done and policy_steps_executed >= max_steps),
         counterfactual_diagnostics,
+        policy_guard_decisions,
     )
 
 
@@ -935,6 +966,7 @@ def run_single_task(
         "success_predicate": (
             "counterfactual" if instruction_condition == "counterfactual" else "source"
         ),
+        "policy_guard_episode_diagnostics": [],
     }
     if intervention_record is not None:
         results["pair_id"] = intervention_record.get("pair_id")
@@ -957,6 +989,7 @@ def run_single_task(
             policy_steps_executed,
             horizon_timeout,
             counterfactual_diagnostics,
+            policy_guard_decisions,
         ) = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
@@ -979,6 +1012,17 @@ def run_single_task(
         )
         results["inference_latencies_ms"].extend(inference_latencies_ms)
         results["episode_policy_steps"].append(policy_steps_executed)
+        results["policy_guard_episode_diagnostics"].append(
+            {
+                "episode": trial_idx,
+                "decision_count": len(policy_guard_decisions),
+                "override_count": sum(
+                    int(item["selected_counterfactual"])
+                    for item in policy_guard_decisions
+                ),
+                "decisions": policy_guard_decisions,
+            }
+        )
         if horizon_timeout:
             results["horizon_timeout_episodes"].append(trial_idx)
         if success:
@@ -1057,6 +1101,35 @@ def run_single_task(
         )
         results["latency_p95_ms"] = float(
             np.percentile(results["inference_latencies_ms"], 95)
+        )
+    policy_guard_decisions = [
+        decision
+        for episode in results["policy_guard_episode_diagnostics"]
+        for decision in episode["decisions"]
+    ]
+    results["policy_guard_decision_count"] = len(policy_guard_decisions)
+    results["policy_guard_override_count"] = sum(
+        int(item["selected_counterfactual"])
+        for item in policy_guard_decisions
+    )
+    results["policy_guard_override_rate"] = (
+        float(results["policy_guard_override_count"])
+        / max(1, results["policy_guard_decision_count"])
+    )
+    if policy_guard_decisions:
+        results["policy_guard_base_score_mean"] = float(
+            np.mean([item["base_score"] for item in policy_guard_decisions])
+        )
+        results["policy_guard_counterfactual_score_mean"] = float(
+            np.mean(
+                [
+                    item["counterfactual_score"]
+                    for item in policy_guard_decisions
+                ]
+            )
+        )
+        results["policy_guard_score_margin_mean"] = float(
+            np.mean([item["score_margin"] for item in policy_guard_decisions])
         )
     if instruction_condition == "shuffled":
         # The simulator success predicate still represents the original task.

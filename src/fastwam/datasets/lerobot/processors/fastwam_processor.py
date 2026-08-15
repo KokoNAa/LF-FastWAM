@@ -276,6 +276,10 @@ class FastWAMProcessor(BaseProcessor):
         assert sample["proprio"].shape[-1] == self.proprio_output_dim
 
         sample["idx"] = data["idx"]
+        if "dataset_index" in data:
+            sample["dataset_index"] = torch.as_tensor(
+                data["dataset_index"], dtype=torch.long
+            )
 
         # sample = self.tokenizer(sample)
         

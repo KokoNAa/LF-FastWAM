@@ -17,6 +17,9 @@ This working tree also includes the LF-FastWAM language-adherence MVP. See
 [`docs/LF_FASTWAM_MVP.md`](docs/LF_FASTWAM_MVP.md) for architecture, controlled
 B0/B1/M1 training, tests, and language-intervention evaluation.
 
+The policy-protected counterfactual successor is documented in
+[`docs/PGC_FASTWAM.md`](docs/PGC_FASTWAM.md).
+
 ## Index
 
 - [File Structure](#file-structure)
