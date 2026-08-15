@@ -42,7 +42,8 @@ fi
   --require-suite libero_spatial \
   --require-suite libero_object \
   --require-suite libero_goal \
-  --require-suite libero_10
+  --require-suite libero_10 \
+  --require-complete-task-coverage
 
 NATIVE_JSON="$(${PYTHON_BIN} - "${LIBERO_DATA_ROOT}" <<'PY'
 import json

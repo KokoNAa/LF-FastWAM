@@ -47,6 +47,7 @@ python scripts/validate_pgc_counterfactual_datasets.py \
   "action_supervision": "executed_counterfactual_success_trajectory",
   "state_aligned": true,
   "successful_only": true,
+  "state_catalog": "meta/pgc_initial_states/episode_{episode_index:06d}.npy",
   "successful_episode_count": 100,
   "source_suites": ["libero_object"],
   "pairs": [
@@ -65,10 +66,131 @@ python scripts/validate_pgc_counterfactual_datasets.py \
 逐 episode 审计示例：
 
 ```json
-{"episode_index": 0, "pair_id": "libero_object_00_to_01", "source_initial_state_index": 3, "initial_state_sha256": "<64 lowercase hex characters>", "initial_state_match": true, "counterfactual_goal_satisfied": true}
+{"episode_index": 0, "pair_id": "libero_object_00_to_01", "source_initial_state_index": 0, "source_initial_state_catalog": "meta/pgc_initial_states/episode_000000.npy", "initial_state_sha256": "<64 lowercase hex characters>", "initial_state_match": true, "counterfactual_goal_satisfied": true}
 ```
 
 任务文件 `meta/tasks.jsonl` 中的 instruction 必须是实际执行的替代指令；失败轨迹不能混入。
+
+## 构建直接反事实动作数据
+
+### 数据来源与有效性条件
+
+构建器读取 LIBERO 官方原始 HDF5 人类示教（`data/demo_*/states` 与
+`actions`），而不是把现有 LeRobot 轨迹替换一段文本。对每个
+Source→Counterfactual 配对，它执行以下流程：
+
+1. 从 Counterfactual 任务的成功 demo 取得 `states[0]` 和动作序列；
+2. 创建 Source BDDL 环境，只把成功谓词替换成经过审计的替代谓词；
+3. 把 `states[0]` 精确写入 Source 模拟器并验证形状、数值和 SHA-256；
+4. 按 LIBERO 数据再生成协议执行 10 个稳定化空动作并过滤 no-op；
+5. 先做一次无记录验证；成功后从同一状态做第二次录制；
+6. 第二次也完成替代谓词时，才写入双相机 LeRobot episode 和审计文件。
+
+这里的 `source_initial_state_index` 指向数据集自己的
+`meta/pgc_initial_states/` 状态目录。状态虽然来自目标任务 demo，但已经在 Source
+环境中实际恢复并验证；模型结构或平坦状态维度不兼容时会直接拒绝，不能把
+失败重放伪装成正样本。
+
+官方 HDF5 下载和格式说明见 [LIBERO 数据集说明](https://github.com/Lifelong-Robot-Learning/LIBERO#datasets)
+及 [LIBERO 示教采集脚本](https://github.com/Lifelong-Robot-Learning/LIBERO/blob/master/scripts/libero_100_collect_demonstrations.py)。
+
+### 先检查服务器是否有原始 HDF5
+
+现有的 `*_no_noops_lerobot` 目录不能还原完整 MuJoCo 初始状态；必须找到原始
+HDF5：
+
+```bash
+find /root/gpufree-data/fastwam -type f \
+  \( -name '*_demo.hdf5' -o -name '*_demo.h5' \) \
+  | sort | tee /root/gpufree-data/libero_hdf5_files.txt
+
+wc -l /root/gpufree-data/libero_hdf5_files.txt
+sed -n '1,20p' /root/gpufree-data/libero_hdf5_files.txt
+```
+
+标准下载应包含 Spatial、Object、Goal 和 LIBERO-100 的 `*_demo.hdf5`；其中
+LIBERO-100 同时提供 LIBERO-10 与 LIBERO-90 donor。若没有，需要先用 LIBERO
+官方下载脚本补齐原始示教，不能从 MP4 或 Parquet 反推状态。
+
+### 配对与只读规划检查
+
+配对器会在四个源 suite 加 LIBERO-90 donor 池中寻找不同目标谓词，并默认要求
+Source 与 Target 的环境类、objects 和 fixtures 完全一致。加入 LIBERO-90 是
+为了给 LIBERO-10 的 held-out 场景寻找同模型替代目标，并不会把 LIBERO-90
+当作评估 source。先只做规划检查，不启动 MuJoCo 录制：
+
+```bash
+cd /root/gpufree-data/LF-FastWAM
+
+export PGC_HDF5_ROOT=/path/to/LIBERO/libero/datasets
+export PGC_DATA_ROOT=/root/gpufree-data/pgc_libero_data_v1
+
+PGC_PLAN_ONLY=true \
+bash scripts/build_pgc_libero_datasets.sh \
+  "$PGC_HDF5_ROOT" \
+  "$PGC_DATA_ROOT" \
+  5 \
+  42
+```
+
+结果写到 `manifests/pgc_manifest_coverage.json`。默认模式只接受可以安全重放
+平坦状态的配对；若某些任务显示 `no executable state-compatible donor task`，
+应为这些场景采集人工/脚本 oracle demo。`PGC_RELAXED_SCENE_MATCH=true` 只适合
+诊断候选，实际状态维度不匹配仍会被采集器拒绝。
+
+### 四卡后台正式构建
+
+规划通过后，每张卡负责一个 suite：
+
+```bash
+cd /root/gpufree-data/LF-FastWAM
+
+nohup env \
+  PGC_VIDEO_CODEC=h264 \
+  PGC_MAX_DEMOS_PER_PAIR=50 \
+  bash scripts/build_pgc_libero_datasets.sh \
+    "$PGC_HDF5_ROOT" \
+    "$PGC_DATA_ROOT" \
+    5 \
+    42 \
+  > /root/gpufree-data/pgc_libero_data_build.log 2>&1 &
+
+echo $! > /root/gpufree-data/pgc_libero_data_build.pid
+```
+
+监控：
+
+```bash
+tail -f /root/gpufree-data/pgc_libero_data_build.log
+
+for f in "$PGC_DATA_ROOT"/logs/*.log; do
+  echo "===== $f ====="
+  tail -n 20 "$f"
+done
+
+find "$PGC_DATA_ROOT" -path '*/meta/pgc_collection_summary.json' \
+  -exec sh -c 'echo "===== $1 ====="; cat "$1"' _ {} \;
+```
+
+网络或终端中断后使用相同目录续跑；已提交的 donor demo 不会重复：
+
+```bash
+PGC_RESUME=true \
+bash scripts/build_pgc_libero_datasets.sh \
+  "$PGC_HDF5_ROOT" \
+  "$PGC_DATA_ROOT" \
+  5 \
+  42
+```
+
+完成后会生成 `pgc_counterfactual_datasets.txt`，并自动执行四 suite、每 suite
+10 个源任务、每个配对至少一个成功 episode 的强校验。每个数据目录同时包含：
+
+- `data/` 与 `videos/`：FastWAM 可直接读取的 Parquet/MP4；
+- `meta/pgc_provenance.json`：配对和采集协议；
+- `meta/pgc_episodes.jsonl`：逐 episode 成功与状态审计；
+- `meta/pgc_initial_states/`：可复验的精确初始状态；
+- `meta/pgc_collection_summary.json`：成功数、缺口和最近拒绝原因。
 
 ## LIBERO 全 suite 训练
 

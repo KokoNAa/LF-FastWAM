@@ -8,6 +8,6 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 PYTHONPATH=src "${PYTHON_BIN}" -m unittest discover -s tests -v
 "${PYTHON_BIN}" -m compileall -q src experiments scripts tests
 bash -n scripts/train_pgc_libero.sh scripts/eval_pgc_libero.sh \
-  scripts/validate_pgc_server.sh
+  scripts/build_pgc_libero_datasets.sh scripts/validate_pgc_server.sh
 
 echo "PGC-FastWAM static, regression, and small-model validation passed."

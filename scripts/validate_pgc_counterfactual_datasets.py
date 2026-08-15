@@ -4,15 +4,37 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 EXPECTED_FORMAT = "pgc_counterfactual_actions_v1"
 EXPECTED_SUPERVISION = "executed_counterfactual_success_trajectory"
 LIBERO_SUITES = {"libero_spatial", "libero_object", "libero_goal", "libero_10"}
+
+
+def _state_sha256(state: np.ndarray) -> str:
+    array = np.asarray(state)
+    if array.ndim == 0 or not np.issubdtype(array.dtype, np.number):
+        raise ValueError("PGC simulator state must be a non-scalar numeric array.")
+    array = np.ascontiguousarray(array.astype("<f8", copy=False))
+    if not np.isfinite(array).all():
+        raise ValueError("PGC simulator state contains NaN or infinity.")
+    header = json.dumps(
+        {"dtype": "float64-le", "shape": list(array.shape)},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    digest = hashlib.sha256()
+    digest.update(header)
+    digest.update(b"\0")
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -64,6 +86,8 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
         raise ValueError(f"{dataset_dir}: `state_aligned` must be true.")
     if provenance.get("successful_only") is not True:
         raise ValueError(f"{dataset_dir}: `successful_only` must be true.")
+    if not str(provenance.get("state_catalog", "")).strip():
+        raise ValueError(f"{dataset_dir}: provenance requires `state_catalog`.")
 
     source_suites = set(provenance.get("source_suites") or [])
     if not source_suites or not source_suites.issubset(LIBERO_SUITES):
@@ -76,6 +100,7 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
     pair_ids = set()
     pair_suites = set()
     target_instructions = set()
+    source_task_keys = set()
     for index, pair in enumerate(pairs):
         if not isinstance(pair, dict):
             raise ValueError(f"{dataset_dir}: pairs[{index}] must be an object.")
@@ -96,11 +121,18 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
         if pair_id in pair_ids:
             raise ValueError(f"{dataset_dir}: duplicate pair_id={pair_id!r}.")
         pair_ids.add(pair_id)
-        if str(pair["source_suite"]) not in source_suites:
+        source_suite = str(pair["source_suite"])
+        if source_suite not in source_suites:
             raise ValueError(
                 f"{dataset_dir}: pair {pair_id} references an undeclared suite."
             )
-        pair_suites.add(str(pair["source_suite"]))
+        source_task_key = (source_suite, int(pair["source_task_id"]))
+        if source_task_key in source_task_keys:
+            raise ValueError(
+                f"{dataset_dir}: duplicate source task pair {source_task_key}."
+            )
+        source_task_keys.add(source_task_key)
+        pair_suites.add(source_suite)
         if not isinstance(pair["counterfactual_goal_state"], list) or not pair[
             "counterfactual_goal_state"
         ]:
@@ -125,6 +157,12 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
         raise ValueError(
             f"{dataset_dir}: task instructions lack provenance pairs: {sorted(uncovered)}."
         )
+    missing_instructions = target_instructions - dataset_instructions
+    if missing_instructions:
+        raise ValueError(
+            f"{dataset_dir}: provenance pairs have no successful task data: "
+            f"{sorted(missing_instructions)}."
+        )
     if not episode_records:
         raise ValueError(f"{dataset_dir}: no counterfactual episodes were recorded.")
 
@@ -132,12 +170,14 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
     if len(episode_indices) != len(episode_records):
         raise ValueError(f"{dataset_dir}: episodes.jsonl has duplicate episode indices.")
     audited_indices = set()
+    audited_pair_ids = set()
     state_hash_pattern = re.compile(r"^[0-9a-f]{64}$")
     for index, audit in enumerate(episode_audits):
         required_audit_fields = {
             "episode_index",
             "pair_id",
             "source_initial_state_index",
+            "source_initial_state_catalog",
             "initial_state_sha256",
             "initial_state_match",
             "counterfactual_goal_satisfied",
@@ -159,6 +199,7 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
                 f"{dataset_dir}: episode {episode_index} references unknown "
                 f"pair_id={audit['pair_id']!r}."
             )
+        audited_pair_ids.add(str(audit["pair_id"]))
         if int(audit["source_initial_state_index"]) < 0:
             raise ValueError(
                 f"{dataset_dir}: episode {episode_index} has a negative "
@@ -170,6 +211,31 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
             raise ValueError(
                 f"{dataset_dir}: episode {episode_index} needs a 64-character "
                 "initial_state_sha256."
+            )
+        state_relpath = Path(str(audit["source_initial_state_catalog"]))
+        if state_relpath.is_absolute():
+            raise ValueError(
+                f"{dataset_dir}: episode {episode_index} state catalog path "
+                "must be relative to the dataset."
+            )
+        state_path = (dataset_dir / state_relpath).resolve()
+        if not state_path.is_relative_to(dataset_dir):
+            raise ValueError(
+                f"{dataset_dir}: episode {episode_index} state catalog path "
+                "escapes the dataset root."
+            )
+        if not state_path.is_file():
+            raise ValueError(
+                f"{dataset_dir}: episode {episode_index} initial state file "
+                f"is missing: {state_path}."
+            )
+        state = np.load(state_path, allow_pickle=False)
+        actual_hash = _state_sha256(state)
+        declared_hash = str(audit["initial_state_sha256"]).strip().lower()
+        if actual_hash != declared_hash:
+            raise ValueError(
+                f"{dataset_dir}: episode {episode_index} initial state hash "
+                f"mismatch: {actual_hash} != {declared_hash}."
             )
         if audit["initial_state_match"] is not True:
             raise ValueError(
@@ -186,6 +252,12 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
             f"missing={sorted(episode_indices - audited_indices)} "
             f"extra={sorted(audited_indices - episode_indices)}."
         )
+    unused_pairs = pair_ids - audited_pair_ids
+    if unused_pairs:
+        raise ValueError(
+            f"{dataset_dir}: provenance pairs have no successful episodes: "
+            f"{sorted(unused_pairs)}."
+        )
 
     declared_episodes = provenance.get("successful_episode_count")
     if declared_episodes is not None and int(declared_episodes) != len(episode_records):
@@ -199,6 +271,7 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
         "pairs": len(pairs),
         "tasks": len(task_records),
         "episodes": len(episode_records),
+        "source_task_keys": sorted(source_task_keys),
     }
 
 
@@ -226,6 +299,11 @@ def main() -> None:
         default=[],
         help="Require direct counterfactual coverage for this LIBERO suite.",
     )
+    parser.add_argument(
+        "--require-complete-task-coverage",
+        action="store_true",
+        help="Require source task IDs 0..9 for every requested suite.",
+    )
     args = parser.parse_args()
     datasets = list(args.datasets)
     if args.list_path is not None:
@@ -243,6 +321,26 @@ def main() -> None:
             "Direct counterfactual datasets do not cover required suites: "
             f"{sorted(missing_suites)}."
         )
+    if args.require_complete_task_coverage:
+        covered_task_ids = {
+            suite: {
+                int(task_id)
+                for summary in summaries
+                for source_suite, task_id in summary["source_task_keys"]
+                if source_suite == suite
+            }
+            for suite in args.require_suite
+        }
+        incomplete = {
+            suite: sorted(set(range(10)) - task_ids)
+            for suite, task_ids in covered_task_ids.items()
+            if task_ids != set(range(10))
+        }
+        if incomplete:
+            raise ValueError(
+                "Direct counterfactual datasets have incomplete LIBERO task "
+                f"coverage: {incomplete}."
+            )
     for summary in summaries:
         print(
             "Validated PGC dataset: "

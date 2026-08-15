@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import io
 import logging
 import shutil
 from pathlib import Path
@@ -817,13 +818,55 @@ class LeRobotDataset(torch.utils.data.Dataset):
         )
         return self.root / fpath
 
-    # def _save_image(self, image: torch.Tensor | np.ndarray | PIL.Image.Image | bytes, fpath: Path) -> None:
-    #     if self.image_writer is None:
-    #         if isinstance(image, torch.Tensor):
-    #             image = image.cpu().numpy()
-    #         write_image(image, fpath)
-    #     else:
-    #         self.image_writer.save_image(image=image, fpath=fpath)
+    def _save_image(
+        self,
+        image: torch.Tensor | np.ndarray | PIL.Image.Image | bytes,
+        fpath: Path,
+    ) -> None:
+        """Persist one RGB frame for the episode video encoder.
+
+        The upstream asynchronous writer was removed from this vendored
+        LeRobot copy, but ``add_frame`` still stored the paths that it would
+        have produced.  Recording therefore failed later with ``No images
+        found``.  Keep collection deterministic and crash-local by writing the
+        JPEG synchronously; simulation is substantially slower than this I/O
+        path, so an asynchronous pool is not needed for LIBERO collection.
+        """
+        if isinstance(image, bytes):
+            pil_image = PIL.Image.open(io.BytesIO(image)).convert("RGB")
+        elif isinstance(image, PIL.Image.Image):
+            pil_image = image.convert("RGB")
+        else:
+            if isinstance(image, torch.Tensor):
+                image = image.detach().cpu().numpy()
+            array = np.asarray(image)
+            if array.ndim != 3:
+                raise ValueError(
+                    f"Image frame must have 3 dimensions, got {array.shape}."
+                )
+            if array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+                array = np.moveaxis(array, 0, -1)
+            if np.issubdtype(array.dtype, np.floating):
+                finite = array[np.isfinite(array)]
+                if finite.size == 0:
+                    raise ValueError("Image frame contains no finite pixels.")
+                if float(finite.min()) >= 0.0 and float(finite.max()) <= 1.0:
+                    array = array * 255.0
+                array = np.clip(array, 0.0, 255.0).astype(np.uint8)
+            elif array.dtype != np.uint8:
+                array = np.clip(array, 0, 255).astype(np.uint8)
+            if array.shape[-1] == 1:
+                array = np.repeat(array, 3, axis=-1)
+            elif array.shape[-1] == 4:
+                array = array[..., :3]
+            if array.shape[-1] != 3:
+                raise ValueError(
+                    f"Image frame must have 1, 3, or 4 channels, got {array.shape}."
+                )
+            pil_image = PIL.Image.fromarray(np.ascontiguousarray(array), mode="RGB")
+
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        pil_image.save(fpath, format="JPEG", quality=95)
 
     def add_frame(self, frame: dict, task: List[str], timestamp: float | None = None) -> None:
         """
@@ -863,7 +906,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 )
                 if frame_index == 0:
                     img_path.parent.mkdir(parents=True, exist_ok=True)
-                # self._save_image(frame[key], img_path)
+                self._save_image(frame[key], img_path)
                 self.episode_buffer[key].append(str(img_path))
             else:
                 self.episode_buffer[key].append(frame[key])

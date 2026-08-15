@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
@@ -30,13 +32,20 @@ class PolicyGuardDataContractTest(unittest.TestCase):
             json.dumps({"episode_index": 0, "tasks": [0]}) + "\n",
             encoding="utf-8",
         )
+        state_dir = meta / "pgc_initial_states"
+        state_dir.mkdir()
+        state = np.arange(12, dtype=np.float64)
+        np.save(state_dir / "episode_000000.npy", state, allow_pickle=False)
         (meta / "pgc_episodes.jsonl").write_text(
             json.dumps(
                 {
                     "episode_index": 0,
                     "pair_id": "libero_object_00_to_07",
                     "source_initial_state_index": 3,
-                    "initial_state_sha256": "a" * 64,
+                    "source_initial_state_catalog": (
+                        "meta/pgc_initial_states/episode_000000.npy"
+                    ),
+                    "initial_state_sha256": VALIDATOR._state_sha256(state),
                     "initial_state_match": True,
                     "counterfactual_goal_satisfied": True,
                 }
@@ -51,6 +60,9 @@ class PolicyGuardDataContractTest(unittest.TestCase):
             "state_aligned": state_aligned,
             "successful_only": True,
             "successful_episode_count": 1,
+            "state_catalog": (
+                "meta/pgc_initial_states/episode_{episode_index:06d}.npy"
+            ),
             "source_suites": ["libero_object"],
             "pairs": [
                 {
@@ -95,6 +107,37 @@ class PolicyGuardDataContractTest(unittest.TestCase):
             dataset = self._write_dataset(Path(tmpdir))
             (dataset / "meta/pgc_episodes.jsonl").unlink()
             with self.assertRaisesRegex(ValueError, "pgc_episodes"):
+                VALIDATOR.validate_dataset(dataset)
+
+    def test_rejects_pair_without_successful_episode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = self._write_dataset(Path(tmpdir))
+            provenance_path = dataset / "meta/pgc_provenance.json"
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            provenance["pairs"].append(
+                {
+                    "pair_id": "libero_object_01_to_07",
+                    "source_suite": "libero_object",
+                    "source_task_id": 1,
+                    "source_instruction": "pick up the cream cheese",
+                    "counterfactual_instruction": "pick up the milk",
+                    "counterfactual_goal_state": [
+                        ["in", "milk_1", "basket_1_contain_region"]
+                    ],
+                }
+            )
+            provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "no successful"):
+                VALIDATOR.validate_dataset(dataset)
+
+    def test_rejects_tampered_initial_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = self._write_dataset(Path(tmpdir))
+            state_path = (
+                dataset / "meta/pgc_initial_states/episode_000000.npy"
+            )
+            np.save(state_path, np.ones(12), allow_pickle=False)
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
                 VALIDATOR.validate_dataset(dataset)
 
 
