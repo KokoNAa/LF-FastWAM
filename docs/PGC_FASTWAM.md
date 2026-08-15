@@ -26,7 +26,7 @@ PGC 包含两条物理隔离的动作路径：
 
 ## 为什么必须准备新数据
 
-仅将旧轨迹换成另一条文本不是反事实动作正监督。PGC 要求在**源任务当前状态**下，以替代指令执行并成功完成替代目标的真实轨迹。每个直接反事实 LeRobot 数据目录必须包含：
+仅将旧轨迹换成另一条文本不是反事实动作正监督。PGC 要求在**源任务仿真模型中的已审计状态**下，以替代指令执行并成功完成请求结果的真实轨迹。该状态可以是布局完全一致时精确恢复的 donor flat state，也可以是按同名关节把 donor 的机器人、目标物体及公共物体迁移到 Source 模型后得到的 Source flat state；两者都必须在 Source 环境中成功回放。每个直接反事实 LeRobot 数据目录必须包含：
 
 - `meta/pgc_provenance.json`：数据集级任务配对与监督来源；
 - `meta/pgc_episodes.jsonl`：逐 episode 的源初始状态索引、初始状态 SHA-256、配对 ID 与成功谓词审计。
@@ -80,16 +80,17 @@ python scripts/validate_pgc_counterfactual_datasets.py \
 Source→Counterfactual 配对，它执行以下流程：
 
 1. 从 Counterfactual 任务的成功 demo 取得 `states[0]` 和动作序列；
-2. 创建 Source BDDL 环境，只把成功谓词替换成经过审计的替代谓词；
-3. 把 `states[0]` 精确写入 Source 模拟器并验证形状、数值和 SHA-256；
+2. 创建 Source BDDL 环境并安装经过审计的请求谓词；
+3. 若两个任务的有序 objects/fixtures 完全一致，直接精确恢复 `states[0]`；否则在相同环境类和 fixtures 下创建 Target 环境，按 MuJoCo joint name 把机器人、目标物体及公共物体的 qpos/qvel 迁移到 Source，保留 Source-only distractor，再把生成的 Source flat state 写回验证；
 4. 按 LIBERO 数据再生成协议执行 10 个稳定化空动作并过滤 no-op；
 5. 先做一次无记录验证；成功后从同一状态做第二次录制；
 6. 第二次也完成替代谓词时，才写入双相机 LeRobot episode 和审计文件。
 
+Spatial 的十个任务共享终点谓词，语言差异来自被描述的初始 bowl 位置，因此其正监督允许“终点谓词不变、目标任务初态和动作不同”，并明确写入 `counterfactual_goal_changed=false`。Object 的 donor 往往拥有不同 distractor 集合，必须使用 `named_joint_remap`，不能直接复制等长 flat state；否则相同 qpos 索引可能绑定到错误物体。
+
 这里的 `source_initial_state_index` 指向数据集自己的
 `meta/pgc_initial_states/` 状态目录。状态虽然来自目标任务 demo，但已经在 Source
-环境中实际恢复并验证；模型结构或平坦状态维度不兼容时会直接拒绝，不能把
-失败重放伪装成正样本。
+环境中实际恢复或按名称迁移并验证；两次回放有任意一次不满足请求谓词都会拒绝，不能把失败重放伪装成正样本。
 
 官方 HDF5 下载和格式说明见 [LIBERO 数据集说明](https://github.com/Lifelong-Robot-Learning/LIBERO#datasets)
 及 [LIBERO 示教采集脚本](https://github.com/Lifelong-Robot-Learning/LIBERO/blob/master/scripts/libero_100_collect_demonstrations.py)。
@@ -114,10 +115,12 @@ LIBERO-100 同时提供 LIBERO-10 与 LIBERO-90 donor。若没有，需要先用
 
 ### 配对与只读规划检查
 
-配对器会在四个源 suite 加 LIBERO-90 donor 池中寻找不同目标谓词，并默认要求
-Source 与 Target 的环境类、objects 和 fixtures 完全一致。加入 LIBERO-90 是
+配对器会在四个源 suite 加 LIBERO-90 donor 池中寻找可执行 donor。完全相同的
+有序 objects/fixtures 使用 `flat_exact`；相同环境类与 fixtures、但 distractor
+物体清单不同的任务使用 `named_joint_remap`。加入 LIBERO-90 是
 为了给 LIBERO-10 的 held-out 场景寻找同模型替代目标，并不会把 LIBERO-90
-当作评估 source。先只做规划检查，不启动 MuJoCo 录制：
+当作评估 source。Spatial 依据不同初态描述配对，不把其共同终点谓词误判成
+无反事实信号。先只做规划检查，不启动 MuJoCo 录制：
 
 ```bash
 cd /root/gpufree-data/LF-FastWAM
@@ -133,10 +136,10 @@ bash scripts/build_pgc_libero_datasets.sh \
   42
 ```
 
-结果写到 `manifests/pgc_manifest_coverage.json`。默认模式只接受可以安全重放
-平坦状态的配对；若某些任务显示 `no executable state-compatible donor task`，
-应为这些场景采集人工/脚本 oracle demo。`PGC_RELAXED_SCENE_MATCH=true` 只适合
-诊断候选，实际状态维度不匹配仍会被采集器拒绝。
+结果写到 `manifests/pgc_manifest_coverage.json`，并统计两种 state-transfer
+mode。若某些任务仍显示 `no executable state-compatible donor task`，应为这些
+场景采集人工/脚本 oracle demo。`PGC_RELAXED_SCENE_MATCH=true` 只适合诊断
+fixture 也不同的候选，不用于正式数据。
 
 ### 四卡后台正式构建
 

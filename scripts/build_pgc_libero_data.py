@@ -2,11 +2,13 @@
 """Build state-aligned successful PGC trajectories from LIBERO HDF5 demos.
 
 For every audited source->counterfactual pair this program takes a successful
-demonstration of the counterfactual task, restores that demonstration's exact
-MuJoCo state in the *source* environment, installs the alternate success
-predicate, and replays the actions.  The trajectory is written only if:
+demonstration of the counterfactual task, transfers that demonstration into the
+*source* environment, installs the requested success predicate, and replays the
+actions.  Identical simulator layouts use exact flat-state restoration; layouts
+with different distractor inventories use audited named-joint transfer.  The
+trajectory is written only if:
 
-1. the source simulator reports the requested state was restored;
+1. the source simulator reports the transferred source state was restored;
 2. replay satisfies the alternate predicate; and
 3. a second recording pass is also successful.
 
@@ -196,10 +198,7 @@ def _sim_state(env: Any) -> np.ndarray:
 def _set_counterfactual_goal(env: Any, record: Mapping[str, Any]) -> list[list[Any]]:
     from libero.libero.envs import bddl_utils as BDDLUtils
 
-    from experiments.libero.language_interventions import (
-        canonical_goal_state,
-        validate_counterfactual_problem,
-    )
+    from experiments.libero.language_interventions import canonical_goal_state
 
     target_bddl = Path(str(record["counterfactual_bddl_file"]))
     if not target_bddl.is_file():
@@ -209,7 +208,31 @@ def _set_counterfactual_goal(env: Any, record: Mapping[str, Any]) -> list[list[A
     target_problem = BDDLUtils.robosuite_parse_problem(str(target_bddl))
     inner = _get_inner_env(env)
     source_problem = inner.parsed_problem
-    computed_goal = validate_counterfactual_problem(source_problem, target_problem)
+    source_problem_name = str(source_problem.get("problem_name", ""))
+    target_problem_name = str(target_problem.get("problem_name", ""))
+    if source_problem_name != target_problem_name:
+        raise ValueError(
+            "Counterfactual donor uses a different LIBERO environment class: "
+            f"{source_problem_name!r} != {target_problem_name!r}."
+        )
+    computed_goal = target_problem.get("goal_state", [])
+    if not isinstance(computed_goal, list) or not computed_goal:
+        raise ValueError("Counterfactual donor has no non-empty goal_state.")
+    computed_goal = [list(predicate) for predicate in computed_goal]
+    goal_changed = canonical_goal_state(source_problem.get("goal_state", [])) != (
+        canonical_goal_state(computed_goal)
+    )
+    declared_goal_changed = bool(record.get("counterfactual_goal_changed", True))
+    if goal_changed != declared_goal_changed:
+        raise ValueError(
+            f"Manifest pair {record['pair_id']!r} counterfactual_goal_changed="
+            f"{declared_goal_changed} but BDDL comparison gives {goal_changed}."
+        )
+    if not goal_changed and str(record.get("task_suite_name")) != "libero_spatial":
+        raise ValueError(
+            "An unchanged terminal goal is permitted only for LIBERO-Spatial, "
+            "where the language distinction is the initial object placement."
+        )
     declared_goal = record["counterfactual_goal_state"]
     if canonical_goal_state(computed_goal) != canonical_goal_state(declared_goal):
         raise ValueError(
@@ -253,6 +276,195 @@ def _make_source_env(
     env, _ = get_libero_env(task, resolution, seed, env_num=1)
     _set_counterfactual_goal(env, record)
     return env, task
+
+
+def _make_target_env(
+    record: Mapping[str, Any], *, resolution: int, seed: int
+) -> tuple[Any, Any]:
+    from libero.libero import benchmark
+
+    from experiments.libero.libero_utils import get_libero_env
+
+    suite_name = str(record["counterfactual_task_suite_name"])
+    task_id = int(record["counterfactual_task_id"])
+    suite = benchmark.get_benchmark_dict()[suite_name]()
+    task = suite.get_task(task_id)
+    expected = str(record["counterfactual_instruction"]).strip().casefold()
+    if str(task.language).strip().casefold() != expected:
+        raise ValueError(
+            f"Target task text changed for {suite_name}/{task_id}: "
+            f"{task.language!r} != {record['counterfactual_instruction']!r}."
+        )
+    env, _ = get_libero_env(task, resolution, seed, env_num=1)
+    return env, task
+
+
+def _joint_names(sim: Any) -> list[str]:
+    model = sim.model
+    names = getattr(model, "joint_names", None)
+    if names is not None:
+        return [
+            name.decode("utf-8") if isinstance(name, bytes) else str(name)
+            for name in names
+            if name is not None
+        ]
+    resolved = []
+    for joint_id in range(int(model.njnt)):
+        name = None
+        method = getattr(model, "joint_id2name", None)
+        if callable(method):
+            name = method(joint_id)
+        if name is None:
+            method = getattr(model, "id2name", None)
+            if callable(method):
+                try:
+                    name = method(joint_id, "joint")
+                except TypeError:
+                    name = None
+        if name is None:
+            try:
+                import mujoco
+
+                name = mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_JOINT, joint_id
+                )
+            except Exception:
+                name = None
+        if name:
+            resolved.append(str(name))
+    if not resolved:
+        raise RuntimeError("MuJoCo model exposes no named joints for state transfer.")
+    return resolved
+
+
+def _problem_object_names(problem: Mapping[str, Any]) -> set[str]:
+    mapping = problem.get("objects", {})
+    if not isinstance(mapping, Mapping):
+        return set()
+    return {
+        str(value)
+        for values in mapping.values()
+        for value in (values if isinstance(values, (list, tuple, set)) else [values])
+    }
+
+
+def _copy_joint_value(
+    *, source_data: Any, target_data: Any, joint_name: str, quantity: str
+) -> None:
+    getter = getattr(target_data, f"get_joint_{quantity}")
+    setter = getattr(source_data, f"set_joint_{quantity}")
+    value = np.asarray(getter(joint_name)).copy()
+    setter(joint_name, value.item() if value.ndim == 0 else value)
+
+
+def _named_joint_transfer_state(
+    source_env: Any,
+    target_env: Any,
+    donor_state: np.ndarray,
+    record: Mapping[str, Any],
+    *,
+    state_atol: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Build a valid source flat state by copying shared donor joints by name."""
+    target_env.reset()
+    target_env.set_init_state(np.asarray(donor_state))
+    actual_target_state = _sim_state(target_env)
+    if not states_match(donor_state, actual_target_state, atol=state_atol):
+        raise ValueError(
+            "Target simulator could not restore its own HDF5 donor state exactly."
+        )
+
+    source_env.reset()
+    source_inner = _get_inner_env(source_env)
+    target_inner = _get_inner_env(target_env)
+    source_sim = source_inner.sim
+    target_sim = target_inner.sim
+    source_joints = set(_joint_names(source_sim))
+    target_joints = set(_joint_names(target_sim))
+    shared_joints = sorted(source_joints & target_joints)
+    if not shared_joints:
+        raise ValueError("Source and target environments have no shared named joints.")
+
+    goal_entities = {
+        str(entity)
+        for predicate in record["counterfactual_goal_state"]
+        for entity in predicate[1:]
+    }
+    source_objects = _problem_object_names(source_inner.parsed_problem)
+    goal_objects = sorted(goal_entities & source_objects)
+    missing_goal_object_joints = [
+        entity
+        for entity in goal_objects
+        if not any(
+            joint == entity or joint.startswith(f"{entity}_")
+            for joint in shared_joints
+        )
+    ]
+    if missing_goal_object_joints:
+        raise ValueError(
+            "Named-joint transfer cannot locate goal objects in both models: "
+            f"{missing_goal_object_joints}."
+        )
+
+    for joint_name in shared_joints:
+        _copy_joint_value(
+            source_data=source_sim.data,
+            target_data=target_sim.data,
+            joint_name=joint_name,
+            quantity="qpos",
+        )
+        try:
+            _copy_joint_value(
+                source_data=source_sim.data,
+                target_data=target_sim.data,
+                joint_name=joint_name,
+                quantity="qvel",
+            )
+        except (AttributeError, KeyError, ValueError):
+            # Some fixed or compatibility-wrapper joints expose qpos only.
+            pass
+    source_sim.forward()
+    source_inner._post_process()
+    source_inner._update_observables(force=True)
+    transferred_state = _sim_state(source_env)
+    source_env.set_init_state(transferred_state)
+    if not states_match(transferred_state, _sim_state(source_env), atol=state_atol):
+        raise ValueError("Named-joint transferred source state is not round-trip stable.")
+    return transferred_state, {
+        "state_transfer_mode": "named_joint_remap",
+        "donor_initial_state_sha256": state_sha256(donor_state),
+        "transferred_initial_state_sha256": state_sha256(transferred_state),
+        "shared_joint_count": len(shared_joints),
+        "goal_object_joint_count": len(goal_objects),
+    }
+
+
+def _prepare_source_initial_state(
+    source_env: Any,
+    target_env: Any | None,
+    donor_state: np.ndarray,
+    record: Mapping[str, Any],
+    *,
+    state_atol: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    mode = str(record.get("state_transfer_mode", "flat_exact"))
+    if mode == "flat_exact":
+        return np.asarray(donor_state).copy(), {
+            "state_transfer_mode": mode,
+            "donor_initial_state_sha256": state_sha256(donor_state),
+            "transferred_initial_state_sha256": state_sha256(donor_state),
+        }
+    if mode == "named_joint_remap":
+        if target_env is None:
+            raise ValueError("named_joint_remap requires a target environment.")
+        return _named_joint_transfer_state(
+            source_env,
+            target_env,
+            donor_state,
+            record,
+            state_atol=state_atol,
+        )
+    raise ValueError(f"Unsupported state_transfer_mode={mode!r}.")
 
 
 def _goal_satisfied(env: Any, *, done: bool) -> bool:
@@ -307,7 +519,7 @@ def _reset_exact_state(
         if requested.shape == actual.shape:
             max_error = float(np.max(np.abs(requested - actual)))
         raise ValueError(
-            "Source simulator did not restore the donor initial state exactly: "
+            "Source simulator did not restore the prepared initial state exactly: "
             f"requested_shape={requested.shape} actual_shape={actual.shape} "
             f"max_abs_error={max_error}."
         )
@@ -507,6 +719,7 @@ def _save_successful_episode(
     used_actions: int,
     raw_action_count: int,
     filtered_action_count: int,
+    transfer_audit: Mapping[str, Any],
 ) -> dict[str, Any]:
     output = args.output.expanduser().resolve()
     episode_index = int(dataset.meta.total_episodes)
@@ -528,13 +741,19 @@ def _save_successful_episode(
             record["counterfactual_instruction"]
         ).strip(),
         "counterfactual_goal_state": record["counterfactual_goal_state"],
+        "counterfactual_goal_changed": bool(
+            record.get("counterfactual_goal_changed", True)
+        ),
         "donor_demo_file": str(demo_path),
         "donor_demo_group": str(demo_group),
         "donor_demo_key": f"{demo_path.resolve()}::{demo_group}",
         "recorded_action_count": int(used_actions),
         "donor_raw_action_count": int(raw_action_count),
         "donor_filtered_action_count": int(filtered_action_count),
-        "collection_method": "target_demo_replay_in_paired_source_environment",
+        "collection_method": (
+            "audited_target_demo_replay_with_exact_or_named_joint_state_transfer"
+        ),
+        **dict(transfer_audit),
     }
     atomic_write_json(output / PGC_PENDING, audit)
     dataset.save_episode(raw_file_name=audit["donor_demo_key"])
@@ -578,6 +797,7 @@ def _collect(
             continue
         demo_path = demo_paths[pair_id]
         env = None
+        target_env = None
         attempted = 0
         try:
             env, _ = _make_source_env(
@@ -585,6 +805,16 @@ def _collect(
                 resolution=args.camera_resolution,
                 seed=args.seed + pair_offset,
             )
+            if str(record.get("state_transfer_mode", "flat_exact")) == (
+                "named_joint_remap"
+            ):
+                target_env, _ = _make_target_env(
+                    record,
+                    # Target is used only to decode named simulator joints;
+                    # small camera buffers avoid doubling collector EGL memory.
+                    resolution=min(args.camera_resolution, 64),
+                    seed=args.seed + pair_offset + 100_000,
+                )
             for demo in iter_libero_hdf5_demos(demo_path):
                 donor_key = f"{demo_path.resolve()}::{demo.group_name}"
                 if (pair_id, donor_key) in used_demos:
@@ -598,9 +828,18 @@ def _collect(
                         if args.keep_noops
                         else filter_libero_noops(demo.actions)
                     )
+                    source_initial_state, transfer_audit = (
+                        _prepare_source_initial_state(
+                            env,
+                            target_env,
+                            demo.initial_state,
+                            record,
+                            state_atol=args.state_atol,
+                        )
+                    )
                     validation = _replay(
                         env,
-                        demo.initial_state,
+                        source_initial_state,
                         replay_actions,
                         state_atol=args.state_atol,
                         settle_steps=args.settle_steps,
@@ -622,7 +861,7 @@ def _collect(
                     instruction = str(record["counterfactual_instruction"]).strip()
                     recording = _replay(
                         env,
-                        demo.initial_state,
+                        source_initial_state,
                         replay_actions,
                         state_atol=args.state_atol,
                         settle_steps=args.settle_steps,
@@ -642,10 +881,11 @@ def _collect(
                         record=record,
                         demo_path=demo_path,
                         demo_group=demo.group_name,
-                        initial_state=demo.initial_state,
+                        initial_state=source_initial_state,
                         used_actions=int(recording["actions"]),
                         raw_action_count=int(demo.actions.shape[0]),
                         filtered_action_count=int(replay_actions.shape[0]),
+                        transfer_audit=transfer_audit,
                     )
                     counts[pair_id] += 1
                     used_demos.add((pair_id, donor_key))
@@ -671,6 +911,10 @@ def _collect(
                         traceback.format_exc(),
                     )
         finally:
+            if target_env is not None:
+                close = getattr(target_env, "close", None)
+                if callable(close):
+                    close()
             if env is not None:
                 close = getattr(env, "close", None)
                 if callable(close):

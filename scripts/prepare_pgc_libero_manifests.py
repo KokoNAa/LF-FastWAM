@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Create executable cross-task PGC manifests for the four LIBERO suites.
 
-Unlike a plain shuffle, every selected target contributes a different BDDL goal
-whose entities are present in the source scene.  By default the source and
-target must also have identical object/fixture inventories so that a target
-HDF5 simulator state can be replayed in the source environment.
+Unlike a plain shuffle, every selected target contributes an executable
+language-conditioned trajectory whose entities are present in the source
+scene. Exact simulator layouts use flat-state replay; compatible layouts with
+different distractors use named-joint transfer. LIBERO-Spatial is handled as a
+state-grounded special case because its ten tasks intentionally share one final
+predicate and differ through the initial bowl placement named by the language.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from experiments.libero.language_interventions import (  # noqa: E402
     canonical_goal_state,
+    goal_entity_names,
+    problem_entity_names,
     validate_counterfactual_problem,
 )
 from libero.libero import benchmark, get_libero_path  # noqa: E402
@@ -57,13 +61,78 @@ def _canonical_mapping(mapping: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
     return tuple(sorted(items))
 
 
-def _scene_signature(problem: Mapping[str, Any]) -> tuple[Any, ...]:
-    """Signature of simulator bodies whose ordering determines flat state shape."""
+def _ordered_mapping(mapping: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Preserve BDDL declaration order for exact flattened-state replay."""
+    if not isinstance(mapping, Mapping):
+        return ()
+    items = []
+    for key, values in mapping.items():
+        if not isinstance(values, (list, tuple, set)):
+            values = [values]
+        items.append(
+            (
+                str(key).casefold(),
+                tuple(str(value).casefold() for value in values),
+            )
+        )
+    return tuple(items)
+
+
+def _flat_state_signature(problem: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Signature required to copy one simulator's flat state byte-for-byte."""
     return (
         str(problem.get("problem_name", "")).casefold(),
-        _canonical_mapping(problem.get("objects", {})),
-        _canonical_mapping(problem.get("fixtures", {})),
+        _ordered_mapping(problem.get("objects", {})),
+        _ordered_mapping(problem.get("fixtures", {})),
     )
+
+
+def _semantic_transfer_compatible(
+    source_problem: Mapping[str, Any], target_problem: Mapping[str, Any]
+) -> bool:
+    """Whether named-joint transfer keeps the same workspace/environment class."""
+    return (
+        str(source_problem.get("problem_name", "")).casefold()
+        == str(target_problem.get("problem_name", "")).casefold()
+        and _canonical_mapping(source_problem.get("fixtures", {}))
+        == _canonical_mapping(target_problem.get("fixtures", {}))
+    )
+
+
+def _object_names(problem: Mapping[str, Any]) -> set[str]:
+    mapping = problem.get("objects", {})
+    if not isinstance(mapping, Mapping):
+        return set()
+    return {
+        str(value).casefold()
+        for values in mapping.values()
+        for value in (values if isinstance(values, (list, tuple, set)) else [values])
+    }
+
+
+def _spatial_state_variant_goal(
+    source: Mapping[str, Any], target: Mapping[str, Any], *, exact_scene: bool
+) -> list[list[Any]] | None:
+    """Allow Spatial positives whose language difference is in initial placement.
+
+    LIBERO-Spatial deliberately shares one final predicate across its ten tasks.
+    The supervision-changing signal is which initial bowl placement the instruction
+    names, so a different official task state/action remains a direct positive even
+    though the terminal BDDL predicate is unchanged.
+    """
+    if not exact_scene:
+        return None
+    if source["suite"] != "libero_spatial" or target["suite"] != "libero_spatial":
+        return None
+    source_problem = source["problem"]
+    target_problem = target["problem"]
+    source_goal = canonical_goal_state(source_problem.get("goal_state", []))
+    target_goal = canonical_goal_state(target_problem.get("goal_state", []))
+    source_initial = canonical_goal_state(source_problem.get("initial_state", []))
+    target_initial = canonical_goal_state(target_problem.get("initial_state", []))
+    if not target_goal or source_goal != target_goal or source_initial == target_initial:
+        return None
+    return [list(predicate) for predicate in target_problem["goal_state"]]
 
 
 def _load_tasks(suite_names: list[str]) -> list[dict[str, Any]]:
@@ -84,7 +153,7 @@ def _load_tasks(suite_names: list[str]) -> list[dict[str, Any]]:
                     "task": task,
                     "bddl_path": bddl_path,
                     "problem": problem,
-                    "scene_signature": _scene_signature(problem),
+                    "flat_state_signature": _flat_state_signature(problem),
                 }
             )
     return entries
@@ -95,7 +164,15 @@ def _candidate_records(
     candidates: list[dict[str, Any]],
     *,
     relaxed_scene_match: bool,
-) -> list[tuple[tuple[int, str, int], dict[str, Any], list[list[Any]]]]:
+) -> list[
+    tuple[
+        tuple[int, int, int, str, int],
+        dict[str, Any],
+        list[list[Any]],
+        str,
+        bool,
+    ]
+]:
     ranked = []
     source_problem = source["problem"]
     source_initial = {
@@ -108,22 +185,52 @@ def _candidate_records(
             source["task_id"],
         ):
             continue
-        exact_scene = target["scene_signature"] == source["scene_signature"]
-        if not exact_scene and not relaxed_scene_match:
+        exact_scene = (
+            target["flat_state_signature"] == source["flat_state_signature"]
+        )
+        semantic_transfer = _semantic_transfer_compatible(
+            source_problem, target["problem"]
+        )
+        if not exact_scene and not semantic_transfer and not relaxed_scene_match:
             continue
+        goal_changed = True
         try:
             goal = validate_counterfactual_problem(source_problem, target["problem"])
         except ValueError:
-            continue
+            goal = _spatial_state_variant_goal(
+                source,
+                target,
+                exact_scene=exact_scene,
+            )
+            if goal is None:
+                continue
+            goal_changed = False
         if canonical_goal_state(goal) in source_initial:
             continue
+        required_entities = goal_entity_names(goal)
+        if not required_entities.issubset(problem_entity_names(source_problem)):
+            continue
         same_suite = target["suite"] == source["suite"]
+        transfer_mode = "flat_exact" if exact_scene else "named_joint_remap"
+        object_overlap = len(
+            _object_names(source_problem) & _object_names(target["problem"])
+        )
         rank = (
-            0 if exact_scene and same_suite else 1 if exact_scene else 2,
+            0
+            if exact_scene and same_suite
+            else 1
+            if exact_scene
+            else 2
+            if semantic_transfer and same_suite
+            else 3
+            if semantic_transfer
+            else 4,
+            0 if goal_changed else 1,
+            -object_overlap,
             str(target["suite"]),
             int(target["task_id"]),
         )
-        ranked.append((rank, target, goal))
+        ranked.append((rank, target, goal, transfer_mode, goal_changed))
     return sorted(ranked, key=lambda item: item[0])
 
 
@@ -155,7 +262,7 @@ def build_manifests(
                 }
             )
             continue
-        _, target, goal = available[0]
+        _, target, goal, transfer_mode, goal_changed = available[0]
         source_task = source["task"]
         target_task = target["task"]
         pair_id = (
@@ -176,15 +283,18 @@ def build_manifests(
                 "counterfactual_task_id": target["task_id"],
                 "counterfactual_task_name": target_task.language,
                 "counterfactual_is_executable": True,
-                "counterfactual_state_replay_compatible": (
-                    target["scene_signature"] == source["scene_signature"]
-                ),
+                "counterfactual_state_replay_compatible": transfer_mode
+                == "flat_exact",
+                "state_transfer_mode": transfer_mode,
+                "counterfactual_goal_changed": goal_changed,
+                "counterfactual_state_changed": True,
                 "source_bddl_file": str(source["bddl_path"]),
                 "counterfactual_bddl_file": str(target["bddl_path"]),
                 "counterfactual_goal_state": goal,
                 "notes": (
-                    "Target demo state is restored in the source environment; "
-                    "the alternate BDDL predicate must succeed before export."
+                    "Target demo is replayed in the source environment using "
+                    f"{transfer_mode}; the requested language-conditioned "
+                    "outcome must succeed twice before export."
                 ),
             }
         )
@@ -218,8 +328,9 @@ def main() -> None:
         "--relaxed-scene-match",
         action="store_true",
         help=(
-            "Allow source/target object inventories to differ. The collector "
-            "will still reject incompatible simulator-state shapes."
+            "Diagnostic only: also consider donors whose fixtures differ. "
+            "Normal mode already supports safe named-joint transfer across "
+            "different distractor-object inventories."
         ),
     )
     args = parser.parse_args()
@@ -249,6 +360,13 @@ def main() -> None:
                 "source_suites": source_suites,
                 "candidate_suites": candidate_suites,
                 "pair_count": len(combined),
+                "state_transfer_modes": {
+                    mode: sum(
+                        record.get("state_transfer_mode") == mode
+                        for record in combined
+                    )
+                    for mode in ("flat_exact", "named_joint_remap")
+                },
                 "uncovered_count": len(uncovered),
                 "uncovered": uncovered,
             },

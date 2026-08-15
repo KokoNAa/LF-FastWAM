@@ -26,6 +26,7 @@ LIBERO_SUITES = (
     "libero_goal",
     "libero_10",
 )
+PGC_STATE_TRANSFER_MODES = ("flat_exact", "named_joint_remap")
 
 
 @dataclass(frozen=True)
@@ -277,6 +278,20 @@ def validate_manifest_record(record: Mapping[str, Any]) -> None:
     goal = record["counterfactual_goal_state"]
     if not isinstance(goal, list) or not goal:
         raise ValueError(f"Pair {record['pair_id']!r} has no alternate goal state.")
+    transfer_mode = str(record.get("state_transfer_mode", "flat_exact"))
+    if transfer_mode not in PGC_STATE_TRANSFER_MODES:
+        raise ValueError(
+            f"Pair {record['pair_id']!r} has unsupported state_transfer_mode "
+            f"{transfer_mode!r}; expected one of {PGC_STATE_TRANSFER_MODES}."
+        )
+    if (
+        record.get("counterfactual_goal_changed") is False
+        and str(record["task_suite_name"]) != "libero_spatial"
+    ):
+        raise ValueError(
+            f"Pair {record['pair_id']!r} may keep the terminal goal only for "
+            "LIBERO-Spatial state-grounded supervision."
+        )
 
 
 def provenance_pair(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -300,6 +315,15 @@ def provenance_pair(record: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "source_bddl_file": str(record.get("source_bddl_file", "")),
         "counterfactual_bddl_file": str(record["counterfactual_bddl_file"]),
+        "state_transfer_mode": str(
+            record.get("state_transfer_mode", "flat_exact")
+        ),
+        "counterfactual_goal_changed": bool(
+            record.get("counterfactual_goal_changed", True)
+        ),
+        "counterfactual_state_changed": bool(
+            record.get("counterfactual_state_changed", True)
+        ),
     }
 
 
@@ -319,7 +343,9 @@ def build_provenance(
         "format": PGC_DATA_FORMAT,
         "benchmark": "libero",
         "action_supervision": PGC_ACTION_SUPERVISION,
-        "collection_method": "target_demo_replay_in_paired_source_environment",
+        "collection_method": (
+            "audited_target_demo_replay_with_exact_or_named_joint_state_transfer"
+        ),
         "state_aligned": True,
         "state_match_tolerance": 1e-7,
         "state_catalog": "meta/pgc_initial_states/episode_{episode_index:06d}.npy",

@@ -16,6 +16,7 @@ import numpy as np
 EXPECTED_FORMAT = "pgc_counterfactual_actions_v1"
 EXPECTED_SUPERVISION = "executed_counterfactual_success_trajectory"
 LIBERO_SUITES = {"libero_spatial", "libero_object", "libero_goal", "libero_10"}
+STATE_TRANSFER_MODES = {"flat_exact", "named_joint_remap"}
 
 
 def _state_sha256(state: np.ndarray) -> str:
@@ -98,6 +99,7 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
     if not isinstance(pairs, list) or not pairs:
         raise ValueError(f"{dataset_dir}: provenance requires non-empty `pairs`.")
     pair_ids = set()
+    pairs_by_id = {}
     pair_suites = set()
     target_instructions = set()
     source_task_keys = set()
@@ -121,6 +123,20 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
         if pair_id in pair_ids:
             raise ValueError(f"{dataset_dir}: duplicate pair_id={pair_id!r}.")
         pair_ids.add(pair_id)
+        transfer_mode = str(pair.get("state_transfer_mode", "flat_exact"))
+        if transfer_mode not in STATE_TRANSFER_MODES:
+            raise ValueError(
+                f"{dataset_dir}: pair {pair_id} has invalid state_transfer_mode="
+                f"{transfer_mode!r}."
+            )
+        if (
+            pair.get("counterfactual_goal_changed") is False
+            and str(pair["source_suite"]) != "libero_spatial"
+        ):
+            raise ValueError(
+                f"{dataset_dir}: only LIBERO-Spatial may keep the terminal goal."
+            )
+        pairs_by_id[pair_id] = pair
         source_suite = str(pair["source_suite"])
         if source_suite not in source_suites:
             raise ValueError(
@@ -194,12 +210,24 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
                 f"{dataset_dir}: duplicate PGC audit for episode {episode_index}."
             )
         audited_indices.add(episode_index)
-        if str(audit["pair_id"]) not in pair_ids:
+        audit_pair_id = str(audit["pair_id"])
+        if audit_pair_id not in pair_ids:
             raise ValueError(
                 f"{dataset_dir}: episode {episode_index} references unknown "
                 f"pair_id={audit['pair_id']!r}."
             )
-        audited_pair_ids.add(str(audit["pair_id"]))
+        audited_pair_ids.add(audit_pair_id)
+        pair = pairs_by_id[audit_pair_id]
+        pair_transfer_mode = str(pair.get("state_transfer_mode", "flat_exact"))
+        audit_transfer_mode = str(
+            audit.get("state_transfer_mode", pair_transfer_mode)
+        )
+        if audit_transfer_mode != pair_transfer_mode:
+            raise ValueError(
+                f"{dataset_dir}: episode {episode_index} state transfer mode "
+                f"{audit_transfer_mode!r} does not match pair mode "
+                f"{pair_transfer_mode!r}."
+            )
         if int(audit["source_initial_state_index"]) < 0:
             raise ValueError(
                 f"{dataset_dir}: episode {episode_index} has a negative "
@@ -237,6 +265,33 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
                 f"{dataset_dir}: episode {episode_index} initial state hash "
                 f"mismatch: {actual_hash} != {declared_hash}."
             )
+        transferred_hash = str(
+            audit.get("transferred_initial_state_sha256", declared_hash)
+        ).strip().lower()
+        if transferred_hash != declared_hash:
+            raise ValueError(
+                f"{dataset_dir}: episode {episode_index} transferred state hash "
+                "does not match the catalogued Source state."
+            )
+        donor_hash = audit.get("donor_initial_state_sha256")
+        if donor_hash is not None and not state_hash_pattern.fullmatch(
+            str(donor_hash).strip().lower()
+        ):
+            raise ValueError(
+                f"{dataset_dir}: episode {episode_index} has an invalid donor "
+                "initial-state hash."
+            )
+        if pair_transfer_mode == "named_joint_remap":
+            if donor_hash is None:
+                raise ValueError(
+                    f"{dataset_dir}: episode {episode_index} named-joint transfer "
+                    "requires donor_initial_state_sha256."
+                )
+            if int(audit.get("shared_joint_count", 0)) <= 0:
+                raise ValueError(
+                    f"{dataset_dir}: episode {episode_index} named-joint transfer "
+                    "requires a positive shared_joint_count."
+                )
         if audit["initial_state_match"] is not True:
             raise ValueError(
                 f"{dataset_dir}: episode {episode_index} is not state-aligned."
