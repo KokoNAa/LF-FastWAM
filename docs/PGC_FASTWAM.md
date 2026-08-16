@@ -1,8 +1,42 @@
-# PGC-FastWAM v3
+# PGC-FastWAM v4
 
 PGC（Policy-Guarded Counterfactual FastWAM）用于在不破坏原始 FastWAM 策略的前提下提升语言遵守，尤其针对 CIS 中“仍执行原指令 / 改变行为但抓错物体 / 什么也不抓”三类失败。
 
-## 架构
+## v4：最终动作空间的 rollout-aligned proposal
+
+Object 实验确认 release Base 与 PGC v3 在相同 CIS manifest 上都是 30%，而 v3
+Verifier 的 Base/CF 分数同时饱和在约 0.99、BF16 margin 接近量化零，guarded
+模式没有发生 override。PGC v4 因此不再沿用“随机 diffusion timestep 上学习
+velocity residual、部署时积分多个 residual”的训练路径，也不再使用 sigmoid
+绝对分数门控。
+
+v4 的部署路径是：
+
+1. 冻结的 release Base 按正式评估相同的步数完成整段 action denoising，得到
+   `a_base`；训练和部署都只编码当前观测帧，不读取示教未来帧。Base
+   Video/Action Expert 不复制、不加 LoRA、不进入优化器。
+2. Goal Graph 读取请求语言和当前帧视觉；小型时序 Proposal 读取
+   `(a_base, goal)`，只执行一次
+   `a_cf = stopgrad(a_base) + tanh(raw_delta) * cap`。输出层零初始化，因此新建
+   v4 的候选逐元素等于 Base。
+3. 直接反事实成功示教在**最终归一化 action chunk**上监督 `a_cf`；Native
+   样本只监督 `delta=0`。夹爪维度可加权，另有残差能量、时序平滑和逐维硬 cap。
+4. FP32 时序 Pairwise Verifier 同时比较完整的 Base/CF action 序列，输出未经过
+   sigmoid 的 `advantage = value_cf - value_base`。训练目标来自两个候选到真实
+   action 的加权 MSE 改善；相同候选的 advantage 严格为零。
+5. guarded 模式只有在 raw advantage 达到 threshold，且 residual RMS/饱和比例
+   通过 support guard 时才覆盖，否则返回 exact Base。`base` 和 `counterfactual`
+   模式仍分别用于保护验证和强制候选诊断。
+
+正式训练的 `PGC_ROLLOUT_INFERENCE_STEPS` 必须与评估命令最后一个
+`num_inference_steps` 参数一致；评估脚本会从 checkpoint 元数据检查并拒绝不一致
+的运行。v4 checkpoint 格式为 `fastwam_policy_guard_v4`，只保存 Goal Graph、
+Final-Action Proposal、FP32 Pairwise Verifier 和元数据。
+
+以下 v3 章节保留用于解释旧 checkpoint 与失败机制；v4 正式实验使用文末的 v4
+启动命令。
+
+## v3 历史架构
 
 PGC v3 保留两个候选，但只存在一份 Action Expert：
 
@@ -12,7 +46,7 @@ PGC v3 保留两个候选，但只存在一份 Action Expert：
 4. **Action–Outcome Verifier**：在当前状态和目标表示下分别给 Base/Counterfactual action chunk 打分。
 5. **Conservative Hard Gate**：只有当反事实候选分数达到绝对阈值，且比 Base 高出安全 margin 时才覆盖；否则逐元素原样返回 Base action。
 
-`policy_guard.enabled=false` 时不会构建或执行 PGC 路径，旧 FastWAM/TC/LangForce 行为保持不变。PGC v3 与 TC、LangForce、任何 Base LoRA 互斥。v1/v2 的独立专家与 LoRA 代码只为历史 checkpoint 兼容，不用于 v3 正式训练。
+`policy_guard.enabled=false` 时不会构建或执行 PGC 路径，旧 FastWAM/TC/LangForce 行为保持不变。PGC v3/v4 与 TC、LangForce、任何 Base LoRA 互斥。v1/v2 的独立专家与 LoRA 代码只为历史 checkpoint 兼容，不用于 v4 正式训练。
 
 v3 训练优化器的严格白名单只有 Goal Graph、Goal Query Seeds、Bounded Velocity Residual 和 Verifier。整套 Base Video/Action Expert 全部 `requires_grad=false` 且保持 eval mode；代码会反向拒绝 v3 启用 LoRA，checkpoint 也不能含独立 Action Expert 或 LoRA tensor。
 
@@ -271,7 +305,7 @@ export LIBERO_DATA_ROOT=/path/to/FastWAM/data/libero_mujoco3.3.2
 BASE="$DIFFSYNTH_MODEL_BASE_PATH/fastwam_release/libero_uncond_2cam224.pt"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-bash scripts/train_pgc_v3_libero_suite.sh \
+bash scripts/train_pgc_v4_libero_suite.sh \
   libero_object \
   4 \
   "$BASE" \
@@ -283,20 +317,21 @@ bash scripts/train_pgc_v3_libero_suite.sh \
 其余三条线仅替换 suite 名和对应数据目录，不能把多个目录放入同一次训练：
 
 ```bash
-bash scripts/train_pgc_v3_libero_suite.sh libero_spatial 4 "$BASE" /path/to/pgc/libero_spatial_pgc_counterfactual_lerobot 42 4000
-bash scripts/train_pgc_v3_libero_suite.sh libero_goal    4 "$BASE" /path/to/pgc/libero_goal_pgc_counterfactual_lerobot    42 4000
-bash scripts/train_pgc_v3_libero_suite.sh libero_10      4 "$BASE" /path/to/pgc/libero_10_pgc_counterfactual_lerobot      42 4000
+bash scripts/train_pgc_v4_libero_suite.sh libero_spatial 4 "$BASE" /path/to/pgc/libero_spatial_pgc_counterfactual_lerobot 42 4000
+bash scripts/train_pgc_v4_libero_suite.sh libero_goal    4 "$BASE" /path/to/pgc/libero_goal_pgc_counterfactual_lerobot    42 4000
+bash scripts/train_pgc_v4_libero_suite.sh libero_10      4 "$BASE" /path/to/pgc/libero_10_pgc_counterfactual_lerobot      42 4000
 ```
 
 `train_pgc_libero_suite.sh` 会同时把原始数据和直接反事实数据限制到指定 suite，
 并检查 `meta/pgc_provenance.json`。任何跨 suite 数据都会在创建训练进程前报错。
-默认按 frame index 把 Native 与 Counterfactual 数据构造成严格 1:1 采样。v3 不使用
-LoRA，默认 residual cap 为 `1.0`、能量/平滑权重均为 `0.01`，这些从零初始化的
-小模块使用学习率 `1e-4`，每卡 micro-batch 为 1、
+默认按 frame index 把 Native 与 Counterfactual 数据构造成严格 1:1 采样。v4 不使用
+LoRA，默认 final-action residual cap 为 `2.0`、能量/平滑权重均为 `0.01`，这些从
+零初始化的小模块使用学习率 `1e-4`，每卡 micro-batch 为 1、
 梯度累积为 4（四卡有效 batch 16），每 500 steps 保存权重。可通过
-`PGC_VELOCITY_RESIDUAL_MAX_ABS`、`PGC_RESIDUAL_REGULARIZATION_WEIGHT`、
+`PGC_ACTION_CHUNK_RESIDUAL_MAX_ABS`、`PGC_ROLLOUT_INFERENCE_STEPS`、
+`PGC_ACTION_GRIPPER_WEIGHT`、`PGC_RESIDUAL_REGULARIZATION_WEIGHT`、
 `PGC_RESIDUAL_SMOOTHNESS_WEIGHT`、`PGC_VERIFIER_START_STEP` 和
-`PGC_VERIFIER_RAMP_STEPS` 修改 v3 超参。默认
+`PGC_VERIFIER_RAMP_STEPS` 修改 v4 超参。默认
 不保存 DeepSpeed state，以避免磁盘空间不足导致最后一步保存失败。
 
 每条线必须依次通过以下门控，才进入下一条：
@@ -318,7 +353,7 @@ LoRA，默认 residual cap 为 `1.0`、能量/平滑权重均为 `0.01`，这些
 ```bash
 PGC_TRAIN_SUITE=all \
 PGC_ALLOW_JOINT_TRAINING=true \
-PGC_VERSION=3 \
+PGC_VERSION=4 \
 bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.txt 42 4000
 ```
 
@@ -328,10 +363,10 @@ bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.
 bash scripts/validate_pgc_server.sh
 ```
 
-输出 checkpoint 格式为 `fastwam_policy_guard_v3`，只保存 Goal Query Seeds、
-Bounded Velocity Residual、Goal Graph、Verifier、架构元数据和外部 Base checkpoint
+输出 checkpoint 格式为 `fastwam_policy_guard_v4`，只保存 Goal Query Seeds、
+Final-Action Proposal、Goal Graph、Pairwise Verifier、架构元数据和外部 Base checkpoint
 路径；既不复制 6.8B Base 权重，也不存在第二套 Action Expert 或 LoRA。加载时先
-恢复外部 Base，再严格恢复小型 PGC 模块。v1/v2 checkpoint 仍按旧格式加载。
+恢复外部 Base，再严格恢复小型 PGC 模块。v1/v2/v3 checkpoint 仍按旧格式加载。
 
 ### 未保存 ZeRO 状态时续训
 
@@ -344,11 +379,12 @@ export PGC_INIT_CHECKPOINT=/path/to/step_000500.pt
 export PGC_CONTINUE_FROM_STEP=500
 
 # 最后一个参数 1500 是绝对目标 step，因此本次实际再训练 1000 steps。
-bash scripts/train_pgc_v3_libero_suite.sh \
+bash scripts/train_pgc_v4_libero_suite.sh \
   libero_object 4 "$BASE" "$PGC_CF_OBJECT" 42 1500
 ```
 
-启动器会校验匹配的 PGC v3 格式、保存步数、外部 Base 路径和 bounded-residual
+启动器会校验匹配的 PGC v4 格式、保存步数、外部 Base 路径、rollout step 和
+final-action residual
 架构。Trainer 会把
 `global_step` 恢复为 500，跳过同一随机序列中已经消费的数据，并为剩余 1000
 steps 新建带短 warmup 的 scheduler。由于原运行没有保存 ZeRO state，优化器
@@ -379,9 +415,9 @@ OUTPUT_ROOT=/path/to/evaluate_results/pgc_base_exact_correct \
 bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
 ```
 
-正式 guarded 门控可通过 `PGC_GATE_THRESHOLD` 和
-`PGC_MIN_COUNTERFACTUAL_SCORE` 调整；必须在独立校准集上选择阈值，不能用最终
-CIS 测试集调参。
+v4 正式 guarded 门控使用 FP32 raw advantage，只通过 `PGC_GATE_THRESHOLD`
+调整；`PGC_MIN_COUNTERFACTUAL_SCORE` 仅供 v1-v3 兼容。阈值必须在独立校准集上
+选择，不能用最终 CIS 测试集调参。
 
 Shuffled / CIS 必须提供经过审计且覆盖所选 suite/task 的 intervention manifest：
 

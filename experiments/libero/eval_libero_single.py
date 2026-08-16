@@ -657,6 +657,26 @@ def _predict_action_chunk(
             "score_margin": float(pred["policy_guard_score_margin"]),
             "gate_mode": str(pred["policy_guard_gate_mode"]),
         }
+        for source_key, output_key, converter in (
+            ("policy_guard_score_space", "score_space", str),
+            (
+                "policy_guard_candidate_supported",
+                "candidate_supported",
+                bool,
+            ),
+            (
+                "policy_guard_candidate_delta_rms",
+                "candidate_delta_rms",
+                float,
+            ),
+            (
+                "policy_guard_candidate_saturation_fraction",
+                "candidate_saturation_fraction",
+                float,
+            ),
+        ):
+            if source_key in pred:
+                policy_guard_diagnostics[output_key] = converter(pred[source_key])
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
@@ -1131,6 +1151,49 @@ def run_single_task(
         results["policy_guard_score_margin_mean"] = float(
             np.mean([item["score_margin"] for item in policy_guard_decisions])
         )
+        score_spaces = sorted(
+            {
+                str(item["score_space"])
+                for item in policy_guard_decisions
+                if "score_space" in item
+            }
+        )
+        if score_spaces:
+            results["policy_guard_score_spaces"] = score_spaces
+        supported = [
+            bool(item["candidate_supported"])
+            for item in policy_guard_decisions
+            if "candidate_supported" in item
+        ]
+        if supported:
+            results["policy_guard_candidate_supported_count"] = sum(supported)
+            results["policy_guard_candidate_supported_rate"] = float(
+                np.mean(supported)
+            )
+        delta_rms = [
+            float(item["candidate_delta_rms"])
+            for item in policy_guard_decisions
+            if "candidate_delta_rms" in item
+        ]
+        if delta_rms:
+            results["policy_guard_candidate_delta_rms_mean"] = float(
+                np.mean(delta_rms)
+            )
+            results["policy_guard_candidate_delta_rms_max"] = float(
+                np.max(delta_rms)
+            )
+        saturation = [
+            float(item["candidate_saturation_fraction"])
+            for item in policy_guard_decisions
+            if "candidate_saturation_fraction" in item
+        ]
+        if saturation:
+            results[
+                "policy_guard_candidate_saturation_fraction_mean"
+            ] = float(np.mean(saturation))
+            results[
+                "policy_guard_candidate_saturation_fraction_max"
+            ] = float(np.max(saturation))
     if instruction_condition == "shuffled":
         # The simulator success predicate still represents the original task.
         results["default_task_successes"] = results["successes"]

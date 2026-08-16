@@ -42,6 +42,8 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn('model.policy_guard.version=${PGC_VERSION}', source)
         self.assertIn('PGC_VERSION="${PGC_VERSION:-2}"', source)
         self.assertIn("model.policy_guard.velocity_residual_max_abs=", source)
+        self.assertIn("model.policy_guard.action_chunk_residual_max_abs=", source)
+        self.assertIn("model.policy_guard.rollout_num_inference_steps=", source)
 
     def test_common_launcher_supports_explicit_weight_only_continuation(self):
         source = (REPO_ROOT / "scripts/train_pgc_libero.sh").read_text(
@@ -83,6 +85,23 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("PGC_LEARNING_RATE", source)
         self.assertIn("PGC_VELOCITY_RESIDUAL_MAX_ABS", source)
         self.assertIn("PGC_VERIFIER_START_STEP", source)
+
+    def test_v4_launcher_selects_rollout_aligned_training(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v4_libero_suite.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("export PGC_VERSION=4", source)
+        self.assertIn("PGC_ACTION_CHUNK_RESIDUAL_MAX_ABS", source)
+        self.assertIn("PGC_ROLLOUT_INFERENCE_STEPS", source)
+        self.assertIn("PGC_ADVANTAGE_TEMPERATURE", source)
+        self.assertIn("PGC_CANDIDATE_MAX_DELTA_RMS", source)
+
+    def test_evaluation_enforces_v4_rollout_step_alignment(self):
+        source = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("rollout/evaluation step alignment", source)
+        self.assertIn("raw_fp32_pairwise_advantage", source)
 
 
 if __name__ == "__main__":

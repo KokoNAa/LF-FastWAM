@@ -15,6 +15,8 @@ from fastwam.models.wan22.policy_guard import (
     GoalActionAlignmentLoss,
     GoalGraphEncoder,
     GoalResidualAdapter,
+    PairwiseActionAdvantageVerifier,
+    RolloutAlignedActionProposal,
 )
 from fastwam.models.wan22.wan_video_dit import WanVideoDiT
 
@@ -92,6 +94,18 @@ def tiny_pgc_fastwam(
             "residual_regularization_weight": 0.01,
             "residual_smoothness_weight": 0.01,
             "velocity_residual_max_abs": 1.0,
+            "action_chunk_residual_max_abs": 0.5,
+            "rollout_num_inference_steps": 2,
+            "proposal_hidden_dim": 8,
+            "proposal_num_heads": 2,
+            "proposal_num_layers": 1,
+            "action_gripper_weight": 2.0,
+            "verifier_num_heads": 2,
+            "verifier_num_layers": 1,
+            "advantage_temperature": 0.25,
+            "advantage_clip": 4.0,
+            "candidate_max_saturation_fraction": 0.25,
+            "candidate_max_delta_rms": 0.5,
             "verifier_start_step": 10,
             "verifier_ramp_steps": 5,
             "goal_residual_scale": 1.0,
@@ -173,6 +187,73 @@ class PolicyGuardModuleTest(unittest.TestCase):
             float(metrics["pgc_velocity_residual_saturation_fraction"]),
             1.0,
         )
+
+    def test_rollout_aligned_proposal_is_zero_initialized_and_capped(self):
+        proposal = RolloutAlignedActionProposal(
+            action_dim=3,
+            goal_dim=12,
+            hidden_dim=8,
+            num_heads=2,
+            num_layers=1,
+            max_abs=[0.25, 0.5, 0.75],
+        )
+        base_action = torch.randn(2, 4, 3, requires_grad=True)
+        goal_queries = torch.randn(2, 2, 12, requires_grad=True)
+        action_is_pad = torch.tensor(
+            [[False, False, False, True], [True, True, True, True]]
+        )
+        candidate, residual, metrics = proposal(
+            base_action=base_action,
+            goal_queries=goal_queries,
+            action_is_pad=action_is_pad,
+        )
+        self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
+        self.assertTrue(torch.equal(candidate, base_action.detach()))
+        self.assertTrue(torch.isfinite(candidate).all())
+        self.assertEqual(float(metrics["pgc_v4_action_residual_rms"]), 0.0)
+
+        with torch.no_grad():
+            proposal.output_projection.bias.fill_(100.0)
+        candidate, residual, _ = proposal(
+            base_action=base_action,
+            goal_queries=goal_queries,
+            action_is_pad=action_is_pad,
+        )
+        cap = torch.tensor([0.25, 0.5, 0.75]).view(1, 1, 3)
+        self.assertTrue(torch.all(residual.abs() <= cap))
+        self.assertTrue(torch.equal(residual[action_is_pad], torch.zeros(5, 3)))
+        self.assertTrue(torch.isfinite(candidate).all())
+
+    def test_pairwise_verifier_is_fp32_temporal_and_equal_candidate_safe(self):
+        verifier = PairwiseActionAdvantageVerifier(
+            action_dim=3,
+            video_dim=16,
+            goal_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            num_layers=1,
+        ).float()
+        action = torch.tensor(
+            [[[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [2.0, 1.0, 0.0]]],
+            dtype=torch.bfloat16,
+        )
+        forward_embedding = verifier.encode_action(action)
+        reverse_embedding = verifier.encode_action(action.flip(1))
+        self.assertFalse(torch.allclose(forward_embedding, reverse_embedding))
+        advantage, base_value, candidate_value, *_ = verifier(
+            current_video_hidden=torch.randn(1, 5, 16, dtype=torch.bfloat16),
+            goal_embedding=torch.randn(1, 8, dtype=torch.bfloat16),
+            base_action=action,
+            counterfactual_action=action.clone(),
+        )
+        self.assertEqual(advantage.dtype, torch.float32)
+        self.assertEqual(base_value.dtype, torch.float32)
+        self.assertTrue(torch.equal(advantage, torch.zeros_like(advantage)))
+        self.assertTrue(torch.equal(base_value, candidate_value))
+
+        all_pad = torch.ones(1, 3, dtype=torch.bool)
+        padded_embedding = verifier.encode_action(action, all_pad)
+        self.assertTrue(torch.isfinite(padded_embedding).all())
 
     def test_verifier_and_alignment_shapes(self):
         verifier = ActionOutcomeVerifier(
@@ -867,6 +948,202 @@ class PolicyGuardV3IntegrationTest(unittest.TestCase):
             )
 
             restored = tiny_pgc_fastwam(version=3)
+            restored.load_checkpoint(pgc_path)
+            for key, value in expected.items():
+                self.assertTrue(
+                    torch.equal(
+                        restored.policy_guard_modules.state_dict()[key],
+                        value,
+                    ),
+                    key,
+                )
+            self.assertEqual(
+                restored.policy_guard_base_checkpoint,
+                str(base_path.resolve()),
+            )
+
+
+class PolicyGuardV4IntegrationTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(41)
+        self.model = tiny_pgc_fastwam(version=4)
+
+    def test_v4_trains_only_sidecars_and_starts_as_exact_base(self):
+        self.assertIsNone(self.model.policy_guard_action_expert)
+        with self.assertRaisesRegex(ValueError, "does not permit LoRA"):
+            self.model.configure_lora(
+                {
+                    "enabled": True,
+                    "rank": 2,
+                    "alpha": 4,
+                    "dropout": 0.0,
+                    "experts": ["action"],
+                    "extra_trainable_patterns": [],
+                }
+            )
+        report = self.model.prepare_trainable_parameters()
+        self.assertGreater(report["trainable"], 0)
+        trainable = {
+            name
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(trainable)
+        self.assertTrue(
+            all(name.startswith("policy_guard_modules.") for name in trainable)
+        )
+        self.assertFalse(any(p.requires_grad for p in self.model.mot.parameters()))
+        self.assertFalse(self.model.mot.training)
+        self.assertTrue(
+            all(
+                parameter.dtype == torch.float32
+                for parameter in self.model.policy_guard_modules[
+                    "verifier"
+                ].parameters()
+            )
+        )
+
+        base_action = torch.randn(2, 4, 3, requires_grad=True)
+        goal_queries = torch.randn(2, 2, 12, requires_grad=True)
+        candidate, residual, _ = self.model.policy_guard_modules[
+            "action_chunk_proposal"
+        ](
+            base_action=base_action,
+            goal_queries=goal_queries,
+        )
+        self.assertTrue(torch.equal(candidate, base_action.detach()))
+        self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
+        candidate.square().mean().backward()
+        self.assertIsNone(base_action.grad)
+        self.assertIsNotNone(
+            self.model.policy_guard_modules[
+                "action_chunk_proposal"
+            ].output_projection.weight.grad
+        )
+
+    def test_v4_final_action_losses_separate_native_and_counterfactual(self):
+        base = torch.zeros(2, 1, 3)
+        residual = torch.tensor(
+            [[[1.0, 0.0, 0.0]], [[1.0, 0.0, 0.0]]]
+        )
+        proposal = base + residual
+        target = torch.tensor(
+            [[[100.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]]]
+        )
+        cf_loss, native_loss, regularization, smoothness, metrics = (
+            self.model._compute_policy_guard_v4_action_losses(
+                proposed_action=proposal,
+                predicted_residual=residual,
+                base_action=base,
+                target_action=target,
+                action_is_pad=None,
+                is_counterfactual=torch.tensor([False, True]),
+                direct_action_valid=torch.tensor([True, True]),
+            )
+        )
+        self.assertAlmostEqual(float(native_loss), 0.125, places=6)
+        self.assertAlmostEqual(float(cf_loss), 0.125, places=6)
+        self.assertAlmostEqual(float(regularization), 1.0 / 3.0, places=6)
+        self.assertEqual(float(smoothness), 0.0)
+        self.assertAlmostEqual(float(metrics["pgc_native_fraction"]), 0.5)
+
+    def test_v4_guard_requires_raw_advantage_and_candidate_support(self):
+        base = torch.zeros(2, 2, 3)
+        counterfactual = torch.ones_like(base)
+        base_value = torch.zeros(2)
+        counterfactual_value = torch.tensor([0.19, 0.30])
+        output, selected = self.model._select_policy_guard_action(
+            base_action=base,
+            counterfactual_action=counterfactual,
+            base_score=base_value,
+            counterfactual_score=counterfactual_value,
+            candidate_supported=torch.tensor([True, False]),
+        )
+        self.assertTrue(torch.equal(output, base))
+        self.assertTrue(torch.equal(selected, torch.tensor([False, False])))
+
+        output, selected = self.model._select_policy_guard_action(
+            base_action=base,
+            counterfactual_action=counterfactual,
+            base_score=base_value,
+            counterfactual_score=counterfactual_value,
+            candidate_supported=torch.tensor([True, True]),
+        )
+        self.assertTrue(torch.equal(selected, torch.tensor([False, True])))
+        self.assertTrue(torch.equal(output[0], base[0]))
+        self.assertTrue(torch.equal(output[1], counterfactual[1]))
+
+    def test_v4_training_rollout_produces_deployed_base_chunk(self):
+        self.model.eval()
+        context = torch.randn(2, 4, 10)
+        context_mask = torch.ones(2, 4, dtype=torch.bool)
+        base_action, video_hidden, tokens_per_frame = (
+            self.model._rollout_policy_guard_base_action(
+                first_frame_latents=torch.randn(2, 2, 1, 1, 1),
+                initial_action_noise=torch.randn(2, 4, 3),
+                context=context,
+                full_context_mask=context_mask,
+                state_only_context_mask=torch.zeros_like(context_mask),
+                fuse_vae_embedding_in_latents=False,
+                num_inference_steps=2,
+            )
+        )
+        self.assertEqual(tuple(base_action.shape), (2, 4, 3))
+        self.assertEqual(video_hidden.shape[0], 2)
+        self.assertGreater(tokens_per_frame, 0)
+        self.assertTrue(torch.isfinite(base_action).all())
+
+        goal_queries, _, _ = self.model._encode_policy_guard_goal(
+            final_video_hidden=video_hidden,
+            video_tokens_per_frame=tokens_per_frame,
+            context=context,
+            context_mask=context_mask,
+        )
+        candidate, residual, _ = self.model.policy_guard_modules[
+            "action_chunk_proposal"
+        ](
+            base_action=base_action,
+            goal_queries=goal_queries,
+        )
+        self.assertTrue(torch.equal(candidate, base_action))
+        self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
+
+    def test_v4_checkpoint_round_trip_is_self_contained_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.pt"
+            pgc_path = Path(tmpdir) / "pgc_v4.pt"
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": self.model.mot.state_dict()},
+                base_path,
+            )
+            self.model.load_checkpoint(base_path)
+            with torch.no_grad():
+                self.model.policy_guard_modules[
+                    "action_chunk_proposal"
+                ].output_projection.bias.add_(0.125)
+            expected = {
+                key: value.detach().clone()
+                for key, value in self.model.policy_guard_modules.state_dict().items()
+            }
+            self.model.save_checkpoint(pgc_path, step=37)
+            payload = torch.load(pgc_path, map_location="cpu", weights_only=False)
+            self.assertEqual(payload["format"], "fastwam_policy_guard_v4")
+            self.assertEqual(payload["step"], 37)
+            self.assertNotIn("mot", payload)
+            self.assertNotIn("counterfactual_action_adapter", payload)
+            self.assertNotIn("counterfactual_lora_config", payload)
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(
+                metadata["counterfactual_tuning"],
+                "rollout_aligned_final_action_residual",
+            )
+            self.assertEqual(
+                metadata["verifier_margin_space"],
+                "raw_fp32_pairwise_advantage",
+            )
+            self.assertEqual(metadata["rollout_num_inference_steps"], 2)
+
+            restored = tiny_pgc_fastwam(version=4)
             restored.load_checkpoint(pgc_path)
             for key, value in expected.items():
                 self.assertTrue(

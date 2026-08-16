@@ -27,14 +27,22 @@ LORA_DROPOUT="${PGC_LORA_DROPOUT:-0.05}"
 RESIDUAL_REG_WEIGHT="${PGC_RESIDUAL_REGULARIZATION_WEIGHT:-0.01}"
 RESIDUAL_SMOOTHNESS_WEIGHT="${PGC_RESIDUAL_SMOOTHNESS_WEIGHT:-0.01}"
 RESIDUAL_MAX_ABS="${PGC_VELOCITY_RESIDUAL_MAX_ABS:-1.0}"
+ACTION_CHUNK_RESIDUAL_MAX_ABS="${PGC_ACTION_CHUNK_RESIDUAL_MAX_ABS:-2.0}"
+ROLLOUT_INFERENCE_STEPS="${PGC_ROLLOUT_INFERENCE_STEPS:-10}"
+ACTION_GRIPPER_WEIGHT="${PGC_ACTION_GRIPPER_WEIGHT:-2.0}"
+ADVANTAGE_TEMPERATURE="${PGC_ADVANTAGE_TEMPERATURE:-0.25}"
+ADVANTAGE_CLIP="${PGC_ADVANTAGE_CLIP:-4.0}"
+CANDIDATE_MAX_SATURATION_FRACTION="${PGC_CANDIDATE_MAX_SATURATION_FRACTION:-0.25}"
+CANDIDATE_MAX_DELTA_RMS="${PGC_CANDIDATE_MAX_DELTA_RMS:-2.0}"
+TRAIN_GATE_THRESHOLD="${PGC_TRAIN_GATE_THRESHOLD:-0.20}"
 VERIFIER_START_STEP="${PGC_VERIFIER_START_STEP:-1000}"
 VERIFIER_RAMP_STEPS="${PGC_VERIFIER_RAMP_STEPS:-500}"
 RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-pgc-v${PGC_VERSION}-${MAX_STEPS}-seed${TRAIN_SEED}}"
 
 case "${PGC_VERSION}" in
-  2|3) ;;
+  2|3|4) ;;
   *)
-    echo "PGC_VERSION must be 2 or 3; got ${PGC_VERSION}." >&2
+    echo "PGC_VERSION must be 2, 3, or 4; got ${PGC_VERSION}." >&2
     exit 1
     ;;
 esac
@@ -58,7 +66,7 @@ case "${TRAIN_SUITE}" in
     ;;
 esac
 
-for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY; do
+for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY ROLLOUT_INFERENCE_STEPS; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${value_name} must be a positive integer, got ${value}." >&2
@@ -103,7 +111,14 @@ fi
   "${LORA_DROPOUT}" \
   "${RESIDUAL_REG_WEIGHT}" \
   "${RESIDUAL_SMOOTHNESS_WEIGHT}" \
-  "${RESIDUAL_MAX_ABS}" <<'PY'
+  "${RESIDUAL_MAX_ABS}" \
+  "${ACTION_CHUNK_RESIDUAL_MAX_ABS}" \
+  "${ACTION_GRIPPER_WEIGHT}" \
+  "${ADVANTAGE_TEMPERATURE}" \
+  "${ADVANTAGE_CLIP}" \
+  "${CANDIDATE_MAX_SATURATION_FRACTION}" \
+  "${CANDIDATE_MAX_DELTA_RMS}" \
+  "${TRAIN_GATE_THRESHOLD}" <<'PY'
 import sys
 
 version = int(sys.argv[1])
@@ -112,15 +127,37 @@ dropout = float(sys.argv[3])
 regularization = float(sys.argv[4])
 smoothness = float(sys.argv[5])
 cap = float(sys.argv[6])
+action_chunk_cap = float(sys.argv[7])
+gripper_weight = float(sys.argv[8])
+advantage_temperature = float(sys.argv[9])
+advantage_clip = float(sys.argv[10])
+candidate_max_saturation = float(sys.argv[11])
+candidate_max_delta_rms = float(sys.argv[12])
+gate_threshold = float(sys.argv[13])
 if version == 2:
     if alpha <= 0:
         raise SystemExit(f"PGC_LORA_ALPHA must be positive, got {alpha}")
     if not 0 <= dropout < 1:
         raise SystemExit(f"PGC_LORA_DROPOUT must be in [0, 1), got {dropout}")
 if regularization < 0 or smoothness < 0:
-    raise SystemExit("PGC v3 residual regularization weights must be non-negative")
+    raise SystemExit("PGC residual regularization weights must be non-negative")
 if cap <= 0:
     raise SystemExit("PGC v3 velocity residual cap must be positive")
+if gate_threshold < 0:
+    raise SystemExit("PGC training gate threshold must be non-negative")
+if version == 4:
+    if action_chunk_cap <= 0:
+        raise SystemExit("PGC v4 final-action residual cap must be positive")
+    if gripper_weight <= 0:
+        raise SystemExit("PGC v4 action gripper weight must be positive")
+    if advantage_temperature <= 0 or advantage_clip <= 0:
+        raise SystemExit("PGC v4 advantage temperature/clip must be positive")
+    if not 0 <= candidate_max_saturation <= 1:
+        raise SystemExit(
+            "PGC v4 candidate saturation fraction must be in [0, 1]"
+        )
+    if candidate_max_delta_rms <= 0:
+        raise SystemExit("PGC v4 candidate max delta RMS must be positive")
 PY
 if [[ ! -f "${BASE_CHECKPOINT}" ]]; then
   echo "Base checkpoint not found: ${BASE_CHECKPOINT}" >&2
@@ -234,6 +271,7 @@ if payload.get("format") in {
     "fastwam_policy_guard_v1",
     "fastwam_policy_guard_v2",
     "fastwam_policy_guard_v3",
+    "fastwam_policy_guard_v4",
 }:
     raise SystemExit("PGC base must be the immutable full FastWAM release, not an adapter")
 print(f"Validated protected base: format={payload.get('format', 'legacy_full')} tensors={len(payload['mot'])}")
@@ -252,6 +290,14 @@ if [[ -n "${CONTINUE_FROM_STEP}" ]]; then
     "${RESIDUAL_REG_WEIGHT}" \
     "${RESIDUAL_SMOOTHNESS_WEIGHT}" \
     "${RESIDUAL_MAX_ABS}" \
+    "${ACTION_CHUNK_RESIDUAL_MAX_ABS}" \
+    "${ROLLOUT_INFERENCE_STEPS}" \
+    "${ACTION_GRIPPER_WEIGHT}" \
+    "${ADVANTAGE_TEMPERATURE}" \
+    "${ADVANTAGE_CLIP}" \
+    "${CANDIDATE_MAX_SATURATION_FRACTION}" \
+    "${CANDIDATE_MAX_DELTA_RMS}" \
+    "${TRAIN_GATE_THRESHOLD}" \
     "${VERIFIER_START_STEP}" \
     "${VERIFIER_RAMP_STEPS}" <<'PY'
 import math
@@ -270,8 +316,16 @@ expected_dropout = float(sys.argv[7])
 expected_residual_regularization = float(sys.argv[8])
 expected_residual_smoothness = float(sys.argv[9])
 expected_residual_cap = float(sys.argv[10])
-expected_verifier_start = int(sys.argv[11])
-expected_verifier_ramp = int(sys.argv[12])
+expected_action_chunk_cap = float(sys.argv[11])
+expected_rollout_steps = int(sys.argv[12])
+expected_gripper_weight = float(sys.argv[13])
+expected_advantage_temperature = float(sys.argv[14])
+expected_advantage_clip = float(sys.argv[15])
+expected_candidate_max_saturation = float(sys.argv[16])
+expected_candidate_max_delta_rms = float(sys.argv[17])
+expected_gate_threshold = float(sys.argv[18])
+expected_verifier_start = int(sys.argv[19])
+expected_verifier_ramp = int(sys.argv[20])
 payload = torch.load(init_path, map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
 expected_format = f"fastwam_policy_guard_v{expected_version}"
@@ -298,6 +352,17 @@ if recorded_base != base_path:
         "PGC continuation base mismatch: "
         f"checkpoint={recorded_base} requested={base_path}"
     )
+actual_gate_threshold = float(metadata.get("gate_threshold", float("nan")))
+if not math.isclose(
+    actual_gate_threshold,
+    expected_gate_threshold,
+    rel_tol=0.0,
+    abs_tol=1.0e-12,
+):
+    raise SystemExit(
+        "PGC continuation gate threshold mismatch: "
+        f"checkpoint={actual_gate_threshold} requested={expected_gate_threshold}"
+    )
 if expected_version == 2:
     lora = payload.get("counterfactual_lora_config") or {}
     if int(lora.get("rank", -1)) != expected_rank:
@@ -318,7 +383,7 @@ if expected_version == 2:
                 f"PGC continuation LoRA {name} mismatch: "
                 f"checkpoint={actual} requested={expected}"
             )
-else:
+elif expected_version == 3:
     if metadata.get("counterfactual_tuning") != "bounded_velocity_residual":
         raise SystemExit("PGC v3 continuation lacks bounded residual metadata")
     if payload.get("counterfactual_action_adapter") is not None:
@@ -346,6 +411,58 @@ else:
         raise SystemExit("PGC v3 continuation verifier_start_step mismatch")
     if int(metadata.get("verifier_ramp_steps", -1)) != expected_verifier_ramp:
         raise SystemExit("PGC v3 continuation verifier_ramp_steps mismatch")
+else:
+    if metadata.get("counterfactual_tuning") != (
+        "rollout_aligned_final_action_residual"
+    ):
+        raise SystemExit("PGC v4 continuation lacks rollout-aligned metadata")
+    if any(
+        key in payload
+        for key in (
+            "counterfactual_action_adapter",
+            "counterfactual_action_expert",
+            "counterfactual_lora_config",
+        )
+    ):
+        raise SystemExit("PGC v4 continuation unexpectedly contains Action-Expert tensors")
+    for name, expected in (
+        ("residual_regularization_weight", expected_residual_regularization),
+        ("residual_smoothness_weight", expected_residual_smoothness),
+        ("action_gripper_weight", expected_gripper_weight),
+        ("advantage_temperature", expected_advantage_temperature),
+        ("advantage_clip", expected_advantage_clip),
+        ("candidate_max_saturation_fraction", expected_candidate_max_saturation),
+        ("candidate_max_delta_rms", expected_candidate_max_delta_rms),
+    ):
+        actual = float(metadata.get(name, float("nan")))
+        if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
+            raise SystemExit(
+                f"PGC v4 continuation {name} mismatch: "
+                f"checkpoint={actual} requested={expected}"
+            )
+    caps = [
+        float(value)
+        for value in metadata.get("action_chunk_residual_max_abs", [])
+    ]
+    if not caps or any(
+        not math.isclose(
+            value,
+            expected_action_chunk_cap,
+            rel_tol=0.0,
+            abs_tol=1.0e-6,
+        )
+        for value in caps
+    ):
+        raise SystemExit(
+            "PGC v4 continuation action-chunk residual cap mismatch: "
+            f"checkpoint={caps} requested={expected_action_chunk_cap}"
+        )
+    if int(metadata.get("rollout_num_inference_steps", -1)) != expected_rollout_steps:
+        raise SystemExit("PGC v4 continuation rollout inference-step mismatch")
+    if int(metadata.get("verifier_start_step", -1)) != expected_verifier_start:
+        raise SystemExit("PGC v4 continuation verifier_start_step mismatch")
+    if int(metadata.get("verifier_ramp_steps", -1)) != expected_verifier_ramp:
+        raise SystemExit("PGC v4 continuation verifier_ramp_steps mismatch")
 print(
     "Validated PGC weight-only continuation: "
     f"step={expected_step} base={base_path}"
@@ -407,8 +524,14 @@ echo "  seed=${TRAIN_SEED} max_steps=${MAX_STEPS} lr=${LEARNING_RATE}"
 if [[ "${PGC_VERSION}" == "2" ]]; then
   echo "  tuning=action-only-lora rank=${LORA_RANK} alpha=${LORA_ALPHA} dropout=${LORA_DROPOUT}"
   LORA_ENABLED=true
-else
+elif [[ "${PGC_VERSION}" == "3" ]]; then
   echo "  tuning=bounded-velocity-residual cap=${RESIDUAL_MAX_ABS} regularization=${RESIDUAL_REG_WEIGHT} smoothness=${RESIDUAL_SMOOTHNESS_WEIGHT}"
+  echo "  verifier_schedule=start:${VERIFIER_START_STEP} ramp:${VERIFIER_RAMP_STEPS}"
+  LORA_ENABLED=false
+else
+  echo "  tuning=rollout-aligned-final-action-residual cap=${ACTION_CHUNK_RESIDUAL_MAX_ABS} rollout_steps=${ROLLOUT_INFERENCE_STEPS} gripper_weight=${ACTION_GRIPPER_WEIGHT}"
+  echo "  advantage=temperature:${ADVANTAGE_TEMPERATURE} clip:${ADVANTAGE_CLIP} gate_threshold:${TRAIN_GATE_THRESHOLD}"
+  echo "  candidate_support=max_saturation:${CANDIDATE_MAX_SATURATION_FRACTION} max_delta_rms:${CANDIDATE_MAX_DELTA_RMS}"
   echo "  verifier_schedule=start:${VERIFIER_START_STEP} ramp:${VERIFIER_RAMP_STEPS}"
   LORA_ENABLED=false
 fi
@@ -441,6 +564,14 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.residual_regularization_weight=${RESIDUAL_REG_WEIGHT}" \
   "model.policy_guard.residual_smoothness_weight=${RESIDUAL_SMOOTHNESS_WEIGHT}" \
   "model.policy_guard.velocity_residual_max_abs=${RESIDUAL_MAX_ABS}" \
+  "model.policy_guard.action_chunk_residual_max_abs=${ACTION_CHUNK_RESIDUAL_MAX_ABS}" \
+  "model.policy_guard.rollout_num_inference_steps=${ROLLOUT_INFERENCE_STEPS}" \
+  "model.policy_guard.action_gripper_weight=${ACTION_GRIPPER_WEIGHT}" \
+  "model.policy_guard.advantage_temperature=${ADVANTAGE_TEMPERATURE}" \
+  "model.policy_guard.advantage_clip=${ADVANTAGE_CLIP}" \
+  "model.policy_guard.candidate_max_saturation_fraction=${CANDIDATE_MAX_SATURATION_FRACTION}" \
+  "model.policy_guard.candidate_max_delta_rms=${CANDIDATE_MAX_DELTA_RMS}" \
+  "model.policy_guard.gate_threshold=${TRAIN_GATE_THRESHOLD}" \
   "model.policy_guard.verifier_start_step=${VERIFIER_START_STEP}" \
   "model.policy_guard.verifier_ramp_steps=${VERIFIER_RAMP_STEPS}" \
   "model.lora.enabled=${LORA_ENABLED}" \

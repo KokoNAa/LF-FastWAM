@@ -3,9 +3,10 @@
 PGC deliberately keeps the released FastWAM policy outside the optimization
 graph. Historical v1/v2 checkpoints use a separate goal-conditioned Action
 Expert. v3 instead evaluates the same frozen Base Expert and learns only a
-bounded goal-conditioned correction in flow-velocity space. An
-:class:`ActionOutcomeVerifier` decides whether that proposal is sufficiently
-more compatible with the requested goal to override the exact Base candidate.
+bounded goal-conditioned correction in flow-velocity space. v4 removes that
+train/deploy mismatch: it runs the Base sampler to completion, proposes one
+bounded temporal correction in final action-chunk space, and uses an FP32
+pairwise advantage verifier before any override of the exact Base candidate.
 """
 
 from __future__ import annotations
@@ -432,6 +433,372 @@ class BoundedActionVelocityResidual(nn.Module):
             "pgc_velocity_residual_attention_entropy": entropy.mean(),
         }
         return residual, metrics
+
+
+def _sinusoidal_positions(
+    length: int,
+    dim: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return deterministic temporal positions without a horizon limit."""
+    if length <= 0 or dim <= 0:
+        raise ValueError("Temporal position length/dimension must be positive.")
+    positions = torch.arange(length, device=device, dtype=torch.float32)[:, None]
+    frequencies = torch.exp(
+        torch.arange(0, dim, 2, device=device, dtype=torch.float32)
+        * (-math.log(10000.0) / max(1, dim))
+    )
+    encoding = torch.zeros(length, dim, device=device, dtype=torch.float32)
+    encoding[:, 0::2] = torch.sin(positions * frequencies)
+    if dim > 1:
+        encoding[:, 1::2] = torch.cos(
+            positions * frequencies[: encoding[:, 1::2].shape[1]]
+        )
+    return encoding.to(dtype=dtype).unsqueeze(0)
+
+
+class RolloutAlignedActionProposal(nn.Module):
+    """Correct a fully denoised Base action chunk in deployment space.
+
+    Unlike the v3 velocity residual, this module is applied exactly once after
+    the frozen Base sampler has completed. Training and inference therefore see
+    the same kind of action candidate. The final projection is zero initialized
+    so constructing v4 preserves the released policy bit-for-bit until the hard
+    gate explicitly selects a learned proposal.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        goal_dim: int,
+        hidden_dim: int = 256,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        max_abs: float | Sequence[float] = 2.0,
+    ):
+        super().__init__()
+        if min(action_dim, goal_dim, hidden_dim, num_heads, num_layers) <= 0:
+            raise ValueError("PGC v4 proposal dimensions/layers must be positive.")
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"PGC v4 proposal hidden_dim={hidden_dim} must divide "
+                f"num_heads={num_heads}."
+            )
+        if isinstance(max_abs, Sequence) and not isinstance(max_abs, (str, bytes)):
+            cap_values = [float(value) for value in max_abs]
+            if len(cap_values) != int(action_dim):
+                raise ValueError(
+                    "PGC v4 per-dimension action caps must match action_dim: "
+                    f"{len(cap_values)} vs {action_dim}."
+                )
+        else:
+            cap_values = [float(max_abs)] * int(action_dim)
+        if any(value <= 0 for value in cap_values):
+            raise ValueError("PGC v4 action residual caps must be positive.")
+
+        self.action_dim = int(action_dim)
+        self.goal_dim = int(goal_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
+        self.action_projection = nn.Sequential(
+            nn.LayerNorm(action_dim),
+            nn.Linear(action_dim, hidden_dim),
+        )
+        self.goal_projection = nn.Sequential(
+            nn.LayerNorm(goal_dim),
+            nn.Linear(goal_dim, hidden_dim),
+        )
+        self.goal_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output_projection = nn.Linear(hidden_dim, action_dim)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+        self.register_buffer(
+            "max_abs",
+            torch.tensor(cap_values, dtype=torch.float32).view(1, 1, action_dim),
+            persistent=True,
+        )
+
+    def forward(
+        self,
+        *,
+        base_action: torch.Tensor,
+        goal_queries: torch.Tensor,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if base_action.ndim != 3 or base_action.shape[-1] != self.action_dim:
+            raise ValueError(
+                "PGC v4 base action must be [B,T,A] with the configured "
+                f"action_dim={self.action_dim}."
+            )
+        if goal_queries.ndim != 3 or goal_queries.shape[-1] != self.goal_dim:
+            raise ValueError(
+                "PGC v4 goal queries must be [B,K,D] with the configured "
+                f"goal_dim={self.goal_dim}."
+            )
+        if base_action.shape[0] != goal_queries.shape[0]:
+            raise ValueError("PGC v4 proposal inputs must share a batch dimension.")
+        if action_is_pad is not None and action_is_pad.shape != base_action.shape[:2]:
+            raise ValueError("PGC v4 action padding mask must be [B,T].")
+
+        action = self.action_projection(base_action.detach())
+        action = action + _sinusoidal_positions(
+            int(action.shape[1]),
+            int(action.shape[2]),
+            device=action.device,
+            dtype=action.dtype,
+        )
+        goal = self.goal_projection(goal_queries)
+        goal_delta, attention = self.goal_attention(
+            query=action,
+            key=goal,
+            value=goal,
+            need_weights=True,
+        )
+        hidden = action + goal_delta
+        output_padding = None
+        encoder_padding = None
+        if action_is_pad is not None:
+            output_padding = action_is_pad.to(
+                device=hidden.device, dtype=torch.bool
+            )
+            encoder_padding = output_padding.clone()
+            empty = encoder_padding.all(dim=1)
+            if bool(empty.any()):
+                encoder_padding[empty, 0] = False
+                hidden = hidden.clone()
+                hidden[empty, 0] = 0
+        hidden = self.temporal_encoder(
+            hidden, src_key_padding_mask=encoder_padding
+        )
+        raw_residual = self.output_projection(self.output_norm(hidden))
+        cap = self.max_abs.to(
+            device=raw_residual.device, dtype=raw_residual.dtype
+        )
+        residual = torch.tanh(raw_residual) * cap
+        if output_padding is not None:
+            residual = residual.masked_fill(output_padding.unsqueeze(-1), 0.0)
+        proposal = base_action.detach() + residual
+
+        probabilities = attention.float().clamp_min(1.0e-8)
+        entropy = -(probabilities * probabilities.log()).sum(dim=-1)
+        entropy = entropy / math.log(max(2, probabilities.shape[-1]))
+        saturation = residual.float().abs() >= cap.float() * 0.95
+        per_sample_rms = residual.float().square().mean(dim=(1, 2)).sqrt()
+        metrics = {
+            "pgc_v4_action_residual_norm": residual.float().norm(dim=-1).mean(),
+            "pgc_v4_action_residual_rms": per_sample_rms.mean(),
+            "pgc_v4_action_residual_max_abs": residual.float().abs().max(),
+            "pgc_v4_action_residual_saturation_fraction": saturation.float().mean(),
+            "pgc_v4_action_residual_attention_entropy": entropy.mean(),
+            "pgc_v4_action_residual_cap_mean": cap.float().mean(),
+        }
+        return proposal, residual, metrics
+
+
+class PairwiseActionAdvantageVerifier(nn.Module):
+    """FP32 temporal verifier that predicts CF advantage over Base directly."""
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        video_dim: int,
+        goal_dim: int,
+        hidden_dim: int = 256,
+        num_heads: int = 8,
+        num_layers: int = 2,
+    ):
+        super().__init__()
+        if min(
+            action_dim,
+            video_dim,
+            goal_dim,
+            hidden_dim,
+            num_heads,
+            num_layers,
+        ) <= 0:
+            raise ValueError("PGC v4 verifier dimensions/layers must be positive.")
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"PGC v4 verifier hidden_dim={hidden_dim} must divide "
+                f"num_heads={num_heads}."
+            )
+        self.action_dim = int(action_dim)
+        self.video_dim = int(video_dim)
+        self.goal_dim = int(goal_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
+        self.action_projection = nn.Linear(action_dim, hidden_dim)
+        action_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.action_encoder = nn.TransformerEncoder(
+            action_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
+        self.action_pool_query = nn.Parameter(
+            torch.randn(1, 1, hidden_dim) / math.sqrt(hidden_dim)
+        )
+        self.action_pool = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True
+        )
+        self.visual_encoder = nn.Sequential(
+            nn.LayerNorm(video_dim),
+            nn.Linear(video_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+        )
+        self.goal_encoder = nn.Sequential(
+            nn.LayerNorm(goal_dim),
+            nn.Linear(goal_dim, hidden_dim),
+        )
+        self.goal_state_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def encode_action(
+        self,
+        action: torch.Tensor,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if action.ndim != 3 or action.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"PGC v4 verifier action must be [B,T,{self.action_dim}]."
+            )
+        action = action.float()
+        hidden = self.action_projection(action)
+        hidden = hidden + _sinusoidal_positions(
+            int(hidden.shape[1]),
+            int(hidden.shape[2]),
+            device=hidden.device,
+            dtype=hidden.dtype,
+        )
+        padding = None
+        if action_is_pad is not None:
+            if action_is_pad.shape != action.shape[:2]:
+                raise ValueError("PGC v4 verifier padding mask must be [B,T].")
+            padding = action_is_pad.to(
+                device=hidden.device, dtype=torch.bool
+            ).clone()
+            empty = padding.all(dim=1)
+            if bool(empty.any()):
+                padding[empty, 0] = False
+                hidden = hidden.clone()
+                hidden[empty, 0] = 0
+        hidden = self.action_encoder(hidden, src_key_padding_mask=padding)
+        query = self.action_pool_query.expand(hidden.shape[0], -1, -1)
+        pooled, _ = self.action_pool(
+            query=query,
+            key=hidden,
+            value=hidden,
+            key_padding_mask=padding,
+            need_weights=False,
+        )
+        return F.normalize(pooled[:, 0].float(), dim=-1, eps=1.0e-6)
+
+    def encode_goal_state(
+        self,
+        current_video_hidden: torch.Tensor,
+        goal_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        if current_video_hidden.ndim != 3 or (
+            current_video_hidden.shape[-1] != self.video_dim
+        ):
+            raise ValueError("PGC v4 verifier visual tokens have invalid shape.")
+        if goal_embedding.ndim != 2 or goal_embedding.shape[-1] != self.goal_dim:
+            raise ValueError("PGC v4 verifier goal embedding has invalid shape.")
+        visual = self.visual_encoder(current_video_hidden.float()).mean(dim=1)
+        goal = self.goal_encoder(goal_embedding.float())
+        fused = self.goal_state_fusion(torch.cat([visual, goal], dim=-1))
+        return F.normalize(fused.float(), dim=-1, eps=1.0e-6)
+
+    def score_candidate(
+        self,
+        goal_state: torch.Tensor,
+        action_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        if goal_state.shape != action_embedding.shape or goal_state.ndim != 2:
+            raise ValueError("PGC v4 verifier embeddings must share [B,D] shape.")
+        interaction = torch.cat(
+            [
+                goal_state.float(),
+                action_embedding.float(),
+                (goal_state.float() - action_embedding.float()).abs(),
+                goal_state.float() * action_embedding.float(),
+            ],
+            dim=-1,
+        )
+        return self.value_head(interaction).squeeze(-1)
+
+    def forward(
+        self,
+        *,
+        current_video_hidden: torch.Tensor,
+        goal_embedding: torch.Tensor,
+        base_action: torch.Tensor,
+        counterfactual_action: torch.Tensor,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        goal_state = self.encode_goal_state(current_video_hidden, goal_embedding)
+        base_embedding = self.encode_action(base_action, action_is_pad)
+        counterfactual_embedding = self.encode_action(
+            counterfactual_action, action_is_pad
+        )
+        base_value = self.score_candidate(goal_state, base_embedding)
+        counterfactual_value = self.score_candidate(
+            goal_state, counterfactual_embedding
+        )
+        advantage = counterfactual_value - base_value
+        return (
+            advantage.float(),
+            base_value.float(),
+            counterfactual_value.float(),
+            goal_state,
+            base_embedding,
+            counterfactual_embedding,
+        )
 
 
 class ActionOutcomeVerifier(nn.Module):

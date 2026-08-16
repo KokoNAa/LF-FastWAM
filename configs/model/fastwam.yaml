@@ -144,8 +144,9 @@ transition_contract:
 # Policy-Guarded Counterfactual FastWAM. PGC is mutually exclusive with the
 # LangForce/TC mainlines. v1/v2 retain their historical independent Action
 # Expert for checkpoint compatibility. v3 shares one immutable released Base
-# Action Expert and learns only a bounded goal-conditioned flow-velocity
-# residual, then deploys a conservative verifier gate that falls back to Base.
+# Action Expert and learns a bounded flow-velocity residual. v4 instead learns
+# one bounded temporal correction after the frozen Base sampler has completed,
+# then deploys an FP32 pairwise gate that falls back exactly to Base.
 policy_guard:
   enabled: false
   version: 2
@@ -165,6 +166,23 @@ policy_guard:
   residual_regularization_weight: 0.01
   residual_smoothness_weight: 0.01
   velocity_residual_max_abs: 1.0
+  # v4 runs the immutable Base sampler to completion and applies one temporal
+  # correction to the deployed normalized action chunk. Formal training must
+  # use the same action inference-step count as evaluation.
+  action_chunk_residual_max_abs: 2.0
+  rollout_num_inference_steps: 10
+  proposal_hidden_dim: 256
+  proposal_num_heads: 8
+  proposal_num_layers: 2
+  action_gripper_weight: 2.0
+  # The v4 verifier is an FP32 temporal pairwise model. It regresses raw
+  # proposal advantage; no sigmoid probability or minimum-CF score is used.
+  verifier_num_heads: 8
+  verifier_num_layers: 2
+  advantage_temperature: 0.25
+  advantage_clip: 4.0
+  candidate_max_saturation_fraction: 0.25
+  candidate_max_delta_rms: 2.0
   # First learn the directly supervised residual. Only then train the moving
   # Verifier/alignment objectives, with a linear optimizer-step ramp.
   verifier_start_step: 1000

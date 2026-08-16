@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# PGC v4 keeps the released FastWAM Action Expert immutable. It runs the Base
+# sampler to completion and trains only a bounded temporal correction in final
+# action-chunk space plus an FP32 pairwise advantage verifier. The rollout-step
+# count must match formal evaluation.
+export PGC_VERSION=4
+export PGC_LEARNING_RATE="${PGC_LEARNING_RATE:-1.0e-4}"
+export PGC_RESIDUAL_REGULARIZATION_WEIGHT="${PGC_RESIDUAL_REGULARIZATION_WEIGHT:-0.01}"
+export PGC_RESIDUAL_SMOOTHNESS_WEIGHT="${PGC_RESIDUAL_SMOOTHNESS_WEIGHT:-0.01}"
+export PGC_ACTION_CHUNK_RESIDUAL_MAX_ABS="${PGC_ACTION_CHUNK_RESIDUAL_MAX_ABS:-2.0}"
+export PGC_ROLLOUT_INFERENCE_STEPS="${PGC_ROLLOUT_INFERENCE_STEPS:-10}"
+export PGC_ACTION_GRIPPER_WEIGHT="${PGC_ACTION_GRIPPER_WEIGHT:-2.0}"
+export PGC_ADVANTAGE_TEMPERATURE="${PGC_ADVANTAGE_TEMPERATURE:-0.25}"
+export PGC_ADVANTAGE_CLIP="${PGC_ADVANTAGE_CLIP:-4.0}"
+export PGC_CANDIDATE_MAX_SATURATION_FRACTION="${PGC_CANDIDATE_MAX_SATURATION_FRACTION:-0.25}"
+export PGC_CANDIDATE_MAX_DELTA_RMS="${PGC_CANDIDATE_MAX_DELTA_RMS:-2.0}"
+export PGC_TRAIN_GATE_THRESHOLD="${PGC_TRAIN_GATE_THRESHOLD:-0.20}"
+export PGC_VERIFIER_START_STEP="${PGC_VERIFIER_START_STEP:-1000}"
+export PGC_VERIFIER_RAMP_STEPS="${PGC_VERIFIER_RAMP_STEPS:-500}"
+
+exec bash scripts/train_pgc_libero_suite.sh "$@"
