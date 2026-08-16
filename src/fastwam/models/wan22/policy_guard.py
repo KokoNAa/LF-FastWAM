@@ -228,6 +228,194 @@ class GoalGraphEncoder(nn.Module):
         return routed_queries, goal_embedding, metrics
 
 
+class LanguageVisualTargetBinder(nn.Module):
+    """Route language through a visual-only target bottleneck.
+
+    The language representation is used only to score current-frame visual
+    patches.  Neither the Proposal query nor the deployment embedding receives
+    a direct language residual: both are projected from the attention-pooled
+    visual value.  This prevents a same-state language classifier from
+    satisfying the grounding objective without locating a different object.
+    """
+
+    def __init__(
+        self,
+        *,
+        text_dim: int,
+        video_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        projection_dim: int = 256,
+        num_heads: int = 8,
+        temperature: float = 0.07,
+    ) -> None:
+        super().__init__()
+        if min(
+            text_dim,
+            video_dim,
+            action_dim,
+            hidden_dim,
+            projection_dim,
+            num_heads,
+        ) <= 0:
+            raise ValueError("PGC target-binding dimensions must be positive.")
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"PGC target-binding hidden_dim={hidden_dim} must divide "
+                f"num_heads={num_heads}."
+            )
+        if temperature <= 0:
+            raise ValueError("PGC target-binding temperature must be positive.")
+
+        self.text_dim = int(text_dim)
+        self.video_dim = int(video_dim)
+        self.action_dim = int(action_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.projection_dim = int(projection_dim)
+        self.num_heads = int(num_heads)
+        self.temperature = float(temperature)
+
+        self.target_language_seed = nn.Parameter(
+            torch.randn(1, 1, hidden_dim) / math.sqrt(hidden_dim)
+        )
+        self.text_projection = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, hidden_dim),
+        )
+        self.language_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True
+        )
+        self.language_norm = nn.LayerNorm(hidden_dim)
+        self.visual_projection = nn.Sequential(
+            nn.LayerNorm(video_dim),
+            nn.Linear(video_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.binding_query_projection = nn.Sequential(
+            nn.LayerNorm(video_dim),
+            nn.Linear(video_dim, action_dim),
+        )
+        nn.init.zeros_(self.binding_query_projection[-1].weight)
+        nn.init.zeros_(self.binding_query_projection[-1].bias)
+        self.binding_embedding_projection = nn.Sequential(
+            nn.LayerNorm(video_dim),
+            nn.Linear(video_dim, projection_dim),
+        )
+
+    def forward(
+        self,
+        *,
+        base_queries: torch.Tensor,
+        language_hidden: torch.Tensor,
+        language_mask: torch.Tensor,
+        current_video_hidden: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+    ]:
+        if (
+            base_queries.ndim != 3
+            or language_hidden.ndim != 3
+            or current_video_hidden.ndim != 3
+        ):
+            raise ValueError("PGC target-binding inputs must be 3D tensors.")
+        if language_mask.shape != language_hidden.shape[:2]:
+            raise ValueError("PGC target-binding language mask must be [B,L].")
+        if not (
+            base_queries.shape[0]
+            == language_hidden.shape[0]
+            == current_video_hidden.shape[0]
+        ):
+            raise ValueError("PGC target-binding inputs must share batch size.")
+        if base_queries.shape[-1] != self.action_dim:
+            raise ValueError("PGC target-binding base-query dimension mismatch.")
+        if language_hidden.shape[-1] != self.text_dim:
+            raise ValueError("PGC target-binding language dimension mismatch.")
+        if current_video_hidden.shape[-1] != self.video_dim:
+            raise ValueError("PGC target-binding video dimension mismatch.")
+        if current_video_hidden.shape[1] <= 0:
+            raise ValueError("PGC target binding requires visual patches.")
+
+        text = self.text_projection(language_hidden)
+        text, text_padding = _safe_key_padding_mask(text, language_mask)
+        seed = self.target_language_seed.expand(language_hidden.shape[0], -1, -1)
+        language_delta, language_attention = self.language_attention(
+            query=seed,
+            key=text,
+            value=text,
+            key_padding_mask=text_padding,
+            need_weights=True,
+        )
+        language_query = F.normalize(
+            self.language_norm(seed + language_delta).float(),
+            dim=-1,
+            eps=1.0e-6,
+        )[:, 0]
+        visual_features = F.normalize(
+            self.visual_projection(current_video_hidden).float(),
+            dim=-1,
+            eps=1.0e-6,
+        )
+        similarity = torch.einsum(
+            "bd,bnd->bn", language_query, visual_features
+        )
+        target_attention = torch.softmax(
+            similarity / self.temperature, dim=-1
+        )
+
+        # This pooled visual tensor is the only deployment path from language
+        # to the Proposal.  Do not add language_query as a residual here.
+        pooled_visual = torch.einsum(
+            "bn,bnd->bd",
+            target_attention.to(dtype=current_video_hidden.dtype),
+            current_video_hidden,
+        )
+        visual_query_delta = self.binding_query_projection(pooled_visual).unsqueeze(1)
+        binding_queries = base_queries + visual_query_delta
+        binding_embedding = F.normalize(
+            self.binding_embedding_projection(pooled_visual).float(),
+            dim=-1,
+            eps=1.0e-6,
+        )
+
+        visual_probs = target_attention.float().clamp_min(1.0e-8)
+        language_probs = language_attention.float().clamp_min(1.0e-8)
+        metrics = {
+            "pgc_v6_target_attention_entropy": (
+                -(visual_probs * visual_probs.log()).sum(dim=-1)
+                / math.log(max(2, visual_probs.shape[-1]))
+            ).mean(),
+            "pgc_v6_target_attention_top1_mass": visual_probs.max(
+                dim=-1
+            ).values.mean(),
+            "pgc_v6_target_similarity_max": similarity.max(dim=-1).values.mean(),
+            "pgc_v6_target_language_attention_entropy": (
+                -(language_probs * language_probs.log()).sum(dim=-1)
+                / math.log(max(2, language_probs.shape[-1]))
+            ).mean(),
+            "pgc_v6_target_binding_query_norm": binding_queries.float()
+            .norm(dim=-1)
+            .mean(),
+            "pgc_v6_target_binding_query_delta_norm": visual_query_delta.float()
+            .norm(dim=-1)
+            .mean(),
+            "pgc_v6_target_binding_embedding_norm": binding_embedding.norm(
+                dim=-1
+            ).mean(),
+        }
+        return (
+            binding_queries,
+            binding_embedding,
+            target_attention,
+            visual_features,
+            metrics,
+        )
+
+
 class GoalResidualAdapter(nn.Module):
     """Inject goal information without replacing the pretrained visual path.
 

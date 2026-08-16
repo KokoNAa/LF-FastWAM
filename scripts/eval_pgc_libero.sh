@@ -71,9 +71,9 @@ metadata = payload.get("architecture_metadata") or {}
 if metadata.get("architecture") != "pgc_fastwam":
     raise SystemExit("Checkpoint is missing PGC architecture metadata")
 version = int(metadata.get("policy_guard_version", -1))
-if version not in {2, 3, 4, 5}:
+if version not in {2, 3, 4, 5, 6}:
     raise SystemExit(
-        f"Only PGC versions 2, 3, 4, and 5 are supported, got {version}"
+        f"Only PGC versions 2, 3, 4, 5, and 6 are supported, got {version}"
     )
 if payload.get("format") != f"fastwam_policy_guard_v{version}":
     raise SystemExit("PGC checkpoint format/version mismatch")
@@ -89,6 +89,7 @@ expected_tuning = {
     3: "bounded_velocity_residual",
     4: "rollout_aligned_final_action_residual",
     5: "paired_language_prefix_aligned_action_residual",
+    6: "visual_target_bottleneck_paired_action_residual",
 }[version]
 if metadata.get("counterfactual_tuning") != expected_tuning:
     raise SystemExit(f"PGC v{version} tuning metadata is incompatible")
@@ -100,7 +101,7 @@ if version >= 3 and any(
         "counterfactual_lora_config",
     )
 ):
-    raise SystemExit("PGC v3/v4/v5 must not contain an Action-Expert copy or LoRA")
+    raise SystemExit("PGC v3+ must not contain an Action-Expert copy or LoRA")
 if version >= 4:
     rollout_steps = int(metadata.get("rollout_num_inference_steps", -1))
     if rollout_steps != evaluation_inference_steps:
@@ -114,6 +115,21 @@ if version >= 4:
         )
 if version >= 5 and int(metadata.get("execution_prefix_steps", -1)) <= 0:
     raise SystemExit("PGC v5 checkpoint lacks its executed-prefix contract")
+if version >= 6 and (
+    metadata.get("target_binding_bottleneck")
+    != "visual_only_no_direct_language_residual"
+):
+    raise SystemExit("PGC v6 checkpoint lacks its visual-only target bottleneck")
+if version >= 6 and (
+    metadata.get("target_binding_visual_source")
+    != "pre_dit_language_neutral_current_frame"
+):
+    raise SystemExit("PGC v6 checkpoint uses a language-leaking visual source")
+if version >= 6 and (
+    metadata.get("target_prototype_bank_persisted") is not True
+    or not isinstance(payload.get("target_prototype_bank"), dict)
+):
+    raise SystemExit("PGC v6 checkpoint lacks its persisted target prototypes")
 print(version)
 PY
 )"

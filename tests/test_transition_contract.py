@@ -662,6 +662,16 @@ class TransitionContractTest(unittest.TestCase):
             valid_mask=valid,
         )
         self.assertEqual(float(retrieval), 1.0)
+        identity_loss, identity_metrics = bank.classification_loss(
+            task_ids=torch.tensor([20, 10]),
+            visual_features=same_scene,
+            attention=target,
+            valid_mask=valid,
+        )
+        self.assertLess(float(identity_loss), 1.0e-4)
+        self.assertEqual(
+            float(identity_metrics["state_grounding_identity_acc"]), 1.0
+        )
 
     def test_state_grounder_changes_patch_scores_with_language_and_state(self):
         grounder = StateConditionedTargetGrounder(

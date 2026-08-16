@@ -106,6 +106,42 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("PGC_GOAL_SEPARATION_WEIGHT", source)
         self.assertIn("PGC_VERIFIER_WRONG_LANGUAGE_WEIGHT", source)
 
+    def test_v6_launcher_selects_visual_target_binding_and_v5_warm_start(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v6_libero_suite.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("export PGC_VERSION=6", source)
+        self.assertIn("PGC_WARM_START_V5", source)
+        self.assertIn("PGC_INIT_CHECKPOINT", source)
+        self.assertIn("PGC_TARGET_BINDING_INTERACTION_WEIGHT", source)
+        self.assertIn("PGC_TARGET_BINDING_PROTOTYPE_WEIGHT", source)
+        self.assertIn("PGC_TARGET_BINDING_HARD_NEGATIVE_WEIGHT", source)
+        self.assertIn("PGC_TARGET_BINDING_ACTION_START_STEP", source)
+        self.assertIn('PGC_VERIFIER_START_STEP:-1500', source)
+
+    def test_common_launcher_forwards_v6_target_binding_contract(self):
+        source = (REPO_ROOT / "scripts/train_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('2|3|4|5|6', source)
+        self.assertIn("PGC v5-to-v6 warm start", source)
+        self.assertIn(
+            "model.policy_guard.target_binding_interaction_weight=", source
+        )
+        self.assertIn(
+            "model.policy_guard.target_binding_prototype_weight=", source
+        )
+        self.assertIn(
+            "model.policy_guard.target_binding_hard_negative_weight=", source
+        )
+        self.assertIn(
+            "model.policy_guard.target_binding_action_start_step=", source
+        )
+        self.assertIn(
+            "model.policy_guard.target_binding_action_ramp_steps=", source
+        )
+        self.assertIn("target_prototype_bank_persisted", source)
+
     def test_evaluation_enforces_v4_rollout_step_alignment(self):
         source = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
             encoding="utf-8"

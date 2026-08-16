@@ -46,12 +46,31 @@ RESIDUAL_SEPARATION_WEIGHT="${PGC_RESIDUAL_SEPARATION_WEIGHT:-0.25}"
 RESIDUAL_SEPARATION_MARGIN="${PGC_RESIDUAL_SEPARATION_MARGIN:-0.05}"
 VERIFIER_WRONG_LANGUAGE_WEIGHT="${PGC_VERIFIER_WRONG_LANGUAGE_WEIGHT:-0.50}"
 VERIFIER_BAD_CANDIDATE_WEIGHT="${PGC_VERIFIER_BAD_CANDIDATE_WEIGHT:-0.50}"
+TARGET_BINDING_INTERACTION_WEIGHT="${PGC_TARGET_BINDING_INTERACTION_WEIGHT:-1.0}"
+TARGET_BINDING_PROTOTYPE_WEIGHT="${PGC_TARGET_BINDING_PROTOTYPE_WEIGHT:-0.50}"
+TARGET_BINDING_SOURCE_WEIGHT="${PGC_TARGET_BINDING_SOURCE_WEIGHT:-0.50}"
+TARGET_BINDING_HARD_NEGATIVE_WEIGHT="${PGC_TARGET_BINDING_HARD_NEGATIVE_WEIGHT:-0.50}"
+TARGET_BINDING_SEPARATION_WEIGHT="${PGC_TARGET_BINDING_SEPARATION_WEIGHT:-0.25}"
+TARGET_BINDING_HARD_NEGATIVE_MARGIN="${PGC_TARGET_BINDING_HARD_NEGATIVE_MARGIN:-0.20}"
+TARGET_BINDING_SEPARATION_MARGIN="${PGC_TARGET_BINDING_SEPARATION_MARGIN:-0.15}"
+TARGET_BINDING_TEACHER_TOPK="${PGC_TARGET_BINDING_TEACHER_TOPK:-0.15}"
+TARGET_BINDING_TEACHER_TEMPERATURE="${PGC_TARGET_BINDING_TEACHER_TEMPERATURE:-0.25}"
+TARGET_BINDING_HIDDEN_DIM="${PGC_TARGET_BINDING_HIDDEN_DIM:-256}"
+TARGET_BINDING_NUM_HEADS="${PGC_TARGET_BINDING_NUM_HEADS:-8}"
+TARGET_BINDING_TEMPERATURE="${PGC_TARGET_BINDING_TEMPERATURE:-0.07}"
+TARGET_BINDING_PROTOTYPE_SLOTS="${PGC_TARGET_BINDING_PROTOTYPE_SLOTS:-64}"
+TARGET_BINDING_PROTOTYPE_MOMENTUM="${PGC_TARGET_BINDING_PROTOTYPE_MOMENTUM:-0.95}"
+TARGET_BINDING_PROTOTYPE_TEMPERATURE="${PGC_TARGET_BINDING_PROTOTYPE_TEMPERATURE:-0.07}"
+TARGET_BINDING_PROTOTYPE_TOPK="${PGC_TARGET_BINDING_PROTOTYPE_TOPK:-0.10}"
+TARGET_BINDING_ACTION_START_STEP="${PGC_TARGET_BINDING_ACTION_START_STEP:-1000}"
+TARGET_BINDING_ACTION_RAMP_STEPS="${PGC_TARGET_BINDING_ACTION_RAMP_STEPS:-500}"
+WARM_START_V5="${PGC_WARM_START_V5:-false}"
 RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-pgc-v${PGC_VERSION}-${MAX_STEPS}-seed${TRAIN_SEED}}"
 
 case "${PGC_VERSION}" in
-  2|3|4|5) ;;
+  2|3|4|5|6) ;;
   *)
-    echo "PGC_VERSION must be 2, 3, 4, or 5; got ${PGC_VERSION}." >&2
+    echo "PGC_VERSION must be 2, 3, 4, 5, or 6; got ${PGC_VERSION}." >&2
     exit 1
     ;;
 esac
@@ -75,7 +94,7 @@ case "${TRAIN_SUITE}" in
     ;;
 esac
 
-for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY ROLLOUT_INFERENCE_STEPS EXECUTION_PREFIX_STEPS; do
+for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY ROLLOUT_INFERENCE_STEPS EXECUTION_PREFIX_STEPS TARGET_BINDING_HIDDEN_DIM TARGET_BINDING_NUM_HEADS TARGET_BINDING_PROTOTYPE_SLOTS; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${value_name} must be a positive integer, got ${value}." >&2
@@ -86,7 +105,7 @@ if [[ "${PGC_VERSION}" == "2" ]] && ! [[ "${LORA_RANK}" =~ ^[1-9][0-9]*$ ]]; the
   echo "LORA_RANK must be a positive integer for PGC v2, got ${LORA_RANK}." >&2
   exit 1
 fi
-for value_name in VERIFIER_START_STEP VERIFIER_RAMP_STEPS; do
+for value_name in VERIFIER_START_STEP VERIFIER_RAMP_STEPS TARGET_BINDING_ACTION_START_STEP TARGET_BINDING_ACTION_RAMP_STEPS; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
     echo "${value_name} must be a non-negative integer, got ${value}." >&2
@@ -110,6 +129,21 @@ case "${BALANCE_NATIVE_COUNTERFACTUAL}" in
     exit 1
     ;;
 esac
+case "${WARM_START_V5}" in
+  true|false) ;;
+  *)
+    echo "PGC_WARM_START_V5 must be true or false." >&2
+    exit 1
+    ;;
+esac
+if [[ "${WARM_START_V5}" == "true" && "${PGC_VERSION}" != "6" ]]; then
+  echo "PGC_WARM_START_V5=true is valid only for PGC_VERSION=6." >&2
+  exit 1
+fi
+if [[ "${WARM_START_V5}" == "true" && -n "${CONTINUE_FROM_STEP}" ]]; then
+  echo "PGC v5-to-v6 warm start begins a fresh optimizer schedule; do not set PGC_CONTINUE_FROM_STEP." >&2
+  exit 1
+fi
 if [[ "${BALANCE_NATIVE_COUNTERFACTUAL}" == "true" && "${OVERSAMPLE_FACTOR}" != "1" ]]; then
   echo "PGC exact 1:1 balancing requires PGC_COUNTERFACTUAL_OVERSAMPLE_FACTOR=1." >&2
   exit 1
@@ -135,7 +169,23 @@ fi
   "${RESIDUAL_SEPARATION_WEIGHT}" \
   "${RESIDUAL_SEPARATION_MARGIN}" \
   "${VERIFIER_WRONG_LANGUAGE_WEIGHT}" \
-  "${VERIFIER_BAD_CANDIDATE_WEIGHT}" <<'PY'
+  "${VERIFIER_BAD_CANDIDATE_WEIGHT}" \
+  "${TARGET_BINDING_INTERACTION_WEIGHT}" \
+  "${TARGET_BINDING_PROTOTYPE_WEIGHT}" \
+  "${TARGET_BINDING_SOURCE_WEIGHT}" \
+  "${TARGET_BINDING_HARD_NEGATIVE_WEIGHT}" \
+  "${TARGET_BINDING_SEPARATION_WEIGHT}" \
+  "${TARGET_BINDING_HARD_NEGATIVE_MARGIN}" \
+  "${TARGET_BINDING_SEPARATION_MARGIN}" \
+  "${TARGET_BINDING_TEACHER_TOPK}" \
+  "${TARGET_BINDING_TEACHER_TEMPERATURE}" \
+  "${TARGET_BINDING_HIDDEN_DIM}" \
+  "${TARGET_BINDING_NUM_HEADS}" \
+  "${TARGET_BINDING_TEMPERATURE}" \
+  "${TARGET_BINDING_PROTOTYPE_SLOTS}" \
+  "${TARGET_BINDING_PROTOTYPE_MOMENTUM}" \
+  "${TARGET_BINDING_PROTOTYPE_TEMPERATURE}" \
+  "${TARGET_BINDING_PROTOTYPE_TOPK}" <<'PY'
 import sys
 
 version = int(sys.argv[1])
@@ -153,6 +203,16 @@ candidate_max_delta_rms = float(sys.argv[12])
 gate_threshold = float(sys.argv[13])
 suffix_weight = float(sys.argv[14])
 paired_weights = [float(value) for value in sys.argv[15:22]]
+target_binding_weights = [float(value) for value in sys.argv[22:29]]
+teacher_topk = float(sys.argv[29])
+teacher_temperature = float(sys.argv[30])
+binding_hidden_dim = int(sys.argv[31])
+binding_num_heads = int(sys.argv[32])
+binding_temperature = float(sys.argv[33])
+prototype_slots = int(sys.argv[34])
+prototype_momentum = float(sys.argv[35])
+prototype_temperature = float(sys.argv[36])
+prototype_topk = float(sys.argv[37])
 if version == 2:
     if alpha <= 0:
         raise SystemExit(f"PGC_LORA_ALPHA must be positive, got {alpha}")
@@ -182,6 +242,21 @@ if version >= 5:
         raise SystemExit("PGC v5 suffix loss weight must be in [0, 1]")
     if any(value < 0 for value in paired_weights):
         raise SystemExit("PGC v5 paired-language weights must be non-negative")
+if version >= 6:
+    if any(value < 0 for value in target_binding_weights):
+        raise SystemExit("PGC v6 target-binding weights/margins must be non-negative")
+    if binding_hidden_dim <= 0 or prototype_slots <= 0:
+        raise SystemExit("PGC v6 target-binding dimensions/slots must be positive")
+    if binding_num_heads <= 0 or binding_hidden_dim % binding_num_heads != 0:
+        raise SystemExit(
+            "PGC v6 target-binding hidden dim must divide its attention heads"
+        )
+    if min(teacher_temperature, binding_temperature, prototype_temperature) <= 0:
+        raise SystemExit("PGC v6 target-binding temperatures must be positive")
+    if not 0 < teacher_topk <= 1 or not 0 < prototype_topk <= 1:
+        raise SystemExit("PGC v6 target-binding top-k fractions must be in (0, 1]")
+    if not 0 <= prototype_momentum < 1:
+        raise SystemExit("PGC v6 prototype momentum must be in [0, 1)")
 PY
 if [[ ! -f "${BASE_CHECKPOINT}" ]]; then
   echo "Base checkpoint not found: ${BASE_CHECKPOINT}" >&2
@@ -297,13 +372,76 @@ if payload.get("format") in {
     "fastwam_policy_guard_v3",
     "fastwam_policy_guard_v4",
     "fastwam_policy_guard_v5",
+    "fastwam_policy_guard_v6",
 }:
     raise SystemExit("PGC base must be the immutable full FastWAM release, not an adapter")
 print(f"Validated protected base: format={payload.get('format', 'legacy_full')} tensors={len(payload['mot'])}")
 PY
 
 WEIGHT_ONLY_START_STEP=null
-if [[ -n "${CONTINUE_FROM_STEP}" ]]; then
+if [[ "${WARM_START_V5}" == "true" ]]; then
+  "${PYTHON_BIN}" - \
+    "${INIT_CHECKPOINT}" \
+    "${BASE_CHECKPOINT}" \
+    "${ROLLOUT_INFERENCE_STEPS}" \
+    "${EXECUTION_PREFIX_STEPS}" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+
+init_path = Path(sys.argv[1]).expanduser().resolve()
+base_path = Path(sys.argv[2]).expanduser().resolve()
+expected_rollout_steps = int(sys.argv[3])
+expected_execution_prefix = int(sys.argv[4])
+payload = torch.load(init_path, map_location="cpu", weights_only=False)
+metadata = payload.get("architecture_metadata") or {}
+if payload.get("format") != "fastwam_policy_guard_v5":
+    raise SystemExit(
+        "PGC v6 warm start requires a PGC v5 checkpoint, got "
+        f"{payload.get('format')!r}"
+    )
+if metadata.get("architecture") != "pgc_fastwam" or int(
+    metadata.get("policy_guard_version", -1)
+) != 5:
+    raise SystemExit("PGC v6 warm start checkpoint lacks valid PGC v5 metadata")
+if (
+    metadata.get("counterfactual_tuning")
+    != "paired_language_prefix_aligned_action_residual"
+    or metadata.get("policy_protection")
+    != "single_immutable_base_plus_conservative_hard_gate"
+):
+    raise SystemExit("PGC v6 warm start checkpoint lacks the protected V5 contract")
+if any(
+    key in payload
+    for key in (
+        "counterfactual_action_adapter",
+        "counterfactual_action_expert",
+        "counterfactual_lora_config",
+    )
+):
+    raise SystemExit("PGC v6 warm start checkpoint contains forbidden policy tensors")
+if not isinstance(payload.get("policy_guard"), dict) or not payload["policy_guard"]:
+    raise SystemExit("PGC v6 warm start checkpoint has no V5 sidecar tensors")
+recorded_base = Path(str(payload.get("base_checkpoint", ""))).expanduser()
+if not recorded_base.is_absolute():
+    recorded_base = init_path.parent / recorded_base
+recorded_base = recorded_base.resolve()
+if recorded_base != base_path:
+    raise SystemExit(
+        "PGC v6 warm-start base mismatch: "
+        f"checkpoint={recorded_base} requested={base_path}"
+    )
+if int(metadata.get("rollout_num_inference_steps", -1)) != expected_rollout_steps:
+    raise SystemExit("PGC v6 warm start rollout inference-step mismatch")
+if int(metadata.get("execution_prefix_steps", -1)) != expected_execution_prefix:
+    raise SystemExit("PGC v6 warm start execution-prefix mismatch")
+print(
+    "Validated PGC v5-to-v6 warm start: "
+    f"step={payload.get('step')} base={base_path}"
+)
+PY
+elif [[ -n "${CONTINUE_FROM_STEP}" ]]; then
   "${PYTHON_BIN}" - \
     "${INIT_CHECKPOINT}" \
     "${BASE_CHECKPOINT}" \
@@ -333,7 +471,25 @@ if [[ -n "${CONTINUE_FROM_STEP}" ]]; then
     "${RESIDUAL_SEPARATION_WEIGHT}" \
     "${RESIDUAL_SEPARATION_MARGIN}" \
     "${VERIFIER_WRONG_LANGUAGE_WEIGHT}" \
-    "${VERIFIER_BAD_CANDIDATE_WEIGHT}" <<'PY'
+    "${VERIFIER_BAD_CANDIDATE_WEIGHT}" \
+    "${TARGET_BINDING_INTERACTION_WEIGHT}" \
+    "${TARGET_BINDING_PROTOTYPE_WEIGHT}" \
+    "${TARGET_BINDING_SOURCE_WEIGHT}" \
+    "${TARGET_BINDING_HARD_NEGATIVE_WEIGHT}" \
+    "${TARGET_BINDING_SEPARATION_WEIGHT}" \
+    "${TARGET_BINDING_HARD_NEGATIVE_MARGIN}" \
+    "${TARGET_BINDING_SEPARATION_MARGIN}" \
+    "${TARGET_BINDING_TEACHER_TOPK}" \
+    "${TARGET_BINDING_TEACHER_TEMPERATURE}" \
+    "${TARGET_BINDING_HIDDEN_DIM}" \
+    "${TARGET_BINDING_NUM_HEADS}" \
+    "${TARGET_BINDING_TEMPERATURE}" \
+    "${TARGET_BINDING_PROTOTYPE_SLOTS}" \
+    "${TARGET_BINDING_PROTOTYPE_MOMENTUM}" \
+    "${TARGET_BINDING_PROTOTYPE_TEMPERATURE}" \
+    "${TARGET_BINDING_PROTOTYPE_TOPK}" \
+    "${TARGET_BINDING_ACTION_START_STEP}" \
+    "${TARGET_BINDING_ACTION_RAMP_STEPS}" <<'PY'
 import math
 import sys
 from pathlib import Path
@@ -370,6 +526,30 @@ expected_v5_scalars = {
     "residual_separation_margin": float(sys.argv[27]),
     "verifier_wrong_language_weight": float(sys.argv[28]),
     "verifier_bad_candidate_weight": float(sys.argv[29]),
+}
+expected_v6_scalars = {
+    "target_binding_interaction_weight": float(sys.argv[30]),
+    "target_binding_prototype_weight": float(sys.argv[31]),
+    "target_binding_source_weight": float(sys.argv[32]),
+    "target_binding_hard_negative_weight": float(sys.argv[33]),
+    "target_binding_separation_weight": float(sys.argv[34]),
+    "target_binding_hard_negative_margin": float(sys.argv[35]),
+    "target_binding_separation_margin": float(sys.argv[36]),
+    "target_binding_teacher_topk": float(sys.argv[37]),
+    "target_binding_teacher_temperature": float(sys.argv[38]),
+    "target_binding_temperature": float(sys.argv[41]),
+    "target_binding_prototype_momentum": float(sys.argv[43]),
+    "target_binding_prototype_temperature": float(sys.argv[44]),
+    "target_binding_prototype_topk": float(sys.argv[45]),
+}
+expected_v6_architecture = {
+    "target_binding_hidden_dim": int(sys.argv[39]),
+    "target_binding_num_heads": int(sys.argv[40]),
+    "target_binding_prototype_slots": int(sys.argv[42]),
+}
+expected_v6_schedule = {
+    "target_binding_action_start_step": int(sys.argv[46]),
+    "target_binding_action_ramp_steps": int(sys.argv[47]),
 }
 payload = torch.load(init_path, map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
@@ -458,9 +638,13 @@ elif expected_version == 3:
         raise SystemExit("PGC v3 continuation verifier_ramp_steps mismatch")
 else:
     expected_tuning = (
-        "paired_language_prefix_aligned_action_residual"
-        if expected_version >= 5
-        else "rollout_aligned_final_action_residual"
+        "visual_target_bottleneck_paired_action_residual"
+        if expected_version >= 6
+        else (
+            "paired_language_prefix_aligned_action_residual"
+            if expected_version >= 5
+            else "rollout_aligned_final_action_residual"
+        )
     )
     if metadata.get("counterfactual_tuning") != expected_tuning:
         raise SystemExit(
@@ -522,6 +706,60 @@ else:
             if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
                 raise SystemExit(
                     f"PGC v5 continuation {name} mismatch: "
+                    f"checkpoint={actual} requested={expected}"
+                )
+    if expected_version >= 6:
+        if (
+            metadata.get("target_binding_bottleneck")
+            != "visual_only_no_direct_language_residual"
+        ):
+            raise SystemExit("PGC v6 continuation lacks its visual-only bottleneck")
+        if (
+            metadata.get("target_binding_visual_source")
+            != "pre_dit_language_neutral_current_frame"
+        ):
+            raise SystemExit("PGC v6 continuation uses a language-leaking visual source")
+        if metadata.get("target_prototype_bank_persisted") is not True:
+            raise SystemExit("PGC v6 continuation lacks persisted target prototypes")
+        prototype_state = payload.get("target_prototype_bank")
+        if not isinstance(prototype_state, dict) or set(prototype_state) != {
+            "task_ids",
+            "counts",
+            "prototypes",
+        }:
+            raise SystemExit("PGC v6 continuation has invalid target prototype state")
+        expected_prototype_shapes = {
+            "task_ids": (expected_v6_architecture["target_binding_prototype_slots"],),
+            "counts": (expected_v6_architecture["target_binding_prototype_slots"],),
+            "prototypes": (
+                expected_v6_architecture["target_binding_prototype_slots"],
+                expected_v6_architecture["target_binding_hidden_dim"],
+            ),
+        }
+        for name, shape in expected_prototype_shapes.items():
+            value = prototype_state[name]
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape:
+                raise SystemExit(
+                    f"PGC v6 continuation target prototype {name} mismatch: "
+                    f"checkpoint={getattr(value, 'shape', None)} requested={shape}"
+                )
+        for name, expected in expected_v6_architecture.items():
+            if int(metadata.get(name, -1)) != expected:
+                raise SystemExit(
+                    f"PGC v6 continuation {name} mismatch: "
+                    f"checkpoint={metadata.get(name)} requested={expected}"
+                )
+        for name, expected in expected_v6_schedule.items():
+            if int(metadata.get(name, -1)) != expected:
+                raise SystemExit(
+                    f"PGC v6 continuation {name} mismatch: "
+                    f"checkpoint={metadata.get(name)} requested={expected}"
+                )
+        for name, expected in expected_v6_scalars.items():
+            actual = float(metadata.get(name, float("nan")))
+            if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
+                raise SystemExit(
+                    f"PGC v6 continuation {name} mismatch: "
                     f"checkpoint={actual} requested={expected}"
                 )
 print(
@@ -600,9 +838,14 @@ else
   echo "  tuning=rollout-aligned-final-action-residual cap=${ACTION_CHUNK_RESIDUAL_MAX_ABS} rollout_steps=${ROLLOUT_INFERENCE_STEPS} gripper_weight=${ACTION_GRIPPER_WEIGHT}"
   echo "  advantage=temperature:${ADVANTAGE_TEMPERATURE} clip:${ADVANTAGE_CLIP} gate_threshold:${TRAIN_GATE_THRESHOLD}"
   echo "  candidate_support=max_saturation:${CANDIDATE_MAX_SATURATION_FRACTION} max_delta_rms:${CANDIDATE_MAX_DELTA_RMS}"
-  if [[ "${PGC_VERSION}" == "5" ]]; then
+  if [[ "${PGC_VERSION}" -ge "5" ]]; then
     echo "  paired_language=source_zero:${SAME_STATE_SOURCE_ZERO_WEIGHT} goal_sep:${GOAL_SEPARATION_WEIGHT}/${GOAL_SEPARATION_MARGIN} residual_sep:${RESIDUAL_SEPARATION_WEIGHT}/${RESIDUAL_SEPARATION_MARGIN}"
     echo "  executed_prefix=${EXECUTION_PREFIX_STEPS} suffix_weight=${SUFFIX_LOSS_WEIGHT} verifier_negatives=wrong_language:${VERIFIER_WRONG_LANGUAGE_WEIGHT} bad_candidate:${VERIFIER_BAD_CANDIDATE_WEIGHT}"
+  fi
+  if [[ "${PGC_VERSION}" == "6" ]]; then
+    echo "  target_binding=visual_only interaction:${TARGET_BINDING_INTERACTION_WEIGHT} prototypes:${TARGET_BINDING_PROTOTYPE_WEIGHT}/${TARGET_BINDING_SOURCE_WEIGHT} hard_negative:${TARGET_BINDING_HARD_NEGATIVE_WEIGHT}/${TARGET_BINDING_HARD_NEGATIVE_MARGIN} separation:${TARGET_BINDING_SEPARATION_WEIGHT}/${TARGET_BINDING_SEPARATION_MARGIN}"
+    echo "  target_binding_arch=hidden:${TARGET_BINDING_HIDDEN_DIM} heads:${TARGET_BINDING_NUM_HEADS} temperature:${TARGET_BINDING_TEMPERATURE} teacher_topk:${TARGET_BINDING_TEACHER_TOPK} prototype_slots:${TARGET_BINDING_PROTOTYPE_SLOTS} warm_start_v5:${WARM_START_V5}"
+    echo "  target_binding_schedule=binding_only_through:${TARGET_BINDING_ACTION_START_STEP} action_ramp:${TARGET_BINDING_ACTION_RAMP_STEPS} verifier_start:${VERIFIER_START_STEP}"
   fi
   echo "  verifier_schedule=start:${VERIFIER_START_STEP} ramp:${VERIFIER_RAMP_STEPS}"
   LORA_ENABLED=false
@@ -655,6 +898,24 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.residual_separation_margin=${RESIDUAL_SEPARATION_MARGIN}" \
   "model.policy_guard.verifier_wrong_language_weight=${VERIFIER_WRONG_LANGUAGE_WEIGHT}" \
   "model.policy_guard.verifier_bad_candidate_weight=${VERIFIER_BAD_CANDIDATE_WEIGHT}" \
+  "model.policy_guard.target_binding_interaction_weight=${TARGET_BINDING_INTERACTION_WEIGHT}" \
+  "model.policy_guard.target_binding_prototype_weight=${TARGET_BINDING_PROTOTYPE_WEIGHT}" \
+  "model.policy_guard.target_binding_source_weight=${TARGET_BINDING_SOURCE_WEIGHT}" \
+  "model.policy_guard.target_binding_hard_negative_weight=${TARGET_BINDING_HARD_NEGATIVE_WEIGHT}" \
+  "model.policy_guard.target_binding_separation_weight=${TARGET_BINDING_SEPARATION_WEIGHT}" \
+  "model.policy_guard.target_binding_hard_negative_margin=${TARGET_BINDING_HARD_NEGATIVE_MARGIN}" \
+  "model.policy_guard.target_binding_separation_margin=${TARGET_BINDING_SEPARATION_MARGIN}" \
+  "model.policy_guard.target_binding_teacher_topk=${TARGET_BINDING_TEACHER_TOPK}" \
+  "model.policy_guard.target_binding_teacher_temperature=${TARGET_BINDING_TEACHER_TEMPERATURE}" \
+  "model.policy_guard.target_binding_hidden_dim=${TARGET_BINDING_HIDDEN_DIM}" \
+  "model.policy_guard.target_binding_num_heads=${TARGET_BINDING_NUM_HEADS}" \
+  "model.policy_guard.target_binding_temperature=${TARGET_BINDING_TEMPERATURE}" \
+  "model.policy_guard.target_binding_prototype_slots=${TARGET_BINDING_PROTOTYPE_SLOTS}" \
+  "model.policy_guard.target_binding_prototype_momentum=${TARGET_BINDING_PROTOTYPE_MOMENTUM}" \
+  "model.policy_guard.target_binding_prototype_temperature=${TARGET_BINDING_PROTOTYPE_TEMPERATURE}" \
+  "model.policy_guard.target_binding_prototype_topk=${TARGET_BINDING_PROTOTYPE_TOPK}" \
+  "model.policy_guard.target_binding_action_start_step=${TARGET_BINDING_ACTION_START_STEP}" \
+  "model.policy_guard.target_binding_action_ramp_steps=${TARGET_BINDING_ACTION_RAMP_STEPS}" \
   "model.lora.enabled=${LORA_ENABLED}" \
   "model.lora.rank=${LORA_RANK}" \
   "model.lora.alpha=${LORA_ALPHA}" \

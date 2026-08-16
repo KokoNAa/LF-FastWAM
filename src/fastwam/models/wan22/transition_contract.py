@@ -1107,6 +1107,62 @@ class StateTargetPrototypeBank(nn.Module):
             == task_ids.to(device=pooled.device, dtype=torch.long)[valid]
         ).float().mean()
 
+    def classification_loss(
+        self,
+        *,
+        task_ids: torch.Tensor,
+        visual_features: torch.Tensor,
+        attention: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Contrast a language-selected visual value against all task prototypes."""
+        if task_ids.ndim != 1 or valid_mask.shape != task_ids.shape:
+            raise ValueError("State-target task IDs and valid mask must be [B].")
+        if visual_features.ndim != 3 or visual_features.shape[0] != task_ids.shape[0]:
+            raise ValueError("State-target visual features must be [B,N,D].")
+        if attention.shape != visual_features.shape[:2]:
+            raise ValueError("State-target attention must be [B,N].")
+        pooled = F.normalize(
+            torch.einsum(
+                "bn,bnd->bd", attention.float(), visual_features.float()
+            ),
+            dim=-1,
+            eps=1e-6,
+        )
+        active = self.task_ids >= 0
+        zero = pooled.sum() * 0.0
+        if not bool(active.any()):
+            return zero, {
+                "state_grounding_identity_valid_fraction": zero.detach(),
+                "state_grounding_identity_acc": zero.detach(),
+            }
+        active_ids = self.task_ids[active].to(device=pooled.device)
+        active_prototypes = F.normalize(
+            self.prototypes[active].to(
+                device=pooled.device, dtype=pooled.dtype
+            ),
+            dim=-1,
+            eps=1e-6,
+        )
+        logits = torch.matmul(pooled, active_prototypes.transpose(0, 1))
+        logits = logits / self.temperature
+        requested_ids = task_ids.to(device=pooled.device, dtype=torch.long)
+        matches = requested_ids[:, None] == active_ids[None, :]
+        available = matches.any(dim=-1)
+        valid = valid_mask.to(device=pooled.device, dtype=torch.bool) & available
+        targets = matches.to(dtype=torch.long).argmax(dim=-1)
+        per_sample = F.cross_entropy(logits, targets, reduction="none")
+        per_sample = per_sample / math.log(max(2, int(active_ids.numel())))
+        loss = (per_sample * valid.to(dtype=per_sample.dtype)).sum()
+        loss = loss / valid.to(dtype=per_sample.dtype).sum().clamp_min(1.0)
+        accuracy = (logits.argmax(dim=-1) == targets).to(dtype=pooled.dtype)
+        accuracy = (accuracy * valid.to(dtype=pooled.dtype)).sum()
+        accuracy = accuracy / valid.to(dtype=pooled.dtype).sum().clamp_min(1.0)
+        return loss, {
+            "state_grounding_identity_valid_fraction": valid.float().mean(),
+            "state_grounding_identity_acc": accuracy.detach(),
+        }
+
 
 class ContrastiveContractLoss(nn.Module):
     """Symmetric transition InfoNCE with distributed in-batch negatives."""

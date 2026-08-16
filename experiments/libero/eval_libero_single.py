@@ -674,6 +674,21 @@ def _predict_action_chunk(
                 "candidate_saturation_fraction",
                 float,
             ),
+            (
+                "policy_guard_target_binding_top1_mass",
+                "target_binding_top1_mass",
+                float,
+            ),
+            (
+                "policy_guard_target_binding_entropy",
+                "target_binding_entropy",
+                float,
+            ),
+            (
+                "policy_guard_target_binding_similarity_max",
+                "target_binding_similarity_max",
+                float,
+            ),
         ):
             if source_key in pred:
                 policy_guard_diagnostics[output_key] = converter(pred[source_key])
@@ -1194,6 +1209,21 @@ def run_single_task(
             results[
                 "policy_guard_candidate_saturation_fraction_max"
             ] = float(np.max(saturation))
+        for decision_key, result_key in (
+            ("target_binding_top1_mass", "policy_guard_target_binding_top1_mass_mean"),
+            ("target_binding_entropy", "policy_guard_target_binding_entropy_mean"),
+            (
+                "target_binding_similarity_max",
+                "policy_guard_target_binding_similarity_max_mean",
+            ),
+        ):
+            values = [
+                float(item[decision_key])
+                for item in policy_guard_decisions
+                if decision_key in item
+            ]
+            if values:
+                results[result_key] = float(np.mean(values))
     if instruction_condition == "shuffled":
         # The simulator success predicate still represents the original task.
         results["default_task_successes"] = results["successes"]

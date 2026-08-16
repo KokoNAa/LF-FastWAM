@@ -148,7 +148,9 @@ transition_contract:
 # one bounded temporal correction after the frozen Base sampler has completed,
 # then deploys an FP32 pairwise gate that falls back exactly to Base. v5 adds
 # same-state paired-language identifiability, execution-prefix alignment, and
-# explicit wrong-language / bad-proposal verifier negatives.
+# explicit wrong-language / bad-proposal verifier negatives. v6 replaces the
+# direct language-to-Proposal path with a language-selected visual target
+# bottleneck and adds successful-transition / task-appearance supervision.
 policy_guard:
   enabled: false
   version: 2
@@ -200,8 +202,34 @@ policy_guard:
   # Stage-2 verifier negatives prevent the old shortcut "any CF row is good".
   verifier_wrong_language_weight: 0.50
   verifier_bad_candidate_weight: 0.50
+  # PGC v6: language scores current-frame visual patches, while the Proposal
+  # receives only the selected visual value plus language-independent query
+  # seeds. Future demonstration frames are training-only and locate the
+  # interaction region; task appearance prototypes transfer that target to a
+  # same-state counterfactual scene. Neither teacher is used at deployment.
+  target_binding_interaction_weight: 1.0
+  target_binding_prototype_weight: 0.50
+  target_binding_source_weight: 0.50
+  target_binding_hard_negative_weight: 0.50
+  target_binding_separation_weight: 0.25
+  target_binding_hard_negative_margin: 0.20
+  target_binding_separation_margin: 0.15
+  target_binding_teacher_topk: 0.15
+  target_binding_teacher_temperature: 0.25
+  target_binding_hidden_dim: 256
+  target_binding_num_heads: 8
+  target_binding_temperature: 0.07
+  target_binding_prototype_slots: 64
+  target_binding_prototype_momentum: 0.95
+  target_binding_prototype_temperature: 0.07
+  target_binding_prototype_topk: 0.10
+  # Stage A learns only language-to-visual binding. Stage B linearly enables
+  # V5 action objectives; the verifier has its own later schedule below.
+  target_binding_action_start_step: 1000
+  target_binding_action_ramp_steps: 500
   # First learn the directly supervised residual. Only then train the moving
-  # Verifier/alignment objectives, with a linear optimizer-step ramp.
+  # Verifier/alignment objectives, with a linear optimizer-step ramp. For v6,
+  # the effective start is also clamped to action_start + action_ramp.
   verifier_start_step: 1000
   verifier_ramp_steps: 500
   # Goal information is injected into the query-free/raw-visual Action Expert
