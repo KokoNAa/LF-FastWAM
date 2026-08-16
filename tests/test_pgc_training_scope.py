@@ -96,6 +96,16 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("PGC_ADVANTAGE_TEMPERATURE", source)
         self.assertIn("PGC_CANDIDATE_MAX_DELTA_RMS", source)
 
+    def test_v5_launcher_selects_paired_language_prefix_training(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v5_libero_suite.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("export PGC_VERSION=5", source)
+        self.assertIn("PGC_EXECUTION_PREFIX_STEPS", source)
+        self.assertIn("PGC_SAME_STATE_SOURCE_ZERO_WEIGHT", source)
+        self.assertIn("PGC_GOAL_SEPARATION_WEIGHT", source)
+        self.assertIn("PGC_VERIFIER_WRONG_LANGUAGE_WEIGHT", source)
+
     def test_evaluation_enforces_v4_rollout_step_alignment(self):
         source = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
             encoding="utf-8"

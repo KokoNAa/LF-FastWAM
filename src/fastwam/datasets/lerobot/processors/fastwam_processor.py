@@ -280,6 +280,10 @@ class FastWAMProcessor(BaseProcessor):
             sample["dataset_index"] = torch.as_tensor(
                 data["dataset_index"], dtype=torch.long
             )
+        if "episode_index" in data:
+            sample["episode_index"] = torch.as_tensor(
+                data["episode_index"], dtype=torch.long
+            )
 
         # sample = self.tokenizer(sample)
         

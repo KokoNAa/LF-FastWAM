@@ -146,7 +146,9 @@ transition_contract:
 # Expert for checkpoint compatibility. v3 shares one immutable released Base
 # Action Expert and learns a bounded flow-velocity residual. v4 instead learns
 # one bounded temporal correction after the frozen Base sampler has completed,
-# then deploys an FP32 pairwise gate that falls back exactly to Base.
+# then deploys an FP32 pairwise gate that falls back exactly to Base. v5 adds
+# same-state paired-language identifiability, execution-prefix alignment, and
+# explicit wrong-language / bad-proposal verifier negatives.
 policy_guard:
   enabled: false
   version: 2
@@ -183,6 +185,21 @@ policy_guard:
   advantage_clip: 4.0
   candidate_max_saturation_fraction: 0.25
   candidate_max_delta_rms: 2.0
+  # LIBERO executes only the first 10 of the 32 predicted actions before
+  # replanning. v5 gives that deployed prefix full weight while retaining a
+  # small suffix auxiliary loss.
+  execution_prefix_steps: 10
+  suffix_loss_weight: 0.10
+  # On every audited CF state, source language must reproduce exact Base while
+  # counterfactual language must produce the demonstrated successful residual.
+  same_state_source_zero_weight: 1.0
+  goal_separation_weight: 0.25
+  goal_separation_margin: 0.20
+  residual_separation_weight: 0.25
+  residual_separation_margin: 0.05
+  # Stage-2 verifier negatives prevent the old shortcut "any CF row is good".
+  verifier_wrong_language_weight: 0.50
+  verifier_bad_candidate_weight: 0.50
   # First learn the directly supervised residual. Only then train the moving
   # Verifier/alignment objectives, with a linear optimizer-step ramp.
   verifier_start_step: 1000

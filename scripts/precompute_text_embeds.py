@@ -133,7 +133,8 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
     total_task_rows = 0
 
     for ds_dir in dataset_dirs:
-        tasks_path = Path(ds_dir) / "meta" / "tasks.jsonl"
+        dataset_path = Path(ds_dir)
+        tasks_path = dataset_path / "meta" / "tasks.jsonl"
         if not tasks_path.exists():
             raise FileNotFoundError(f"Missing tasks file: {tasks_path}")
 
@@ -151,6 +152,20 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
                 if prompt not in seen:
                     seen.add(prompt)
                     prompts.append(prompt)
+        # PGC v5 also encodes the source instruction on each already-recorded
+        # counterfactual state. Source text normally appears in the native
+        # suite, but reading the provenance makes that cache requirement
+        # explicit and keeps isolated/custom-suite datasets self-contained.
+        provenance_path = dataset_path / "meta" / "pgc_provenance.json"
+        if provenance_path.is_file():
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            for pair in provenance.get("pairs") or []:
+                for key in ("source_instruction", "counterfactual_instruction"):
+                    task = str(pair[key])
+                    prompt = DEFAULT_PROMPT.format(task=task)
+                    if prompt not in seen:
+                        seen.add(prompt)
+                        prompts.append(prompt)
 
     logger.info(
         "Loaded %d task rows from %d datasets, deduplicated to %d prompts.",

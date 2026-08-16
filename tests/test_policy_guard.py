@@ -106,6 +106,15 @@ def tiny_pgc_fastwam(
             "advantage_clip": 4.0,
             "candidate_max_saturation_fraction": 0.25,
             "candidate_max_delta_rms": 0.5,
+            "execution_prefix_steps": 2,
+            "suffix_loss_weight": 0.1,
+            "same_state_source_zero_weight": 1.0,
+            "goal_separation_weight": 0.25,
+            "goal_separation_margin": 0.2,
+            "residual_separation_weight": 0.25,
+            "residual_separation_margin": 0.05,
+            "verifier_wrong_language_weight": 0.5,
+            "verifier_bad_candidate_weight": 0.5,
             "verifier_start_step": 10,
             "verifier_ramp_steps": 5,
             "goal_residual_scale": 1.0,
@@ -1177,6 +1186,177 @@ class PolicyGuardV4IntegrationTest(unittest.TestCase):
             self.assertEqual(metadata["rollout_num_inference_steps"], 2)
 
             restored = tiny_pgc_fastwam(version=4)
+            restored.load_checkpoint(pgc_path)
+            for key, value in expected.items():
+                self.assertTrue(
+                    torch.equal(
+                        restored.policy_guard_modules.state_dict()[key],
+                        value,
+                    ),
+                    key,
+                )
+            self.assertEqual(
+                restored.policy_guard_base_checkpoint,
+                str(base_path.resolve()),
+            )
+
+
+class PolicyGuardV5IntegrationTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(51)
+        self.model = tiny_pgc_fastwam(version=5)
+
+    def test_v5_keeps_base_frozen_and_uses_prefix_weighting(self):
+        report = self.model.prepare_trainable_parameters()
+        self.assertGreater(report["trainable"], 0)
+        self.assertFalse(any(p.requires_grad for p in self.model.mot.parameters()))
+        self.assertTrue(
+            all(
+                name.startswith("policy_guard_modules.")
+                for name, parameter in self.model.named_parameters()
+                if parameter.requires_grad
+            )
+        )
+        prediction = torch.tensor(
+            [[[1.0, 1.0, 1.0], [1.0, 1.0, 1.0],
+              [10.0, 10.0, 10.0], [10.0, 10.0, 10.0]]]
+        )
+        weighted = self.model._compute_policy_guard_v5_weighted_action_mse_per_sample(
+            prediction=prediction,
+            target=torch.zeros_like(prediction),
+            action_is_pad=None,
+        )
+        self.assertAlmostEqual(float(weighted), 10.0, places=5)
+
+    def test_v5_same_state_pair_has_source_zero_and_goal_separation(self):
+        base = torch.zeros(2, 4, 3)
+        residual = torch.zeros_like(base)
+        residual[1] = 0.1
+        source_residual = torch.zeros_like(base)
+        source_residual[1] = 0.2
+        proposal = base + residual
+        target = torch.zeros_like(base)
+        target[1] = 1.0
+        goal = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+        source_goal = goal.clone()
+        (
+            action_loss,
+            native_zero,
+            source_zero,
+            goal_separation,
+            residual_separation,
+            regularization,
+            smoothness,
+            metrics,
+        ) = self.model._compute_policy_guard_v5_action_losses(
+            proposed_action=proposal,
+            predicted_residual=residual,
+            source_predicted_residual=source_residual,
+            base_action=base,
+            target_action=target,
+            counterfactual_goal_embedding=goal,
+            source_goal_embedding=source_goal,
+            action_is_pad=None,
+            is_counterfactual=torch.tensor([False, True]),
+            direct_action_valid=torch.tensor([True, True]),
+            paired_language_valid=torch.tensor([False, True]),
+        )
+        self.assertGreater(float(action_loss), 0.0)
+        self.assertEqual(float(native_zero), 0.0)
+        self.assertGreater(float(source_zero), 0.0)
+        self.assertAlmostEqual(float(goal_separation), 0.2, places=6)
+        self.assertEqual(float(residual_separation), 0.0)
+        self.assertGreater(float(regularization), 0.0)
+        self.assertEqual(float(smoothness), 0.0)
+        self.assertAlmostEqual(
+            float(metrics["pgc_v5_paired_language_valid_fraction"]),
+            0.5,
+        )
+        self.assertIn("pgc_v5_prefix_final_action_mse_improvement", metrics)
+
+    def test_v5_zero_initialized_residual_separation_backward_is_finite(self):
+        base = torch.zeros(1, 4, 3)
+        residual = torch.zeros_like(base, requires_grad=True)
+        source_residual = torch.zeros_like(base, requires_grad=True)
+        goal = torch.tensor([[1.0, 0.0]], requires_grad=True)
+        source_goal = torch.tensor([[1.0, 0.0]], requires_grad=True)
+        losses = self.model._compute_policy_guard_v5_action_losses(
+            proposed_action=base + residual,
+            predicted_residual=residual,
+            source_predicted_residual=source_residual,
+            base_action=base,
+            target_action=torch.ones_like(base),
+            counterfactual_goal_embedding=goal,
+            source_goal_embedding=source_goal,
+            action_is_pad=None,
+            is_counterfactual=torch.tensor([True]),
+            direct_action_valid=torch.tensor([True]),
+            paired_language_valid=torch.tensor([True]),
+        )
+        sum(losses[:7]).backward()
+        for tensor in (residual, source_residual, goal, source_goal):
+            self.assertTrue(torch.isfinite(tensor.grad).all())
+
+    def test_v5_verifier_trains_on_wrong_language_and_bad_candidates(self):
+        batch_size = 2
+        horizon = 4
+        current_video = torch.randn(batch_size, 3, 16)
+        goal = torch.randn(batch_size, 8)
+        base = torch.zeros(batch_size, horizon, 3)
+        proposal = base.clone()
+        proposal[1] = 0.5
+        source = base.clone()
+        target = base.clone()
+        target[1] = 0.75
+        verifier_loss, alignment_loss, metrics = (
+            self.model._compute_policy_guard_v5_verifier_loss(
+                current_video_hidden=current_video,
+                goal_embedding=goal,
+                demonstrated_action=target,
+                base_candidate_action=base,
+                counterfactual_candidate_action=proposal,
+                source_candidate_action=source,
+                action_is_pad=None,
+                is_counterfactual=torch.tensor([False, True]),
+                direct_action_valid=torch.tensor([True, True]),
+                paired_language_valid=torch.tensor([False, True]),
+                goal_ids=torch.tensor([0, 1]),
+            )
+        )
+        self.assertTrue(torch.isfinite(verifier_loss))
+        self.assertTrue(torch.isfinite(alignment_loss))
+        self.assertIn("pgc_v5_wrong_language_target_advantage", metrics)
+        self.assertIn("pgc_v5_bad_candidate_target_advantage", metrics)
+
+    def test_v5_checkpoint_round_trip_records_paired_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.pt"
+            pgc_path = Path(tmpdir) / "pgc_v5.pt"
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": self.model.mot.state_dict()},
+                base_path,
+            )
+            self.model.load_checkpoint(base_path)
+            with torch.no_grad():
+                self.model.policy_guard_modules[
+                    "action_chunk_proposal"
+                ].output_projection.bias.add_(0.125)
+            expected = {
+                key: value.detach().clone()
+                for key, value in self.model.policy_guard_modules.state_dict().items()
+            }
+            self.model.save_checkpoint(pgc_path, step=41)
+            payload = torch.load(pgc_path, map_location="cpu", weights_only=False)
+            self.assertEqual(payload["format"], "fastwam_policy_guard_v5")
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(
+                metadata["counterfactual_tuning"],
+                "paired_language_prefix_aligned_action_residual",
+            )
+            self.assertEqual(metadata["execution_prefix_steps"], 2)
+            self.assertEqual(metadata["suffix_loss_weight"], 0.1)
+
+            restored = tiny_pgc_fastwam(version=5)
             restored.load_checkpoint(pgc_path)
             for key, value in expected.items():
                 self.assertTrue(

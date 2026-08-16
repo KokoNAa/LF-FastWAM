@@ -16,6 +16,7 @@ from ..counterfactual import (
     load_counterfactual_instruction_map,
     stable_instruction_id,
 )
+from ..pgc_libero import load_pgc_episode_language_pairs
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
@@ -119,6 +120,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.pgc_has_counterfactual_data = bool(
             self.pgc_counterfactual_dataset_dirs
         )
+        self.pgc_episode_language_pairs: dict[
+            int, dict[int, dict[str, object]]
+        ] = {
+            self.pgc_native_dataset_count + offset: (
+                load_pgc_episode_language_pairs(dataset_dir)
+            )
+            for offset, dataset_dir in enumerate(
+                self.pgc_counterfactual_dataset_dirs
+            )
+        }
         self.pgc_balance_native_counterfactual = bool(
             pgc_balance_native_counterfactual
         )
@@ -363,6 +374,37 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_is_counterfactual = (
             dataset_index >= self.pgc_native_dataset_count
         )
+        pgc_source_task = str(task)
+        pgc_pair_valid = False
+        if pgc_is_counterfactual:
+            if "episode_index" not in sample:
+                raise KeyError(
+                    "PGC counterfactual samples require `episode_index` to "
+                    "recover their paired source instruction."
+                )
+            episode_index = int(
+                torch.as_tensor(sample["episode_index"]).reshape(-1)[0].item()
+            )
+            try:
+                pair = self.pgc_episode_language_pairs[dataset_index][
+                    episode_index
+                ]
+            except KeyError as exc:
+                raise KeyError(
+                    "No audited PGC language pair for dataset/episode "
+                    f"{dataset_index}/{episode_index}."
+                ) from exc
+            recorded_counterfactual = str(
+                pair["counterfactual_instruction"]
+            ).strip()
+            if str(task).strip().casefold() != recorded_counterfactual.casefold():
+                raise ValueError(
+                    "PGC recorded task text does not match its audited "
+                    "counterfactual instruction: "
+                    f"{task!r} != {recorded_counterfactual!r}."
+                )
+            pgc_source_task = str(pair["source_instruction"]).strip()
+            pgc_pair_valid = True
         
         # FIXME
         if self.override_instruction is not None:
@@ -373,6 +415,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         # NOTE: to keep consistent with wan2.2's behavior
         context[~context_mask] = 0.0
         context_mask = torch.ones_like(context_mask)
+
+        if pgc_pair_valid:
+            pgc_source_prompt = DEFAULT_PROMPT.format(task=pgc_source_task)
+            pgc_source_context, pgc_source_context_mask = (
+                self._get_cached_text_context(pgc_source_prompt)
+            )
+            pgc_source_context[~pgc_source_context_mask] = 0.0
+            pgc_source_context_mask = torch.ones_like(
+                pgc_source_context_mask
+            )
+        else:
+            # Keep the batch schema uniform. Native rows do not use this copy;
+            # their ordinary zero-residual objective remains authoritative.
+            pgc_source_prompt = instruction
+            pgc_source_context = context.clone()
+            pgc_source_context_mask = context_mask.clone()
 
         negative_prompt = None
         negative_context = None
@@ -422,6 +480,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             ),
             "pgc_goal_id": torch.tensor(
                 stable_instruction_id(task), dtype=torch.long
+            ),
+            "pgc_source_prompt": pgc_source_prompt,
+            "pgc_source_context": pgc_source_context,
+            "pgc_source_context_mask": pgc_source_context_mask,
+            "pgc_source_goal_id": torch.tensor(
+                stable_instruction_id(pgc_source_task), dtype=torch.long
+            ),
+            "pgc_paired_language_valid": torch.tensor(
+                pgc_pair_valid, dtype=torch.bool
             ),
             "pgc_dataset_index": torch.tensor(dataset_index, dtype=torch.long),
         }

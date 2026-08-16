@@ -55,6 +55,102 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
+def load_pgc_episode_language_pairs(
+    dataset_root: str | Path,
+) -> dict[int, dict[str, Any]]:
+    """Map each audited PGC episode to its same-state language pair.
+
+    PGC v5 reuses the already collected successful counterfactual trajectory
+    twice: once with its recorded counterfactual instruction (positive action
+    supervision), and once with the source instruction on the *identical*
+    visual state (strict zero-residual supervision).  The collection contract
+    deliberately stores the language pair at dataset level and the pair ID at
+    episode level, so the training dataset can recover this mapping without
+    duplicating videos or actions.
+    """
+    dataset_root = Path(dataset_root).expanduser()
+    provenance_path = dataset_root / "meta/pgc_provenance.json"
+    episodes_path = dataset_root / "meta/pgc_episodes.jsonl"
+    if not provenance_path.is_file():
+        raise FileNotFoundError(f"Missing PGC provenance: {provenance_path}")
+    if not episodes_path.is_file():
+        raise FileNotFoundError(f"Missing PGC episode audit: {episodes_path}")
+
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if provenance.get("format") != PGC_DATA_FORMAT:
+        raise ValueError(
+            f"Unsupported PGC data format at {provenance_path}: "
+            f"{provenance.get('format')!r}."
+        )
+    if provenance.get("state_aligned") is not True:
+        raise ValueError(
+            f"PGC paired-language training requires state_aligned=true: "
+            f"{provenance_path}."
+        )
+
+    pairs_by_id: dict[str, dict[str, Any]] = {}
+    for pair in provenance.get("pairs") or []:
+        pair_id = str(pair.get("pair_id", "")).strip()
+        source_instruction = str(pair.get("source_instruction", "")).strip()
+        counterfactual_instruction = str(
+            pair.get("counterfactual_instruction", "")
+        ).strip()
+        if not pair_id or not source_instruction or not counterfactual_instruction:
+            raise ValueError(
+                f"PGC provenance contains an incomplete language pair: {pair!r}."
+            )
+        if source_instruction.casefold() == counterfactual_instruction.casefold():
+            raise ValueError(
+                f"PGC pair {pair_id!r} must change the instruction for v5."
+            )
+        if pair_id in pairs_by_id:
+            raise ValueError(f"Duplicate PGC provenance pair ID: {pair_id!r}.")
+        pairs_by_id[pair_id] = {
+            "pair_id": pair_id,
+            "source_instruction": source_instruction,
+            "counterfactual_instruction": counterfactual_instruction,
+            "source_suite": str(pair.get("source_suite", "")),
+            "source_task_id": int(pair.get("source_task_id", -1)),
+        }
+    if not pairs_by_id:
+        raise ValueError(f"PGC provenance has no language pairs: {provenance_path}.")
+
+    result: dict[int, dict[str, Any]] = {}
+    for audit in read_jsonl(episodes_path):
+        try:
+            episode_index = int(audit["episode_index"])
+            pair_id = str(audit["pair_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid PGC episode audit in {episodes_path}: {audit!r}."
+            ) from exc
+        if episode_index < 0:
+            raise ValueError("PGC episode indices must be non-negative.")
+        if episode_index in result:
+            raise ValueError(
+                f"Duplicate PGC episode audit index {episode_index} in "
+                f"{episodes_path}."
+            )
+        try:
+            pair = pairs_by_id[pair_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"PGC episode {episode_index} references unknown pair "
+                f"{pair_id!r}."
+            ) from exc
+        result[episode_index] = dict(pair)
+
+    expected_count = int(provenance.get("successful_episode_count", len(result)))
+    if expected_count != len(result):
+        raise ValueError(
+            "PGC successful episode count does not match its audit table: "
+            f"provenance={expected_count}, audits={len(result)}."
+        )
+    if not result:
+        raise ValueError(f"PGC episode audit is empty: {episodes_path}.")
+    return result
+
+
 def append_jsonl(path: str | Path, record: Mapping[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

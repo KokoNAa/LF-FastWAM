@@ -6,6 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
+from fastwam.datasets.pgc_libero import load_pgc_episode_language_pairs
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
@@ -93,6 +95,32 @@ class PolicyGuardDataContractTest(unittest.TestCase):
             )
         self.assertEqual(summary["episodes"], 1)
         self.assertEqual(summary["pairs"], 1)
+
+    def test_recovers_same_state_source_and_counterfactual_language(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = self._write_dataset(Path(tmpdir))
+            pairs = load_pgc_episode_language_pairs(dataset)
+        self.assertEqual(set(pairs), {0})
+        self.assertEqual(
+            pairs[0]["source_instruction"],
+            "pick up the alphabet soup and place it in the basket",
+        )
+        self.assertEqual(
+            pairs[0]["counterfactual_instruction"],
+            "pick up the milk and place it in the basket",
+        )
+
+    def test_paired_language_loader_rejects_identical_instructions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = self._write_dataset(Path(tmpdir))
+            provenance_path = dataset / "meta/pgc_provenance.json"
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            provenance["pairs"][0]["source_instruction"] = provenance["pairs"][0][
+                "counterfactual_instruction"
+            ]
+            provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must change the instruction"):
+                load_pgc_episode_language_pairs(dataset)
 
     def test_rejects_non_state_aligned_data(self):
         with tempfile.TemporaryDirectory() as tmpdir:

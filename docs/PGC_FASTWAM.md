@@ -1,8 +1,33 @@
-# PGC-FastWAM v4
+# PGC-FastWAM v5
 
 PGC（Policy-Guarded Counterfactual FastWAM）用于在不破坏原始 FastWAM 策略的前提下提升语言遵守，尤其针对 CIS 中“仍执行原指令 / 改变行为但抓错物体 / 什么也不抓”三类失败。
 
-## v4：最终动作空间的 rollout-aligned proposal
+## v5：同状态语言配对 + 执行前缀对齐
+
+PGC v4 在 Object 的 Correct 上保持了 100%，但强制 CF 的 CIS 仍是 30%，与
+release Base 完全相同；493/493 次决策都选择了 CF，而评估 residual RMS 只有
+`0.0084`（最大 `0.0154`）。这证明问题不在 Gate，而在 Proposal 对未见过的
+“源状态 + 替代语言”组合退化成近似零残差。v5 保留 v4 的冻结 Base 与最终动作
+Proposal，同时增加三组可识别性约束：
+
+1. 每条已采集 CF episode 从 `pgc_provenance.json` 恢复
+   `source_instruction`，同一视觉 hidden、同一 `a_base` 做两次 Goal/Proposal：
+   CF 语言用成功轨迹正监督，Source 语言严格监督 `delta_source=0`。因此模型不能
+   再用“这是 CF 数据集的状态”代替读取语言。
+2. `goal_cf` 与 `goal_source` 使用 cosine-margin 分离；`delta_cf` 与
+   `delta_source` 使用由真实 `a_target-a_base` 限定的自适应 margin 分离。
+3. LIBERO 每次只执行 32-step chunk 的前 10 步再重规划。v5 对前 10 步赋权 1，
+   后 22 步默认赋权 0.1；训练 Verifier、support guard 和部署 Gate 也只看实际执行
+   前缀。
+4. Stage 2 除真实 Proposal 外，还给 Verifier 同状态 Source-language candidate
+   和 mirrored bad candidate，按真实 prefix action error 生成连续 advantage，避免
+   学成“任何 CF 数据行都给 +4”。
+
+Base Video/Action Expert 仍全部冻结、没有 LoRA；新建模型的 Proposal 输出层仍为
+零，因此 Base fallback 数值路径不变。v5 checkpoint 格式为
+`fastwam_policy_guard_v5`。
+
+## v4 历史：最终动作空间的 rollout-aligned proposal
 
 Object 实验确认 release Base 与 PGC v3 在相同 CIS manifest 上都是 30%，而 v3
 Verifier 的 Base/CF 分数同时饱和在约 0.99、BF16 margin 接近量化零，guarded
@@ -33,8 +58,8 @@ v4 的部署路径是：
 的运行。v4 checkpoint 格式为 `fastwam_policy_guard_v4`，只保存 Goal Graph、
 Final-Action Proposal、FP32 Pairwise Verifier 和元数据。
 
-以下 v3 章节保留用于解释旧 checkpoint 与失败机制；v4 正式实验使用文末的 v4
-启动命令。
+以下 v3/v4 章节保留用于解释旧 checkpoint 与失败机制；新的正式实验使用文末的
+v5 启动命令。
 
 ## v3 历史架构
 
@@ -46,11 +71,26 @@ PGC v3 保留两个候选，但只存在一份 Action Expert：
 4. **Action–Outcome Verifier**：在当前状态和目标表示下分别给 Base/Counterfactual action chunk 打分。
 5. **Conservative Hard Gate**：只有当反事实候选分数达到绝对阈值，且比 Base 高出安全 margin 时才覆盖；否则逐元素原样返回 Base action。
 
-`policy_guard.enabled=false` 时不会构建或执行 PGC 路径，旧 FastWAM/TC/LangForce 行为保持不变。PGC v3/v4 与 TC、LangForce、任何 Base LoRA 互斥。v1/v2 的独立专家与 LoRA 代码只为历史 checkpoint 兼容，不用于 v4 正式训练。
+`policy_guard.enabled=false` 时不会构建或执行 PGC 路径，旧 FastWAM/TC/LangForce 行为保持不变。PGC v3/v4/v5 与 TC、LangForce、任何 Base LoRA 互斥。v1/v2 的独立专家与 LoRA 代码只为历史 checkpoint 兼容，不用于 v5 正式训练。
 
 v3 训练优化器的严格白名单只有 Goal Graph、Goal Query Seeds、Bounded Velocity Residual 和 Verifier。整套 Base Video/Action Expert 全部 `requires_grad=false` 且保持 eval mode；代码会反向拒绝 v3 启用 LoRA，checkpoint 也不能含独立 Action Expert 或 LoRA tensor。
 
-## 监督信号
+## v5 监督信号
+
+- `loss_pgc_action`：CF 成功轨迹对最终 Proposal action 的 prefix-weighted 正监督。
+- `loss_pgc_v5_same_state_source_zero`：完全相同状态换回 Source 语言时，要求 Proposal residual 为零。
+- `loss_pgc_v5_goal_separation`：分离同状态下 Source/CF Goal representation。
+- `loss_pgc_v5_residual_separation`：分离同状态下 Source/CF action residual，margin 不超过真实 target residual。
+- `loss_pgc_native_residual_zero`：广覆盖 Native 数据继续提供原策略保护。
+- `loss_pgc_verifier`：主 Proposal、Source-language candidate 与 mirrored bad candidate 的 prefix action advantage 回归/排序。
+- `loss_pgc_goal_action_alignment`：Goal 与成功 action outcome 的分布式对比对齐。
+
+关键日志包括 `pgc_v5_prefix_final_action_mse_base/proposal/improvement`、
+`pgc_v5_same_state_source_residual_mse`、`pgc_v5_goal_cosine_distance`、
+`pgc_v5_residual_pair_distance`、`pgc_v5_wrong_language_target_advantage`、
+`pgc_v5_bad_candidate_target_advantage` 和两类 negative 的 false-accept rate。
+
+## v3 历史监督信号
 
 - `loss_pgc_action`：仅在直接反事实样本上监督 `Δv_target = v_flow_target − stopgrad(v_base)`，使受限残差真正学习状态对齐的替代动作，而不是只学视觉语义。
 - `loss_pgc_native_residual_zero`：仅在 Native 样本上要求 `Δv=0`。这比让另一套专家蒸馏 Base 更直接：Native 候选从结构上保持原始速度。
@@ -305,7 +345,7 @@ export LIBERO_DATA_ROOT=/path/to/FastWAM/data/libero_mujoco3.3.2
 BASE="$DIFFSYNTH_MODEL_BASE_PATH/fastwam_release/libero_uncond_2cam224.pt"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-bash scripts/train_pgc_v4_libero_suite.sh \
+bash scripts/train_pgc_v5_libero_suite.sh \
   libero_object \
   4 \
   "$BASE" \
@@ -317,21 +357,24 @@ bash scripts/train_pgc_v4_libero_suite.sh \
 其余三条线仅替换 suite 名和对应数据目录，不能把多个目录放入同一次训练：
 
 ```bash
-bash scripts/train_pgc_v4_libero_suite.sh libero_spatial 4 "$BASE" /path/to/pgc/libero_spatial_pgc_counterfactual_lerobot 42 4000
-bash scripts/train_pgc_v4_libero_suite.sh libero_goal    4 "$BASE" /path/to/pgc/libero_goal_pgc_counterfactual_lerobot    42 4000
-bash scripts/train_pgc_v4_libero_suite.sh libero_10      4 "$BASE" /path/to/pgc/libero_10_pgc_counterfactual_lerobot      42 4000
+bash scripts/train_pgc_v5_libero_suite.sh libero_spatial 4 "$BASE" /path/to/pgc/libero_spatial_pgc_counterfactual_lerobot 42 4000
+bash scripts/train_pgc_v5_libero_suite.sh libero_goal    4 "$BASE" /path/to/pgc/libero_goal_pgc_counterfactual_lerobot    42 4000
+bash scripts/train_pgc_v5_libero_suite.sh libero_10      4 "$BASE" /path/to/pgc/libero_10_pgc_counterfactual_lerobot      42 4000
 ```
 
 `train_pgc_libero_suite.sh` 会同时把原始数据和直接反事实数据限制到指定 suite，
 并检查 `meta/pgc_provenance.json`。任何跨 suite 数据都会在创建训练进程前报错。
-默认按 frame index 把 Native 与 Counterfactual 数据构造成严格 1:1 采样。v4 不使用
+默认按 frame index 把 Native 与 Counterfactual 数据构造成严格 1:1 采样。v5 不使用
 LoRA，默认 final-action residual cap 为 `2.0`、能量/平滑权重均为 `0.01`，这些从
 零初始化的小模块使用学习率 `1e-4`，每卡 micro-batch 为 1、
 梯度累积为 4（四卡有效 batch 16），每 500 steps 保存权重。可通过
 `PGC_ACTION_CHUNK_RESIDUAL_MAX_ABS`、`PGC_ROLLOUT_INFERENCE_STEPS`、
 `PGC_ACTION_GRIPPER_WEIGHT`、`PGC_RESIDUAL_REGULARIZATION_WEIGHT`、
 `PGC_RESIDUAL_SMOOTHNESS_WEIGHT`、`PGC_VERIFIER_START_STEP` 和
-`PGC_VERIFIER_RAMP_STEPS` 修改 v4 超参。默认
+`PGC_VERIFIER_RAMP_STEPS` 修改共享的 rollout 超参；v5 另外支持
+`PGC_EXECUTION_PREFIX_STEPS`、`PGC_SUFFIX_LOSS_WEIGHT`、
+`PGC_SAME_STATE_SOURCE_ZERO_WEIGHT`、Goal/Residual separation 以及两类
+Verifier negative 的环境变量。默认
 不保存 DeepSpeed state，以避免磁盘空间不足导致最后一步保存失败。
 
 每条线必须依次通过以下门控，才进入下一条：
@@ -353,7 +396,7 @@ LoRA，默认 final-action residual cap 为 `2.0`、能量/平滑权重均为 `0
 ```bash
 PGC_TRAIN_SUITE=all \
 PGC_ALLOW_JOINT_TRAINING=true \
-PGC_VERSION=4 \
+PGC_VERSION=5 \
 bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.txt 42 4000
 ```
 
@@ -363,10 +406,10 @@ bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.
 bash scripts/validate_pgc_server.sh
 ```
 
-输出 checkpoint 格式为 `fastwam_policy_guard_v4`，只保存 Goal Query Seeds、
+输出 checkpoint 格式为 `fastwam_policy_guard_v5`，只保存 Goal Query Seeds、
 Final-Action Proposal、Goal Graph、Pairwise Verifier、架构元数据和外部 Base checkpoint
 路径；既不复制 6.8B Base 权重，也不存在第二套 Action Expert 或 LoRA。加载时先
-恢复外部 Base，再严格恢复小型 PGC 模块。v1/v2/v3 checkpoint 仍按旧格式加载。
+恢复外部 Base，再严格恢复小型 PGC 模块。v1/v2/v3/v4 checkpoint 仍按旧格式加载。
 
 ### 未保存 ZeRO 状态时续训
 
@@ -379,13 +422,12 @@ export PGC_INIT_CHECKPOINT=/path/to/step_000500.pt
 export PGC_CONTINUE_FROM_STEP=500
 
 # 最后一个参数 1500 是绝对目标 step，因此本次实际再训练 1000 steps。
-bash scripts/train_pgc_v4_libero_suite.sh \
+bash scripts/train_pgc_v5_libero_suite.sh \
   libero_object 4 "$BASE" "$PGC_CF_OBJECT" 42 1500
 ```
 
-启动器会校验匹配的 PGC v4 格式、保存步数、外部 Base 路径、rollout step 和
-final-action residual
-架构。Trainer 会把
+启动器会校验匹配的 PGC v5 格式、保存步数、外部 Base 路径、rollout step、
+executed-prefix 与 paired-language loss 合约。Trainer 会把
 `global_step` 恢复为 500，跳过同一随机序列中已经消费的数据，并为剩余 1000
 steps 新建带短 warmup 的 scheduler。由于原运行没有保存 ZeRO state，优化器
 动量无法恢复；日志会明确标记这是 fresh-optimizer weight-only continuation。
@@ -415,7 +457,7 @@ OUTPUT_ROOT=/path/to/evaluate_results/pgc_base_exact_correct \
 bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
 ```
 
-v4 正式 guarded 门控使用 FP32 raw advantage，只通过 `PGC_GATE_THRESHOLD`
+v4/v5 正式 guarded 门控使用 FP32 raw advantage，只通过 `PGC_GATE_THRESHOLD`
 调整；`PGC_MIN_COUNTERFACTUAL_SCORE` 仅供 v1-v3 兼容。阈值必须在独立校准集上
 选择，不能用最终 CIS 测试集调参。
 

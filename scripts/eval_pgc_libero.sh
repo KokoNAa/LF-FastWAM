@@ -71,8 +71,10 @@ metadata = payload.get("architecture_metadata") or {}
 if metadata.get("architecture") != "pgc_fastwam":
     raise SystemExit("Checkpoint is missing PGC architecture metadata")
 version = int(metadata.get("policy_guard_version", -1))
-if version not in {2, 3, 4}:
-    raise SystemExit(f"Only PGC versions 2, 3, and 4 are supported, got {version}")
+if version not in {2, 3, 4, 5}:
+    raise SystemExit(
+        f"Only PGC versions 2, 3, 4, and 5 are supported, got {version}"
+    )
 if payload.get("format") != f"fastwam_policy_guard_v{version}":
     raise SystemExit("PGC checkpoint format/version mismatch")
 expected_protection = (
@@ -86,6 +88,7 @@ expected_tuning = {
     2: "lora",
     3: "bounded_velocity_residual",
     4: "rollout_aligned_final_action_residual",
+    5: "paired_language_prefix_aligned_action_residual",
 }[version]
 if metadata.get("counterfactual_tuning") != expected_tuning:
     raise SystemExit(f"PGC v{version} tuning metadata is incompatible")
@@ -97,16 +100,20 @@ if version >= 3 and any(
         "counterfactual_lora_config",
     )
 ):
-    raise SystemExit("PGC v3/v4 must not contain an Action-Expert copy or LoRA")
-if version == 4:
+    raise SystemExit("PGC v3/v4/v5 must not contain an Action-Expert copy or LoRA")
+if version >= 4:
     rollout_steps = int(metadata.get("rollout_num_inference_steps", -1))
     if rollout_steps != evaluation_inference_steps:
         raise SystemExit(
-            "PGC v4 requires rollout/evaluation step alignment: "
+            f"PGC v{version} requires rollout/evaluation step alignment: "
             f"checkpoint={rollout_steps}, evaluation={evaluation_inference_steps}"
         )
     if metadata.get("verifier_margin_space") != "raw_fp32_pairwise_advantage":
-        raise SystemExit("PGC v4 checkpoint lacks its FP32 raw-advantage contract")
+        raise SystemExit(
+            f"PGC v{version} checkpoint lacks its FP32 raw-advantage contract"
+        )
+if version >= 5 and int(metadata.get("execution_prefix_steps", -1)) <= 0:
+    raise SystemExit("PGC v5 checkpoint lacks its executed-prefix contract")
 print(version)
 PY
 )"
@@ -143,7 +150,7 @@ EXTRA_OVERRIDES=(
   "model.policy_guard.gate_mode=${GATE_MODE}"
   "model.policy_guard.gate_threshold=${GATE_THRESHOLD}"
   "model.policy_guard.min_counterfactual_score=${MIN_COUNTERFACTUAL_SCORE}"
-  # Keep construction adapter-free. v2 loading injects its saved LoRA; v3/v4
+  # Keep construction adapter-free. v2 loading injects its saved LoRA; v3+
   # strictly restore only their policy-guard sidecar tensors.
   "model.lora.enabled=false"
 )

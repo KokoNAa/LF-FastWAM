@@ -37,12 +37,21 @@ CANDIDATE_MAX_DELTA_RMS="${PGC_CANDIDATE_MAX_DELTA_RMS:-2.0}"
 TRAIN_GATE_THRESHOLD="${PGC_TRAIN_GATE_THRESHOLD:-0.20}"
 VERIFIER_START_STEP="${PGC_VERIFIER_START_STEP:-1000}"
 VERIFIER_RAMP_STEPS="${PGC_VERIFIER_RAMP_STEPS:-500}"
+EXECUTION_PREFIX_STEPS="${PGC_EXECUTION_PREFIX_STEPS:-10}"
+SUFFIX_LOSS_WEIGHT="${PGC_SUFFIX_LOSS_WEIGHT:-0.10}"
+SAME_STATE_SOURCE_ZERO_WEIGHT="${PGC_SAME_STATE_SOURCE_ZERO_WEIGHT:-1.0}"
+GOAL_SEPARATION_WEIGHT="${PGC_GOAL_SEPARATION_WEIGHT:-0.25}"
+GOAL_SEPARATION_MARGIN="${PGC_GOAL_SEPARATION_MARGIN:-0.20}"
+RESIDUAL_SEPARATION_WEIGHT="${PGC_RESIDUAL_SEPARATION_WEIGHT:-0.25}"
+RESIDUAL_SEPARATION_MARGIN="${PGC_RESIDUAL_SEPARATION_MARGIN:-0.05}"
+VERIFIER_WRONG_LANGUAGE_WEIGHT="${PGC_VERIFIER_WRONG_LANGUAGE_WEIGHT:-0.50}"
+VERIFIER_BAD_CANDIDATE_WEIGHT="${PGC_VERIFIER_BAD_CANDIDATE_WEIGHT:-0.50}"
 RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-pgc-v${PGC_VERSION}-${MAX_STEPS}-seed${TRAIN_SEED}}"
 
 case "${PGC_VERSION}" in
-  2|3|4) ;;
+  2|3|4|5) ;;
   *)
-    echo "PGC_VERSION must be 2, 3, or 4; got ${PGC_VERSION}." >&2
+    echo "PGC_VERSION must be 2, 3, 4, or 5; got ${PGC_VERSION}." >&2
     exit 1
     ;;
 esac
@@ -66,7 +75,7 @@ case "${TRAIN_SUITE}" in
     ;;
 esac
 
-for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY ROLLOUT_INFERENCE_STEPS; do
+for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY ROLLOUT_INFERENCE_STEPS EXECUTION_PREFIX_STEPS; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${value_name} must be a positive integer, got ${value}." >&2
@@ -118,7 +127,15 @@ fi
   "${ADVANTAGE_CLIP}" \
   "${CANDIDATE_MAX_SATURATION_FRACTION}" \
   "${CANDIDATE_MAX_DELTA_RMS}" \
-  "${TRAIN_GATE_THRESHOLD}" <<'PY'
+  "${TRAIN_GATE_THRESHOLD}" \
+  "${SUFFIX_LOSS_WEIGHT}" \
+  "${SAME_STATE_SOURCE_ZERO_WEIGHT}" \
+  "${GOAL_SEPARATION_WEIGHT}" \
+  "${GOAL_SEPARATION_MARGIN}" \
+  "${RESIDUAL_SEPARATION_WEIGHT}" \
+  "${RESIDUAL_SEPARATION_MARGIN}" \
+  "${VERIFIER_WRONG_LANGUAGE_WEIGHT}" \
+  "${VERIFIER_BAD_CANDIDATE_WEIGHT}" <<'PY'
 import sys
 
 version = int(sys.argv[1])
@@ -134,6 +151,8 @@ advantage_clip = float(sys.argv[10])
 candidate_max_saturation = float(sys.argv[11])
 candidate_max_delta_rms = float(sys.argv[12])
 gate_threshold = float(sys.argv[13])
+suffix_weight = float(sys.argv[14])
+paired_weights = [float(value) for value in sys.argv[15:22]]
 if version == 2:
     if alpha <= 0:
         raise SystemExit(f"PGC_LORA_ALPHA must be positive, got {alpha}")
@@ -145,7 +164,7 @@ if cap <= 0:
     raise SystemExit("PGC v3 velocity residual cap must be positive")
 if gate_threshold < 0:
     raise SystemExit("PGC training gate threshold must be non-negative")
-if version == 4:
+if version >= 4:
     if action_chunk_cap <= 0:
         raise SystemExit("PGC v4 final-action residual cap must be positive")
     if gripper_weight <= 0:
@@ -158,6 +177,11 @@ if version == 4:
         )
     if candidate_max_delta_rms <= 0:
         raise SystemExit("PGC v4 candidate max delta RMS must be positive")
+if version >= 5:
+    if not 0 <= suffix_weight <= 1:
+        raise SystemExit("PGC v5 suffix loss weight must be in [0, 1]")
+    if any(value < 0 for value in paired_weights):
+        raise SystemExit("PGC v5 paired-language weights must be non-negative")
 PY
 if [[ ! -f "${BASE_CHECKPOINT}" ]]; then
   echo "Base checkpoint not found: ${BASE_CHECKPOINT}" >&2
@@ -272,6 +296,7 @@ if payload.get("format") in {
     "fastwam_policy_guard_v2",
     "fastwam_policy_guard_v3",
     "fastwam_policy_guard_v4",
+    "fastwam_policy_guard_v5",
 }:
     raise SystemExit("PGC base must be the immutable full FastWAM release, not an adapter")
 print(f"Validated protected base: format={payload.get('format', 'legacy_full')} tensors={len(payload['mot'])}")
@@ -299,7 +324,16 @@ if [[ -n "${CONTINUE_FROM_STEP}" ]]; then
     "${CANDIDATE_MAX_DELTA_RMS}" \
     "${TRAIN_GATE_THRESHOLD}" \
     "${VERIFIER_START_STEP}" \
-    "${VERIFIER_RAMP_STEPS}" <<'PY'
+    "${VERIFIER_RAMP_STEPS}" \
+    "${EXECUTION_PREFIX_STEPS}" \
+    "${SUFFIX_LOSS_WEIGHT}" \
+    "${SAME_STATE_SOURCE_ZERO_WEIGHT}" \
+    "${GOAL_SEPARATION_WEIGHT}" \
+    "${GOAL_SEPARATION_MARGIN}" \
+    "${RESIDUAL_SEPARATION_WEIGHT}" \
+    "${RESIDUAL_SEPARATION_MARGIN}" \
+    "${VERIFIER_WRONG_LANGUAGE_WEIGHT}" \
+    "${VERIFIER_BAD_CANDIDATE_WEIGHT}" <<'PY'
 import math
 import sys
 from pathlib import Path
@@ -326,6 +360,17 @@ expected_candidate_max_delta_rms = float(sys.argv[17])
 expected_gate_threshold = float(sys.argv[18])
 expected_verifier_start = int(sys.argv[19])
 expected_verifier_ramp = int(sys.argv[20])
+expected_execution_prefix = int(sys.argv[21])
+expected_v5_scalars = {
+    "suffix_loss_weight": float(sys.argv[22]),
+    "same_state_source_zero_weight": float(sys.argv[23]),
+    "goal_separation_weight": float(sys.argv[24]),
+    "goal_separation_margin": float(sys.argv[25]),
+    "residual_separation_weight": float(sys.argv[26]),
+    "residual_separation_margin": float(sys.argv[27]),
+    "verifier_wrong_language_weight": float(sys.argv[28]),
+    "verifier_bad_candidate_weight": float(sys.argv[29]),
+}
 payload = torch.load(init_path, map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
 expected_format = f"fastwam_policy_guard_v{expected_version}"
@@ -412,10 +457,16 @@ elif expected_version == 3:
     if int(metadata.get("verifier_ramp_steps", -1)) != expected_verifier_ramp:
         raise SystemExit("PGC v3 continuation verifier_ramp_steps mismatch")
 else:
-    if metadata.get("counterfactual_tuning") != (
-        "rollout_aligned_final_action_residual"
-    ):
-        raise SystemExit("PGC v4 continuation lacks rollout-aligned metadata")
+    expected_tuning = (
+        "paired_language_prefix_aligned_action_residual"
+        if expected_version >= 5
+        else "rollout_aligned_final_action_residual"
+    )
+    if metadata.get("counterfactual_tuning") != expected_tuning:
+        raise SystemExit(
+            f"PGC v{expected_version} continuation lacks compatible "
+            "rollout/paired-language metadata"
+        )
     if any(
         key in payload
         for key in (
@@ -463,6 +514,16 @@ else:
         raise SystemExit("PGC v4 continuation verifier_start_step mismatch")
     if int(metadata.get("verifier_ramp_steps", -1)) != expected_verifier_ramp:
         raise SystemExit("PGC v4 continuation verifier_ramp_steps mismatch")
+    if expected_version >= 5:
+        if int(metadata.get("execution_prefix_steps", -1)) != expected_execution_prefix:
+            raise SystemExit("PGC v5 continuation execution_prefix_steps mismatch")
+        for name, expected in expected_v5_scalars.items():
+            actual = float(metadata.get(name, float("nan")))
+            if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
+                raise SystemExit(
+                    f"PGC v5 continuation {name} mismatch: "
+                    f"checkpoint={actual} requested={expected}"
+                )
 print(
     "Validated PGC weight-only continuation: "
     f"step={expected_step} base={base_path}"
@@ -485,10 +546,17 @@ cache_dir = Path(sys.argv[3])
 template = "A video recorded from a robot's point of view executing the following instruction: {task}"
 tasks = set()
 for dataset_dir in dataset_dirs:
-    with (Path(dataset_dir) / "meta/tasks.jsonl").open("r", encoding="utf-8") as handle:
+    dataset_path = Path(dataset_dir)
+    with (dataset_path / "meta/tasks.jsonl").open("r", encoding="utf-8") as handle:
         for line in handle:
             if line.strip():
                 tasks.add(str(json.loads(line)["task"]))
+    provenance_path = dataset_path / "meta/pgc_provenance.json"
+    if provenance_path.is_file():
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        for pair in provenance.get("pairs") or []:
+            tasks.add(str(pair["source_instruction"]))
+            tasks.add(str(pair["counterfactual_instruction"]))
 missing = []
 for task in sorted(tasks):
     prompt = template.format(task=task)
@@ -532,6 +600,10 @@ else
   echo "  tuning=rollout-aligned-final-action-residual cap=${ACTION_CHUNK_RESIDUAL_MAX_ABS} rollout_steps=${ROLLOUT_INFERENCE_STEPS} gripper_weight=${ACTION_GRIPPER_WEIGHT}"
   echo "  advantage=temperature:${ADVANTAGE_TEMPERATURE} clip:${ADVANTAGE_CLIP} gate_threshold:${TRAIN_GATE_THRESHOLD}"
   echo "  candidate_support=max_saturation:${CANDIDATE_MAX_SATURATION_FRACTION} max_delta_rms:${CANDIDATE_MAX_DELTA_RMS}"
+  if [[ "${PGC_VERSION}" == "5" ]]; then
+    echo "  paired_language=source_zero:${SAME_STATE_SOURCE_ZERO_WEIGHT} goal_sep:${GOAL_SEPARATION_WEIGHT}/${GOAL_SEPARATION_MARGIN} residual_sep:${RESIDUAL_SEPARATION_WEIGHT}/${RESIDUAL_SEPARATION_MARGIN}"
+    echo "  executed_prefix=${EXECUTION_PREFIX_STEPS} suffix_weight=${SUFFIX_LOSS_WEIGHT} verifier_negatives=wrong_language:${VERIFIER_WRONG_LANGUAGE_WEIGHT} bad_candidate:${VERIFIER_BAD_CANDIDATE_WEIGHT}"
+  fi
   echo "  verifier_schedule=start:${VERIFIER_START_STEP} ramp:${VERIFIER_RAMP_STEPS}"
   LORA_ENABLED=false
 fi
@@ -574,6 +646,15 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.gate_threshold=${TRAIN_GATE_THRESHOLD}" \
   "model.policy_guard.verifier_start_step=${VERIFIER_START_STEP}" \
   "model.policy_guard.verifier_ramp_steps=${VERIFIER_RAMP_STEPS}" \
+  "model.policy_guard.execution_prefix_steps=${EXECUTION_PREFIX_STEPS}" \
+  "model.policy_guard.suffix_loss_weight=${SUFFIX_LOSS_WEIGHT}" \
+  "model.policy_guard.same_state_source_zero_weight=${SAME_STATE_SOURCE_ZERO_WEIGHT}" \
+  "model.policy_guard.goal_separation_weight=${GOAL_SEPARATION_WEIGHT}" \
+  "model.policy_guard.goal_separation_margin=${GOAL_SEPARATION_MARGIN}" \
+  "model.policy_guard.residual_separation_weight=${RESIDUAL_SEPARATION_WEIGHT}" \
+  "model.policy_guard.residual_separation_margin=${RESIDUAL_SEPARATION_MARGIN}" \
+  "model.policy_guard.verifier_wrong_language_weight=${VERIFIER_WRONG_LANGUAGE_WEIGHT}" \
+  "model.policy_guard.verifier_bad_candidate_weight=${VERIFIER_BAD_CANDIDATE_WEIGHT}" \
   "model.lora.enabled=${LORA_ENABLED}" \
   "model.lora.rank=${LORA_RANK}" \
   "model.lora.alpha=${LORA_ALPHA}" \
