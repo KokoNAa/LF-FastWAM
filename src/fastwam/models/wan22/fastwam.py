@@ -1005,8 +1005,8 @@ class FastWAM(torch.nn.Module):
         if self.policy_guard_enabled and normalized["enabled"]:
             if self.policy_guard_version >= 3:
                 raise ValueError(
-                    "PGC v3/v4 keep the single Base Action Expert immutable "
-                    "and do not permit LoRA; train only policy-guard sidecars."
+                    "PGC v3/v4 policy-guard training does not permit LoRA; "
+                    "the single Base Action Expert remains immutable."
                 )
             if normalized["experts"] != ["action"]:
                 raise ValueError(

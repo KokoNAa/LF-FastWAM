@@ -1084,7 +1084,7 @@ class PolicyGuardV4IntegrationTest(unittest.TestCase):
                 context=context,
                 full_context_mask=context_mask,
                 state_only_context_mask=torch.zeros_like(context_mask),
-                fuse_vae_embedding_in_latents=False,
+                fuse_vae_embedding_in_latents=True,
                 num_inference_steps=2,
             )
         )
