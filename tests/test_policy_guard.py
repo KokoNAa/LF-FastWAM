@@ -255,6 +255,39 @@ class PolicyGuardModuleTest(unittest.TestCase):
         padded_embedding = verifier.encode_action(action, all_pad)
         self.assertTrue(torch.isfinite(padded_embedding).all())
 
+    def test_pairwise_verifier_survives_distributed_bf16_parameter_cast(self):
+        verifier = PairwiseActionAdvantageVerifier(
+            action_dim=3,
+            video_dim=16,
+            goal_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            num_layers=1,
+        ).bfloat16()
+        self.assertTrue(
+            all(
+                parameter.dtype == torch.bfloat16
+                for parameter in verifier.parameters()
+            )
+        )
+        action = torch.randn(2, 4, 3, dtype=torch.bfloat16)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            advantage, base_value, candidate_value, *_ = verifier(
+                current_video_hidden=torch.randn(
+                    2, 5, 16, dtype=torch.bfloat16
+                ),
+                goal_embedding=torch.randn(2, 8, dtype=torch.bfloat16),
+                base_action=action,
+                counterfactual_action=action + 0.25,
+            )
+        self.assertEqual(advantage.dtype, torch.float32)
+        self.assertEqual(base_value.dtype, torch.float32)
+        self.assertEqual(candidate_value.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(advantage).all())
+        (base_value + candidate_value).sum().backward()
+        self.assertIsNotNone(verifier.value_head[0].weight.grad)
+        self.assertTrue(torch.isfinite(verifier.value_head[0].weight.grad).all())
+
     def test_verifier_and_alignment_shapes(self):
         verifier = ActionOutcomeVerifier(
             action_dim=3, video_dim=16, goal_dim=8, hidden_dim=8

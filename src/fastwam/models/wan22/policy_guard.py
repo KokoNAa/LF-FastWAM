@@ -459,6 +459,41 @@ def _sinusoidal_positions(
     return encoding.to(dtype=dtype).unsqueeze(0)
 
 
+def _functional_call_fp32(module: nn.Module, *args: Any, **kwargs: Any) -> Any:
+    """Run a small sidecar in FP32 without mutating ZeRO-owned parameters.
+
+    DeepSpeed BF16 preparation may cast every parameter in the wrapped model,
+    including a verifier that was explicitly constructed in FP32.  Casting
+    only the verifier inputs back to FP32 then makes normalization layers fail
+    because their weights remain BF16.  A stateless FP32 view keeps the
+    verifier computation numerically stable while gradients still flow through
+    the casts to the original parameters managed by the optimizer.
+    """
+    parameters_and_buffers = {
+        name: parameter.float()
+        for name, parameter in module.named_parameters()
+    }
+    parameters_and_buffers.update(
+        {
+            name: buffer.float() if buffer.is_floating_point() else buffer
+            for name, buffer in module.named_buffers()
+        }
+    )
+    try:
+        device_type = next(module.parameters()).device.type
+    except StopIteration as error:
+        raise ValueError(
+            "FP32 functional call requires module parameters."
+        ) from error
+    with torch.autocast(device_type=device_type, enabled=False):
+        return torch.func.functional_call(
+            module,
+            parameters_and_buffers,
+            args,
+            kwargs,
+        )
+
+
 class RolloutAlignedActionProposal(nn.Module):
     """Correct a fully denoised Base action chunk in deployment space.
 
@@ -701,7 +736,7 @@ class PairwiseActionAdvantageVerifier(nn.Module):
                 f"PGC v4 verifier action must be [B,T,{self.action_dim}]."
             )
         action = action.float()
-        hidden = self.action_projection(action)
+        hidden = _functional_call_fp32(self.action_projection, action)
         hidden = hidden + _sinusoidal_positions(
             int(hidden.shape[1]),
             int(hidden.shape[2]),
@@ -720,9 +755,14 @@ class PairwiseActionAdvantageVerifier(nn.Module):
                 padding[empty, 0] = False
                 hidden = hidden.clone()
                 hidden[empty, 0] = 0
-        hidden = self.action_encoder(hidden, src_key_padding_mask=padding)
-        query = self.action_pool_query.expand(hidden.shape[0], -1, -1)
-        pooled, _ = self.action_pool(
+        hidden = _functional_call_fp32(
+            self.action_encoder,
+            hidden,
+            src_key_padding_mask=padding,
+        )
+        query = self.action_pool_query.float().expand(hidden.shape[0], -1, -1)
+        pooled, _ = _functional_call_fp32(
+            self.action_pool,
             query=query,
             key=hidden,
             value=hidden,
@@ -742,9 +782,13 @@ class PairwiseActionAdvantageVerifier(nn.Module):
             raise ValueError("PGC v4 verifier visual tokens have invalid shape.")
         if goal_embedding.ndim != 2 or goal_embedding.shape[-1] != self.goal_dim:
             raise ValueError("PGC v4 verifier goal embedding has invalid shape.")
-        visual = self.visual_encoder(current_video_hidden.float()).mean(dim=1)
-        goal = self.goal_encoder(goal_embedding.float())
-        fused = self.goal_state_fusion(torch.cat([visual, goal], dim=-1))
+        visual = _functional_call_fp32(
+            self.visual_encoder, current_video_hidden.float()
+        ).mean(dim=1)
+        goal = _functional_call_fp32(self.goal_encoder, goal_embedding.float())
+        fused = _functional_call_fp32(
+            self.goal_state_fusion, torch.cat([visual, goal], dim=-1)
+        )
         return F.normalize(fused.float(), dim=-1, eps=1.0e-6)
 
     def score_candidate(
@@ -763,7 +807,7 @@ class PairwiseActionAdvantageVerifier(nn.Module):
             ],
             dim=-1,
         )
-        return self.value_head(interaction).squeeze(-1)
+        return _functional_call_fp32(self.value_head, interaction).squeeze(-1)
 
     def forward(
         self,
