@@ -39,6 +39,10 @@ VERIFIER_START_STEP="${PGC_VERIFIER_START_STEP:-1000}"
 VERIFIER_RAMP_STEPS="${PGC_VERIFIER_RAMP_STEPS:-500}"
 EXECUTION_PREFIX_STEPS="${PGC_EXECUTION_PREFIX_STEPS:-10}"
 SUFFIX_LOSS_WEIGHT="${PGC_SUFFIX_LOSS_WEIGHT:-0.10}"
+COMPLETION_PHASE_ENABLED="${PGC_COMPLETION_PHASE_ENABLED:-false}"
+COMPLETION_TRANSPORT_WEIGHT="${PGC_COMPLETION_TRANSPORT_WEIGHT:-2.0}"
+COMPLETION_RELEASE_WEIGHT="${PGC_COMPLETION_RELEASE_WEIGHT:-3.0}"
+COMPLETION_TRAIN_PROPOSAL_ONLY="${PGC_COMPLETION_TRAIN_PROPOSAL_ONLY:-true}"
 SAME_STATE_SOURCE_ZERO_WEIGHT="${PGC_SAME_STATE_SOURCE_ZERO_WEIGHT:-1.0}"
 GOAL_SEPARATION_WEIGHT="${PGC_GOAL_SEPARATION_WEIGHT:-0.25}"
 GOAL_SEPARATION_MARGIN="${PGC_GOAL_SEPARATION_MARGIN:-0.20}"
@@ -145,6 +149,33 @@ case "${WARM_START_V5}" in
     exit 1
     ;;
 esac
+case "${COMPLETION_PHASE_ENABLED}" in
+  true|false) ;;
+  *)
+    echo "PGC_COMPLETION_PHASE_ENABLED must be true or false." >&2
+    exit 1
+    ;;
+esac
+case "${COMPLETION_TRAIN_PROPOSAL_ONLY}" in
+  true|false) ;;
+  *)
+    echo "PGC_COMPLETION_TRAIN_PROPOSAL_ONLY must be true or false." >&2
+    exit 1
+    ;;
+esac
+if [[ "${COMPLETION_PHASE_ENABLED}" == "true" && "${PGC_VERSION}" != "5" ]]; then
+  echo "PGC completion recovery is restricted to PGC_VERSION=5." >&2
+  exit 1
+fi
+"${PYTHON_BIN}" - \
+  "${COMPLETION_TRANSPORT_WEIGHT}" \
+  "${COMPLETION_RELEASE_WEIGHT}" <<'PY'
+import sys
+
+weights = [float(value) for value in sys.argv[1:]]
+if any(value < 1.0 for value in weights):
+    raise SystemExit("PGC completion transport/release weights must be >= 1")
+PY
 if [[ "${WARM_START_V5}" == "true" && "${PGC_VERSION}" != "6" && "${PGC_VERSION}" != "7" ]]; then
   echo "PGC_WARM_START_V5=true is valid only for PGC_VERSION=6 or 7." >&2
   exit 1
@@ -402,6 +433,25 @@ for path in paths:
     if len(index["episodes_by_index"]) <= 0:
         raise SystemExit(f"PGC v7 mask sidecar has no audited episodes: {path}")
 print(f"Validated PGC v7 target-mask sidecars: {len(paths)} dataset(s)")
+PY
+fi
+
+COMPLETION_PHASE_REQUIRED=false
+if [[ "${COMPLETION_PHASE_ENABLED}" == "true" ]]; then
+  COMPLETION_PHASE_REQUIRED=true
+  "${PYTHON_BIN}" - "${CF_JSON}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from fastwam.datasets.pgc_libero import load_pgc_completion_phase_index
+
+paths = [Path(value) for value in json.loads(sys.argv[1])]
+for path in paths:
+    index = load_pgc_completion_phase_index(path)
+    if not index:
+        raise SystemExit(f"PGC V5 completion sidecar is empty: {path}")
+print(f"Validated PGC V5 completion sidecars: {len(paths)} dataset(s)")
 PY
 fi
 
@@ -955,6 +1005,9 @@ else
   if [[ "${PGC_VERSION}" -ge "5" ]]; then
     echo "  paired_language=source_zero:${SAME_STATE_SOURCE_ZERO_WEIGHT} goal_sep:${GOAL_SEPARATION_WEIGHT}/${GOAL_SEPARATION_MARGIN} residual_sep:${RESIDUAL_SEPARATION_WEIGHT}/${RESIDUAL_SEPARATION_MARGIN}"
     echo "  executed_prefix=${EXECUTION_PREFIX_STEPS} suffix_weight=${SUFFIX_LOSS_WEIGHT} verifier_negatives=wrong_language:${VERIFIER_WRONG_LANGUAGE_WEIGHT} bad_candidate:${VERIFIER_BAD_CANDIDATE_WEIGHT}"
+    if [[ "${COMPLETION_PHASE_ENABLED}" == "true" ]]; then
+      echo "  completion_recovery=transport:${COMPLETION_TRANSPORT_WEIGHT} release:${COMPLETION_RELEASE_WEIGHT} proposal_only:${COMPLETION_TRAIN_PROPOSAL_ONLY}"
+    fi
   fi
   if [[ "${PGC_VERSION}" == "6" ]]; then
     echo "  target_binding=visual_only interaction:${TARGET_BINDING_INTERACTION_WEIGHT} prototypes:${TARGET_BINDING_PROTOTYPE_WEIGHT}/${TARGET_BINDING_SOURCE_WEIGHT} hard_negative:${TARGET_BINDING_HARD_NEGATIVE_WEIGHT}/${TARGET_BINDING_HARD_NEGATIVE_MARGIN} separation:${TARGET_BINDING_SEPARATION_WEIGHT}/${TARGET_BINDING_SEPARATION_MARGIN}"
@@ -979,6 +1032,7 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "data.train.pgc_counterfactual_oversample_factor=${OVERSAMPLE_FACTOR}" \
   "data.train.pgc_balance_native_counterfactual=${BALANCE_NATIVE_COUNTERFACTUAL}" \
   "data.train.pgc_target_mask_supervision_required=${TARGET_MASK_REQUIRED}" \
+  "data.train.pgc_completion_phase_supervision_required=${COMPLETION_PHASE_REQUIRED}" \
   "++data.train.pretrained_norm_stats=${STATS_PATH}" \
   "data.train.text_embedding_cache_dir=${CACHE_DIR}" \
   "seed=${TRAIN_SEED}" \
@@ -1010,6 +1064,10 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.verifier_ramp_steps=${VERIFIER_RAMP_STEPS}" \
   "model.policy_guard.execution_prefix_steps=${EXECUTION_PREFIX_STEPS}" \
   "model.policy_guard.suffix_loss_weight=${SUFFIX_LOSS_WEIGHT}" \
+  "model.policy_guard.completion_phase_enabled=${COMPLETION_PHASE_ENABLED}" \
+  "model.policy_guard.completion_transport_weight=${COMPLETION_TRANSPORT_WEIGHT}" \
+  "model.policy_guard.completion_release_weight=${COMPLETION_RELEASE_WEIGHT}" \
+  "model.policy_guard.completion_train_proposal_only=${COMPLETION_TRAIN_PROPOSAL_ONLY}" \
   "model.policy_guard.same_state_source_zero_weight=${SAME_STATE_SOURCE_ZERO_WEIGHT}" \
   "model.policy_guard.goal_separation_weight=${GOAL_SEPARATION_WEIGHT}" \
   "model.policy_guard.goal_separation_margin=${GOAL_SEPARATION_MARGIN}" \

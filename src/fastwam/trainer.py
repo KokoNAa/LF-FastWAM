@@ -127,6 +127,23 @@ class Wan22Trainer:
                     "sampling. Set "
                     "`data.train.pgc_balance_native_counterfactual=true`."
                 )
+            if bool(
+                getattr(
+                    self.model,
+                    "policy_guard_completion_phase_enabled",
+                    False,
+                )
+            ) and not bool(
+                getattr(
+                    self.train_dataset,
+                    "pgc_completion_phase_supervision_required",
+                    False,
+                )
+            ):
+                raise ValueError(
+                    "PGC V5-completion requires the audited phase sidecar. "
+                    "Set data.train.pgc_completion_phase_supervision_required=true."
+                )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # In LoRA mode only adapters plus explicitly selected small modules are

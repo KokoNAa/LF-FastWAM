@@ -641,6 +641,18 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_suffix_loss_weight = float(
             guard_config.get("suffix_loss_weight", 0.10)
         )
+        self.policy_guard_completion_phase_enabled = bool(
+            guard_config.get("completion_phase_enabled", False)
+        )
+        self.policy_guard_completion_transport_weight = float(
+            guard_config.get("completion_transport_weight", 2.0)
+        )
+        self.policy_guard_completion_release_weight = float(
+            guard_config.get("completion_release_weight", 3.0)
+        )
+        self.policy_guard_completion_train_proposal_only = bool(
+            guard_config.get("completion_train_proposal_only", True)
+        )
         self.policy_guard_same_state_source_zero_weight = float(
             guard_config.get("same_state_source_zero_weight", 1.0)
         )
@@ -843,6 +855,19 @@ class FastWAM(torch.nn.Module):
                 raise ValueError("PGC weights, margins, and thresholds must be non-negative.")
             if self.policy_guard_execution_prefix_steps <= 0:
                 raise ValueError("PGC execution_prefix_steps must be positive.")
+            if self.policy_guard_completion_phase_enabled:
+                if self.policy_guard_version != 5:
+                    raise ValueError(
+                        "PGC completion-phase recovery is intentionally "
+                        "restricted to the V5 baseline."
+                    )
+                if min(
+                    self.policy_guard_completion_transport_weight,
+                    self.policy_guard_completion_release_weight,
+                ) < 1.0:
+                    raise ValueError(
+                        "PGC completion transport/release weights must be >= 1."
+                    )
             if self.policy_guard_version >= 6:
                 if (
                     self.policy_guard_target_binding_action_start_step < 0
@@ -1430,6 +1455,18 @@ class FastWAM(torch.nn.Module):
                     )
                 self.policy_guard_modules.train()
                 self.policy_guard_modules.requires_grad_(True)
+                if (
+                    self.policy_guard_version == 5
+                    and self.policy_guard_completion_phase_enabled
+                    and self.policy_guard_completion_train_proposal_only
+                ):
+                    for name, module in self.policy_guard_modules.items():
+                        if name == "action_chunk_proposal":
+                            module.train()
+                            module.requires_grad_(True)
+                        else:
+                            module.eval()
+                            module.requires_grad_(False)
                 if self.policy_guard_version >= 6:
                     # V6/V7 have no deployment edge through the legacy Goal Graph.
                     # Keep it only for checkpoint migration/history, but exclude
@@ -2737,6 +2774,8 @@ class FastWAM(torch.nn.Module):
         is_counterfactual: torch.Tensor,
         direct_action_valid: torch.Tensor,
         paired_language_valid: torch.Tensor,
+        completion_phase: Optional[torch.Tensor] = None,
+        completion_phase_valid: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2808,8 +2847,50 @@ class FastWAM(torch.nn.Module):
             source_predicted_residual,
             torch.zeros_like(source_predicted_residual),
         )
+        completion_sample_weight = torch.ones_like(
+            proposal_error, dtype=torch.float32
+        )
+        completion_transport = torch.zeros_like(counterfactual_valid)
+        completion_release = torch.zeros_like(counterfactual_valid)
+        if self.policy_guard_completion_phase_enabled:
+            if completion_phase is None or completion_phase_valid is None:
+                raise ValueError(
+                    "PGC V5-completion action loss requires phase/value mask."
+                )
+            completion_phase = completion_phase.to(
+                device=proposed_action.device, dtype=torch.long
+            )
+            completion_phase_valid = completion_phase_valid.to(
+                device=proposed_action.device, dtype=torch.bool
+            )
+            if completion_phase.shape != is_counterfactual.shape or (
+                completion_phase_valid.shape != is_counterfactual.shape
+            ):
+                raise ValueError(
+                    "PGC V5-completion phase/value mask must share [B] shape."
+                )
+            completion_transport = completion_phase_valid & (completion_phase == 1)
+            completion_release = completion_phase_valid & (completion_phase == 2)
+            completion_sample_weight = torch.where(
+                completion_transport,
+                completion_sample_weight.new_tensor(
+                    self.policy_guard_completion_transport_weight
+                ),
+                completion_sample_weight,
+            )
+            completion_sample_weight = torch.where(
+                completion_release,
+                completion_sample_weight.new_tensor(
+                    self.policy_guard_completion_release_weight
+                ),
+                completion_sample_weight,
+            )
+        # Do not renormalize by the sum of phase weights. With micro-batch one,
+        # that would cancel the intended stronger gradient on rare completion
+        # states. Native and pre-grasp samples retain their original scale.
         counterfactual_action_loss = self._masked_policy_guard_mean(
-            proposal_error, counterfactual_valid
+            proposal_error * completion_sample_weight,
+            counterfactual_valid,
         )
         native_zero_loss = self._masked_policy_guard_mean(
             current_zero_error, native_valid
@@ -2937,6 +3018,15 @@ class FastWAM(torch.nn.Module):
             ).detach(),
             "pgc_v5_required_residual_pair_distance": self._masked_policy_guard_mean(
                 required_residual_distance, paired_valid
+            ).detach(),
+            "pgc_v5_completion_transport_fraction": self._masked_policy_guard_mean(
+                completion_transport.float(), counterfactual_valid
+            ).detach(),
+            "pgc_v5_completion_release_fraction": self._masked_policy_guard_mean(
+                completion_release.float(), counterfactual_valid
+            ).detach(),
+            "pgc_v5_completion_sample_weight": self._masked_policy_guard_mean(
+                completion_sample_weight, counterfactual_valid
             ).detach(),
         }
         return (
@@ -4261,6 +4351,8 @@ class FastWAM(torch.nn.Module):
             is_counterfactual=is_counterfactual,
             direct_action_valid=direct_action_valid,
             paired_language_valid=paired_language_valid,
+            completion_phase=inputs.get("pgc_completion_phase"),
+            completion_phase_valid=inputs.get("pgc_completion_phase_valid"),
         )
 
         prefix = min(
@@ -4484,6 +4576,23 @@ class FastWAM(torch.nn.Module):
             "pgc_target_binding_action_training_scale": action_training_scale,
             "pgc_v5_execution_prefix_steps": float(prefix),
             "pgc_v5_suffix_loss_weight": self.policy_guard_suffix_loss_weight,
+            "pgc_v5_completion_enabled": float(
+                self.policy_guard_completion_phase_enabled
+            ),
+            "pgc_v5_completion_transport_weight": (
+                self.policy_guard_completion_transport_weight
+                if self.policy_guard_completion_phase_enabled
+                else 1.0
+            ),
+            "pgc_v5_completion_release_weight": (
+                self.policy_guard_completion_release_weight
+                if self.policy_guard_completion_phase_enabled
+                else 1.0
+            ),
+            "pgc_v5_completion_proposal_only": float(
+                self.policy_guard_completion_phase_enabled
+                and self.policy_guard_completion_train_proposal_only
+            ),
             "pgc_v5_rollout_num_inference_steps": float(
                 self.policy_guard_rollout_num_inference_steps
             ),
@@ -5462,6 +5571,8 @@ class FastWAM(torch.nn.Module):
         pgc_source_context_mask = sample.get("pgc_source_context_mask")
         pgc_source_goal_id = sample.get("pgc_source_goal_id")
         pgc_paired_language_valid = sample.get("pgc_paired_language_valid")
+        pgc_completion_phase = sample.get("pgc_completion_phase")
+        pgc_completion_phase_valid = sample.get("pgc_completion_phase_valid")
         pgc_target_object_mask = sample.get("pgc_target_object_mask")
         pgc_source_object_mask = sample.get("pgc_source_object_mask")
         pgc_aux_object_mask = sample.get("pgc_aux_object_mask")
@@ -5512,6 +5623,24 @@ class FastWAM(torch.nn.Module):
                         "PGC v5 requires same-state paired-language fields: "
                         f"{missing_v5}. Recreate the dataset loader after "
                         "updating LF-FastWAM."
+                    )
+            if self.policy_guard_completion_phase_enabled:
+                missing_completion = [
+                    name
+                    for name, value in (
+                        ("pgc_completion_phase", pgc_completion_phase),
+                        (
+                            "pgc_completion_phase_valid",
+                            pgc_completion_phase_valid,
+                        ),
+                    )
+                    if value is None
+                ]
+                if missing_completion:
+                    raise ValueError(
+                        "PGC V5-completion requires audited phase fields: "
+                        f"{missing_completion}. Build the completion sidecar "
+                        "and enable its dataset contract."
                     )
             if self.policy_guard_version == 7:
                 missing_v7 = [
@@ -5798,6 +5927,31 @@ class FastWAM(torch.nn.Module):
                 )
             if pgc_paired_language_valid.shape != (batch_size,):
                 raise ValueError("`pgc_paired_language_valid` must be [B].")
+        if pgc_completion_phase is not None:
+            pgc_completion_phase = torch.as_tensor(
+                pgc_completion_phase,
+                device=self.device,
+                dtype=torch.long,
+            )
+            pgc_completion_phase_valid = torch.as_tensor(
+                pgc_completion_phase_valid,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            if pgc_completion_phase.ndim == 0:
+                pgc_completion_phase = pgc_completion_phase.expand(batch_size)
+            if pgc_completion_phase_valid.ndim == 0:
+                pgc_completion_phase_valid = pgc_completion_phase_valid.expand(
+                    batch_size
+                )
+            if pgc_completion_phase.shape != (batch_size,) or (
+                pgc_completion_phase_valid.shape != (batch_size,)
+            ):
+                raise ValueError(
+                    "PGC completion phase/value mask must share [B] shape."
+                )
+            if bool(((pgc_completion_phase < 0) | (pgc_completion_phase > 2)).any()):
+                raise ValueError("PGC completion phase must be 0, 1, or 2.")
         if self.policy_guard_version == 7:
             pgc_target_object_mask = pgc_target_object_mask.to(
                 device=self.device, dtype=torch.float32, non_blocking=True
@@ -5901,6 +6055,8 @@ class FastWAM(torch.nn.Module):
             "pgc_source_context_mask": pgc_source_context_mask,
             "pgc_source_goal_id": pgc_source_goal_id,
             "pgc_paired_language_valid": pgc_paired_language_valid,
+            "pgc_completion_phase": pgc_completion_phase,
+            "pgc_completion_phase_valid": pgc_completion_phase_valid,
             "pgc_target_object_mask": pgc_target_object_mask,
             "pgc_source_object_mask": pgc_source_object_mask,
             "pgc_aux_object_mask": pgc_aux_object_mask,
@@ -8367,6 +8523,31 @@ class FastWAM(torch.nn.Module):
             ),
             "suffix_loss_weight": (
                 self.policy_guard_suffix_loss_weight if is_v5 else None
+            ),
+            "completion_phase_enabled": (
+                self.policy_guard_completion_phase_enabled if is_v5 else None
+            ),
+            "completion_phase_source": (
+                "audited_executed_gripper_transition_sidecar"
+                if is_v5 and self.policy_guard_completion_phase_enabled
+                else None
+            ),
+            "completion_transport_weight": (
+                self.policy_guard_completion_transport_weight
+                if is_v5 and self.policy_guard_completion_phase_enabled
+                else None
+            ),
+            "completion_release_weight": (
+                self.policy_guard_completion_release_weight
+                if is_v5 and self.policy_guard_completion_phase_enabled
+                else None
+            ),
+            "completion_trainable_scope": (
+                "action_chunk_proposal_only"
+                if is_v5
+                and self.policy_guard_completion_phase_enabled
+                and self.policy_guard_completion_train_proposal_only
+                else None
             ),
             "same_state_source_zero_weight": (
                 self.policy_guard_same_state_source_zero_weight if is_v5 else None

@@ -34,7 +34,10 @@ class TinyVAE(nn.Module):
 
 
 def tiny_pgc_fastwam(
-    *, configure_lora: bool = True, version: int = 2
+    *,
+    configure_lora: bool = True,
+    version: int = 2,
+    completion_phase_enabled: bool = False,
 ) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
@@ -111,6 +114,10 @@ def tiny_pgc_fastwam(
             "candidate_max_delta_rms": 0.5,
             "execution_prefix_steps": 2,
             "suffix_loss_weight": 0.1,
+            "completion_phase_enabled": completion_phase_enabled,
+            "completion_transport_weight": 2.0,
+            "completion_release_weight": 3.0,
+            "completion_train_proposal_only": True,
             "same_state_source_zero_weight": 1.0,
             "goal_separation_weight": 0.25,
             "goal_separation_margin": 0.2,
@@ -1350,6 +1357,60 @@ class PolicyGuardV5IntegrationTest(unittest.TestCase):
             action_is_pad=None,
         )
         self.assertAlmostEqual(float(weighted), 10.0, places=5)
+
+    def test_v5_completion_weights_post_grasp_and_freezes_other_sidecars(self):
+        model = tiny_pgc_fastwam(
+            version=5,
+            completion_phase_enabled=True,
+        )
+        report = model.prepare_trainable_parameters()
+        self.assertGreater(report["trainable"], 0)
+        trainable_names = {
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(trainable_names)
+        self.assertTrue(
+            all(
+                name.startswith("policy_guard_modules.action_chunk_proposal.")
+                for name in trainable_names
+            )
+        )
+
+        base = torch.zeros(1, 4, 3)
+        residual = torch.zeros_like(base)
+        proposal = base.clone()
+        target = torch.ones_like(base)
+        goal = torch.tensor([[1.0, 0.0]])
+
+        def action_loss(phase: int) -> float:
+            losses = model._compute_policy_guard_v5_action_losses(
+                proposed_action=proposal,
+                predicted_residual=residual,
+                source_predicted_residual=residual,
+                base_action=base,
+                target_action=target,
+                counterfactual_goal_embedding=goal,
+                source_goal_embedding=goal,
+                action_is_pad=None,
+                is_counterfactual=torch.tensor([True]),
+                direct_action_valid=torch.tensor([True]),
+                paired_language_valid=torch.tensor([True]),
+                completion_phase=torch.tensor([phase]),
+                completion_phase_valid=torch.tensor([True]),
+            )
+            return float(losses[0])
+
+        pregrasp = action_loss(0)
+        self.assertAlmostEqual(action_loss(1), 2.0 * pregrasp, places=6)
+        self.assertAlmostEqual(action_loss(2), 3.0 * pregrasp, places=6)
+        metadata = model._policy_guard_metadata()
+        self.assertTrue(metadata["completion_phase_enabled"])
+        self.assertEqual(
+            metadata["completion_trainable_scope"],
+            "action_chunk_proposal_only",
+        )
 
     def test_v5_same_state_pair_has_source_zero_and_goal_separation(self):
         base = torch.zeros(2, 4, 3)

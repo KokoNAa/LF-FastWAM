@@ -18,6 +18,7 @@ from ..counterfactual import (
     stable_instruction_id,
 )
 from ..pgc_libero import (
+    load_pgc_completion_phase_index,
     load_pgc_episode_language_pairs,
     load_pgc_target_mask_index,
 )
@@ -102,6 +103,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_counterfactual_oversample_factor: int = 1,
         pgc_balance_native_counterfactual: bool = False,
         pgc_target_mask_supervision_required: bool = False,
+        pgc_completion_phase_supervision_required: bool = False,
     ):
         native_dataset_dirs = [str(path) for path in dataset_dirs]
         pgc_counterfactual_dataset_dirs = [
@@ -138,6 +140,28 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.pgc_target_mask_supervision_required = bool(
             pgc_target_mask_supervision_required
         )
+        self.pgc_completion_phase_supervision_required = bool(
+            pgc_completion_phase_supervision_required
+        )
+        if self.pgc_completion_phase_supervision_required and not (
+            self.pgc_counterfactual_dataset_dirs
+        ):
+            raise ValueError(
+                "PGC V5 completion supervision requires at least one direct "
+                "counterfactual dataset."
+            )
+        self.pgc_completion_phase_indices: dict[
+            int, dict[int, dict[str, object]]
+        ] = {}
+        if self.pgc_completion_phase_supervision_required:
+            self.pgc_completion_phase_indices = {
+                self.pgc_native_dataset_count + offset: (
+                    load_pgc_completion_phase_index(dataset_dir)
+                )
+                for offset, dataset_dir in enumerate(
+                    self.pgc_counterfactual_dataset_dirs
+                )
+            }
         if self.pgc_target_mask_supervision_required and not (
             self.pgc_counterfactual_dataset_dirs
         ):
@@ -513,6 +537,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         )
         pgc_source_task = str(task)
         pgc_pair_valid = False
+        pgc_completion_phase = 0
+        pgc_completion_phase_valid = False
         episode_index = -1
         frame_index = -1
         if pgc_is_counterfactual:
@@ -558,6 +584,32 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 )
             pgc_source_task = str(pair["source_instruction"]).strip()
             pgc_pair_valid = True
+            if self.pgc_completion_phase_supervision_required:
+                if frame_index < 0:
+                    raise KeyError("PGC completion supervision requires frame_index.")
+                try:
+                    phase_record = self.pgc_completion_phase_indices[dataset_index][
+                        episode_index
+                    ]
+                except KeyError as exc:
+                    raise KeyError(
+                        "No audited PGC completion phase for dataset/episode "
+                        f"{dataset_index}/{episode_index}."
+                    ) from exc
+                action_count = int(phase_record["action_count"])
+                if not 0 <= frame_index < action_count:
+                    raise ValueError(
+                        "PGC completion frame is outside its audited action "
+                        f"range: frame={frame_index} count={action_count}."
+                    )
+                grasp_close_step = int(phase_record["grasp_close_step"])
+                release_open_step = phase_record["release_open_step"]
+                pgc_completion_phase = int(frame_index >= grasp_close_step)
+                if release_open_step is not None and frame_index >= int(
+                    release_open_step
+                ):
+                    pgc_completion_phase = 2
+                pgc_completion_phase_valid = True
         
         # FIXME
         if self.override_instruction is not None:
@@ -676,6 +728,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             ),
             "pgc_paired_language_valid": torch.tensor(
                 pgc_pair_valid, dtype=torch.bool
+            ),
+            "pgc_completion_phase": torch.tensor(
+                pgc_completion_phase, dtype=torch.long
+            ),
+            "pgc_completion_phase_valid": torch.tensor(
+                pgc_completion_phase_valid, dtype=torch.bool
             ),
             "pgc_target_object_mask": pgc_target_object_mask,
             "pgc_source_object_mask": pgc_source_object_mask,

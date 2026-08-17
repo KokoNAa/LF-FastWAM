@@ -194,6 +194,14 @@ policy_guard:
   # small suffix auxiliary loss.
   execution_prefix_steps: 10
   suffix_loss_weight: 0.10
+  # Optional V5-completion continuation. Phase labels come from the exact
+  # gripper commands in each audited successful PGC trajectory. Transport and
+  # release states receive stronger action supervision while the learned V5
+  # language encoder and Verifier remain frozen.
+  completion_phase_enabled: false
+  completion_transport_weight: 2.0
+  completion_release_weight: 3.0
+  completion_train_proposal_only: true
   # On every audited CF state, source language must reproduce exact Base while
   # counterfactual language must produce the demonstrated successful residual.
   same_state_source_zero_weight: 1.0

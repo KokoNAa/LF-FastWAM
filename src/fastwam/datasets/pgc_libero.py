@@ -22,6 +22,8 @@ PGC_DATA_FORMAT = "pgc_counterfactual_actions_v1"
 PGC_ACTION_SUPERVISION = "executed_counterfactual_success_trajectory"
 PGC_TARGET_MASK_FORMAT = "pgc_libero_element_target_masks_v1"
 PGC_TARGET_MASK_INDEX = Path("meta/pgc_v7_target_masks/index.json")
+PGC_COMPLETION_PHASE_FORMAT = "pgc_libero_completion_phases_v1"
+PGC_COMPLETION_PHASE_INDEX = Path("meta/pgc_v5_completion_phases.json")
 LIBERO_SUITES = (
     "libero_spatial",
     "libero_object",
@@ -29,6 +31,113 @@ LIBERO_SUITES = (
     "libero_10",
 )
 PGC_STATE_TRANSFER_MODES = ("flat_exact", "named_joint_remap")
+
+
+def detect_pgc_completion_phase(
+    actions: np.ndarray,
+    *,
+    close_threshold: float = 0.0,
+) -> dict[str, int | None]:
+    """Locate grasp-close and optional release transitions in a LIBERO demo.
+
+    LIBERO actions use the seventh dimension for the binary gripper command.
+    The collected PGC trajectory is aligned one-to-one with these commands, so
+    the first positive command is a conservative boundary between target
+    acquisition and post-grasp completion. A later non-positive command, when
+    present, marks release. Successful collection may stop before a release is
+    recorded; in that case ``release_open_step`` is intentionally ``None``.
+    """
+    actions = np.asarray(actions)
+    if actions.ndim != 2 or actions.shape[1] != 7 or actions.shape[0] <= 0:
+        raise ValueError(
+            "PGC completion phases require non-empty LIBERO actions [T,7], "
+            f"got {actions.shape}."
+        )
+    if not np.isfinite(actions).all():
+        raise ValueError("PGC completion actions contain NaN or infinity.")
+    closed = np.asarray(actions[:, -1] > float(close_threshold), dtype=np.bool_)
+    close_indices = np.flatnonzero(closed)
+    if close_indices.size == 0:
+        raise ValueError("PGC successful trajectory has no gripper-close command.")
+    grasp_close_step = int(close_indices[0])
+    release_indices = np.flatnonzero(~closed[grasp_close_step + 1 :])
+    release_open_step = (
+        None
+        if release_indices.size == 0
+        else int(grasp_close_step + 1 + release_indices[0])
+    )
+    return {
+        "grasp_close_step": grasp_close_step,
+        "release_open_step": release_open_step,
+    }
+
+
+def load_pgc_completion_phase_index(
+    dataset_root: str | Path,
+) -> dict[int, dict[str, Any]]:
+    """Load audited grasp-to-completion boundaries for a PGC action dataset."""
+    dataset_root = Path(dataset_root).expanduser().resolve()
+    index_path = dataset_root / PGC_COMPLETION_PHASE_INDEX
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            f"Missing PGC V5 completion-phase sidecar: {index_path}. Run "
+            "scripts/build_pgc_completion_phases.py first."
+        )
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    if payload.get("format") != PGC_COMPLETION_PHASE_FORMAT:
+        raise ValueError(
+            f"Unsupported PGC completion-phase format at {index_path}: "
+            f"{payload.get('format')!r}."
+        )
+    audited_pairs = load_pgc_episode_language_pairs(dataset_root)
+    records = payload.get("episodes")
+    if not isinstance(records, list) or len(records) != len(audited_pairs):
+        raise ValueError(
+            "PGC completion-phase episode count does not match action audit: "
+            f"phases={len(records or [])} audits={len(audited_pairs)}."
+        )
+    indexed: dict[int, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("PGC completion-phase records must be objects.")
+        episode_index = int(record.get("episode_index", -1))
+        if episode_index in indexed or episode_index not in audited_pairs:
+            raise ValueError(
+                f"Invalid or duplicate PGC completion episode {episode_index}."
+            )
+        action_count = int(record.get("action_count", 0))
+        grasp_close_step = int(record.get("grasp_close_step", -1))
+        release_raw = record.get("release_open_step")
+        release_open_step = None if release_raw is None else int(release_raw)
+        if action_count <= 0 or not 0 <= grasp_close_step < action_count:
+            raise ValueError(
+                f"Invalid completion boundary for episode {episode_index}: "
+                f"count={action_count} close={grasp_close_step}."
+            )
+        if release_open_step is not None and not (
+            grasp_close_step < release_open_step < action_count
+        ):
+            raise ValueError(
+                f"Invalid release boundary for episode {episode_index}: "
+                f"close={grasp_close_step} release={release_open_step} "
+                f"count={action_count}."
+            )
+        pair = audited_pairs[episode_index]
+        if str(record.get("pair_id", "")) != str(pair["pair_id"]):
+            raise ValueError(
+                f"PGC completion pair mismatch for episode {episode_index}."
+            )
+        normalized = dict(record)
+        normalized.update(
+            {
+                "episode_index": episode_index,
+                "action_count": action_count,
+                "grasp_close_step": grasp_close_step,
+                "release_open_step": release_open_step,
+            }
+        )
+        indexed[episode_index] = normalized
+    return indexed
 
 
 def _file_sha256(path: Path) -> str:
