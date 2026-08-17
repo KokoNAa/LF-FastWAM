@@ -118,6 +118,12 @@ def tiny_pgc_fastwam(
             "completion_transport_weight": 2.0,
             "completion_release_weight": 3.0,
             "completion_train_proposal_only": True,
+            "closed_loop_corrective_enabled": version == 8,
+            "closed_loop_corrective_weight": 2.0,
+            "offline_acquisition_weight": 1.0,
+            "native_guard_weight": 0.1,
+            "acquisition_only": True,
+            "closed_loop_train_proposal_only": True,
             "same_state_source_zero_weight": 1.0,
             "goal_separation_weight": 0.25,
             "goal_separation_margin": 0.2,
@@ -1554,6 +1560,120 @@ class PolicyGuardV5IntegrationTest(unittest.TestCase):
                 restored.policy_guard_base_checkpoint,
                 str(base_path.resolve()),
             )
+
+
+class PolicyGuardV8IntegrationTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(81)
+        self.model = tiny_pgc_fastwam(version=8)
+
+    def test_v8_trains_only_proposal_and_weights_closed_loop_rows(self):
+        report = self.model.prepare_trainable_parameters()
+        self.assertGreater(report["trainable"], 0)
+        trainable = {
+            name
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(trainable)
+        self.assertTrue(
+            all(
+                name.startswith(
+                    "policy_guard_modules.action_chunk_proposal."
+                )
+                for name in trainable
+            )
+        )
+        self.assertEqual(self.model._policy_guard_verifier_scale(), 0.0)
+
+        base = torch.zeros(3, 4, 3)
+        target = torch.ones_like(base)
+        residual = torch.zeros_like(base)
+        goal = torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]
+        )
+        losses = self.model._compute_policy_guard_v5_action_losses(
+            proposed_action=base,
+            predicted_residual=residual,
+            source_predicted_residual=residual,
+            base_action=base,
+            target_action=target,
+            counterfactual_goal_embedding=goal,
+            source_goal_embedding=goal,
+            action_is_pad=None,
+            is_counterfactual=torch.tensor([False, True, True]),
+            direct_action_valid=torch.tensor([True, True, True]),
+            paired_language_valid=torch.tensor([False, True, True]),
+            is_closed_loop_corrective=torch.tensor([False, False, True]),
+        )
+        metrics = losses[-1]
+        self.assertAlmostEqual(
+            float(metrics["pgc_v8_closed_loop_fraction"]), 1.0 / 3.0
+        )
+        self.assertAlmostEqual(
+            float(metrics["pgc_v8_offline_counterfactual_fraction"]),
+            1.0 / 3.0,
+        )
+        self.assertAlmostEqual(
+            float(metrics["pgc_v8_acquisition_sample_weight"]), 1.5
+        )
+
+    def test_v8_strictly_warm_starts_v5_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v5_path = root / "v5.pt"
+            v8_path = root / "v8.pt"
+            v5 = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v5.mot.state_dict()},
+                base_path,
+            )
+            v5.load_checkpoint(base_path)
+            with torch.no_grad():
+                v5.policy_guard_modules[
+                    "action_chunk_proposal"
+                ].output_projection.bias.add_(0.25)
+            expected = {
+                key: value.detach().clone()
+                for key, value in v5.policy_guard_modules.state_dict().items()
+            }
+            v5.save_checkpoint(v5_path, step=4000)
+
+            self.model.load_checkpoint(v5_path)
+            for key, value in expected.items():
+                self.assertTrue(
+                    torch.equal(
+                        self.model.policy_guard_modules.state_dict()[key],
+                        value,
+                    ),
+                    key,
+                )
+            self.model.save_checkpoint(v8_path, step=2000)
+            payload = torch.load(
+                v8_path, map_location="cpu", weights_only=False
+            )
+            self.assertEqual(payload["format"], "fastwam_policy_guard_v8")
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(
+                metadata["counterfactual_tuning"],
+                "closed_loop_replay_verified_target_acquisition_residual",
+            )
+            self.assertEqual(
+                metadata["closed_loop_trainable_scope"],
+                "action_chunk_proposal_only",
+            )
+
+            restored = tiny_pgc_fastwam(version=8)
+            restored.load_checkpoint(v8_path)
+            for key, value in self.model.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(
+                        restored.policy_guard_modules.state_dict()[key],
+                        value,
+                    ),
+                    key,
+                )
 
 
 class PolicyGuardV6IntegrationTest(unittest.TestCase):

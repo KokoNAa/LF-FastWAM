@@ -77,13 +77,20 @@ AUX_MASK_WEIGHT="${PGC_AUX_MASK_WEIGHT:-0.50}"
 MASK_MASS_WEIGHT="${PGC_MASK_MASS_WEIGHT:-0.50}"
 CROSS_OBJECT_WEIGHT="${PGC_CROSS_OBJECT_WEIGHT:-0.50}"
 CROSS_OBJECT_MARGIN="${PGC_CROSS_OBJECT_MARGIN:-0.25}"
+CLOSED_LOOP_CORRECTIVE_LIST="${PGC_CLOSED_LOOP_CORRECTIVE_LIST:-}"
+CLOSED_LOOP_OVERSAMPLE_FACTOR="${PGC_CLOSED_LOOP_OVERSAMPLE_FACTOR:-4}"
+CLOSED_LOOP_CORRECTIVE_WEIGHT="${PGC_CLOSED_LOOP_CORRECTIVE_WEIGHT:-2.0}"
+OFFLINE_ACQUISITION_WEIGHT="${PGC_OFFLINE_ACQUISITION_WEIGHT:-1.0}"
+NATIVE_GUARD_WEIGHT="${PGC_NATIVE_GUARD_WEIGHT:-0.10}"
+CLOSED_LOOP_TRAIN_PROPOSAL_ONLY="${PGC_CLOSED_LOOP_TRAIN_PROPOSAL_ONLY:-true}"
+CLOSED_LOOP_ENABLED=false
 WARM_START_V5="${PGC_WARM_START_V5:-false}"
 RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-pgc-v${PGC_VERSION}-${MAX_STEPS}-seed${TRAIN_SEED}}"
 
 case "${PGC_VERSION}" in
-  2|3|4|5|6|7) ;;
+  2|3|4|5|6|7|8) ;;
   *)
-    echo "PGC_VERSION must be 2, 3, 4, 5, 6, or 7; got ${PGC_VERSION}." >&2
+    echo "PGC_VERSION must be 2, 3, 4, 5, 6, 7, or 8; got ${PGC_VERSION}." >&2
     exit 1
     ;;
 esac
@@ -107,7 +114,7 @@ case "${TRAIN_SUITE}" in
     ;;
 esac
 
-for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY ROLLOUT_INFERENCE_STEPS EXECUTION_PREFIX_STEPS TARGET_BINDING_HIDDEN_DIM TARGET_BINDING_NUM_HEADS TARGET_BINDING_PROTOTYPE_SLOTS TARGET_BINDING_NUM_OBJECT_TOKENS TARGET_BINDING_CAMERA_COUNT; do
+for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR CLOSED_LOOP_OVERSAMPLE_FACTOR SAVE_EVERY ROLLOUT_INFERENCE_STEPS EXECUTION_PREFIX_STEPS TARGET_BINDING_HIDDEN_DIM TARGET_BINDING_NUM_HEADS TARGET_BINDING_PROTOTYPE_SLOTS TARGET_BINDING_NUM_OBJECT_TOKENS TARGET_BINDING_CAMERA_COUNT; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${value_name} must be a positive integer, got ${value}." >&2
@@ -163,6 +170,13 @@ case "${COMPLETION_TRAIN_PROPOSAL_ONLY}" in
     exit 1
     ;;
 esac
+case "${CLOSED_LOOP_TRAIN_PROPOSAL_ONLY}" in
+  true|false) ;;
+  *)
+    echo "PGC_CLOSED_LOOP_TRAIN_PROPOSAL_ONLY must be true or false." >&2
+    exit 1
+    ;;
+esac
 if [[ "${COMPLETION_PHASE_ENABLED}" == "true" && "${PGC_VERSION}" != "5" ]]; then
   echo "PGC completion recovery is restricted to PGC_VERSION=5." >&2
   exit 1
@@ -176,12 +190,12 @@ weights = [float(value) for value in sys.argv[1:]]
 if any(value < 1.0 for value in weights):
     raise SystemExit("PGC completion transport/release weights must be >= 1")
 PY
-if [[ "${WARM_START_V5}" == "true" && "${PGC_VERSION}" != "6" && "${PGC_VERSION}" != "7" ]]; then
-  echo "PGC_WARM_START_V5=true is valid only for PGC_VERSION=6 or 7." >&2
+if [[ "${WARM_START_V5}" == "true" && "${PGC_VERSION}" != "6" && "${PGC_VERSION}" != "7" && "${PGC_VERSION}" != "8" ]]; then
+  echo "PGC_WARM_START_V5=true is valid only for PGC_VERSION=6, 7, or 8." >&2
   exit 1
 fi
 if [[ "${WARM_START_V5}" == "true" && -n "${CONTINUE_FROM_STEP}" ]]; then
-  echo "PGC v5 target-binder warm start begins a fresh optimizer schedule; do not set PGC_CONTINUE_FROM_STEP." >&2
+  echo "PGC v5 architecture warm start begins a fresh optimizer schedule; do not set PGC_CONTINUE_FROM_STEP." >&2
   exit 1
 fi
 if [[ "${BALANCE_NATIVE_COUNTERFACTUAL}" == "true" && "${OVERSAMPLE_FACTOR}" != "1" ]]; then
@@ -282,7 +296,7 @@ if version >= 5:
         raise SystemExit("PGC v5 suffix loss weight must be in [0, 1]")
     if any(value < 0 for value in paired_weights):
         raise SystemExit("PGC v5 paired-language weights must be non-negative")
-if version >= 6:
+if version in {6, 7}:
     if any(value < 0 for value in target_binding_weights):
         raise SystemExit("PGC v6 target-binding weights/margins must be non-negative")
     if binding_hidden_dim <= 0 or prototype_slots <= 0:
@@ -298,6 +312,33 @@ if version >= 6:
     if not 0 <= prototype_momentum < 1:
         raise SystemExit("PGC v6 prototype momentum must be in [0, 1)")
 PY
+if [[ "${PGC_VERSION}" == "8" ]]; then
+  CLOSED_LOOP_ENABLED=true
+  if [[ -z "${CLOSED_LOOP_CORRECTIVE_LIST}" || ! -f "${CLOSED_LOOP_CORRECTIVE_LIST}" ]]; then
+    echo "PGC v8 requires PGC_CLOSED_LOOP_CORRECTIVE_LIST pointing to an audited dataset list." >&2
+    exit 1
+  fi
+  if [[ "${WARM_START_V5}" != "true" ]]; then
+    echo "PGC v8 must set PGC_WARM_START_V5=true and initialize from validated V5." >&2
+    exit 1
+  fi
+  if [[ "${CLOSED_LOOP_TRAIN_PROPOSAL_ONLY}" != "true" ]]; then
+    echo "PGC v8 must train only the action-chunk Proposal." >&2
+    exit 1
+  fi
+  "${PYTHON_BIN}" - \
+    "${CLOSED_LOOP_CORRECTIVE_WEIGHT}" \
+    "${OFFLINE_ACQUISITION_WEIGHT}" \
+    "${NATIVE_GUARD_WEIGHT}" <<'PY'
+import sys
+
+values = [float(value) for value in sys.argv[1:]]
+if any(value < 0 for value in values):
+    raise SystemExit("PGC v8 corrective, offline, and native weights must be non-negative")
+if values[0] <= 0:
+    raise SystemExit("PGC v8 closed-loop corrective weight must be positive")
+PY
+fi
 if [[ "${PGC_VERSION}" == "7" ]]; then
   "${PYTHON_BIN}" - \
     "${TARGET_BINDING_VISUAL_ASPECT_RATIO}" \
@@ -417,6 +458,87 @@ print(json.dumps(paths, separators=(",", ":")))
 PY
 )"
 
+CLOSED_LOOP_JSON="[]"
+if [[ "${PGC_VERSION}" == "8" ]]; then
+  CLOSED_LOOP_JSON="$(${PYTHON_BIN} - \
+    "${CLOSED_LOOP_CORRECTIVE_LIST}" \
+    "${NATIVE_JSON}" \
+    "${CF_JSON}" \
+    "${TRAIN_SUITE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from fastwam.datasets.pgc_libero import load_pgc_closed_loop_corrective_index
+
+list_path = Path(sys.argv[1]).expanduser().resolve()
+native = {str(Path(path).resolve()) for path in json.loads(sys.argv[2])}
+offline_paths = [Path(path).resolve() for path in json.loads(sys.argv[3])]
+offline = {str(path) for path in offline_paths}
+scope = sys.argv[4]
+expected_suites = {scope} if scope != "all" else {
+    "libero_spatial", "libero_object", "libero_goal", "libero_10"
+}
+expected_pairs = set()
+for path in offline_paths:
+    provenance = json.loads(
+        (path / "meta/pgc_provenance.json").read_text(encoding="utf-8")
+    )
+    expected_pairs.update(
+        str(pair["pair_id"]) for pair in provenance.get("pairs") or []
+    )
+
+paths = []
+covered_suites = set()
+covered_pairs = set()
+for raw in list_path.read_text(encoding="utf-8").splitlines():
+    raw = raw.strip()
+    if not raw or raw.startswith("#"):
+        continue
+    path = Path(raw).expanduser()
+    path = (list_path.parent / path).resolve() if not path.is_absolute() else path.resolve()
+    if str(path) in native or str(path) in offline:
+        raise SystemExit(f"PGC v8 corrective dataset duplicates another split: {path}")
+    for required in ("meta/info.json", "meta/tasks.jsonl", "meta/episodes.jsonl", "meta/pgc_provenance.json"):
+        if not (path / required).is_file():
+            raise SystemExit(f"Incomplete PGC v8 corrective dataset {path}: missing {required}")
+    provenance = json.loads(
+        (path / "meta/pgc_provenance.json").read_text(encoding="utf-8")
+    )
+    suites = {str(item) for item in provenance.get("source_suites", [])}
+    if not suites or not suites.issubset(expected_suites):
+        raise SystemExit(
+            f"PGC v8 dataset {path} leaks suites {sorted(suites)} "
+            f"outside {sorted(expected_suites)}"
+        )
+    index = load_pgc_closed_loop_corrective_index(path)
+    covered_suites.update(suites)
+    covered_pairs.update(str(record["pair_id"]) for record in index.values())
+    paths.append(str(path))
+if not paths or len(set(paths)) != len(paths):
+    raise SystemExit("PGC v8 corrective list is empty or contains duplicates")
+if covered_suites != expected_suites:
+    raise SystemExit(
+        f"PGC v8 suite coverage mismatch: {sorted(covered_suites)} != {sorted(expected_suites)}"
+    )
+missing_pairs = sorted(expected_pairs - covered_pairs)
+unknown_pairs = sorted(covered_pairs - expected_pairs)
+if unknown_pairs:
+    raise SystemExit(
+        "PGC v8 corrective data contains pairs outside the offline PGC set: "
+        + ", ".join(unknown_pairs)
+    )
+if missing_pairs:
+    print(
+        "PGC v8: no failed closed-loop captures for pairs; keeping their V5 "
+        "offline anchors only: " + ", ".join(missing_pairs),
+        file=sys.stderr,
+    )
+print(json.dumps(paths, separators=(",", ":")))
+PY
+  )"
+fi
+
 TARGET_MASK_REQUIRED=false
 if [[ "${PGC_VERSION}" == "7" ]]; then
   TARGET_MASK_REQUIRED=true
@@ -471,6 +593,7 @@ if payload.get("format") in {
     "fastwam_policy_guard_v5",
     "fastwam_policy_guard_v6",
     "fastwam_policy_guard_v7",
+    "fastwam_policy_guard_v8",
 }:
     raise SystemExit("PGC base must be the immutable full FastWAM release, not an adapter")
 print(f"Validated protected base: format={payload.get('format', 'legacy_full')} tensors={len(payload['mot'])}")
@@ -496,20 +619,20 @@ payload = torch.load(init_path, map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
 if payload.get("format") != "fastwam_policy_guard_v5":
     raise SystemExit(
-        "PGC target-binder warm start requires a PGC v5 checkpoint, got "
+        "PGC architecture warm start requires a PGC v5 checkpoint, got "
         f"{payload.get('format')!r}"
     )
 if metadata.get("architecture") != "pgc_fastwam" or int(
     metadata.get("policy_guard_version", -1)
 ) != 5:
-    raise SystemExit("PGC target-binder warm start lacks valid PGC v5 metadata")
+    raise SystemExit("PGC architecture warm start lacks valid PGC v5 metadata")
 if (
     metadata.get("counterfactual_tuning")
     != "paired_language_prefix_aligned_action_residual"
     or metadata.get("policy_protection")
     != "single_immutable_base_plus_conservative_hard_gate"
 ):
-    raise SystemExit("PGC target-binder warm start lacks the protected V5 contract")
+    raise SystemExit("PGC architecture warm start lacks the protected V5 contract")
 if any(
     key in payload
     for key in (
@@ -518,24 +641,24 @@ if any(
         "counterfactual_lora_config",
     )
 ):
-    raise SystemExit("PGC target-binder warm start contains forbidden policy tensors")
+    raise SystemExit("PGC architecture warm start contains forbidden policy tensors")
 if not isinstance(payload.get("policy_guard"), dict) or not payload["policy_guard"]:
-    raise SystemExit("PGC target-binder warm start has no V5 sidecar tensors")
+    raise SystemExit("PGC architecture warm start has no V5 sidecar tensors")
 recorded_base = Path(str(payload.get("base_checkpoint", ""))).expanduser()
 if not recorded_base.is_absolute():
     recorded_base = init_path.parent / recorded_base
 recorded_base = recorded_base.resolve()
 if recorded_base != base_path:
     raise SystemExit(
-        "PGC target-binder warm-start base mismatch: "
+        "PGC architecture warm-start base mismatch: "
         f"checkpoint={recorded_base} requested={base_path}"
     )
 if int(metadata.get("rollout_num_inference_steps", -1)) != expected_rollout_steps:
-    raise SystemExit("PGC target-binder warm start rollout-step mismatch")
+    raise SystemExit("PGC architecture warm start rollout-step mismatch")
 if int(metadata.get("execution_prefix_steps", -1)) != expected_execution_prefix:
-    raise SystemExit("PGC target-binder warm start execution-prefix mismatch")
+    raise SystemExit("PGC architecture warm start execution-prefix mismatch")
 print(
-    "Validated PGC v5 target-binder warm start: "
+    "Validated PGC v5 architecture warm start: "
     f"step={payload.get('step')} base={base_path}"
 )
 PY
@@ -937,14 +1060,18 @@ elif [[ "$(cd -- "$(dirname -- "${INIT_CHECKPOINT}")" && pwd -P)/$(basename -- "
   exit 1
 fi
 
-MISSING_CACHE_COUNT="$(${PYTHON_BIN} - "${NATIVE_JSON}" "${CF_JSON}" "${CACHE_DIR}" <<'PY'
+MISSING_CACHE_COUNT="$(${PYTHON_BIN} - "${NATIVE_JSON}" "${CF_JSON}" "${CLOSED_LOOP_JSON}" "${CACHE_DIR}" <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
 
-dataset_dirs = json.loads(sys.argv[1]) + json.loads(sys.argv[2])
-cache_dir = Path(sys.argv[3])
+dataset_dirs = (
+    json.loads(sys.argv[1])
+    + json.loads(sys.argv[2])
+    + json.loads(sys.argv[3])
+)
+cache_dir = Path(sys.argv[4])
 template = "A video recorded from a robot's point of view executing the following instruction: {task}"
 tasks = set()
 for dataset_dir in dataset_dirs:
@@ -989,6 +1116,7 @@ echo "  protected_base=${BASE_CHECKPOINT}"
 echo "  initialization_checkpoint=${INIT_CHECKPOINT} weight_only_start_step=${WEIGHT_ONLY_START_STEP}"
 echo "  native_datasets=${NATIVE_JSON}"
 echo "  direct_counterfactual_datasets=${CF_JSON}"
+echo "  closed_loop_corrective_datasets=${CLOSED_LOOP_JSON}"
 echo "  counterfactual_oversample=${OVERSAMPLE_FACTOR} balanced_1to1=${BALANCE_NATIVE_COUNTERFACTUAL}"
 echo "  seed=${TRAIN_SEED} max_steps=${MAX_STEPS} lr=${LEARNING_RATE}"
 if [[ "${PGC_VERSION}" == "2" ]]; then
@@ -1017,6 +1145,9 @@ else
     echo "  target_binding=explicit-current-frame-element-masks target:${TARGET_MASK_WEIGHT} source:${SOURCE_MASK_WEIGHT} aux:${AUX_MASK_WEIGHT} mass:${MASK_MASS_WEIGHT} cross_object:${CROSS_OBJECT_WEIGHT}/${CROSS_OBJECT_MARGIN}"
     echo "  object_tokens=count:${TARGET_BINDING_NUM_OBJECT_TOKENS} cameras:${TARGET_BINDING_CAMERA_COUNT} aspect_ratio:${TARGET_BINDING_VISUAL_ASPECT_RATIO} hidden:${TARGET_BINDING_HIDDEN_DIM} heads:${TARGET_BINDING_NUM_HEADS} temperature:${TARGET_BINDING_TEMPERATURE}"
     echo "  target_binding_schedule=binding_only_through:${TARGET_BINDING_ACTION_START_STEP} action_ramp:${TARGET_BINDING_ACTION_RAMP_STEPS} verifier_start:${VERIFIER_START_STEP} warm_start_v5:${WARM_START_V5}"
+  elif [[ "${PGC_VERSION}" == "8" ]]; then
+    echo "  closed_loop_acquisition=oversample:${CLOSED_LOOP_OVERSAMPLE_FACTOR} corrective_weight:${CLOSED_LOOP_CORRECTIVE_WEIGHT} offline_weight:${OFFLINE_ACQUISITION_WEIGHT} native_guard:${NATIVE_GUARD_WEIGHT}"
+    echo "  protected_sidecars=base+v5_goal_graph+v5_verifier frozen proposal_only:${CLOSED_LOOP_TRAIN_PROPOSAL_ONLY} warm_start_v5:${WARM_START_V5}"
   fi
   echo "  verifier_schedule=start:${VERIFIER_START_STEP} ramp:${VERIFIER_RAMP_STEPS}"
   LORA_ENABLED=false
@@ -1029,7 +1160,9 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "weight_only_start_step=${WEIGHT_ONLY_START_STEP}" \
   "data.train.dataset_dirs=${NATIVE_JSON}" \
   "data.train.pgc_counterfactual_dataset_dirs=${CF_JSON}" \
+  "data.train.pgc_closed_loop_corrective_dataset_dirs=${CLOSED_LOOP_JSON}" \
   "data.train.pgc_counterfactual_oversample_factor=${OVERSAMPLE_FACTOR}" \
+  "data.train.pgc_closed_loop_corrective_oversample_factor=${CLOSED_LOOP_OVERSAMPLE_FACTOR}" \
   "data.train.pgc_balance_native_counterfactual=${BALANCE_NATIVE_COUNTERFACTUAL}" \
   "data.train.pgc_target_mask_supervision_required=${TARGET_MASK_REQUIRED}" \
   "data.train.pgc_completion_phase_supervision_required=${COMPLETION_PHASE_REQUIRED}" \
@@ -1068,6 +1201,12 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.completion_transport_weight=${COMPLETION_TRANSPORT_WEIGHT}" \
   "model.policy_guard.completion_release_weight=${COMPLETION_RELEASE_WEIGHT}" \
   "model.policy_guard.completion_train_proposal_only=${COMPLETION_TRAIN_PROPOSAL_ONLY}" \
+  "model.policy_guard.closed_loop_corrective_enabled=${CLOSED_LOOP_ENABLED}" \
+  "model.policy_guard.closed_loop_corrective_weight=${CLOSED_LOOP_CORRECTIVE_WEIGHT}" \
+  "model.policy_guard.offline_acquisition_weight=${OFFLINE_ACQUISITION_WEIGHT}" \
+  "model.policy_guard.native_guard_weight=${NATIVE_GUARD_WEIGHT}" \
+  model.policy_guard.acquisition_only=true \
+  "model.policy_guard.closed_loop_train_proposal_only=${CLOSED_LOOP_TRAIN_PROPOSAL_ONLY}" \
   "model.policy_guard.same_state_source_zero_weight=${SAME_STATE_SOURCE_ZERO_WEIGHT}" \
   "model.policy_guard.goal_separation_weight=${GOAL_SEPARATION_WEIGHT}" \
   "model.policy_guard.goal_separation_margin=${GOAL_SEPARATION_MARGIN}" \

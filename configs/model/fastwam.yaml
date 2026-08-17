@@ -202,6 +202,16 @@ policy_guard:
   completion_transport_weight: 2.0
   completion_release_weight: 3.0
   completion_train_proposal_only: true
+  # PGC v8: train the V5 action-chunk Proposal on exact states captured from
+  # failed/weak closed-loop rollouts. Corrective trajectories are admitted only
+  # after replay from that state lifts the requested target. The released Base,
+  # V5 language encoder, and Verifier stay frozen.
+  closed_loop_corrective_enabled: false
+  closed_loop_corrective_weight: 2.0
+  offline_acquisition_weight: 1.0
+  native_guard_weight: 0.10
+  acquisition_only: true
+  closed_loop_train_proposal_only: true
   # On every audited CF state, source language must reproduce exact Base while
   # counterfactual language must produce the demonstrated successful residual.
   same_state_source_zero_weight: 1.0

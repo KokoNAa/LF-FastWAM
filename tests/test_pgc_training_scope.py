@@ -124,7 +124,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('2|3|4|5|6|7', source)
-        self.assertIn("PGC v5 target-binder warm start", source)
+        self.assertIn("PGC v5 architecture warm start", source)
         self.assertIn(
             "model.policy_guard.target_binding_interaction_weight=", source
         )

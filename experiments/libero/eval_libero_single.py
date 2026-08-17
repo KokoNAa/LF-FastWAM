@@ -47,6 +47,7 @@ from experiments.libero.language_interventions import (
     validate_counterfactual_problem,
 )
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
+from fastwam.datasets.pgc_libero import state_sha256 as _canonical_state_sha256
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
@@ -737,6 +738,108 @@ def _resolve_max_steps(cfg: DictConfig) -> int:
     return max_steps
 
 
+def _capture_libero_sim_state(env: Any) -> np.ndarray:
+    """Return the exact flattened simulator state used by LIBERO reset APIs."""
+    inner = getattr(env, "env", None)
+    sim = None if inner is None else getattr(inner, "sim", None)
+    if sim is None or not hasattr(sim, "get_state"):
+        raise RuntimeError(
+            "PGC closed-loop capture requires env.env.sim.get_state()."
+        )
+    state = sim.get_state()
+    if hasattr(state, "flatten"):
+        state = state.flatten()
+    return np.asarray(state).copy()
+
+
+def _state_sha256(state: np.ndarray) -> str:
+    return _canonical_state_sha256(state)
+
+
+def _write_closed_loop_capture_records(
+    *,
+    cfg: DictConfig,
+    episode_idx: int,
+    initial_state: np.ndarray,
+    task_description: str,
+    policy_instruction: str,
+    counterfactual_metadata: dict[str, Any],
+    counterfactual_diagnostics: dict[str, Any],
+    captured_states: list[dict[str, Any]],
+) -> int:
+    """Persist failed pre-grasp rollout states without cross-worker writes."""
+    capture_root_value = cfg.EVALUATION.get("closed_loop_capture_dir")
+    if capture_root_value in (None, "", "null") or not captured_states:
+        return 0
+    target_objects = set(
+        counterfactual_diagnostics["counterfactual_target_objects"]
+    )
+    lifted_objects = set(counterfactual_diagnostics["lifted_objects"])
+    if target_objects & lifted_objects:
+        # V8 first repairs target acquisition. States from episodes that already
+        # lifted the requested target belong to a later completion stage.
+        return 0
+
+    suite_name = str(cfg.EVALUATION.task_suite_name)
+    task_id = int(cfg.EVALUATION.task_id)
+    trial_dir = (
+        Path(str(capture_root_value)).expanduser().resolve()
+        / suite_name
+        / f"task_{task_id:02d}"
+        / f"trial_{episode_idx:03d}"
+    )
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    initial_state = np.asarray(initial_state).copy()
+    written = 0
+    for item in captured_states:
+        replan_index = int(item["replan_index"])
+        capture_id = (
+            f"{suite_name}_task{task_id:02d}_trial{episode_idx:03d}_"
+            f"replan{replan_index:04d}"
+        )
+        state = np.asarray(item["state"]).copy()
+        state_path = trial_dir / f"{capture_id}.npz"
+        np.savez_compressed(
+            state_path,
+            simulator_state=state,
+            source_initial_state=initial_state,
+        )
+        record = {
+            "format": "pgc_libero_closed_loop_capture_v1",
+            "capture_id": capture_id,
+            "state_file": state_path.name,
+            "capture_state_sha256": _state_sha256(state),
+            "source_initial_state_sha256": _state_sha256(initial_state),
+            "task_suite_name": suite_name,
+            "task_id": task_id,
+            "trial_index": int(episode_idx),
+            "replan_index": replan_index,
+            "policy_step": int(item["policy_step"]),
+            "pair_id": str(counterfactual_metadata.get("pair_id", "")),
+            "correct_instruction": str(task_description),
+            "counterfactual_instruction": str(policy_instruction),
+            "source_goal_state": counterfactual_metadata["source_goal_state"],
+            "counterfactual_goal_state": counterfactual_metadata[
+                "counterfactual_goal_state"
+            ],
+            "episode_category": str(counterfactual_diagnostics["category"]),
+            "target_objects": sorted(target_objects),
+            "grasped_objects": counterfactual_diagnostics["grasped_objects"],
+            "lifted_objects": counterfactual_diagnostics["lifted_objects"],
+            "checkpoint": str(cfg.ckpt),
+            "seed": None if cfg.get("seed") is None else int(cfg.seed),
+        }
+        record_path = trial_dir / f"{capture_id}.json"
+        temporary_path = record_path.with_suffix(".json.tmp")
+        temporary_path.write_text(
+            json.dumps(record, indent=2, cls=NumpyEncoder) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, record_path)
+        written += 1
+    return written
+
+
 def run_single_episode(
     env,
     initial_state,
@@ -802,6 +905,25 @@ def run_single_episode(
     current_replan_idx = -1
     inference_latencies_ms: list[float] = []
     policy_guard_decisions: list[dict[str, Any]] = []
+    closed_loop_capture_enabled = cfg.EVALUATION.get(
+        "closed_loop_capture_dir"
+    ) not in (None, "", "null")
+    capture_stride_replans = int(
+        cfg.EVALUATION.get("closed_loop_capture_stride_replans", 1)
+    )
+    capture_max_states = int(
+        cfg.EVALUATION.get("closed_loop_capture_max_states_per_episode", 12)
+    )
+    if capture_stride_replans <= 0 or capture_max_states <= 0:
+        raise ValueError(
+            "PGC closed-loop capture stride/max states must be positive."
+        )
+    if closed_loop_capture_enabled and counterfactual_tracker is None:
+        raise ValueError(
+            "PGC closed-loop capture requires counterfactual diagnostics."
+        )
+    captured_states: list[dict[str, Any]] = []
+    inference_replan_index = -1
 
     t = 0
     policy_steps_executed = 0
@@ -815,6 +937,30 @@ def run_single_episode(
             continue
 
         if len(pending_actions) == 0:
+            inference_replan_index += 1
+            capture_before_interaction = True
+            if counterfactual_tracker is not None:
+                targets = counterfactual_tracker.counterfactual_target_objects
+                capture_before_interaction = not bool(
+                    targets
+                    & (
+                        counterfactual_tracker.grasped_objects
+                        | counterfactual_tracker.lifted_objects
+                    )
+                )
+            if (
+                closed_loop_capture_enabled
+                and capture_before_interaction
+                and inference_replan_index % capture_stride_replans == 0
+                and len(captured_states) < capture_max_states
+            ):
+                captured_states.append(
+                    {
+                        "replan_index": inference_replan_index,
+                        "policy_step": policy_steps_executed,
+                        "state": _capture_libero_sim_state(env),
+                    }
+                )
             (
                 action_chunk,
                 imgs,
@@ -930,6 +1076,24 @@ def run_single_episode(
         if counterfactual_tracker is None
         else counterfactual_tracker.result(episode_idx=episode_idx)
     )
+    if closed_loop_capture_enabled:
+        if counterfactual_diagnostics is None or counterfactual_metadata is None:
+            raise RuntimeError(
+                "PGC closed-loop capture finished without counterfactual metadata."
+            )
+        capture_count = _write_closed_loop_capture_records(
+            cfg=cfg,
+            episode_idx=episode_idx,
+            initial_state=np.asarray(initial_state),
+            task_description=task_description,
+            policy_instruction=policy_instruction,
+            counterfactual_metadata=counterfactual_metadata,
+            counterfactual_diagnostics=counterfactual_diagnostics,
+            captured_states=captured_states,
+        )
+        counterfactual_diagnostics["closed_loop_capture_count"] = int(
+            capture_count
+        )
     return (
         bool(done),
         replay_images,
@@ -983,6 +1147,14 @@ def run_single_task(
             "EVALUATION.counterfactual_diagnostics=true requires "
             "instruction_condition=counterfactual."
         )
+    closed_loop_capture_enabled = cfg.EVALUATION.get(
+        "closed_loop_capture_dir"
+    ) not in (None, "", "null")
+    if closed_loop_capture_enabled and not counterfactual_diagnostics_enabled:
+        raise ValueError(
+            "EVALUATION.closed_loop_capture_dir requires "
+            "counterfactual_diagnostics=true."
+        )
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     results = {
         "successes": 0,
@@ -1002,6 +1174,7 @@ def run_single_task(
             "counterfactual" if instruction_condition == "counterfactual" else "source"
         ),
         "policy_guard_episode_diagnostics": [],
+        "closed_loop_capture_count": 0,
     }
     if intervention_record is not None:
         results["pair_id"] = intervention_record.get("pair_id")
@@ -1079,6 +1252,11 @@ def run_single_task(
             )
             results["counterfactual_episode_diagnostics"].append(
                 counterfactual_diagnostics
+            )
+            results["closed_loop_capture_count"] += int(
+                counterfactual_diagnostics.get(
+                    "closed_loop_capture_count", 0
+                )
             )
             category = str(counterfactual_diagnostics["category"])
             results["counterfactual_behavior_counts"][category] += 1

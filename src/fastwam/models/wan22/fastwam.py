@@ -653,6 +653,24 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_completion_train_proposal_only = bool(
             guard_config.get("completion_train_proposal_only", True)
         )
+        self.policy_guard_closed_loop_corrective_enabled = bool(
+            guard_config.get("closed_loop_corrective_enabled", False)
+        )
+        self.policy_guard_closed_loop_corrective_weight = float(
+            guard_config.get("closed_loop_corrective_weight", 2.0)
+        )
+        self.policy_guard_offline_acquisition_weight = float(
+            guard_config.get("offline_acquisition_weight", 1.0)
+        )
+        self.policy_guard_native_guard_weight = float(
+            guard_config.get("native_guard_weight", 0.10)
+        )
+        self.policy_guard_acquisition_only = bool(
+            guard_config.get("acquisition_only", True)
+        )
+        self.policy_guard_closed_loop_train_proposal_only = bool(
+            guard_config.get("closed_loop_train_proposal_only", True)
+        )
         self.policy_guard_same_state_source_zero_weight = float(
             guard_config.get("same_state_source_zero_weight", 1.0)
         )
@@ -795,10 +813,10 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_legacy_full_loaded = False
 
         if self.policy_guard_enabled:
-            if self.policy_guard_version not in {1, 2, 3, 4, 5, 6, 7}:
+            if self.policy_guard_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
                 raise ValueError(
                     "The current PGC implementation supports version=1, 2, "
-                    "3, 4, 5, 6, or 7."
+                    "3, 4, 5, 6, 7, or 8."
                 )
             if self.langforce_mvp_enabled or self.transition_contract_enabled:
                 raise ValueError(
@@ -851,6 +869,9 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_mask_mass_weight,
                 self.policy_guard_cross_object_weight,
                 self.policy_guard_cross_object_margin,
+                self.policy_guard_closed_loop_corrective_weight,
+                self.policy_guard_offline_acquisition_weight,
+                self.policy_guard_native_guard_weight,
             ) < 0:
                 raise ValueError("PGC weights, margins, and thresholds must be non-negative.")
             if self.policy_guard_execution_prefix_steps <= 0:
@@ -868,7 +889,20 @@ class FastWAM(torch.nn.Module):
                     raise ValueError(
                         "PGC completion transport/release weights must be >= 1."
                     )
-            if self.policy_guard_version >= 6:
+            if self.policy_guard_closed_loop_corrective_enabled:
+                if self.policy_guard_version != 8:
+                    raise ValueError(
+                        "Closed-loop corrective supervision is restricted to PGC v8."
+                    )
+                if not self.policy_guard_acquisition_only:
+                    raise ValueError(
+                        "PGC v8 currently requires acquisition_only=true."
+                    )
+            elif self.policy_guard_version == 8:
+                raise ValueError(
+                    "PGC v8 requires closed_loop_corrective_enabled=true."
+                )
+            if self.policy_guard_version in {6, 7}:
                 if (
                     self.policy_guard_target_binding_action_start_step < 0
                     or self.policy_guard_target_binding_action_ramp_steps < 0
@@ -1117,7 +1151,7 @@ class FastWAM(torch.nn.Module):
                             ),
                         )
                     )
-                    if self.policy_guard_version >= 6:
+                    if self.policy_guard_version in {6, 7}:
                         binder_kwargs = {
                             "text_dim": self.text_dim,
                             "video_dim": int(self.video_expert.hidden_dim),
@@ -1207,11 +1241,16 @@ class FastWAM(torch.nn.Module):
         """Delay v3 verifier/alignment until the action residual is useful."""
         if self.policy_guard_version < 3:
             return 1.0
+        if (
+            self.policy_guard_version == 8
+            and self.policy_guard_closed_loop_train_proposal_only
+        ):
+            return 0.0
         if not self._policy_guard_training_progress_active:
             return 1.0
         step = self._policy_guard_training_step
         start = self.policy_guard_verifier_start_step
-        if self.policy_guard_version >= 6:
+        if self.policy_guard_version in {6, 7}:
             # V6/V7 are deliberately staged: first learn the visual target map,
             # then let that map shape the Proposal, and only then fit the
             # moving candidate Verifier.  Taking the maximum also protects a
@@ -1235,7 +1274,7 @@ class FastWAM(torch.nn.Module):
 
     def _policy_guard_target_binding_action_scale(self) -> float:
         """Keep V5 action sidecars frozen while V6 first learns its target map."""
-        if self.policy_guard_version < 6:
+        if self.policy_guard_version not in {6, 7}:
             return 1.0
         if not self._policy_guard_training_progress_active:
             return 1.0
@@ -1467,7 +1506,20 @@ class FastWAM(torch.nn.Module):
                         else:
                             module.eval()
                             module.requires_grad_(False)
-                if self.policy_guard_version >= 6:
+                if (
+                    self.policy_guard_version == 8
+                    and self.policy_guard_closed_loop_train_proposal_only
+                ):
+                    # V8 repairs the deployed V5 candidate only. The released
+                    # Base plus V5 language and gate sidecars remain immutable.
+                    for name, module in self.policy_guard_modules.items():
+                        if name == "action_chunk_proposal":
+                            module.train()
+                            module.requires_grad_(True)
+                        else:
+                            module.eval()
+                            module.requires_grad_(False)
+                if self.policy_guard_version in {6, 7}:
                     # V6/V7 have no deployment edge through the legacy Goal Graph.
                     # Keep it only for checkpoint migration/history, but exclude
                     # it from the optimizer so language cannot regain a direct
@@ -1850,7 +1902,7 @@ class FastWAM(torch.nn.Module):
         )
         if current_token_count <= 0:
             raise ValueError("PGC requires at least one current visual token.")
-        if self.policy_guard_version >= 6:
+        if self.policy_guard_version in {6, 7}:
             if current_visual_hidden is None:
                 raise ValueError(
                     "PGC v6/v7 requires language-neutral current visual tokens."
@@ -1910,7 +1962,10 @@ class FastWAM(torch.nn.Module):
         torch.Tensor,
         dict[str, torch.Tensor],
     ]:
-        if not self.policy_guard_enabled or self.policy_guard_version < 6:
+        if (
+            not self.policy_guard_enabled
+            or self.policy_guard_version not in {6, 7}
+        ):
             raise RuntimeError("Visual target binding requires PGC v6/v7.")
         current_token_count = min(
             int(video_tokens_per_frame), int(current_visual_hidden.shape[1])
@@ -2774,6 +2829,7 @@ class FastWAM(torch.nn.Module):
         is_counterfactual: torch.Tensor,
         direct_action_valid: torch.Tensor,
         paired_language_valid: torch.Tensor,
+        is_closed_loop_corrective: Optional[torch.Tensor] = None,
         completion_phase: Optional[torch.Tensor] = None,
         completion_phase_valid: Optional[torch.Tensor] = None,
     ) -> tuple[
@@ -2787,9 +2843,9 @@ class FastWAM(torch.nn.Module):
         dict[str, torch.Tensor],
     ]:
         """PGC v5 paired-language and execution-prefix proposal objectives."""
-        if self.policy_guard_version not in {5, 6, 7}:
+        if self.policy_guard_version not in {5, 6, 7, 8}:
             raise RuntimeError(
-                "PGC paired action losses require version 5, 6, or 7."
+                "PGC paired action losses require version 5, 6, 7, or 8."
             )
         if not (
             proposed_action.shape
@@ -2820,6 +2876,42 @@ class FastWAM(torch.nn.Module):
         native_valid = direct_action_valid & ~is_counterfactual
         counterfactual_valid = direct_action_valid & is_counterfactual
         paired_valid = counterfactual_valid & paired_language_valid
+        closed_loop_valid = torch.zeros_like(counterfactual_valid)
+        offline_counterfactual_valid = counterfactual_valid
+        acquisition_sample_weight = torch.ones_like(
+            proposed_action[:, 0, 0], dtype=torch.float32
+        )
+        if self.policy_guard_version == 8:
+            if is_closed_loop_corrective is None:
+                raise ValueError(
+                    "PGC v8 action loss requires closed-loop provenance."
+                )
+            is_closed_loop_corrective = is_closed_loop_corrective.to(
+                device=proposed_action.device, dtype=torch.bool
+            )
+            if is_closed_loop_corrective.shape != is_counterfactual.shape:
+                raise ValueError(
+                    "PGC v8 closed-loop provenance must share [B] shape."
+                )
+            if bool((is_closed_loop_corrective & ~is_counterfactual).any()):
+                raise ValueError(
+                    "PGC v8 corrective samples must be counterfactual samples."
+                )
+            closed_loop_valid = (
+                counterfactual_valid & is_closed_loop_corrective
+            )
+            offline_counterfactual_valid = (
+                counterfactual_valid & ~is_closed_loop_corrective
+            )
+            acquisition_sample_weight = torch.where(
+                is_closed_loop_corrective,
+                acquisition_sample_weight.new_tensor(
+                    self.policy_guard_closed_loop_corrective_weight
+                ),
+                acquisition_sample_weight.new_tensor(
+                    self.policy_guard_offline_acquisition_weight
+                ),
+            )
 
         dimension_weight = self._policy_guard_v4_dimension_weight(
             proposed_action
@@ -2889,7 +2981,9 @@ class FastWAM(torch.nn.Module):
         # that would cancel the intended stronger gradient on rare completion
         # states. Native and pre-grasp samples retain their original scale.
         counterfactual_action_loss = self._masked_policy_guard_mean(
-            proposal_error * completion_sample_weight,
+            proposal_error
+            * completion_sample_weight
+            * acquisition_sample_weight,
             counterfactual_valid,
         )
         native_zero_loss = self._masked_policy_guard_mean(
@@ -3028,6 +3122,33 @@ class FastWAM(torch.nn.Module):
             "pgc_v5_completion_sample_weight": self._masked_policy_guard_mean(
                 completion_sample_weight, counterfactual_valid
             ).detach(),
+            "pgc_v8_closed_loop_fraction": closed_loop_valid.float().mean(),
+            "pgc_v8_offline_counterfactual_fraction": (
+                offline_counterfactual_valid.float().mean()
+            ),
+            "pgc_v8_closed_loop_action_loss": self._masked_policy_guard_mean(
+                proposal_error, closed_loop_valid
+            ).detach(),
+            "pgc_v8_offline_action_loss": self._masked_policy_guard_mean(
+                proposal_error, offline_counterfactual_valid
+            ).detach(),
+            "pgc_v8_closed_loop_prefix_mse_improvement": (
+                self._masked_policy_guard_mean(
+                    prefix_base_mse - prefix_proposal_mse,
+                    closed_loop_valid,
+                ).detach()
+            ),
+            "pgc_v8_offline_prefix_mse_improvement": (
+                self._masked_policy_guard_mean(
+                    prefix_base_mse - prefix_proposal_mse,
+                    offline_counterfactual_valid,
+                ).detach()
+            ),
+            "pgc_v8_acquisition_sample_weight": (
+                self._masked_policy_guard_mean(
+                    acquisition_sample_weight, counterfactual_valid
+                ).detach()
+            ),
         }
         return (
             counterfactual_action_loss,
@@ -3056,9 +3177,9 @@ class FastWAM(torch.nn.Module):
         goal_ids: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Train v5 on the deployed proposal plus wrong-language/bad negatives."""
-        if self.policy_guard_version not in {5, 6, 7}:
+        if self.policy_guard_version not in {5, 6, 7, 8}:
             raise RuntimeError(
-                "PGC paired verifier loss requires version 5, 6, or 7."
+                "PGC paired verifier loss requires version 5, 6, 7, or 8."
             )
         prefix = min(
             self.policy_guard_execution_prefix_steps,
@@ -4001,9 +4122,9 @@ class FastWAM(torch.nn.Module):
         state_only_context_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Train a language-identifiable, prefix-aligned protected proposal."""
-        if self.policy_guard_version not in {5, 6, 7}:
+        if self.policy_guard_version not in {5, 6, 7, 8}:
             raise RuntimeError(
-                "Paired-language training requires PGC v5/v6/v7."
+                "Paired-language training requires PGC v5/v6/v7/v8."
             )
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
@@ -4351,6 +4472,9 @@ class FastWAM(torch.nn.Module):
             is_counterfactual=is_counterfactual,
             direct_action_valid=direct_action_valid,
             paired_language_valid=paired_language_valid,
+            is_closed_loop_corrective=inputs.get(
+                "pgc_is_closed_loop_corrective"
+            ),
             completion_phase=inputs.get("pgc_completion_phase"),
             completion_phase_valid=inputs.get("pgc_completion_phase_valid"),
         )
@@ -4412,7 +4536,13 @@ class FastWAM(torch.nn.Module):
         )
         action_objective = (
             self.policy_guard_action_weight * counterfactual_action_loss
-            + self.policy_guard_native_distillation_weight * native_zero_loss
+            + self.policy_guard_native_distillation_weight
+            * (
+                self.policy_guard_native_guard_weight
+                if self.policy_guard_version == 8
+                else 1.0
+            )
+            * native_zero_loss
             + self.policy_guard_same_state_source_zero_weight
             * same_state_source_zero_loss
             + self.policy_guard_goal_separation_weight * goal_separation_loss
@@ -4520,6 +4650,11 @@ class FastWAM(torch.nn.Module):
             "pgc_native_distillation_effective_weight": (
                 action_training_scale
                 * self.policy_guard_native_distillation_weight
+                * (
+                    self.policy_guard_native_guard_weight
+                    if self.policy_guard_version == 8
+                    else 1.0
+                )
             ),
             "pgc_v5_source_zero_effective_weight": (
                 action_training_scale
@@ -4595,6 +4730,26 @@ class FastWAM(torch.nn.Module):
             ),
             "pgc_v5_rollout_num_inference_steps": float(
                 self.policy_guard_rollout_num_inference_steps
+            ),
+            "pgc_v8_enabled": float(self.policy_guard_version == 8),
+            "pgc_v8_closed_loop_corrective_weight": (
+                self.policy_guard_closed_loop_corrective_weight
+                if self.policy_guard_version == 8
+                else 0.0
+            ),
+            "pgc_v8_offline_acquisition_weight": (
+                self.policy_guard_offline_acquisition_weight
+                if self.policy_guard_version == 8
+                else 0.0
+            ),
+            "pgc_v8_native_guard_multiplier": (
+                self.policy_guard_native_guard_weight
+                if self.policy_guard_version == 8
+                else 1.0
+            ),
+            "pgc_v8_proposal_only": float(
+                self.policy_guard_version == 8
+                and self.policy_guard_closed_loop_train_proposal_only
             ),
             "pgc_base_policy_frozen": 1.0,
             "pgc_video_loss_optimization_weight": 0.0,
@@ -5565,6 +5720,9 @@ class FastWAM(torch.nn.Module):
         transition_task_id = sample.get("transition_task_id")
         counterfactual_task_id = sample.get("counterfactual_task_id")
         pgc_is_counterfactual = sample.get("pgc_is_counterfactual")
+        pgc_is_closed_loop_corrective = sample.get(
+            "pgc_is_closed_loop_corrective"
+        )
         pgc_direct_action_valid = sample.get("pgc_direct_action_valid")
         pgc_goal_id = sample.get("pgc_goal_id")
         pgc_source_context = sample.get("pgc_source_context")
@@ -5620,10 +5778,18 @@ class FastWAM(torch.nn.Module):
                 ]
                 if missing_v5:
                     raise ValueError(
-                        "PGC v5 requires same-state paired-language fields: "
+                        "PGC v5+ requires same-state paired-language fields: "
                         f"{missing_v5}. Recreate the dataset loader after "
                         "updating LF-FastWAM."
                     )
+            if (
+                self.policy_guard_version == 8
+                and pgc_is_closed_loop_corrective is None
+            ):
+                raise ValueError(
+                    "PGC v8 requires `pgc_is_closed_loop_corrective` from "
+                    "the audited mixed dataset."
+                )
             if self.policy_guard_completion_phase_enabled:
                 missing_completion = [
                     name
@@ -5891,6 +6057,26 @@ class FastWAM(torch.nn.Module):
                 pgc_is_counterfactual = pgc_is_counterfactual.expand(batch_size)
             if pgc_is_counterfactual.shape != (batch_size,):
                 raise ValueError("`pgc_is_counterfactual` must be [B].")
+        if pgc_is_closed_loop_corrective is not None:
+            pgc_is_closed_loop_corrective = torch.as_tensor(
+                pgc_is_closed_loop_corrective,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            if pgc_is_closed_loop_corrective.ndim == 0:
+                pgc_is_closed_loop_corrective = (
+                    pgc_is_closed_loop_corrective.expand(batch_size)
+                )
+            if pgc_is_closed_loop_corrective.shape != (batch_size,):
+                raise ValueError(
+                    "`pgc_is_closed_loop_corrective` must be [B]."
+                )
+            if pgc_is_counterfactual is not None and bool(
+                (pgc_is_closed_loop_corrective & ~pgc_is_counterfactual).any()
+            ):
+                raise ValueError(
+                    "PGC V8 corrective rows must also be counterfactual rows."
+                )
         if pgc_direct_action_valid is not None:
             pgc_direct_action_valid = torch.as_tensor(
                 pgc_direct_action_valid, device=self.device, dtype=torch.bool
@@ -6049,6 +6235,9 @@ class FastWAM(torch.nn.Module):
             "transition_task_id": transition_task_id,
             "counterfactual_task_id": counterfactual_task_id,
             "pgc_is_counterfactual": pgc_is_counterfactual,
+            "pgc_is_closed_loop_corrective": (
+                pgc_is_closed_loop_corrective
+            ),
             "pgc_direct_action_valid": pgc_direct_action_valid,
             "pgc_goal_id": pgc_goal_id,
             "pgc_source_context": pgc_source_context,
@@ -8054,7 +8243,7 @@ class FastWAM(torch.nn.Module):
                     .to(device="cpu", dtype=torch.float32)
                 ),
             }
-            if self.policy_guard_version >= 6:
+            if self.policy_guard_version in {6, 7}:
                 metric_prefix = (
                     "pgc_v7" if self.policy_guard_version == 7 else "pgc_v6"
                 )
@@ -8304,6 +8493,7 @@ class FastWAM(torch.nn.Module):
         is_v5 = self.policy_guard_version >= 5
         is_v6 = self.policy_guard_version == 6
         is_v7 = self.policy_guard_version == 7
+        is_v8 = self.policy_guard_version == 8
         uses_target_binder = is_v6 or is_v7
         residual_cap = None
         if is_v3:
@@ -8348,19 +8538,25 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "counterfactual_tuning": (
-                "object_token_mask_grounded_paired_action_residual"
-                if is_v7
+                "closed_loop_replay_verified_target_acquisition_residual"
+                if is_v8
                 else (
-                    "visual_target_bottleneck_paired_action_residual"
-                    if is_v6
+                    "object_token_mask_grounded_paired_action_residual"
+                    if is_v7
                     else (
-                        "paired_language_prefix_aligned_action_residual"
-                        if is_v5
+                        "visual_target_bottleneck_paired_action_residual"
+                        if is_v6
                         else (
-                            "rollout_aligned_final_action_residual"
-                            if is_v4
+                            "paired_language_prefix_aligned_action_residual"
+                            if is_v5
                             else (
-                                "bounded_velocity_residual" if is_v3 else "lora"
+                                "rollout_aligned_final_action_residual"
+                                if is_v4
+                                else (
+                                    "bounded_velocity_residual"
+                                    if is_v3
+                                    else "lora"
+                                )
                             )
                         )
                     )
@@ -8447,21 +8643,25 @@ class FastWAM(torch.nn.Module):
                 else "immutable_base_plus_conservative_hard_gate"
             ),
             "representation_supervision": (
-                "explicit_current_state_element_masks_and_cross_object_negatives"
-                if is_v7
+                "frozen_v5_language_plus_exact_closed_loop_state_corrective_actions"
+                if is_v8
                 else (
-                    "interaction_teacher_task_prototypes_same_state_hard_negatives"
-                    if is_v6
+                    "explicit_current_state_element_masks_and_cross_object_negatives"
+                    if is_v7
                     else (
-                        "same_state_paired_language_plus_prefix_action_and_hard_negatives"
-                        if is_v5
+                        "interaction_teacher_task_prototypes_same_state_hard_negatives"
+                        if is_v6
                         else (
-                            "rollout_aligned_direct_action_plus_goal_action_alignment"
-                            if is_v4
+                            "same_state_paired_language_plus_prefix_action_and_hard_negatives"
+                            if is_v5
                             else (
-                                "direct_residual_action_plus_goal_action_alignment"
-                                if is_v3
-                                else "direct_goal_action_alignment"
+                                "rollout_aligned_direct_action_plus_goal_action_alignment"
+                                if is_v4
+                                else (
+                                    "direct_residual_action_plus_goal_action_alignment"
+                                    if is_v3
+                                    else "direct_goal_action_alignment"
+                                )
                             )
                         )
                     )
@@ -8703,6 +8903,39 @@ class FastWAM(torch.nn.Module):
             ),
             "cross_object_margin": (
                 self.policy_guard_cross_object_margin if is_v7 else None
+            ),
+            "closed_loop_corrective_enabled": (
+                self.policy_guard_closed_loop_corrective_enabled
+                if is_v8
+                else None
+            ),
+            "closed_loop_corrective_format": (
+                "pgc_libero_closed_loop_corrective_v1" if is_v8 else None
+            ),
+            "closed_loop_corrective_weight": (
+                self.policy_guard_closed_loop_corrective_weight
+                if is_v8
+                else None
+            ),
+            "offline_acquisition_weight": (
+                self.policy_guard_offline_acquisition_weight
+                if is_v8
+                else None
+            ),
+            "native_guard_weight": (
+                self.policy_guard_native_guard_weight if is_v8 else None
+            ),
+            "acquisition_only": (
+                self.policy_guard_acquisition_only if is_v8 else None
+            ),
+            "closed_loop_trainable_scope": (
+                "action_chunk_proposal_only"
+                if is_v8
+                and self.policy_guard_closed_loop_train_proposal_only
+                else None
+            ),
+            "warm_start_contract": (
+                "exact_pgc_v5_sidecars" if is_v8 else None
             ),
         }
 
@@ -9143,9 +9376,14 @@ class FastWAM(torch.nn.Module):
             saved_policy_guard_version == 5
             and int(self.policy_guard_version) in {6, 7}
         )
+        migrate_v5_to_v8 = (
+            saved_policy_guard_version == 5
+            and int(self.policy_guard_version) == 8
+        )
         if (
             saved_policy_guard_version != int(self.policy_guard_version)
             and not migrate_v5_to_target_binder
+            and not migrate_v5_to_v8
         ):
             raise ValueError(
                 "PGC checkpoint version mismatch: "
@@ -9191,18 +9429,22 @@ class FastWAM(torch.nn.Module):
 
         if saved_policy_guard_version >= 3:
             expected_tuning = (
-                "object_token_mask_grounded_paired_action_residual"
-                if saved_policy_guard_version == 7
+                "closed_loop_replay_verified_target_acquisition_residual"
+                if saved_policy_guard_version == 8
                 else (
-                    "visual_target_bottleneck_paired_action_residual"
-                    if saved_policy_guard_version == 6
+                    "object_token_mask_grounded_paired_action_residual"
+                    if saved_policy_guard_version == 7
                     else (
-                        "paired_language_prefix_aligned_action_residual"
-                        if saved_policy_guard_version >= 5
+                        "visual_target_bottleneck_paired_action_residual"
+                        if saved_policy_guard_version == 6
                         else (
-                            "rollout_aligned_final_action_residual"
-                            if saved_policy_guard_version >= 4
-                            else "bounded_velocity_residual"
+                            "paired_language_prefix_aligned_action_residual"
+                            if saved_policy_guard_version >= 5
+                            else (
+                                "rollout_aligned_final_action_residual"
+                                if saved_policy_guard_version >= 4
+                                else "bounded_velocity_residual"
+                            )
                         )
                     )
                 )
@@ -9242,7 +9484,7 @@ class FastWAM(torch.nn.Module):
                     "verifier_num_heads": int(verifier_module.num_heads),
                     "verifier_num_layers": int(verifier_module.num_layers),
                 }
-                if saved_policy_guard_version >= 6:
+                if saved_policy_guard_version in {6, 7}:
                     target_binder = self.policy_guard_modules["target_binder"]
                     architecture_fields.update(
                         {
@@ -9704,6 +9946,53 @@ class FastWAM(torch.nn.Module):
                         target_binder.temperature = (
                             self.policy_guard_target_binding_temperature
                         )
+                    elif saved_policy_guard_version == 8:
+                        if (
+                            metadata.get("closed_loop_corrective_format")
+                            != "pgc_libero_closed_loop_corrective_v1"
+                            or metadata.get("closed_loop_corrective_enabled")
+                            is not True
+                            or metadata.get("acquisition_only") is not True
+                            or metadata.get("closed_loop_trainable_scope")
+                            != "action_chunk_proposal_only"
+                        ):
+                            raise ValueError(
+                                "PGC v8 checkpoint does not declare its audited "
+                                "closed-loop acquisition-only contract."
+                            )
+                        v8_scalar_fields = {
+                            "closed_loop_corrective_weight": (
+                                "policy_guard_closed_loop_corrective_weight",
+                                float,
+                            ),
+                            "offline_acquisition_weight": (
+                                "policy_guard_offline_acquisition_weight",
+                                float,
+                            ),
+                            "native_guard_weight": (
+                                "policy_guard_native_guard_weight",
+                                float,
+                            ),
+                        }
+                        for metadata_name, (
+                            attribute_name,
+                            cast,
+                        ) in v8_scalar_fields.items():
+                            value = metadata.get(metadata_name)
+                            if value is None:
+                                raise ValueError(
+                                    "PGC v8 checkpoint is missing corrective "
+                                    f"value {metadata_name!r}."
+                                )
+                            setattr(self, attribute_name, cast(value))
+                        if min(
+                            self.policy_guard_closed_loop_corrective_weight,
+                            self.policy_guard_offline_acquisition_weight,
+                            self.policy_guard_native_guard_weight,
+                        ) < 0:
+                            raise ValueError(
+                                "PGC v8 checkpoint has negative corrective weights."
+                            )
             base_payload = self.load_checkpoint(resolved_base, optimizer=None)
             if base_payload.get("format") in {
                 "fastwam_policy_guard_v1",
@@ -9713,6 +10002,7 @@ class FastWAM(torch.nn.Module):
                 "fastwam_policy_guard_v5",
                 "fastwam_policy_guard_v6",
                 "fastwam_policy_guard_v7",
+                "fastwam_policy_guard_v8",
             }:
                 raise ValueError(
                     "Nested PGC checkpoints are not supported as bases."
@@ -9743,6 +10033,7 @@ class FastWAM(torch.nn.Module):
                 optimizer is not None
                 and "optimizer" in payload
                 and not migrate_v5_to_target_binder
+                and not migrate_v5_to_v8
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -9754,6 +10045,14 @@ class FastWAM(torch.nn.Module):
                     resolved_base,
                     len(guard_state),
                     len(incompatible.missing_keys),
+                )
+            elif migrate_v5_to_v8:
+                logger.info(
+                    "Warm-started PGC v8 from exact validated PGC v5 "
+                    "sidecars at %s (base=%s restored=%d new_tensors=0).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
                 )
             else:
                 logger.info(
@@ -9794,6 +10093,7 @@ class FastWAM(torch.nn.Module):
             "fastwam_policy_guard_v5",
             "fastwam_policy_guard_v6",
             "fastwam_policy_guard_v7",
+            "fastwam_policy_guard_v8",
         }:
             raise ValueError("Nested PGC checkpoints are not supported as bases.")
 
@@ -9884,6 +10184,7 @@ class FastWAM(torch.nn.Module):
             "fastwam_policy_guard_v5",
             "fastwam_policy_guard_v6",
             "fastwam_policy_guard_v7",
+            "fastwam_policy_guard_v8",
         }:
             return self._load_policy_guard_checkpoint(
                 str(path), payload, optimizer=optimizer

@@ -18,6 +18,7 @@ from ..counterfactual import (
     stable_instruction_id,
 )
 from ..pgc_libero import (
+    load_pgc_closed_loop_corrective_index,
     load_pgc_completion_phase_index,
     load_pgc_episode_language_pairs,
     load_pgc_target_mask_index,
@@ -77,6 +78,60 @@ def build_pgc_sample_indices(
     return native + counterfactual * counterfactual_oversample_factor
 
 
+def build_pgc_v8_sample_indices(
+    *,
+    native_frame_count: int,
+    offline_counterfactual_frame_count: int,
+    total_frame_count: int,
+    closed_loop_oversample_factor: int = 4,
+    balance_native_counterfactual: bool = True,
+) -> list[int]:
+    """Build a deterministic V8 native/offline/closed-loop sample mixture.
+
+    The corrective set is usually much smaller than the original successful
+    demonstration set.  It is repeated *inside* the counterfactual half, then
+    the native half is repeated to the same total size.  This retains an exact
+    1:1 policy-protection mix without allowing broad native zero-residual data
+    to drown out the deployment-state corrections.
+    """
+    native_frame_count = int(native_frame_count)
+    offline_counterfactual_frame_count = int(
+        offline_counterfactual_frame_count
+    )
+    total_frame_count = int(total_frame_count)
+    closed_loop_oversample_factor = int(closed_loop_oversample_factor)
+    if not (
+        0 <= native_frame_count <= offline_counterfactual_frame_count
+        <= total_frame_count
+    ):
+        raise ValueError("PGC V8 frame boundaries are inconsistent.")
+    if closed_loop_oversample_factor < 1:
+        raise ValueError("PGC V8 closed-loop oversample factor must be >= 1.")
+    native = list(range(native_frame_count))
+    offline = list(
+        range(native_frame_count, offline_counterfactual_frame_count)
+    )
+    corrective = list(
+        range(offline_counterfactual_frame_count, total_frame_count)
+    )
+    if not native or not offline or not corrective:
+        raise ValueError(
+            "PGC V8 requires non-empty native, offline CF, and closed-loop CF data."
+        )
+    counterfactual = offline + corrective * closed_loop_oversample_factor
+    if not balance_native_counterfactual:
+        return native + counterfactual
+
+    def _repeat_to(values: list[int], count: int) -> list[int]:
+        repeats = (count + len(values) - 1) // len(values)
+        return (values * repeats)[:count]
+
+    target_count = max(len(native), len(counterfactual))
+    return _repeat_to(native, target_count) + _repeat_to(
+        counterfactual, target_count
+    )
+
+
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -100,7 +155,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         counterfactual_manifest_path: Optional[str] = None,
         counterfactual_negative_probability: float = 0.0,
         pgc_counterfactual_dataset_dirs: Optional[list[str]] = None,
+        pgc_closed_loop_corrective_dataset_dirs: Optional[list[str]] = None,
         pgc_counterfactual_oversample_factor: int = 1,
+        pgc_closed_loop_corrective_oversample_factor: int = 4,
         pgc_balance_native_counterfactual: bool = False,
         pgc_target_mask_supervision_required: bool = False,
         pgc_completion_phase_supervision_required: bool = False,
@@ -109,13 +166,27 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_counterfactual_dataset_dirs = [
             str(path) for path in (pgc_counterfactual_dataset_dirs or [])
         ]
+        pgc_closed_loop_corrective_dataset_dirs = [
+            str(path)
+            for path in (pgc_closed_loop_corrective_dataset_dirs or [])
+        ]
         duplicate_dirs = set(native_dataset_dirs) & set(
             pgc_counterfactual_dataset_dirs
+            + pgc_closed_loop_corrective_dataset_dirs
         )
+        duplicate_counterfactual_dirs = set(
+            pgc_counterfactual_dataset_dirs
+        ) & set(pgc_closed_loop_corrective_dataset_dirs)
         if duplicate_dirs:
             raise ValueError(
                 "PGC direct-counterfactual datasets must be distinct from the "
                 f"native datasets; duplicates={sorted(duplicate_dirs)}."
+            )
+        if duplicate_counterfactual_dirs:
+            raise ValueError(
+                "PGC V8 closed-loop datasets must be distinct from offline "
+                "counterfactual datasets; duplicates="
+                f"{sorted(duplicate_counterfactual_dirs)}."
             )
         self.pgc_counterfactual_oversample_factor = int(
             pgc_counterfactual_oversample_factor
@@ -123,10 +194,29 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if self.pgc_counterfactual_oversample_factor < 1:
             raise ValueError("`pgc_counterfactual_oversample_factor` must be >= 1.")
         self.pgc_native_dataset_count = len(native_dataset_dirs)
-        self.pgc_counterfactual_dataset_dirs = pgc_counterfactual_dataset_dirs
+        self.pgc_offline_counterfactual_dataset_count = len(
+            pgc_counterfactual_dataset_dirs
+        )
+        self.pgc_closed_loop_corrective_dataset_dirs = (
+            pgc_closed_loop_corrective_dataset_dirs
+        )
+        self.pgc_counterfactual_dataset_dirs = (
+            pgc_counterfactual_dataset_dirs
+            + self.pgc_closed_loop_corrective_dataset_dirs
+        )
         self.pgc_has_counterfactual_data = bool(
             self.pgc_counterfactual_dataset_dirs
         )
+        self.pgc_has_closed_loop_corrective_data = bool(
+            self.pgc_closed_loop_corrective_dataset_dirs
+        )
+        self.pgc_closed_loop_corrective_oversample_factor = int(
+            pgc_closed_loop_corrective_oversample_factor
+        )
+        if self.pgc_closed_loop_corrective_oversample_factor < 1:
+            raise ValueError(
+                "`pgc_closed_loop_corrective_oversample_factor` must be >= 1."
+            )
         self.pgc_episode_language_pairs: dict[
             int, dict[int, dict[str, object]]
         ] = {
@@ -135,6 +225,18 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )
             for offset, dataset_dir in enumerate(
                 self.pgc_counterfactual_dataset_dirs
+            )
+        }
+        self.pgc_closed_loop_corrective_indices: dict[
+            int, dict[int, dict[str, object]]
+        ] = {
+            (
+                self.pgc_native_dataset_count
+                + self.pgc_offline_counterfactual_dataset_count
+                + offset
+            ): load_pgc_closed_loop_corrective_index(dataset_dir)
+            for offset, dataset_dir in enumerate(
+                self.pgc_closed_loop_corrective_dataset_dirs
             )
         }
         self.pgc_target_mask_supervision_required = bool(
@@ -215,17 +317,45 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             int(dataset.num_frames)
             for dataset in underlying[: self.pgc_native_dataset_count]
         )
-        total_frame_count = sum(int(dataset.num_frames) for dataset in underlying)
-        self._sample_indices = build_pgc_sample_indices(
-            native_frame_count=self.pgc_native_frame_count,
-            total_frame_count=total_frame_count,
-            counterfactual_oversample_factor=(
-                self.pgc_counterfactual_oversample_factor
-            ),
-            balance_native_counterfactual=(
-                self.pgc_balance_native_counterfactual
-            ),
+        offline_dataset_end = (
+            self.pgc_native_dataset_count
+            + self.pgc_offline_counterfactual_dataset_count
         )
+        self.pgc_offline_counterfactual_frame_end = sum(
+            int(dataset.num_frames)
+            for dataset in underlying[:offline_dataset_end]
+        )
+        total_frame_count = sum(int(dataset.num_frames) for dataset in underlying)
+        if self.pgc_has_closed_loop_corrective_data:
+            if self.pgc_counterfactual_oversample_factor != 1:
+                raise ValueError(
+                    "PGC V8 uses its dedicated closed-loop oversample factor; "
+                    "set pgc_counterfactual_oversample_factor=1."
+                )
+            self._sample_indices = build_pgc_v8_sample_indices(
+                native_frame_count=self.pgc_native_frame_count,
+                offline_counterfactual_frame_count=(
+                    self.pgc_offline_counterfactual_frame_end
+                ),
+                total_frame_count=total_frame_count,
+                closed_loop_oversample_factor=(
+                    self.pgc_closed_loop_corrective_oversample_factor
+                ),
+                balance_native_counterfactual=(
+                    self.pgc_balance_native_counterfactual
+                ),
+            )
+        else:
+            self._sample_indices = build_pgc_sample_indices(
+                native_frame_count=self.pgc_native_frame_count,
+                total_frame_count=total_frame_count,
+                counterfactual_oversample_factor=(
+                    self.pgc_counterfactual_oversample_factor
+                ),
+                balance_native_counterfactual=(
+                    self.pgc_balance_native_counterfactual
+                ),
+            )
         self.pgc_effective_native_sample_count = sum(
             int(index < self.pgc_native_frame_count)
             for index in self._sample_indices
@@ -234,11 +364,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             len(self._sample_indices)
             - self.pgc_effective_native_sample_count
         )
+        self.pgc_effective_closed_loop_corrective_sample_count = sum(
+            int(index >= self.pgc_offline_counterfactual_frame_end)
+            for index in self._sample_indices
+        )
         if self.pgc_has_counterfactual_data:
             logger.info(
-                "PGC sampling: native=%d counterfactual=%d balanced=%s",
+                "PGC sampling: native=%d counterfactual=%d closed_loop=%d balanced=%s",
                 self.pgc_effective_native_sample_count,
                 self.pgc_effective_counterfactual_sample_count,
+                self.pgc_effective_closed_loop_corrective_sample_count,
                 self.pgc_balance_native_counterfactual,
             )
     
@@ -535,6 +670,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_is_counterfactual = (
             dataset_index >= self.pgc_native_dataset_count
         )
+        pgc_is_closed_loop_corrective = dataset_index >= (
+            self.pgc_native_dataset_count
+            + self.pgc_offline_counterfactual_dataset_count
+        )
         pgc_source_task = str(task)
         pgc_pair_valid = False
         pgc_completion_phase = 0
@@ -551,12 +690,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 torch.as_tensor(sample["episode_index"]).reshape(-1)[0].item()
             )
             if (
-                self.pgc_target_mask_supervision_required
+                (
+                    self.pgc_target_mask_supervision_required
+                    or pgc_is_closed_loop_corrective
+                )
                 and "frame_index" not in sample
             ):
                 raise KeyError(
-                    "PGC counterfactual samples require `frame_index` for V7 "
-                    "current-state target masks."
+                    "PGC counterfactual samples require `frame_index` for "
+                    "V7 masks or V8 corrective audit boundaries."
                 )
             if "frame_index" in sample:
                 frame_index = int(
@@ -584,6 +726,24 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 )
             pgc_source_task = str(pair["source_instruction"]).strip()
             pgc_pair_valid = True
+            if pgc_is_closed_loop_corrective:
+                try:
+                    corrective_record = self.pgc_closed_loop_corrective_indices[
+                        dataset_index
+                    ][episode_index]
+                except KeyError as exc:
+                    raise KeyError(
+                        "No audited PGC V8 corrective record for "
+                        f"dataset/episode {dataset_index}/{episode_index}."
+                    ) from exc
+                if frame_index >= int(
+                    corrective_record["recorded_action_count"]
+                ):
+                    raise ValueError(
+                        "PGC V8 frame exceeds its verified correction range: "
+                        f"frame={frame_index} actions="
+                        f"{corrective_record['recorded_action_count']}."
+                    )
             if self.pgc_completion_phase_supervision_required:
                 if frame_index < 0:
                     raise KeyError("PGC completion supervision requires frame_index.")
@@ -709,6 +869,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "proprio_is_pad": sample["proprio_is_pad"],
             "pgc_is_counterfactual": torch.tensor(
                 pgc_is_counterfactual, dtype=torch.bool
+            ),
+            "pgc_is_closed_loop_corrective": torch.tensor(
+                pgc_is_closed_loop_corrective, dtype=torch.bool
             ),
             "pgc_direct_action_valid": torch.tensor(
                 (

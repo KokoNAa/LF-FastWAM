@@ -24,6 +24,8 @@ PGC_TARGET_MASK_FORMAT = "pgc_libero_element_target_masks_v1"
 PGC_TARGET_MASK_INDEX = Path("meta/pgc_v7_target_masks/index.json")
 PGC_COMPLETION_PHASE_FORMAT = "pgc_libero_completion_phases_v1"
 PGC_COMPLETION_PHASE_INDEX = Path("meta/pgc_v5_completion_phases.json")
+PGC_CLOSED_LOOP_CORRECTIVE_FORMAT = "pgc_libero_closed_loop_corrective_v1"
+PGC_CLOSED_LOOP_CORRECTIVE_INDEX = Path("meta/pgc_v8_closed_loop/index.json")
 LIBERO_SUITES = (
     "libero_spatial",
     "libero_object",
@@ -90,6 +92,10 @@ def load_pgc_completion_phase_index(
             f"{payload.get('format')!r}."
         )
     audited_pairs = load_pgc_episode_language_pairs(dataset_root)
+    if int(payload.get("episode_count", -1)) != len(audited_pairs):
+        raise ValueError(
+            "PGC completion-phase episode_count does not match action audits."
+        )
     records = payload.get("episodes")
     if not isinstance(records, list) or len(records) != len(audited_pairs):
         raise ValueError(
@@ -137,6 +143,131 @@ def load_pgc_completion_phase_index(
             }
         )
         indexed[episode_index] = normalized
+    return indexed
+
+
+def load_pgc_closed_loop_corrective_index(
+    dataset_root: str | Path,
+) -> dict[int, dict[str, Any]]:
+    """Load the audited V8 closed-loop target-acquisition contract.
+
+    V8 data are not relabeled offline demonstrations.  Every episode must
+    begin at an exact simulator state captured from a deployed PGC rollout,
+    and its recorded action suffix must have been replay-verified to lift the
+    requested counterfactual target from that exact state.  Keeping this
+    contract in a sidecar lets the ordinary LeRobot action/video schema remain
+    unchanged while preventing unverified rollout states from entering the
+    optimizer.
+    """
+    dataset_root = Path(dataset_root).expanduser().resolve()
+    index_path = dataset_root / PGC_CLOSED_LOOP_CORRECTIVE_INDEX
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            f"Missing PGC V8 closed-loop corrective index: {index_path}. "
+            "Run scripts/build_pgc_v8_corrective_data.py first."
+        )
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    if payload.get("format") != PGC_CLOSED_LOOP_CORRECTIVE_FORMAT:
+        raise ValueError(
+            f"Unsupported PGC V8 corrective format at {index_path}: "
+            f"{payload.get('format')!r}."
+        )
+    if payload.get("acquisition_only") is not True:
+        raise ValueError(
+            "PGC V8 corrective data must declare acquisition_only=true."
+        )
+    audited_pairs = load_pgc_episode_language_pairs(dataset_root)
+    if int(payload.get("episode_count", -1)) != len(audited_pairs):
+        raise ValueError(
+            "PGC V8 corrective episode_count does not match action audits."
+        )
+    episode_audits = {
+        int(audit["episode_index"]): audit
+        for audit in read_jsonl(dataset_root / "meta/pgc_episodes.jsonl")
+    }
+    records = payload.get("episodes")
+    if not isinstance(records, list) or len(records) != len(audited_pairs):
+        raise ValueError(
+            "PGC V8 corrective episode count does not match action audit: "
+            f"index={len(records or [])} audits={len(audited_pairs)}."
+        )
+    indexed: dict[int, dict[str, Any]] = {}
+    capture_ids: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("PGC V8 corrective records must be objects.")
+        episode_index = int(record.get("episode_index", -1))
+        if episode_index in indexed or episode_index not in audited_pairs:
+            raise ValueError(
+                f"Invalid or duplicate PGC V8 episode {episode_index}."
+            )
+        capture_id = str(record.get("capture_id", "")).strip()
+        pair_id = str(record.get("pair_id", "")).strip()
+        state_digest = str(record.get("capture_state_sha256", "")).strip().lower()
+        action_count = int(record.get("recorded_action_count", 0))
+        if not capture_id or capture_id in capture_ids:
+            raise ValueError(
+                f"PGC V8 episode {episode_index} has an invalid/duplicate capture_id."
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", state_digest):
+            raise ValueError(
+                f"PGC V8 episode {episode_index} has no valid state SHA256."
+            )
+        if action_count <= 0:
+            raise ValueError(
+                f"PGC V8 episode {episode_index} has no corrective actions."
+            )
+        if record.get("target_lift_verified") is not True:
+            raise ValueError(
+                f"PGC V8 episode {episode_index} was not target-lift verified."
+            )
+        pair = audited_pairs[episode_index]
+        if pair_id != str(pair["pair_id"]):
+            raise ValueError(
+                f"PGC V8 pair mismatch for episode {episode_index}: "
+                f"{pair_id!r} != {pair['pair_id']!r}."
+            )
+        audit = episode_audits.get(episode_index)
+        if audit is None or (
+            str(audit.get("capture_id", "")) != capture_id
+            or str(audit.get("capture_state_sha256", "")).lower()
+            != state_digest
+            or int(audit.get("recorded_action_count", 0)) != action_count
+            or audit.get("target_lift_verified") is not True
+        ):
+            raise ValueError(
+                f"PGC V8 index/audit mismatch for episode {episode_index}."
+            )
+        state_relpath = Path(
+            str(audit.get("source_initial_state_catalog", ""))
+        )
+        if state_relpath.is_absolute() or ".." in state_relpath.parts:
+            raise ValueError(
+                f"PGC V8 episode {episode_index} has an unsafe state path."
+            )
+        state_path = dataset_root / state_relpath
+        if not state_path.is_file():
+            raise FileNotFoundError(
+                f"Missing PGC V8 captured simulator state: {state_path}."
+            )
+        expected_initial_digest = str(
+            audit.get("initial_state_sha256", "")
+        ).lower()
+        if state_digest != expected_initial_digest:
+            raise ValueError(
+                "PGC V8 captured and recorded initial-state hashes differ for "
+                f"episode {episode_index}."
+            )
+        actual_initial_digest = state_sha256(
+            np.load(state_path, allow_pickle=False)
+        )
+        if expected_initial_digest != actual_initial_digest:
+            raise ValueError(
+                "PGC V8 captured simulator state hash changed for episode "
+                f"{episode_index}."
+            )
+        capture_ids.add(capture_id)
+        indexed[episode_index] = dict(record)
     return indexed
 
 

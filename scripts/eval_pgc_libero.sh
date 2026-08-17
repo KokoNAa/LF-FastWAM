@@ -17,6 +17,9 @@ GATE_MODE="${PGC_GATE_MODE:-guarded}"
 GATE_THRESHOLD="${PGC_GATE_THRESHOLD:-0.20}"
 MIN_COUNTERFACTUAL_SCORE="${PGC_MIN_COUNTERFACTUAL_SCORE:-0.60}"
 MAX_POLICY_STEPS="${PGC_MAX_POLICY_STEPS:-}"
+CLOSED_LOOP_CAPTURE_DIR="${PGC_CLOSED_LOOP_CAPTURE_DIR:-}"
+CLOSED_LOOP_CAPTURE_STRIDE="${PGC_CLOSED_LOOP_CAPTURE_STRIDE_REPLANS:-1}"
+CLOSED_LOOP_CAPTURE_MAX_STATES="${PGC_CLOSED_LOOP_CAPTURE_MAX_STATES_PER_EPISODE:-12}"
 
 for value_name in NUM_GPUS NUM_TRIALS NUM_INFERENCE_STEPS; do
   value="${!value_name}"
@@ -71,9 +74,9 @@ metadata = payload.get("architecture_metadata") or {}
 if metadata.get("architecture") != "pgc_fastwam":
     raise SystemExit("Checkpoint is missing PGC architecture metadata")
 version = int(metadata.get("policy_guard_version", -1))
-if version not in {2, 3, 4, 5, 6, 7}:
+if version not in {2, 3, 4, 5, 6, 7, 8}:
     raise SystemExit(
-        f"Only PGC versions 2 through 7 are supported, got {version}"
+        f"Only PGC versions 2 through 8 are supported, got {version}"
     )
 if payload.get("format") != f"fastwam_policy_guard_v{version}":
     raise SystemExit("PGC checkpoint format/version mismatch")
@@ -91,6 +94,7 @@ expected_tuning = {
     5: "paired_language_prefix_aligned_action_residual",
     6: "visual_target_bottleneck_paired_action_residual",
     7: "object_token_mask_grounded_paired_action_residual",
+    8: "closed_loop_replay_verified_target_acquisition_residual",
 }[version]
 if metadata.get("counterfactual_tuning") != expected_tuning:
     raise SystemExit(f"PGC v{version} tuning metadata is incompatible")
@@ -144,10 +148,22 @@ if version == 7:
         raise SystemExit("PGC v7 checkpoint lacks its explicit mask-supervision contract")
     if payload.get("target_prototype_bank") is not None:
         raise SystemExit("PGC v7 checkpoint unexpectedly contains V6 prototypes")
+if version == 8 and (
+    metadata.get("closed_loop_corrective_format")
+    != "pgc_libero_closed_loop_corrective_v1"
+    or metadata.get("acquisition_only") is not True
+    or metadata.get("closed_loop_trainable_scope")
+    != "action_chunk_proposal_only"
+):
+    raise SystemExit("PGC v8 checkpoint lacks its audited corrective contract")
 print(version)
 PY
 )"
 echo "Validated PGC v${PGC_CHECKPOINT_VERSION} checkpoint: ${PGC_CHECKPOINT}"
+PGC_CLOSED_LOOP_ENABLED=false
+if [[ "${PGC_CHECKPOINT_VERSION}" == "8" ]]; then
+  PGC_CLOSED_LOOP_ENABLED=true
+fi
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   GPU_LIST=""
@@ -177,6 +193,7 @@ EXTRA_OVERRIDES=(
   "model.transition_contract.enabled=false"
   "model.policy_guard.enabled=true"
   "model.policy_guard.version=${PGC_CHECKPOINT_VERSION}"
+  "model.policy_guard.closed_loop_corrective_enabled=${PGC_CLOSED_LOOP_ENABLED}"
   "model.policy_guard.gate_mode=${GATE_MODE}"
   "model.policy_guard.gate_threshold=${GATE_THRESHOLD}"
   "model.policy_guard.min_counterfactual_score=${MIN_COUNTERFACTUAL_SCORE}"
@@ -193,6 +210,21 @@ fi
 if [[ "${CONDITION}" == "counterfactual" ]]; then
   EXTRA_OVERRIDES+=("EVALUATION.counterfactual_diagnostics=true")
 fi
+if [[ -n "${CLOSED_LOOP_CAPTURE_DIR}" ]]; then
+  if [[ "${CONDITION}" != "counterfactual" ]]; then
+    echo "PGC closed-loop state capture requires condition=counterfactual." >&2
+    exit 1
+  fi
+  if ! [[ "${CLOSED_LOOP_CAPTURE_STRIDE}" =~ ^[1-9][0-9]*$ ]] || ! [[ "${CLOSED_LOOP_CAPTURE_MAX_STATES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PGC capture stride/max states must be positive integers." >&2
+    exit 1
+  fi
+  EXTRA_OVERRIDES+=(
+    "+EVALUATION.closed_loop_capture_dir=${CLOSED_LOOP_CAPTURE_DIR}"
+    "+EVALUATION.closed_loop_capture_stride_replans=${CLOSED_LOOP_CAPTURE_STRIDE}"
+    "+EVALUATION.closed_loop_capture_max_states_per_episode=${CLOSED_LOOP_CAPTURE_MAX_STATES}"
+  )
+fi
 
 echo "[PGC-FastWAM] LIBERO ${CONDITION} evaluation"
 echo "  checkpoint=${PGC_CHECKPOINT}"
@@ -200,6 +232,7 @@ echo "  suites=${SUITES} trials=${NUM_TRIALS}"
 echo "  gate=${GATE_MODE} margin=${GATE_THRESHOLD} min_cf=${MIN_COUNTERFACTUAL_SCORE}"
 echo "  max_policy_steps=${MAX_POLICY_STEPS:-suite_default}"
 echo "  output=${OUTPUT_ROOT}"
+echo "  closed_loop_capture=${CLOSED_LOOP_CAPTURE_DIR:-disabled}"
 
 EXP_NAME="pgc-${CONDITION}" "${PYTHON_BIN}" \
   experiments/libero/run_libero_manager.py "${EXTRA_OVERRIDES[@]}"

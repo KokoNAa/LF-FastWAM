@@ -144,6 +144,30 @@ class Wan22Trainer:
                     "PGC V5-completion requires the audited phase sidecar. "
                     "Set data.train.pgc_completion_phase_supervision_required=true."
                 )
+            if int(getattr(self.model, "policy_guard_version", 1)) == 8:
+                if not bool(
+                    getattr(
+                        self.train_dataset,
+                        "pgc_has_closed_loop_corrective_data",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "PGC v8 requires a replay-verified closed-loop "
+                        "corrective LeRobot dataset. Set "
+                        "data.train.pgc_closed_loop_corrective_dataset_dirs."
+                    )
+                if not bool(
+                    getattr(
+                        self.model,
+                        "policy_guard_closed_loop_train_proposal_only",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "PGC v8 must preserve V5 language/gating sidecars and "
+                        "train only the ActionChunkProposal."
+                    )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # In LoRA mode only adapters plus explicitly selected small modules are

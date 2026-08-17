@@ -74,6 +74,11 @@ train:
   # balanced/oversampled without changing native normalization statistics.
   pgc_counterfactual_dataset_dirs: []
   pgc_counterfactual_oversample_factor: 1
+  # PGC V8 only: replay-verified target-acquisition corrections starting from
+  # exact on-policy LIBERO simulator states. Kept separate from offline CF
+  # demonstrations so sampling and metrics cannot silently mix the two.
+  pgc_closed_loop_corrective_dataset_dirs: []
+  pgc_closed_loop_corrective_oversample_factor: 4
   # PGC uses an exact native/counterfactual 1:1 index mix. Disabled for
   # every non-PGC task and enabled by libero_pgc_2cam224.
   pgc_balance_native_counterfactual: false
