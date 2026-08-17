@@ -123,8 +123,8 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         source = (REPO_ROOT / "scripts/train_pgc_libero.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn('2|3|4|5|6', source)
-        self.assertIn("PGC v5-to-v6 warm start", source)
+        self.assertIn('2|3|4|5|6|7', source)
+        self.assertIn("PGC v5 target-binder warm start", source)
         self.assertIn(
             "model.policy_guard.target_binding_interaction_weight=", source
         )
@@ -141,6 +141,27 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             "model.policy_guard.target_binding_action_ramp_steps=", source
         )
         self.assertIn("target_prototype_bank_persisted", source)
+
+    def test_v7_launcher_selects_explicit_mask_object_tokens(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v7_libero_suite.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("export PGC_VERSION=7", source)
+        self.assertIn("PGC_WARM_START_V5", source)
+        self.assertIn("PGC_TARGET_BINDING_NUM_OBJECT_TOKENS", source)
+        self.assertIn("PGC_TARGET_BINDING_CAMERA_COUNT", source)
+        self.assertIn("PGC_TARGET_MASK_WEIGHT", source)
+        self.assertIn("PGC_CROSS_OBJECT_WEIGHT", source)
+
+    def test_common_launcher_requires_and_forwards_v7_mask_sidecars(self):
+        source = (REPO_ROOT / "scripts/train_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("load_pgc_target_mask_index", source)
+        self.assertIn("pgc_target_mask_supervision_required=", source)
+        self.assertIn("model.policy_guard.target_binding_num_object_tokens=", source)
+        self.assertIn("model.policy_guard.target_mask_weight=", source)
+        self.assertIn("model.policy_guard.cross_object_margin=", source)
 
     def test_evaluation_enforces_v4_rollout_step_alignment(self):
         source = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(

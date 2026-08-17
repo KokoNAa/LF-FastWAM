@@ -18,6 +18,8 @@ from fastwam.models.wan22.policy_guard import (
     LanguageVisualTargetBinder,
     PairwiseActionAdvantageVerifier,
     RolloutAlignedActionProposal,
+    SpatialObjectTokenTargetBinder,
+    spatial_mask_to_patch_distribution,
 )
 from fastwam.models.wan22.wan_video_dit import WanVideoDiT
 
@@ -134,6 +136,15 @@ def tiny_pgc_fastwam(
             "target_binding_prototype_topk": 0.25,
             "target_binding_action_start_step": 10,
             "target_binding_action_ramp_steps": 5,
+            "target_binding_num_object_tokens": 2,
+            "target_binding_camera_count": 2,
+            "target_binding_visual_aspect_ratio": 2.0,
+            "target_mask_weight": 1.0,
+            "source_mask_weight": 0.5,
+            "aux_mask_weight": 0.5,
+            "mask_mass_weight": 0.5,
+            "cross_object_weight": 0.5,
+            "cross_object_margin": 0.25,
             "verifier_start_step": 10,
             "verifier_ramp_steps": 5,
             "goal_residual_scale": 1.0,
@@ -159,6 +170,59 @@ def tiny_pgc_fastwam(
 
 
 class PolicyGuardModuleTest(unittest.TestCase):
+    def test_v7_spatial_mask_distribution_preserves_two_camera_location(self):
+        mask = torch.zeros(2, 8, 16)
+        mask[0, :4, :4] = 1
+        distribution, valid, metrics = spatial_mask_to_patch_distribution(
+            mask, token_count=8
+        )
+        self.assertEqual(tuple(distribution.shape), (2, 8))
+        self.assertEqual(valid.tolist(), [True, False])
+        self.assertTrue(torch.allclose(distribution.sum(dim=-1), torch.ones(2)))
+        self.assertGreater(float(distribution[0, :4].sum()), 0.99)
+        self.assertTrue(
+            torch.allclose(distribution[1], torch.full((8,), 1.0 / 8.0))
+        )
+        self.assertEqual(float(metrics["pgc_v7_mask_grid_height"]), 2.0)
+        self.assertEqual(float(metrics["pgc_v7_mask_grid_width"]), 4.0)
+
+    def test_v7_object_tokens_start_exactly_at_base_and_are_query_specific(self):
+        module = SpatialObjectTokenTargetBinder(
+            text_dim=10,
+            video_dim=16,
+            action_dim=12,
+            hidden_dim=8,
+            projection_dim=8,
+            num_heads=2,
+            num_object_tokens=3,
+            camera_count=2,
+            visual_aspect_ratio=2.0,
+        )
+        base_queries = torch.randn(2, 4, 12)
+        language = torch.randn(2, 5, 10)
+        language_mask = torch.ones(2, 5, dtype=torch.bool)
+        visual = torch.randn(2, 8, 16)
+        output = module(
+            base_queries=base_queries,
+            language_hidden=language,
+            language_mask=language_mask,
+            current_video_hidden=visual,
+        )
+        self.assertTrue(torch.equal(output[0], base_queries))
+        self.assertEqual(tuple(output[2].shape), (2, 8))
+        self.assertEqual(float(output[-1]["pgc_v7_binding_query_delta_norm"]), 0.0)
+
+        with torch.no_grad():
+            module.query_output_projection.weight.normal_(std=0.05)
+        changed = module(
+            base_queries=base_queries,
+            language_hidden=language,
+            language_mask=language_mask,
+            current_video_hidden=visual,
+        )[0]
+        delta = changed - base_queries
+        self.assertFalse(torch.allclose(delta[:, 0], delta[:, 1]))
+
     def test_target_binder_is_null_safe_and_starts_from_shared_query_seeds(self):
         module = LanguageVisualTargetBinder(
             text_dim=10,
@@ -1610,6 +1674,139 @@ class PolicyGuardV6IntegrationTest(unittest.TestCase):
             self.assertTrue(
                 torch.equal(restored_bank.prototypes, prototype_bank.prototypes)
             )
+
+
+class PolicyGuardV7IntegrationTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(71)
+        self.model = tiny_pgc_fastwam(version=7)
+
+    def test_v7_mask_losses_reward_correct_language_object_binding(self):
+        target = torch.tensor([[0.90, 0.05, 0.03, 0.02]])
+        source = torch.tensor([[0.02, 0.03, 0.05, 0.90]])
+        aux = torch.tensor([[0.02, 0.90, 0.05, 0.03]])
+        target_teacher = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        source_teacher = torch.tensor([[0.0, 0.0, 0.0, 1.0]])
+        aux_teacher = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+        valid = torch.tensor([True])
+        good = self.model._compute_policy_guard_v7_target_mask_losses(
+            target_attention=target,
+            source_attention=source,
+            aux_attention=aux,
+            target_teacher=target_teacher,
+            source_teacher=source_teacher,
+            aux_teacher=aux_teacher,
+            target_mask_valid=valid,
+            source_mask_valid=valid,
+            aux_mask_valid=valid,
+            direct_action_valid=valid,
+            paired_language_valid=valid,
+        )
+        bad = self.model._compute_policy_guard_v7_target_mask_losses(
+            target_attention=source,
+            source_attention=target,
+            aux_attention=target,
+            target_teacher=target_teacher,
+            source_teacher=source_teacher,
+            aux_teacher=aux_teacher,
+            target_mask_valid=valid,
+            source_mask_valid=valid,
+            aux_mask_valid=valid,
+            direct_action_valid=valid,
+            paired_language_valid=valid,
+        )
+        self.assertLess(float(good[0]), float(bad[0]))
+        self.assertLess(float(good[1]), float(bad[1]))
+        self.assertLess(float(good[2]), float(bad[2]))
+        self.assertLess(float(good[3]), float(bad[3]))
+        self.assertEqual(float(good[4]), 0.0)
+        self.assertGreater(float(bad[4]), 0.0)
+        self.assertIn("pgc_v7_target_mask_mass", good[-1])
+
+    def test_v7_trains_only_sidecars_without_v6_prototype_bank(self):
+        report = self.model.prepare_trainable_parameters()
+        self.assertGreater(report["trainable"], 0)
+        self.assertIsNone(self.model.policy_guard_target_prototype_bank)
+        self.assertFalse(any(p.requires_grad for p in self.model.mot.parameters()))
+        trainable_names = {
+            name
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(
+            any(
+                name.startswith("policy_guard_modules.target_binder.")
+                for name in trainable_names
+            )
+        )
+        self.assertFalse(
+            any(
+                name.startswith("policy_guard_modules.goal_graph.")
+                for name in trainable_names
+            )
+        )
+
+    def test_v5_warm_start_then_v7_checkpoint_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.pt"
+            v5_path = Path(tmpdir) / "pgc_v5.pt"
+            v7_path = Path(tmpdir) / "pgc_v7.pt"
+            v5 = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v5.mot.state_dict()},
+                base_path,
+            )
+            v5.load_checkpoint(base_path)
+            with torch.no_grad():
+                v5.policy_guard_modules[
+                    "action_chunk_proposal"
+                ].output_projection.bias.add_(0.125)
+            expected_v5 = {
+                key: value.detach().clone()
+                for key, value in v5.policy_guard_modules.state_dict().items()
+            }
+            v5.save_checkpoint(v5_path, step=4000)
+
+            migrated = tiny_pgc_fastwam(version=7)
+            migrated.load_checkpoint(v5_path)
+            migrated_state = migrated.policy_guard_modules.state_dict()
+            for key, value in expected_v5.items():
+                self.assertTrue(torch.equal(migrated_state[key], value), key)
+            self.assertIsNone(migrated.policy_guard_target_prototype_bank)
+            self.assertEqual(
+                float(
+                    migrated.policy_guard_modules[
+                        "target_binder"
+                    ].query_output_projection.weight.abs().max()
+                ),
+                0.0,
+            )
+
+            migrated.save_checkpoint(v7_path, step=100)
+            payload = torch.load(v7_path, map_location="cpu", weights_only=False)
+            self.assertEqual(payload["format"], "fastwam_policy_guard_v7")
+            self.assertNotIn("target_prototype_bank", payload)
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(
+                metadata["counterfactual_tuning"],
+                "object_token_mask_grounded_paired_action_residual",
+            )
+            self.assertEqual(
+                metadata["target_binding_bottleneck"],
+                "spatial_object_tokens_no_direct_language_residual",
+            )
+            self.assertEqual(
+                metadata["target_mask_supervision"],
+                "robosuite_element_current_frame_training_only",
+            )
+
+            restored = tiny_pgc_fastwam(version=7)
+            restored.load_checkpoint(v7_path)
+            for key, value in migrated_state.items():
+                self.assertTrue(
+                    torch.equal(restored.policy_guard_modules.state_dict()[key], value),
+                    key,
+                )
 
 
 if __name__ == "__main__":

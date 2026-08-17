@@ -150,7 +150,9 @@ transition_contract:
 # same-state paired-language identifiability, execution-prefix alignment, and
 # explicit wrong-language / bad-proposal verifier negatives. v6 replaces the
 # direct language-to-Proposal path with a language-selected visual target
-# bottleneck and adds successful-transition / task-appearance supervision.
+# bottleneck and adds successful-transition / task-appearance supervision. v7
+# replaces those ambiguous teachers with training-only current-state element
+# masks and routes every action query through camera-aware object tokens.
 policy_guard:
   enabled: false
   version: 2
@@ -223,13 +225,26 @@ policy_guard:
   target_binding_prototype_momentum: 0.95
   target_binding_prototype_temperature: 0.07
   target_binding_prototype_topk: 0.10
+  # PGC v7 replaces the future-change/prototype teachers with explicit
+  # training-only current-frame element masks. The Proposal receives a small
+  # set of camera-aware spatial object tokens; every action query reads those
+  # tokens independently. No mask or segmentation input is needed at rollout.
+  target_binding_num_object_tokens: 8
+  target_binding_camera_count: 2
+  target_binding_visual_aspect_ratio: 2.0
+  target_mask_weight: 1.0
+  source_mask_weight: 0.50
+  aux_mask_weight: 0.50
+  mask_mass_weight: 0.50
+  cross_object_weight: 0.50
+  cross_object_margin: 0.25
   # Stage A learns only language-to-visual binding. Stage B linearly enables
   # V5 action objectives; the verifier has its own later schedule below.
   target_binding_action_start_step: 1000
   target_binding_action_ramp_steps: 500
   # First learn the directly supervised residual. Only then train the moving
-  # Verifier/alignment objectives, with a linear optimizer-step ramp. For v6,
-  # the effective start is also clamped to action_start + action_ramp.
+  # Verifier/alignment objectives, with a linear optimizer-step ramp. For
+  # v6/v7, the effective start is also clamped to action_start + action_ramp.
   verifier_start_step: 1000
   verifier_ramp_steps: 500
   # Goal information is injected into the query-free/raw-visual Action Expert

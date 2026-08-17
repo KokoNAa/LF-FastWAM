@@ -6,6 +6,7 @@ import numpy as np
 import traceback
 import torch
 import torchvision.transforms.functional as transforms_F
+from collections import OrderedDict
 from contextlib import contextmanager
 
 from omegaconf import DictConfig, OmegaConf
@@ -16,7 +17,10 @@ from ..counterfactual import (
     load_counterfactual_instruction_map,
     stable_instruction_id,
 )
-from ..pgc_libero import load_pgc_episode_language_pairs
+from ..pgc_libero import (
+    load_pgc_episode_language_pairs,
+    load_pgc_target_mask_index,
+)
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
@@ -97,6 +101,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_counterfactual_dataset_dirs: Optional[list[str]] = None,
         pgc_counterfactual_oversample_factor: int = 1,
         pgc_balance_native_counterfactual: bool = False,
+        pgc_target_mask_supervision_required: bool = False,
     ):
         native_dataset_dirs = [str(path) for path in dataset_dirs]
         pgc_counterfactual_dataset_dirs = [
@@ -130,6 +135,42 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 self.pgc_counterfactual_dataset_dirs
             )
         }
+        self.pgc_target_mask_supervision_required = bool(
+            pgc_target_mask_supervision_required
+        )
+        if self.pgc_target_mask_supervision_required and not (
+            self.pgc_counterfactual_dataset_dirs
+        ):
+            raise ValueError(
+                "PGC V7 target-mask supervision requires at least one direct "
+                "counterfactual dataset."
+            )
+        self.pgc_target_mask_indices: dict[int, dict[str, object]] = {}
+        if self.pgc_target_mask_supervision_required:
+            self.pgc_target_mask_indices = {
+                self.pgc_native_dataset_count + offset: (
+                    load_pgc_target_mask_index(dataset_dir)
+                )
+                for offset, dataset_dir in enumerate(
+                    self.pgc_counterfactual_dataset_dirs
+                )
+            }
+            mask_shapes = {
+                tuple(index["mask_size"])
+                for index in self.pgc_target_mask_indices.values()
+            }
+            if len(mask_shapes) != 1:
+                raise ValueError(
+                    f"PGC V7 target-mask datasets disagree on shape: {mask_shapes}."
+                )
+            self.pgc_target_mask_shape = next(iter(mask_shapes))
+        else:
+            self.pgc_target_mask_shape = (56, 112)
+        # Each DataLoader worker owns a small decompressed packed-mask cache.
+        self._pgc_target_mask_cache: OrderedDict[
+            tuple[int, int], tuple[np.ndarray, np.ndarray]
+        ] = OrderedDict()
+        self._pgc_target_mask_cache_size = 4
         self.pgc_balance_native_counterfactual = bool(
             pgc_balance_native_counterfactual
         )
@@ -269,6 +310,102 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self._sample_indices)
 
+    def _load_pgc_target_mask_episode(
+        self,
+        *,
+        dataset_index: int,
+        episode_index: int,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, object], dict[str, object]]:
+        """Return packed-mask data and audited metadata for one CF episode."""
+        try:
+            index = self.pgc_target_mask_indices[int(dataset_index)]
+            episode = index["episodes_by_index"][int(episode_index)]
+        except KeyError as exc:
+            raise KeyError(
+                "No PGC V7 target-mask audit for dataset/episode "
+                f"{dataset_index}/{episode_index}."
+            ) from exc
+        cache_key = (int(dataset_index), int(episode_index))
+        cached = self._pgc_target_mask_cache.get(cache_key)
+        if cached is None:
+            with np.load(str(episode["mask_path"]), allow_pickle=False) as payload:
+                packed = np.asarray(payload["packed_masks"], dtype=np.uint8).copy()
+                visible = np.asarray(payload["visible"], dtype=np.bool_).copy()
+            expected_height, expected_width = map(int, index["mask_size"])
+            expected_shape = (
+                int(episode["frame_count"]),
+                len(index["object_catalog"]),
+                expected_height,
+                (expected_width + 7) // 8,
+            )
+            if packed.shape != expected_shape or visible.shape != expected_shape[:2]:
+                raise ValueError(
+                    "PGC V7 packed target-mask tensor shape changed for "
+                    f"dataset/episode {dataset_index}/{episode_index}: "
+                    f"packed={packed.shape} visible={visible.shape}."
+                )
+            cached = (packed, visible)
+            self._pgc_target_mask_cache[cache_key] = cached
+            self._pgc_target_mask_cache.move_to_end(cache_key)
+            while len(self._pgc_target_mask_cache) > self._pgc_target_mask_cache_size:
+                self._pgc_target_mask_cache.popitem(last=False)
+        else:
+            self._pgc_target_mask_cache.move_to_end(cache_key)
+        return cached[0], cached[1], episode, index
+
+    def _get_pgc_target_mask_sample(
+        self,
+        *,
+        dataset_index: int,
+        episode_index: int,
+        frame_index: int,
+    ) -> dict[str, object]:
+        packed, visible, episode, index = self._load_pgc_target_mask_episode(
+            dataset_index=dataset_index,
+            episode_index=episode_index,
+        )
+        frame_index = int(frame_index)
+        if not 0 <= frame_index < packed.shape[0]:
+            raise IndexError(
+                f"PGC V7 mask frame {frame_index} is outside episode "
+                f"{episode_index} with {packed.shape[0]} frames."
+            )
+        width = int(index["mask_size"][1])
+        frame_masks = np.unpackbits(
+            packed[frame_index], axis=-1, count=width, bitorder="little"
+        ).astype(np.bool_, copy=False)
+        target_index = int(episode["target_catalog_index"])
+        source_index = int(episode["source_catalog_index"])
+        visible_indices = [
+            idx
+            for idx, is_visible in enumerate(visible[frame_index].tolist())
+            if is_visible and idx not in {target_index, source_index}
+        ]
+        if not visible_indices:
+            visible_indices = [
+                idx
+                for idx, is_visible in enumerate(visible[frame_index].tolist())
+                if is_visible and idx != target_index
+            ]
+        aux_valid = bool(visible_indices)
+        if aux_valid:
+            aux_index = visible_indices[
+                (int(episode_index) + frame_index) % len(visible_indices)
+            ]
+        else:
+            aux_index = source_index
+        catalog = index["object_catalog"]
+        return {
+            "target_mask": torch.from_numpy(frame_masks[target_index].copy()),
+            "source_mask": torch.from_numpy(frame_masks[source_index].copy()),
+            "aux_mask": torch.from_numpy(frame_masks[aux_index].copy()),
+            "target_valid": bool(visible[frame_index, target_index]),
+            "source_valid": bool(visible[frame_index, source_index]),
+            "aux_valid": aux_valid and bool(visible[frame_index, aux_index]),
+            "aux_instruction": str(catalog[aux_index]["instruction"]),
+            "aux_goal_id": int(catalog[aux_index]["goal_id"]),
+        }
+
     def _get(self, idx):
         if not 0 <= int(idx) < len(self._sample_indices):
             raise IndexError(f"Sample index {idx} is out of bounds.")
@@ -376,6 +513,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         )
         pgc_source_task = str(task)
         pgc_pair_valid = False
+        episode_index = -1
+        frame_index = -1
         if pgc_is_counterfactual:
             if "episode_index" not in sample:
                 raise KeyError(
@@ -385,6 +524,20 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             episode_index = int(
                 torch.as_tensor(sample["episode_index"]).reshape(-1)[0].item()
             )
+            if (
+                self.pgc_target_mask_supervision_required
+                and "frame_index" not in sample
+            ):
+                raise KeyError(
+                    "PGC counterfactual samples require `frame_index` for V7 "
+                    "current-state target masks."
+                )
+            if "frame_index" in sample:
+                frame_index = int(
+                    torch.as_tensor(sample["frame_index"])
+                    .reshape(-1)[0]
+                    .item()
+                )
             try:
                 pair = self.pgc_episode_language_pairs[dataset_index][
                     episode_index
@@ -431,6 +584,40 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             pgc_source_prompt = instruction
             pgc_source_context = context.clone()
             pgc_source_context_mask = context_mask.clone()
+
+        mask_height, mask_width = map(int, self.pgc_target_mask_shape)
+        empty_mask = torch.zeros((mask_height, mask_width), dtype=torch.bool)
+        pgc_target_object_mask = empty_mask
+        pgc_source_object_mask = empty_mask.clone()
+        pgc_aux_object_mask = empty_mask.clone()
+        pgc_target_mask_valid = False
+        pgc_source_mask_valid = False
+        pgc_aux_mask_valid = False
+        pgc_aux_prompt = instruction
+        pgc_aux_context = context.clone()
+        pgc_aux_context_mask = context_mask.clone()
+        pgc_aux_goal_id = stable_instruction_id(str(task))
+        if self.pgc_target_mask_supervision_required and pgc_pair_valid:
+            mask_sample = self._get_pgc_target_mask_sample(
+                dataset_index=dataset_index,
+                episode_index=episode_index,
+                frame_index=frame_index,
+            )
+            pgc_target_object_mask = mask_sample["target_mask"]
+            pgc_source_object_mask = mask_sample["source_mask"]
+            pgc_aux_object_mask = mask_sample["aux_mask"]
+            pgc_target_mask_valid = bool(mask_sample["target_valid"])
+            pgc_source_mask_valid = bool(mask_sample["source_valid"])
+            pgc_aux_mask_valid = bool(mask_sample["aux_valid"])
+            pgc_aux_prompt = DEFAULT_PROMPT.format(
+                task=mask_sample["aux_instruction"]
+            )
+            pgc_aux_context, pgc_aux_context_mask = (
+                self._get_cached_text_context(pgc_aux_prompt)
+            )
+            pgc_aux_context[~pgc_aux_context_mask] = 0.0
+            pgc_aux_context_mask = torch.ones_like(pgc_aux_context_mask)
+            pgc_aux_goal_id = int(mask_sample["aux_goal_id"])
 
         negative_prompt = None
         negative_context = None
@@ -490,6 +677,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "pgc_paired_language_valid": torch.tensor(
                 pgc_pair_valid, dtype=torch.bool
             ),
+            "pgc_target_object_mask": pgc_target_object_mask,
+            "pgc_source_object_mask": pgc_source_object_mask,
+            "pgc_aux_object_mask": pgc_aux_object_mask,
+            "pgc_target_mask_valid": torch.tensor(
+                pgc_target_mask_valid, dtype=torch.bool
+            ),
+            "pgc_source_mask_valid": torch.tensor(
+                pgc_source_mask_valid, dtype=torch.bool
+            ),
+            "pgc_aux_mask_valid": torch.tensor(
+                pgc_aux_mask_valid, dtype=torch.bool
+            ),
+            "pgc_aux_prompt": pgc_aux_prompt,
+            "pgc_aux_context": pgc_aux_context,
+            "pgc_aux_context_mask": pgc_aux_context_mask,
+            "pgc_aux_goal_id": torch.tensor(pgc_aux_goal_id, dtype=torch.long),
             "pgc_dataset_index": torch.tensor(dataset_index, dtype=torch.long),
         }
         if negative_context is not None:

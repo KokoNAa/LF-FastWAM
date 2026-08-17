@@ -284,6 +284,12 @@ class FastWAMProcessor(BaseProcessor):
             sample["episode_index"] = torch.as_tensor(
                 data["episode_index"], dtype=torch.long
             )
+        if "frame_index" in data:
+            # LeRobot stores this as an episode-local index. PGC V7 uses it
+            # to select the current-state mask from its audited sidecar.
+            sample["frame_index"] = torch.as_tensor(
+                data["frame_index"], dtype=torch.long
+            )
 
         # sample = self.tokenizer(sample)
         

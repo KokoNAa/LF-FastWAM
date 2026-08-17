@@ -1,6 +1,71 @@
-# PGC-FastWAM v6
+# PGC-FastWAM v7
 
 PGC（Policy-Guarded Counterfactual FastWAM）用于在不破坏原始 FastWAM 策略的前提下提升语言遵守，尤其针对 CIS 中“仍执行原指令 / 改变行为但抓错物体 / 什么也不抓”三类失败。
+
+## v7：显式目标掩码 + 多空间 Object Tokens
+
+Object 的 50-episode 对照表明，v6 的 CIS、target grasp、target lift 均未超过 v5；
+未来变化区域和跨 episode prototype 仍允许模型走场景捷径。v7 因此保留已验证的
+冻结 Base、V5 Final-Action Proposal、Verifier 与 hard fallback，只替换语言—视觉
+绑定层及其训练监督：
+
+1. 数据构建阶段在原 PGC 成功轨迹上重放 action，用 robosuite `element`
+   segmentation 为当前帧生成 target、source 和一个可见 auxiliary object 的二值
+   mask。mask 以 bit-packed sidecar 保存，不修改原 RGB、action、统计量或 episode
+   审计记录。
+2. `SpatialObjectTokenTargetBinder` 用语言对**语言注入前**的当前帧视觉 patch
+   打分；patch 叠加二维位置和相机身份后，选择 top-K 个空间 object tokens。
+   32 个 action query 分别 cross-attend 这些 tokens，不再接收广播到所有 query 的
+   单一 pooled residual，也没有 direct text-to-Proposal 边。
+3. target/source/aux 三条语言在同一画面上分别拟合自己的显式 mask，同时优化
+   mask 内 attention mass 和跨物体 margin。这使“说的是哪个物体”成为可直接判定
+   的监督，而不是从未来运动或 task prototype 间接猜测。
+4. mask 只在训练时使用。评估和部署输入仍是原 FastWAM 的 RGB、proprio 和文本；
+   checkpoint 不含 V6 prototype bank。Object token 到 action query 的末层保持严格
+   零初始化，所以 V5→v7 热启动时 Proposal 初始输出不变。
+5. 默认训练阶段仍为：0–1000 steps 只训练 mask binder，1000–1500 线性放开
+   Proposal，1500 后线性启动 Verifier。Base Video/Action Expert 全程冻结且无
+   LoRA，hard gate 未覆盖时逐元素返回 Base action chunk。
+
+V7 重点监控 `loss_pgc_v7_target_mask`、`loss_pgc_v7_source_mask`、
+`loss_pgc_v7_aux_mask`、`loss_pgc_v7_mask_mass`、`loss_pgc_v7_cross_object`、
+`pgc_v7_target_mask_mass`、`pgc_v7_target_on_source_mask_mass`、
+`pgc_v7_target_mask_top1_agreement`、`pgc_v7_same_state_attention_distance`、
+`pgc_v7_binding_query_delta_norm` 与 `pgc_v7_action_training_scale`。checkpoint
+格式为 `fastwam_policy_guard_v7`。
+
+以 Object 为例，先给已经采集完成的 action 数据补 mask sidecar：
+
+```bash
+cd /root/gpufree-data/LF-FastWAM
+export MUJOCO_GL=egl
+PGC_CF_OBJECT=/root/gpufree-data/pgc_libero_data_v1/libero_object_pgc_counterfactual_lerobot
+PGC_MANIFEST=/root/gpufree-data/pgc_libero_data_v1/manifests/libero_object_pgc.jsonl
+
+/opt/conda/bin/python scripts/build_pgc_libero_target_masks.py \
+  --dataset "$PGC_CF_OBJECT" \
+  --manifest "$PGC_MANIFEST" \
+  --suite libero_object \
+  --seed 42
+```
+
+完成后从同 suite 已验证的 V5 checkpoint 热启动正式训练：
+
+```bash
+export DIFFSYNTH_MODEL_BASE_PATH=/root/gpufree-data/fastwam/FastWAM/checkpoints
+export LIBERO_DATA_ROOT=/root/gpufree-data/fastwam/FastWAM/data/libero_mujoco3.3.2
+export TEXT_CACHE_DIR=/root/gpufree-data/LF-FastWAM/data/text_embeds_cache/libero
+BASE="$DIFFSYNTH_MODEL_BASE_PATH/fastwam_release/libero_uncond_2cam224.pt"
+V5=/path/to/suite-specific-pgc-v5/checkpoints/weights/step_004000.pt
+
+PGC_INIT_CHECKPOINT="$V5" \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+bash scripts/train_pgc_v7_libero_suite.sh \
+  libero_object 4 "$BASE" "$PGC_CF_OBJECT" 42 4000
+```
+
+每个 suite 必须各自构建 mask、使用自己的 V5 checkpoint 并独立训练/验收；四个
+suite 全部通过之前，不允许联合训练。
 
 ## v6：语言—视觉目标绑定
 
@@ -405,7 +470,7 @@ PGC_INIT_CHECKPOINT=/path/to/libero10-v5.pt bash scripts/train_pgc_v6_libero_sui
 
 `train_pgc_libero_suite.sh` 会同时把原始数据和直接反事实数据限制到指定 suite，
 并检查 `meta/pgc_provenance.json`。任何跨 suite 数据都会在创建训练进程前报错。
-默认按 frame index 把 Native 与 Counterfactual 数据构造成严格 1:1 采样。v5/v6 不使用
+默认按 frame index 把 Native 与 Counterfactual 数据构造成严格 1:1 采样。v5/v6/v7 不使用
 LoRA，默认 final-action residual cap 为 `2.0`、能量/平滑权重均为 `0.01`，这些从
 零初始化的小模块使用学习率 `1e-4`，每卡 micro-batch 为 1、
 梯度累积为 4（四卡有效 batch 16），每 500 steps 保存权重。可通过
@@ -441,7 +506,7 @@ v6 还支持 `PGC_TARGET_BINDING_ACTION_START_STEP` 与
 ```bash
 PGC_TRAIN_SUITE=all \
 PGC_ALLOW_JOINT_TRAINING=true \
-PGC_VERSION=6 \
+PGC_VERSION=7 \
 bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.txt 42 4000
 ```
 
@@ -451,10 +516,11 @@ bash scripts/train_pgc_libero.sh 4 "$BASE" /path/to/pgc_counterfactual_datasets.
 bash scripts/validate_pgc_server.sh
 ```
 
-v6 输出 checkpoint 格式为 `fastwam_policy_guard_v6`，只保存 Goal Query Seeds、
+v7 输出 checkpoint 格式为 `fastwam_policy_guard_v7`，只保存 Goal Query Seeds、
 Visual Target Binder、Final-Action Proposal、Goal Graph、Pairwise Verifier、架构元数据和外部 Base checkpoint
-路径；既不复制 6.8B Base 权重，也不存在第二套 Action Expert 或 LoRA。加载时先
-恢复外部 Base，再严格恢复小型 PGC 模块。v1/v2/v3/v4 checkpoint 仍按旧格式加载。
+路径；不保存训练 mask 或 V6 prototype bank，既不复制 6.8B Base 权重，也不存在
+第二套 Action Expert 或 LoRA。加载时先恢复外部 Base，再严格恢复小型 PGC 模块。
+v1–v6 checkpoint 仍按旧格式加载。
 
 ### 未保存 ZeRO 状态时续训
 

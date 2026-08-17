@@ -64,13 +64,22 @@ TARGET_BINDING_PROTOTYPE_TEMPERATURE="${PGC_TARGET_BINDING_PROTOTYPE_TEMPERATURE
 TARGET_BINDING_PROTOTYPE_TOPK="${PGC_TARGET_BINDING_PROTOTYPE_TOPK:-0.10}"
 TARGET_BINDING_ACTION_START_STEP="${PGC_TARGET_BINDING_ACTION_START_STEP:-1000}"
 TARGET_BINDING_ACTION_RAMP_STEPS="${PGC_TARGET_BINDING_ACTION_RAMP_STEPS:-500}"
+TARGET_BINDING_NUM_OBJECT_TOKENS="${PGC_TARGET_BINDING_NUM_OBJECT_TOKENS:-8}"
+TARGET_BINDING_CAMERA_COUNT="${PGC_TARGET_BINDING_CAMERA_COUNT:-2}"
+TARGET_BINDING_VISUAL_ASPECT_RATIO="${PGC_TARGET_BINDING_VISUAL_ASPECT_RATIO:-2.0}"
+TARGET_MASK_WEIGHT="${PGC_TARGET_MASK_WEIGHT:-1.0}"
+SOURCE_MASK_WEIGHT="${PGC_SOURCE_MASK_WEIGHT:-0.50}"
+AUX_MASK_WEIGHT="${PGC_AUX_MASK_WEIGHT:-0.50}"
+MASK_MASS_WEIGHT="${PGC_MASK_MASS_WEIGHT:-0.50}"
+CROSS_OBJECT_WEIGHT="${PGC_CROSS_OBJECT_WEIGHT:-0.50}"
+CROSS_OBJECT_MARGIN="${PGC_CROSS_OBJECT_MARGIN:-0.25}"
 WARM_START_V5="${PGC_WARM_START_V5:-false}"
 RUN_TAG="${RUN_TAG:-${TRAIN_SUITE}-pgc-v${PGC_VERSION}-${MAX_STEPS}-seed${TRAIN_SEED}}"
 
 case "${PGC_VERSION}" in
-  2|3|4|5|6) ;;
+  2|3|4|5|6|7) ;;
   *)
-    echo "PGC_VERSION must be 2, 3, 4, 5, or 6; got ${PGC_VERSION}." >&2
+    echo "PGC_VERSION must be 2, 3, 4, 5, 6, or 7; got ${PGC_VERSION}." >&2
     exit 1
     ;;
 esac
@@ -94,7 +103,7 @@ case "${TRAIN_SUITE}" in
     ;;
 esac
 
-for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY ROLLOUT_INFERENCE_STEPS EXECUTION_PREFIX_STEPS TARGET_BINDING_HIDDEN_DIM TARGET_BINDING_NUM_HEADS TARGET_BINDING_PROTOTYPE_SLOTS; do
+for value_name in NPROC_PER_NODE MAX_STEPS OVERSAMPLE_FACTOR SAVE_EVERY ROLLOUT_INFERENCE_STEPS EXECUTION_PREFIX_STEPS TARGET_BINDING_HIDDEN_DIM TARGET_BINDING_NUM_HEADS TARGET_BINDING_PROTOTYPE_SLOTS TARGET_BINDING_NUM_OBJECT_TOKENS TARGET_BINDING_CAMERA_COUNT; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${value_name} must be a positive integer, got ${value}." >&2
@@ -136,12 +145,12 @@ case "${WARM_START_V5}" in
     exit 1
     ;;
 esac
-if [[ "${WARM_START_V5}" == "true" && "${PGC_VERSION}" != "6" ]]; then
-  echo "PGC_WARM_START_V5=true is valid only for PGC_VERSION=6." >&2
+if [[ "${WARM_START_V5}" == "true" && "${PGC_VERSION}" != "6" && "${PGC_VERSION}" != "7" ]]; then
+  echo "PGC_WARM_START_V5=true is valid only for PGC_VERSION=6 or 7." >&2
   exit 1
 fi
 if [[ "${WARM_START_V5}" == "true" && -n "${CONTINUE_FROM_STEP}" ]]; then
-  echo "PGC v5-to-v6 warm start begins a fresh optimizer schedule; do not set PGC_CONTINUE_FROM_STEP." >&2
+  echo "PGC v5 target-binder warm start begins a fresh optimizer schedule; do not set PGC_CONTINUE_FROM_STEP." >&2
   exit 1
 fi
 if [[ "${BALANCE_NATIVE_COUNTERFACTUAL}" == "true" && "${OVERSAMPLE_FACTOR}" != "1" ]]; then
@@ -258,6 +267,25 @@ if version >= 6:
     if not 0 <= prototype_momentum < 1:
         raise SystemExit("PGC v6 prototype momentum must be in [0, 1)")
 PY
+if [[ "${PGC_VERSION}" == "7" ]]; then
+  "${PYTHON_BIN}" - \
+    "${TARGET_BINDING_VISUAL_ASPECT_RATIO}" \
+    "${TARGET_MASK_WEIGHT}" \
+    "${SOURCE_MASK_WEIGHT}" \
+    "${AUX_MASK_WEIGHT}" \
+    "${MASK_MASS_WEIGHT}" \
+    "${CROSS_OBJECT_WEIGHT}" \
+    "${CROSS_OBJECT_MARGIN}" <<'PY'
+import sys
+
+aspect_ratio = float(sys.argv[1])
+weights = [float(value) for value in sys.argv[2:]]
+if aspect_ratio <= 0:
+    raise SystemExit("PGC v7 target-binding visual aspect ratio must be positive")
+if any(value < 0 for value in weights):
+    raise SystemExit("PGC v7 mask weights and cross-object margin must be non-negative")
+PY
+fi
 if [[ ! -f "${BASE_CHECKPOINT}" ]]; then
   echo "Base checkpoint not found: ${BASE_CHECKPOINT}" >&2
   exit 1
@@ -358,6 +386,25 @@ print(json.dumps(paths, separators=(",", ":")))
 PY
 )"
 
+TARGET_MASK_REQUIRED=false
+if [[ "${PGC_VERSION}" == "7" ]]; then
+  TARGET_MASK_REQUIRED=true
+  "${PYTHON_BIN}" - "${CF_JSON}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from fastwam.datasets.pgc_libero import load_pgc_target_mask_index
+
+paths = [Path(value) for value in json.loads(sys.argv[1])]
+for path in paths:
+    index = load_pgc_target_mask_index(path)
+    if len(index["episodes_by_index"]) <= 0:
+        raise SystemExit(f"PGC v7 mask sidecar has no audited episodes: {path}")
+print(f"Validated PGC v7 target-mask sidecars: {len(paths)} dataset(s)")
+PY
+fi
+
 "${PYTHON_BIN}" - "${BASE_CHECKPOINT}" <<'PY'
 import sys
 import torch
@@ -373,6 +420,7 @@ if payload.get("format") in {
     "fastwam_policy_guard_v4",
     "fastwam_policy_guard_v5",
     "fastwam_policy_guard_v6",
+    "fastwam_policy_guard_v7",
 }:
     raise SystemExit("PGC base must be the immutable full FastWAM release, not an adapter")
 print(f"Validated protected base: format={payload.get('format', 'legacy_full')} tensors={len(payload['mot'])}")
@@ -398,20 +446,20 @@ payload = torch.load(init_path, map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
 if payload.get("format") != "fastwam_policy_guard_v5":
     raise SystemExit(
-        "PGC v6 warm start requires a PGC v5 checkpoint, got "
+        "PGC target-binder warm start requires a PGC v5 checkpoint, got "
         f"{payload.get('format')!r}"
     )
 if metadata.get("architecture") != "pgc_fastwam" or int(
     metadata.get("policy_guard_version", -1)
 ) != 5:
-    raise SystemExit("PGC v6 warm start checkpoint lacks valid PGC v5 metadata")
+    raise SystemExit("PGC target-binder warm start lacks valid PGC v5 metadata")
 if (
     metadata.get("counterfactual_tuning")
     != "paired_language_prefix_aligned_action_residual"
     or metadata.get("policy_protection")
     != "single_immutable_base_plus_conservative_hard_gate"
 ):
-    raise SystemExit("PGC v6 warm start checkpoint lacks the protected V5 contract")
+    raise SystemExit("PGC target-binder warm start lacks the protected V5 contract")
 if any(
     key in payload
     for key in (
@@ -420,24 +468,24 @@ if any(
         "counterfactual_lora_config",
     )
 ):
-    raise SystemExit("PGC v6 warm start checkpoint contains forbidden policy tensors")
+    raise SystemExit("PGC target-binder warm start contains forbidden policy tensors")
 if not isinstance(payload.get("policy_guard"), dict) or not payload["policy_guard"]:
-    raise SystemExit("PGC v6 warm start checkpoint has no V5 sidecar tensors")
+    raise SystemExit("PGC target-binder warm start has no V5 sidecar tensors")
 recorded_base = Path(str(payload.get("base_checkpoint", ""))).expanduser()
 if not recorded_base.is_absolute():
     recorded_base = init_path.parent / recorded_base
 recorded_base = recorded_base.resolve()
 if recorded_base != base_path:
     raise SystemExit(
-        "PGC v6 warm-start base mismatch: "
+        "PGC target-binder warm-start base mismatch: "
         f"checkpoint={recorded_base} requested={base_path}"
     )
 if int(metadata.get("rollout_num_inference_steps", -1)) != expected_rollout_steps:
-    raise SystemExit("PGC v6 warm start rollout inference-step mismatch")
+    raise SystemExit("PGC target-binder warm start rollout-step mismatch")
 if int(metadata.get("execution_prefix_steps", -1)) != expected_execution_prefix:
-    raise SystemExit("PGC v6 warm start execution-prefix mismatch")
+    raise SystemExit("PGC target-binder warm start execution-prefix mismatch")
 print(
-    "Validated PGC v5-to-v6 warm start: "
+    "Validated PGC v5 target-binder warm start: "
     f"step={payload.get('step')} base={base_path}"
 )
 PY
@@ -489,7 +537,16 @@ elif [[ -n "${CONTINUE_FROM_STEP}" ]]; then
     "${TARGET_BINDING_PROTOTYPE_TEMPERATURE}" \
     "${TARGET_BINDING_PROTOTYPE_TOPK}" \
     "${TARGET_BINDING_ACTION_START_STEP}" \
-    "${TARGET_BINDING_ACTION_RAMP_STEPS}" <<'PY'
+    "${TARGET_BINDING_ACTION_RAMP_STEPS}" \
+    "${TARGET_BINDING_NUM_OBJECT_TOKENS}" \
+    "${TARGET_BINDING_CAMERA_COUNT}" \
+    "${TARGET_BINDING_VISUAL_ASPECT_RATIO}" \
+    "${TARGET_MASK_WEIGHT}" \
+    "${SOURCE_MASK_WEIGHT}" \
+    "${AUX_MASK_WEIGHT}" \
+    "${MASK_MASS_WEIGHT}" \
+    "${CROSS_OBJECT_WEIGHT}" \
+    "${CROSS_OBJECT_MARGIN}" <<'PY'
 import math
 import sys
 from pathlib import Path
@@ -550,6 +607,22 @@ expected_v6_architecture = {
 expected_v6_schedule = {
     "target_binding_action_start_step": int(sys.argv[46]),
     "target_binding_action_ramp_steps": int(sys.argv[47]),
+}
+expected_v7_architecture = {
+    "target_binding_hidden_dim": int(sys.argv[39]),
+    "target_binding_num_heads": int(sys.argv[40]),
+    "target_binding_num_object_tokens": int(sys.argv[48]),
+    "target_binding_camera_count": int(sys.argv[49]),
+}
+expected_v7_scalars = {
+    "target_binding_temperature": float(sys.argv[41]),
+    "target_binding_visual_aspect_ratio": float(sys.argv[50]),
+    "target_mask_weight": float(sys.argv[51]),
+    "source_mask_weight": float(sys.argv[52]),
+    "aux_mask_weight": float(sys.argv[53]),
+    "mask_mass_weight": float(sys.argv[54]),
+    "cross_object_weight": float(sys.argv[55]),
+    "cross_object_margin": float(sys.argv[56]),
 }
 payload = torch.load(init_path, map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
@@ -638,12 +711,16 @@ elif expected_version == 3:
         raise SystemExit("PGC v3 continuation verifier_ramp_steps mismatch")
 else:
     expected_tuning = (
-        "visual_target_bottleneck_paired_action_residual"
-        if expected_version >= 6
+        "object_token_mask_grounded_paired_action_residual"
+        if expected_version == 7
         else (
-            "paired_language_prefix_aligned_action_residual"
-            if expected_version >= 5
-            else "rollout_aligned_final_action_residual"
+            "visual_target_bottleneck_paired_action_residual"
+            if expected_version == 6
+            else (
+                "paired_language_prefix_aligned_action_residual"
+                if expected_version >= 5
+                else "rollout_aligned_final_action_residual"
+            )
         )
     )
     if metadata.get("counterfactual_tuning") != expected_tuning:
@@ -708,7 +785,7 @@ else:
                     f"PGC v5 continuation {name} mismatch: "
                     f"checkpoint={actual} requested={expected}"
                 )
-    if expected_version >= 6:
+    if expected_version == 6:
         if (
             metadata.get("target_binding_bottleneck")
             != "visual_only_no_direct_language_residual"
@@ -760,6 +837,43 @@ else:
             if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
                 raise SystemExit(
                     f"PGC v6 continuation {name} mismatch: "
+                    f"checkpoint={actual} requested={expected}"
+                )
+    if expected_version == 7:
+        if (
+            metadata.get("target_binding_bottleneck")
+            != "spatial_object_tokens_no_direct_language_residual"
+        ):
+            raise SystemExit("PGC v7 continuation lacks its object-token bottleneck")
+        if (
+            metadata.get("target_binding_visual_source")
+            != "pre_dit_language_neutral_current_frame"
+        ):
+            raise SystemExit("PGC v7 continuation uses a language-leaking visual source")
+        if (
+            metadata.get("target_mask_supervision")
+            != "robosuite_element_current_frame_training_only"
+        ):
+            raise SystemExit("PGC v7 continuation lacks explicit target-mask supervision")
+        if payload.get("target_prototype_bank") is not None:
+            raise SystemExit("PGC v7 continuation unexpectedly contains V6 prototypes")
+        for name, expected in expected_v7_architecture.items():
+            if int(metadata.get(name, -1)) != expected:
+                raise SystemExit(
+                    f"PGC v7 continuation {name} mismatch: "
+                    f"checkpoint={metadata.get(name)} requested={expected}"
+                )
+        for name, expected in expected_v6_schedule.items():
+            if int(metadata.get(name, -1)) != expected:
+                raise SystemExit(
+                    f"PGC v7 continuation {name} mismatch: "
+                    f"checkpoint={metadata.get(name)} requested={expected}"
+                )
+        for name, expected in expected_v7_scalars.items():
+            actual = float(metadata.get(name, float("nan")))
+            if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-12):
+                raise SystemExit(
+                    f"PGC v7 continuation {name} mismatch: "
                     f"checkpoint={actual} requested={expected}"
                 )
 print(
@@ -846,6 +960,10 @@ else
     echo "  target_binding=visual_only interaction:${TARGET_BINDING_INTERACTION_WEIGHT} prototypes:${TARGET_BINDING_PROTOTYPE_WEIGHT}/${TARGET_BINDING_SOURCE_WEIGHT} hard_negative:${TARGET_BINDING_HARD_NEGATIVE_WEIGHT}/${TARGET_BINDING_HARD_NEGATIVE_MARGIN} separation:${TARGET_BINDING_SEPARATION_WEIGHT}/${TARGET_BINDING_SEPARATION_MARGIN}"
     echo "  target_binding_arch=hidden:${TARGET_BINDING_HIDDEN_DIM} heads:${TARGET_BINDING_NUM_HEADS} temperature:${TARGET_BINDING_TEMPERATURE} teacher_topk:${TARGET_BINDING_TEACHER_TOPK} prototype_slots:${TARGET_BINDING_PROTOTYPE_SLOTS} warm_start_v5:${WARM_START_V5}"
     echo "  target_binding_schedule=binding_only_through:${TARGET_BINDING_ACTION_START_STEP} action_ramp:${TARGET_BINDING_ACTION_RAMP_STEPS} verifier_start:${VERIFIER_START_STEP}"
+  elif [[ "${PGC_VERSION}" == "7" ]]; then
+    echo "  target_binding=explicit-current-frame-element-masks target:${TARGET_MASK_WEIGHT} source:${SOURCE_MASK_WEIGHT} aux:${AUX_MASK_WEIGHT} mass:${MASK_MASS_WEIGHT} cross_object:${CROSS_OBJECT_WEIGHT}/${CROSS_OBJECT_MARGIN}"
+    echo "  object_tokens=count:${TARGET_BINDING_NUM_OBJECT_TOKENS} cameras:${TARGET_BINDING_CAMERA_COUNT} aspect_ratio:${TARGET_BINDING_VISUAL_ASPECT_RATIO} hidden:${TARGET_BINDING_HIDDEN_DIM} heads:${TARGET_BINDING_NUM_HEADS} temperature:${TARGET_BINDING_TEMPERATURE}"
+    echo "  target_binding_schedule=binding_only_through:${TARGET_BINDING_ACTION_START_STEP} action_ramp:${TARGET_BINDING_ACTION_RAMP_STEPS} verifier_start:${VERIFIER_START_STEP} warm_start_v5:${WARM_START_V5}"
   fi
   echo "  verifier_schedule=start:${VERIFIER_START_STEP} ramp:${VERIFIER_RAMP_STEPS}"
   LORA_ENABLED=false
@@ -860,6 +978,7 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "data.train.pgc_counterfactual_dataset_dirs=${CF_JSON}" \
   "data.train.pgc_counterfactual_oversample_factor=${OVERSAMPLE_FACTOR}" \
   "data.train.pgc_balance_native_counterfactual=${BALANCE_NATIVE_COUNTERFACTUAL}" \
+  "data.train.pgc_target_mask_supervision_required=${TARGET_MASK_REQUIRED}" \
   "++data.train.pretrained_norm_stats=${STATS_PATH}" \
   "data.train.text_embedding_cache_dir=${CACHE_DIR}" \
   "seed=${TRAIN_SEED}" \
@@ -916,6 +1035,15 @@ RUN_ID="pgc-${RUN_TAG}" bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.target_binding_prototype_topk=${TARGET_BINDING_PROTOTYPE_TOPK}" \
   "model.policy_guard.target_binding_action_start_step=${TARGET_BINDING_ACTION_START_STEP}" \
   "model.policy_guard.target_binding_action_ramp_steps=${TARGET_BINDING_ACTION_RAMP_STEPS}" \
+  "model.policy_guard.target_binding_num_object_tokens=${TARGET_BINDING_NUM_OBJECT_TOKENS}" \
+  "model.policy_guard.target_binding_camera_count=${TARGET_BINDING_CAMERA_COUNT}" \
+  "model.policy_guard.target_binding_visual_aspect_ratio=${TARGET_BINDING_VISUAL_ASPECT_RATIO}" \
+  "model.policy_guard.target_mask_weight=${TARGET_MASK_WEIGHT}" \
+  "model.policy_guard.source_mask_weight=${SOURCE_MASK_WEIGHT}" \
+  "model.policy_guard.aux_mask_weight=${AUX_MASK_WEIGHT}" \
+  "model.policy_guard.mask_mass_weight=${MASK_MASS_WEIGHT}" \
+  "model.policy_guard.cross_object_weight=${CROSS_OBJECT_WEIGHT}" \
+  "model.policy_guard.cross_object_margin=${CROSS_OBJECT_MARGIN}" \
   "model.lora.enabled=${LORA_ENABLED}" \
   "model.lora.rank=${LORA_RANK}" \
   "model.lora.alpha=${LORA_ALPHA}" \

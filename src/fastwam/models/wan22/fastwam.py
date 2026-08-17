@@ -28,7 +28,9 @@ from .policy_guard import (
     LanguageVisualTargetBinder,
     PairwiseActionAdvantageVerifier,
     RolloutAlignedActionProposal,
+    SpatialObjectTokenTargetBinder,
     detached_policy_guard_metrics,
+    spatial_mask_to_patch_distribution,
 )
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .transition_contract import (
@@ -705,6 +707,30 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_target_binding_prototype_topk = float(
             guard_config.get("target_binding_prototype_topk", 0.10)
         )
+        self.policy_guard_target_binding_num_object_tokens = int(
+            guard_config.get("target_binding_num_object_tokens", 8)
+        )
+        self.policy_guard_target_binding_camera_count = int(
+            guard_config.get("target_binding_camera_count", 2)
+        )
+        self.policy_guard_target_mask_weight = float(
+            guard_config.get("target_mask_weight", 1.0)
+        )
+        self.policy_guard_source_mask_weight = float(
+            guard_config.get("source_mask_weight", 0.5)
+        )
+        self.policy_guard_aux_mask_weight = float(
+            guard_config.get("aux_mask_weight", 0.5)
+        )
+        self.policy_guard_mask_mass_weight = float(
+            guard_config.get("mask_mass_weight", 0.5)
+        )
+        self.policy_guard_cross_object_weight = float(
+            guard_config.get("cross_object_weight", 0.5)
+        )
+        self.policy_guard_cross_object_margin = float(
+            guard_config.get("cross_object_margin", 0.25)
+        )
         self.policy_guard_target_binding_action_start_step = int(
             guard_config.get("target_binding_action_start_step", 1000)
         )
@@ -757,10 +783,10 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_legacy_full_loaded = False
 
         if self.policy_guard_enabled:
-            if self.policy_guard_version not in {1, 2, 3, 4, 5, 6}:
+            if self.policy_guard_version not in {1, 2, 3, 4, 5, 6, 7}:
                 raise ValueError(
                     "The current PGC implementation supports version=1, 2, "
-                    "3, 4, 5, or 6."
+                    "3, 4, 5, 6, or 7."
                 )
             if self.langforce_mvp_enabled or self.transition_contract_enabled:
                 raise ValueError(
@@ -807,6 +833,12 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_target_binding_separation_weight,
                 self.policy_guard_target_binding_hard_negative_margin,
                 self.policy_guard_target_binding_separation_margin,
+                self.policy_guard_target_mask_weight,
+                self.policy_guard_source_mask_weight,
+                self.policy_guard_aux_mask_weight,
+                self.policy_guard_mask_mass_weight,
+                self.policy_guard_cross_object_weight,
+                self.policy_guard_cross_object_margin,
             ) < 0:
                 raise ValueError("PGC weights, margins, and thresholds must be non-negative.")
             if self.policy_guard_execution_prefix_steps <= 0:
@@ -820,36 +852,49 @@ class FastWAM(torch.nn.Module):
                         "PGC v6 target-binding action start/ramp must be "
                         "non-negative."
                     )
-                if min(
-                    self.policy_guard_target_binding_hidden_dim,
-                    self.policy_guard_target_binding_prototype_slots,
+                if self.policy_guard_target_binding_hidden_dim <= 0:
+                    raise ValueError(
+                        "PGC v6/v7 target-binding dimensions must be positive."
+                    )
+                if self.policy_guard_target_binding_temperature <= 0:
+                    raise ValueError(
+                        "PGC v6/v7 target-binding temperature must be positive."
+                    )
+                if self.policy_guard_version == 6:
+                    if self.policy_guard_target_binding_prototype_slots <= 0:
+                        raise ValueError(
+                            "PGC v6 target-binding prototype slots must be positive."
+                        )
+                    if min(
+                        self.policy_guard_target_binding_teacher_temperature,
+                        self.policy_guard_target_binding_prototype_temperature,
+                    ) <= 0:
+                        raise ValueError(
+                            "PGC v6 target-binding teacher/prototype "
+                            "temperatures must be positive."
+                        )
+                    if not 0.0 < self.policy_guard_target_binding_teacher_topk <= 1.0:
+                        raise ValueError(
+                            "PGC v6 target-binding teacher top-k must be in (0,1]."
+                        )
+                    if not 0.0 < self.policy_guard_target_binding_prototype_topk <= 1.0:
+                        raise ValueError(
+                            "PGC v6 target-binding prototype top-k must be in (0,1]."
+                        )
+                    if not (
+                        0.0
+                        <= self.policy_guard_target_binding_prototype_momentum
+                        < 1.0
+                    ):
+                        raise ValueError(
+                            "PGC v6 target-binding prototype momentum must be in [0,1)."
+                        )
+                if self.policy_guard_version == 7 and min(
+                    self.policy_guard_target_binding_num_object_tokens,
+                    self.policy_guard_target_binding_camera_count,
                 ) <= 0:
                     raise ValueError(
-                        "PGC v6 target-binding dimensions/slots must be positive."
-                    )
-                if min(
-                    self.policy_guard_target_binding_temperature,
-                    self.policy_guard_target_binding_teacher_temperature,
-                    self.policy_guard_target_binding_prototype_temperature,
-                ) <= 0:
-                    raise ValueError(
-                        "PGC v6 target-binding temperatures must be positive."
-                    )
-                if not 0.0 < self.policy_guard_target_binding_teacher_topk <= 1.0:
-                    raise ValueError(
-                        "PGC v6 target-binding teacher top-k must be in (0,1]."
-                    )
-                if not 0.0 < self.policy_guard_target_binding_prototype_topk <= 1.0:
-                    raise ValueError(
-                        "PGC v6 target-binding prototype top-k must be in (0,1]."
-                    )
-                if not (
-                    0.0
-                    <= self.policy_guard_target_binding_prototype_momentum
-                    < 1.0
-                ):
-                    raise ValueError(
-                        "PGC v6 target-binding prototype momentum must be in [0,1)."
+                        "PGC v7 object-token count and camera count must be positive."
                     )
             if self.policy_guard_suffix_loss_weight > 1:
                 raise ValueError("PGC suffix_loss_weight must be in [0, 1].")
@@ -1048,43 +1093,57 @@ class FastWAM(torch.nn.Module):
                         )
                     )
                     if self.policy_guard_version >= 6:
-                        target_binder = LanguageVisualTargetBinder(
-                            text_dim=self.text_dim,
-                            video_dim=int(self.video_expert.hidden_dim),
-                            action_dim=int(policy_action_expert.hidden_dim),
-                            hidden_dim=(
-                                self.policy_guard_target_binding_hidden_dim
+                        binder_kwargs = {
+                            "text_dim": self.text_dim,
+                            "video_dim": int(self.video_expert.hidden_dim),
+                            "action_dim": int(policy_action_expert.hidden_dim),
+                            "hidden_dim": self.policy_guard_target_binding_hidden_dim,
+                            "projection_dim": projection_dim,
+                            "num_heads": int(
+                                guard_config.get("target_binding_num_heads", 8)
                             ),
-                            projection_dim=projection_dim,
-                            num_heads=int(
-                                guard_config.get(
-                                    "target_binding_num_heads", 8
-                                )
-                            ),
-                            temperature=(
-                                self.policy_guard_target_binding_temperature
-                            ),
-                        )
+                            "temperature": self.policy_guard_target_binding_temperature,
+                        }
+                        if self.policy_guard_version == 7:
+                            target_binder = SpatialObjectTokenTargetBinder(
+                                **binder_kwargs,
+                                num_object_tokens=(
+                                    self.policy_guard_target_binding_num_object_tokens
+                                ),
+                                camera_count=(
+                                    self.policy_guard_target_binding_camera_count
+                                ),
+                                visual_aspect_ratio=float(
+                                    guard_config.get(
+                                        "target_binding_visual_aspect_ratio", 2.0
+                                    )
+                                ),
+                            )
+                        else:
+                            target_binder = LanguageVisualTargetBinder(
+                                **binder_kwargs
+                            )
                         self.policy_guard_modules[
                             "target_binder"
                         ] = target_binder
-                        self.policy_guard_target_prototype_bank = (
-                            StateTargetPrototypeBank(
-                                num_slots=(
-                                    self.policy_guard_target_binding_prototype_slots
-                                ),
-                                feature_dim=int(target_binder.hidden_dim),
-                                momentum=(
-                                    self.policy_guard_target_binding_prototype_momentum
-                                ),
-                                temperature=(
-                                    self.policy_guard_target_binding_prototype_temperature
-                                ),
-                                topk_fraction=(
-                                    self.policy_guard_target_binding_prototype_topk
-                                ),
+                        if self.policy_guard_version == 6:
+                            self.policy_guard_target_prototype_bank = (
+                                StateTargetPrototypeBank(
+                                    num_slots=(
+                                        self.policy_guard_target_binding_prototype_slots
+                                    ),
+                                    feature_dim=int(target_binder.hidden_dim),
+                                    momentum=(
+                                        self.policy_guard_target_binding_prototype_momentum
+                                    ),
+                                    temperature=(
+                                        self.policy_guard_target_binding_prototype_temperature
+                                    ),
+                                    topk_fraction=(
+                                        self.policy_guard_target_binding_prototype_topk
+                                    ),
+                                )
                             )
-                        )
             self.policy_guard_modules.to(dtype=self.torch_dtype)
             if self.policy_guard_version >= 4:
                 # The v3 probability gate collapsed in BF16 near sigmoid=1.
@@ -1128,10 +1187,10 @@ class FastWAM(torch.nn.Module):
         step = self._policy_guard_training_step
         start = self.policy_guard_verifier_start_step
         if self.policy_guard_version >= 6:
-            # V6 is deliberately staged: first learn the visual target map,
+            # V6/V7 are deliberately staged: first learn the visual target map,
             # then let that map shape the Proposal, and only then fit the
             # moving candidate Verifier.  Taking the maximum also protects a
-            # direct Hydra launch that forgot the V6 wrapper's later default.
+            # direct Hydra launch that forgot the wrapper's later default.
             start = max(
                 start,
                 self.policy_guard_target_binding_action_start_step
@@ -1372,7 +1431,7 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_modules.train()
                 self.policy_guard_modules.requires_grad_(True)
                 if self.policy_guard_version >= 6:
-                    # V6 has no deployment edge through the legacy Goal Graph.
+                    # V6/V7 have no deployment edge through the legacy Goal Graph.
                     # Keep it only for checkpoint migration/history, but exclude
                     # it from the optimizer so language cannot regain a direct
                     # shortcut around the visual target bottleneck.
@@ -1757,14 +1816,14 @@ class FastWAM(torch.nn.Module):
         if self.policy_guard_version >= 6:
             if current_visual_hidden is None:
                 raise ValueError(
-                    "PGC v6 requires language-neutral current visual tokens."
+                    "PGC v6/v7 requires language-neutral current visual tokens."
                 )
             if language_context_len is None:
                 language_context_len = int(context.shape[1])
             language_context_len = int(language_context_len)
             if not 0 < language_context_len <= int(context.shape[1]):
                 raise ValueError(
-                    "PGC v6 language_context_len must select a non-empty "
+                    "PGC v6/v7 language_context_len must select a non-empty "
                     "language prefix."
                 )
             (
@@ -1815,12 +1874,12 @@ class FastWAM(torch.nn.Module):
         dict[str, torch.Tensor],
     ]:
         if not self.policy_guard_enabled or self.policy_guard_version < 6:
-            raise RuntimeError("Visual target binding requires PGC v6.")
+            raise RuntimeError("Visual target binding requires PGC v6/v7.")
         current_token_count = min(
             int(video_tokens_per_frame), int(current_visual_hidden.shape[1])
         )
         if current_token_count <= 0:
-            raise ValueError("PGC v6 requires current-frame visual patches.")
+            raise ValueError("PGC v6/v7 requires current-frame visual patches.")
         seed_module = self.policy_guard_modules["goal_query_seeds"]
         base_queries = seed_module.weight.unsqueeze(0).expand(
             current_visual_hidden.shape[0], -1, -1
@@ -2689,8 +2748,10 @@ class FastWAM(torch.nn.Module):
         dict[str, torch.Tensor],
     ]:
         """PGC v5 paired-language and execution-prefix proposal objectives."""
-        if self.policy_guard_version not in {5, 6}:
-            raise RuntimeError("PGC v5/v6 action losses require version 5 or 6.")
+        if self.policy_guard_version not in {5, 6, 7}:
+            raise RuntimeError(
+                "PGC paired action losses require version 5, 6, or 7."
+            )
         if not (
             proposed_action.shape
             == predicted_residual.shape
@@ -2905,8 +2966,10 @@ class FastWAM(torch.nn.Module):
         goal_ids: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Train v5 on the deployed proposal plus wrong-language/bad negatives."""
-        if self.policy_guard_version not in {5, 6}:
-            raise RuntimeError("PGC v5/v6 verifier loss requires version 5 or 6.")
+        if self.policy_guard_version not in {5, 6, 7}:
+            raise RuntimeError(
+                "PGC paired verifier loss requires version 5, 6, or 7."
+            )
         prefix = min(
             self.policy_guard_execution_prefix_steps,
             int(demonstrated_action.shape[1]),
@@ -3522,7 +3585,7 @@ class FastWAM(torch.nn.Module):
         dict[str, torch.Tensor],
     ]:
         """Supervise language-selected visual patches with state hard negatives."""
-        if self.policy_guard_version < 6:
+        if self.policy_guard_version != 6:
             raise RuntimeError("Target-binding losses require PGC v6.")
         attention_tensors = (
             source_attention,
@@ -3658,6 +3721,188 @@ class FastWAM(torch.nn.Module):
             metrics,
         )
 
+    def _compute_policy_guard_v7_target_mask_losses(
+        self,
+        *,
+        target_attention: torch.Tensor,
+        source_attention: torch.Tensor,
+        aux_attention: torch.Tensor,
+        target_teacher: torch.Tensor,
+        source_teacher: torch.Tensor,
+        aux_teacher: torch.Tensor,
+        target_mask_valid: torch.Tensor,
+        source_mask_valid: torch.Tensor,
+        aux_mask_valid: torch.Tensor,
+        direct_action_valid: torch.Tensor,
+        paired_language_valid: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+    ]:
+        """Train V7 language binding against explicit current-state masks."""
+        if self.policy_guard_version != 7:
+            raise RuntimeError("Explicit object-mask losses require PGC v7.")
+        distributions = (
+            source_attention,
+            aux_attention,
+            target_teacher,
+            source_teacher,
+            aux_teacher,
+        )
+        if target_attention.ndim != 2 or any(
+            value.shape != target_attention.shape for value in distributions
+        ):
+            raise ValueError(
+                "PGC v7 attention and mask distributions must share [B,N]."
+            )
+        batch_size = int(target_attention.shape[0])
+        validity = (
+            target_mask_valid,
+            source_mask_valid,
+            aux_mask_valid,
+            direct_action_valid,
+            paired_language_valid,
+        )
+        if any(value.shape != (batch_size,) for value in validity):
+            raise ValueError("PGC v7 target-mask validity tensors must be [B].")
+
+        target_valid = direct_action_valid.bool() & target_mask_valid.bool()
+        source_valid = paired_language_valid.bool() & source_mask_valid.bool()
+        aux_valid = paired_language_valid.bool() & aux_mask_valid.bool()
+        log_normalizer = math.log(max(2, int(target_attention.shape[-1])))
+
+        def _normalized_ce(
+            prediction: torch.Tensor, teacher: torch.Tensor
+        ) -> torch.Tensor:
+            return -(
+                teacher.float()
+                * prediction.float().clamp_min(1.0e-8).log()
+            ).sum(dim=-1) / log_normalizer
+
+        target_loss = self._masked_policy_guard_mean(
+            _normalized_ce(target_attention, target_teacher), target_valid
+        )
+        source_loss = self._masked_policy_guard_mean(
+            _normalized_ce(source_attention, source_teacher), source_valid
+        )
+        aux_loss = self._masked_policy_guard_mean(
+            _normalized_ce(aux_attention, aux_teacher), aux_valid
+        )
+
+        def _support_mass(
+            prediction: torch.Tensor, teacher: torch.Tensor
+        ) -> torch.Tensor:
+            support = teacher.float() > 0
+            return (
+                prediction.float() * support.to(prediction.dtype)
+            ).sum(dim=-1)
+
+        target_own_mass = _support_mass(target_attention, target_teacher)
+        source_own_mass = _support_mass(source_attention, source_teacher)
+        aux_own_mass = _support_mass(aux_attention, aux_teacher)
+        target_on_source = _support_mass(target_attention, source_teacher)
+        source_on_target = _support_mass(source_attention, target_teacher)
+        aux_on_target = _support_mass(aux_attention, target_teacher)
+        aux_on_source = _support_mass(aux_attention, source_teacher)
+
+        mass_terms = torch.cat(
+            (
+                -target_own_mass.clamp_min(1.0e-8).log()[target_valid],
+                -source_own_mass.clamp_min(1.0e-8).log()[source_valid],
+                -aux_own_mass.clamp_min(1.0e-8).log()[aux_valid],
+            )
+        )
+        if mass_terms.numel() == 0:
+            mass_loss = target_attention.sum() * 0.0
+        else:
+            mass_loss = mass_terms.mean()
+
+        target_source_valid = target_valid & source_valid
+        aux_target_valid = aux_valid & target_valid
+        aux_source_valid = aux_valid & source_valid
+        cross_terms = torch.cat(
+            (
+                torch.relu(
+                    self.policy_guard_cross_object_margin
+                    - target_own_mass
+                    + target_on_source
+                )[target_source_valid],
+                torch.relu(
+                    self.policy_guard_cross_object_margin
+                    - source_own_mass
+                    + source_on_target
+                )[target_source_valid],
+                torch.relu(
+                    self.policy_guard_cross_object_margin
+                    - aux_own_mass
+                    + aux_on_target
+                )[aux_target_valid],
+                torch.relu(
+                    self.policy_guard_cross_object_margin
+                    - aux_own_mass
+                    + aux_on_source
+                )[aux_source_valid],
+            )
+        )
+        if cross_terms.numel() == 0:
+            cross_object_loss = target_attention.sum() * 0.0
+        else:
+            cross_object_loss = cross_terms.mean()
+
+        target_source_distance = 0.5 * (
+            target_attention.float() - source_attention.float()
+        ).abs().sum(dim=-1)
+        metrics = {
+            "pgc_v7_target_mask_valid_fraction": target_valid.float().mean(),
+            "pgc_v7_source_mask_valid_fraction": source_valid.float().mean(),
+            "pgc_v7_aux_mask_valid_fraction": aux_valid.float().mean(),
+            "pgc_v7_target_mask_mass": self._masked_policy_guard_mean(
+                target_own_mass, target_valid
+            ).detach(),
+            "pgc_v7_source_mask_mass": self._masked_policy_guard_mean(
+                source_own_mass, source_valid
+            ).detach(),
+            "pgc_v7_aux_mask_mass": self._masked_policy_guard_mean(
+                aux_own_mass, aux_valid
+            ).detach(),
+            "pgc_v7_target_on_source_mask_mass": (
+                self._masked_policy_guard_mean(
+                    target_on_source, target_source_valid
+                ).detach()
+            ),
+            "pgc_v7_source_on_target_mask_mass": (
+                self._masked_policy_guard_mean(
+                    source_on_target, target_source_valid
+                ).detach()
+            ),
+            "pgc_v7_same_state_attention_distance": (
+                self._masked_policy_guard_mean(
+                    target_source_distance, target_source_valid
+                ).detach()
+            ),
+            "pgc_v7_target_mask_top1_agreement": (
+                self._masked_policy_guard_mean(
+                    (
+                        target_attention.argmax(dim=-1)
+                        == target_teacher.argmax(dim=-1)
+                    ).float(),
+                    target_valid,
+                ).detach()
+            ),
+        }
+        return (
+            target_loss,
+            source_loss,
+            aux_loss,
+            mass_loss,
+            cross_object_loss,
+            metrics,
+        )
+
     def _training_loss_policy_guard_v5(
         self,
         *,
@@ -3666,8 +3911,10 @@ class FastWAM(torch.nn.Module):
         state_only_context_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Train a language-identifiable, prefix-aligned protected proposal."""
-        if self.policy_guard_version not in {5, 6}:
-            raise RuntimeError("Paired-language training requires PGC v5/v6.")
+        if self.policy_guard_version not in {5, 6, 7}:
+            raise RuntimeError(
+                "Paired-language training requires PGC v5/v6/v7."
+            )
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         is_counterfactual = inputs["pgc_is_counterfactual"]
@@ -3712,7 +3959,7 @@ class FastWAM(torch.nn.Module):
         )
         binding_metrics: dict[str, torch.Tensor] = {}
         prototype_metrics: dict[str, torch.Tensor] = {}
-        if self.policy_guard_version >= 6:
+        if self.policy_guard_version == 6:
             language_context_len = int(inputs["language_context_len"])
             (
                 goal_queries,
@@ -3849,6 +4096,112 @@ class FastWAM(torch.nn.Module):
                     valid_mask=target_prototype_valid,
                 ).detach()
             )
+        elif self.policy_guard_version == 7:
+            language_context_len = int(inputs["language_context_len"])
+            (
+                goal_queries,
+                goal_embedding,
+                target_attention,
+                _,
+                goal_metrics,
+            ) = self._encode_policy_guard_target_binding(
+                current_visual_hidden=neutral_visual_hidden,
+                video_tokens_per_frame=video_tokens_per_frame,
+                language_hidden=inputs["context"][:, :language_context_len],
+                language_mask=full_context_mask[:, :language_context_len],
+            )
+            (
+                source_goal_queries,
+                source_goal_embedding,
+                source_attention,
+                _,
+                source_goal_metrics,
+            ) = self._encode_policy_guard_target_binding(
+                current_visual_hidden=neutral_visual_hidden,
+                video_tokens_per_frame=video_tokens_per_frame,
+                language_hidden=source_context[:, :language_context_len],
+                language_mask=source_context_mask[:, :language_context_len],
+            )
+            (
+                _,
+                _,
+                aux_attention,
+                _,
+                aux_goal_metrics,
+            ) = self._encode_policy_guard_target_binding(
+                current_visual_hidden=neutral_visual_hidden,
+                video_tokens_per_frame=video_tokens_per_frame,
+                language_hidden=inputs["pgc_aux_context"][
+                    :, :language_context_len
+                ],
+                language_mask=inputs["pgc_aux_context_mask"][
+                    :, :language_context_len
+                ],
+            )
+            (
+                target_teacher,
+                target_teacher_valid,
+                target_mask_metrics,
+            ) = spatial_mask_to_patch_distribution(
+                inputs["pgc_target_object_mask"],
+                token_count=int(target_attention.shape[-1]),
+            )
+            (
+                source_teacher,
+                source_teacher_valid,
+                source_mask_metrics,
+            ) = spatial_mask_to_patch_distribution(
+                inputs["pgc_source_object_mask"],
+                token_count=int(source_attention.shape[-1]),
+            )
+            (
+                aux_teacher,
+                aux_teacher_valid,
+                aux_mask_metrics,
+            ) = spatial_mask_to_patch_distribution(
+                inputs["pgc_aux_object_mask"],
+                token_count=int(aux_attention.shape[-1]),
+            )
+            target_mask_valid = (
+                inputs["pgc_target_mask_valid"] & target_teacher_valid
+            )
+            source_mask_valid = (
+                inputs["pgc_source_mask_valid"] & source_teacher_valid
+            )
+            aux_mask_valid = inputs["pgc_aux_mask_valid"] & aux_teacher_valid
+            (
+                binding_interaction_loss,
+                binding_prototype_loss,
+                binding_source_loss,
+                binding_hard_negative_loss,
+                binding_separation_loss,
+                binding_metrics,
+            ) = self._compute_policy_guard_v7_target_mask_losses(
+                target_attention=target_attention,
+                source_attention=source_attention,
+                aux_attention=aux_attention,
+                target_teacher=target_teacher,
+                source_teacher=source_teacher,
+                aux_teacher=aux_teacher,
+                target_mask_valid=target_mask_valid,
+                source_mask_valid=source_mask_valid,
+                aux_mask_valid=aux_mask_valid,
+                direct_action_valid=direct_action_valid,
+                paired_language_valid=paired_language_valid,
+            )
+            for prefix, metrics in (
+                ("target", target_mask_metrics),
+                ("source", source_mask_metrics),
+                ("aux", aux_mask_metrics),
+            ):
+                for name, value in metrics.items():
+                    prototype_metrics[
+                        f"pgc_v7_{prefix}_{name.removeprefix('pgc_v7_')}"
+                    ] = value
+            for name, value in aux_goal_metrics.items():
+                prototype_metrics[
+                    f"pgc_v7_aux_{name.removeprefix('pgc_v7_')}"
+                ] = value
         else:
             goal_queries, goal_embedding, goal_metrics = (
                 self._encode_policy_guard_goal(
@@ -3978,18 +4331,32 @@ class FastWAM(torch.nn.Module):
             + self.policy_guard_residual_smoothness_weight
             * residual_smoothness_loss
         )
-        binding_objective = (
-            self.policy_guard_target_binding_interaction_weight
-            * binding_interaction_loss
-            + self.policy_guard_target_binding_prototype_weight
-            * binding_prototype_loss
-            + self.policy_guard_target_binding_source_weight
-            * binding_source_loss
-            + self.policy_guard_target_binding_hard_negative_weight
-            * binding_hard_negative_loss
-            + self.policy_guard_target_binding_separation_weight
-            * binding_separation_loss
-        )
+        if self.policy_guard_version == 7:
+            binding_objective = (
+                self.policy_guard_target_mask_weight
+                * binding_interaction_loss
+                + self.policy_guard_source_mask_weight
+                * binding_prototype_loss
+                + self.policy_guard_aux_mask_weight
+                * binding_source_loss
+                + self.policy_guard_mask_mass_weight
+                * binding_hard_negative_loss
+                + self.policy_guard_cross_object_weight
+                * binding_separation_loss
+            )
+        else:
+            binding_objective = (
+                self.policy_guard_target_binding_interaction_weight
+                * binding_interaction_loss
+                + self.policy_guard_target_binding_prototype_weight
+                * binding_prototype_loss
+                + self.policy_guard_target_binding_source_weight
+                * binding_source_loss
+                + self.policy_guard_target_binding_hard_negative_weight
+                * binding_hard_negative_loss
+                + self.policy_guard_target_binding_separation_weight
+                * binding_separation_loss
+            )
         scaled_action_objective = (
             action_objective.detach() * 0.0
             if action_training_scale <= 0.0
@@ -4031,7 +4398,7 @@ class FastWAM(torch.nn.Module):
 
         loss_dict: dict[str, float] = {
             "loss_action": float(scaled_action_objective.detach().item()),
-            "loss_pgc_v6_binding_objective": float(
+            "loss_pgc_binding_objective": float(
                 binding_objective.detach().item()
             ),
             "loss_pgc_action": float(counterfactual_action_loss.detach().item()),
@@ -4044,21 +4411,6 @@ class FastWAM(torch.nn.Module):
             ),
             "loss_pgc_v5_residual_separation": float(
                 residual_separation_loss.detach().item()
-            ),
-            "loss_pgc_v6_target_interaction": float(
-                binding_interaction_loss.detach().item()
-            ),
-            "loss_pgc_v6_target_prototype": float(
-                binding_prototype_loss.detach().item()
-            ),
-            "loss_pgc_v6_source_prototype": float(
-                binding_source_loss.detach().item()
-            ),
-            "loss_pgc_v6_same_state_hard_negative": float(
-                binding_hard_negative_loss.detach().item()
-            ),
-            "loss_pgc_v6_attention_separation": float(
-                binding_separation_loss.detach().item()
             ),
             "loss_pgc_residual_regularization": float(
                 residual_regularization_loss.detach().item()
@@ -4099,27 +4451,27 @@ class FastWAM(torch.nn.Module):
             ),
             "pgc_v6_target_interaction_effective_weight": (
                 self.policy_guard_target_binding_interaction_weight
-                if self.policy_guard_version >= 6
+                if self.policy_guard_version == 6
                 else 0.0
             ),
             "pgc_v6_target_prototype_effective_weight": (
                 self.policy_guard_target_binding_prototype_weight
-                if self.policy_guard_version >= 6
+                if self.policy_guard_version == 6
                 else 0.0
             ),
             "pgc_v6_source_prototype_effective_weight": (
                 self.policy_guard_target_binding_source_weight
-                if self.policy_guard_version >= 6
+                if self.policy_guard_version == 6
                 else 0.0
             ),
             "pgc_v6_hard_negative_effective_weight": (
                 self.policy_guard_target_binding_hard_negative_weight
-                if self.policy_guard_version >= 6
+                if self.policy_guard_version == 6
                 else 0.0
             ),
             "pgc_v6_attention_separation_effective_weight": (
                 self.policy_guard_target_binding_separation_weight
-                if self.policy_guard_version >= 6
+                if self.policy_guard_version == 6
                 else 0.0
             ),
             "pgc_verifier_effective_weight": (
@@ -4129,7 +4481,7 @@ class FastWAM(torch.nn.Module):
                 verifier_scale * self.policy_guard_alignment_weight
             ),
             "pgc_verifier_training_scale": verifier_scale,
-            "pgc_v6_action_training_scale": action_training_scale,
+            "pgc_target_binding_action_training_scale": action_training_scale,
             "pgc_v5_execution_prefix_steps": float(prefix),
             "pgc_v5_suffix_loss_weight": self.policy_guard_suffix_loss_weight,
             "pgc_v5_rollout_num_inference_steps": float(
@@ -4138,6 +4490,69 @@ class FastWAM(torch.nn.Module):
             "pgc_base_policy_frozen": 1.0,
             "pgc_video_loss_optimization_weight": 0.0,
         }
+        if self.policy_guard_version == 6:
+            loss_dict.update(
+                {
+                    "loss_pgc_v6_binding_objective": float(
+                        binding_objective.detach().item()
+                    ),
+                    "loss_pgc_v6_target_interaction": float(
+                        binding_interaction_loss.detach().item()
+                    ),
+                    "loss_pgc_v6_target_prototype": float(
+                        binding_prototype_loss.detach().item()
+                    ),
+                    "loss_pgc_v6_source_prototype": float(
+                        binding_source_loss.detach().item()
+                    ),
+                    "loss_pgc_v6_same_state_hard_negative": float(
+                        binding_hard_negative_loss.detach().item()
+                    ),
+                    "loss_pgc_v6_attention_separation": float(
+                        binding_separation_loss.detach().item()
+                    ),
+                    "pgc_v6_action_training_scale": action_training_scale,
+                }
+            )
+        elif self.policy_guard_version == 7:
+            loss_dict.update(
+                {
+                    "loss_pgc_v7_mask_binding_objective": float(
+                        binding_objective.detach().item()
+                    ),
+                    "loss_pgc_v7_target_mask": float(
+                        binding_interaction_loss.detach().item()
+                    ),
+                    "loss_pgc_v7_source_mask": float(
+                        binding_prototype_loss.detach().item()
+                    ),
+                    "loss_pgc_v7_aux_mask": float(
+                        binding_source_loss.detach().item()
+                    ),
+                    "loss_pgc_v7_mask_mass": float(
+                        binding_hard_negative_loss.detach().item()
+                    ),
+                    "loss_pgc_v7_cross_object": float(
+                        binding_separation_loss.detach().item()
+                    ),
+                    "pgc_v7_target_mask_effective_weight": (
+                        self.policy_guard_target_mask_weight
+                    ),
+                    "pgc_v7_source_mask_effective_weight": (
+                        self.policy_guard_source_mask_weight
+                    ),
+                    "pgc_v7_aux_mask_effective_weight": (
+                        self.policy_guard_aux_mask_weight
+                    ),
+                    "pgc_v7_mask_mass_effective_weight": (
+                        self.policy_guard_mask_mass_weight
+                    ),
+                    "pgc_v7_cross_object_effective_weight": (
+                        self.policy_guard_cross_object_weight
+                    ),
+                    "pgc_v7_action_training_scale": action_training_scale,
+                }
+            )
         loss_dict.update(detached_policy_guard_metrics(goal_metrics))
         loss_dict.update(detached_policy_guard_metrics(proposal_metrics))
         loss_dict.update(detached_policy_guard_metrics(action_metrics))
@@ -5047,6 +5462,15 @@ class FastWAM(torch.nn.Module):
         pgc_source_context_mask = sample.get("pgc_source_context_mask")
         pgc_source_goal_id = sample.get("pgc_source_goal_id")
         pgc_paired_language_valid = sample.get("pgc_paired_language_valid")
+        pgc_target_object_mask = sample.get("pgc_target_object_mask")
+        pgc_source_object_mask = sample.get("pgc_source_object_mask")
+        pgc_aux_object_mask = sample.get("pgc_aux_object_mask")
+        pgc_target_mask_valid = sample.get("pgc_target_mask_valid")
+        pgc_source_mask_valid = sample.get("pgc_source_mask_valid")
+        pgc_aux_mask_valid = sample.get("pgc_aux_mask_valid")
+        pgc_aux_context = sample.get("pgc_aux_context")
+        pgc_aux_context_mask = sample.get("pgc_aux_context_mask")
+        pgc_aux_goal_id = sample.get("pgc_aux_goal_id")
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
             raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
@@ -5088,6 +5512,28 @@ class FastWAM(torch.nn.Module):
                         "PGC v5 requires same-state paired-language fields: "
                         f"{missing_v5}. Recreate the dataset loader after "
                         "updating LF-FastWAM."
+                    )
+            if self.policy_guard_version == 7:
+                missing_v7 = [
+                    name
+                    for name, value in (
+                        ("pgc_target_object_mask", pgc_target_object_mask),
+                        ("pgc_source_object_mask", pgc_source_object_mask),
+                        ("pgc_aux_object_mask", pgc_aux_object_mask),
+                        ("pgc_target_mask_valid", pgc_target_mask_valid),
+                        ("pgc_source_mask_valid", pgc_source_mask_valid),
+                        ("pgc_aux_mask_valid", pgc_aux_mask_valid),
+                        ("pgc_aux_context", pgc_aux_context),
+                        ("pgc_aux_context_mask", pgc_aux_context_mask),
+                        ("pgc_aux_goal_id", pgc_aux_goal_id),
+                    )
+                    if value is None
+                ]
+                if missing_v7:
+                    raise ValueError(
+                        "PGC v7 requires explicit current-state object masks "
+                        f"and auxiliary language fields: {missing_v7}. Build "
+                        "the audited mask sidecar before training."
                     )
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(
@@ -5149,7 +5595,7 @@ class FastWAM(torch.nn.Module):
                 ],
                 dim=0,
             )
-            if self.policy_guard_version >= 6:
+            if self.policy_guard_version == 6:
                 # Future frames are used only to construct a detached
                 # interaction-location teacher. They never enter the frozen
                 # Base rollout or the deployed Proposal path.
@@ -5184,6 +5630,28 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     "PGC v5 current/source text-cache tensor shapes must match."
                 )
+        if self.policy_guard_version == 7:
+            if pgc_aux_context.ndim != 3 or pgc_aux_context_mask.ndim != 2:
+                raise ValueError(
+                    "PGC v7 auxiliary context/mask must be [B,L,D]/[B,L]."
+                )
+            if pgc_aux_context.shape != context.shape or (
+                pgc_aux_context_mask.shape != context_mask.shape
+            ):
+                raise ValueError(
+                    "PGC v7 target/source/auxiliary text-cache shapes must match."
+                )
+            mask_tensors = (
+                pgc_target_object_mask,
+                pgc_source_object_mask,
+                pgc_aux_object_mask,
+            )
+            if any(mask.ndim != 3 for mask in mask_tensors):
+                raise ValueError("PGC v7 object masks must be [B,H,W].")
+            if any(mask.shape != mask_tensors[0].shape for mask in mask_tensors):
+                raise ValueError("PGC v7 object-mask tensor shapes must match.")
+            if int(mask_tensors[0].shape[0]) != batch_size:
+                raise ValueError("PGC v7 object-mask batch size mismatch.")
         if self.transition_use_counterfactual_ranking:
             if negative_context is None or negative_context_mask is None:
                 raise ValueError(
@@ -5228,6 +5696,17 @@ class FastWAM(torch.nn.Module):
                 non_blocking=True,
             )
             pgc_source_context_mask = pgc_source_context_mask.to(
+                device=self.device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
+        if pgc_aux_context is not None:
+            pgc_aux_context = pgc_aux_context.to(
+                device=self.device,
+                dtype=self.torch_dtype,
+                non_blocking=True,
+            )
+            pgc_aux_context_mask = pgc_aux_context_mask.to(
                 device=self.device,
                 dtype=torch.bool,
                 non_blocking=True,
@@ -5319,6 +5798,41 @@ class FastWAM(torch.nn.Module):
                 )
             if pgc_paired_language_valid.shape != (batch_size,):
                 raise ValueError("`pgc_paired_language_valid` must be [B].")
+        if self.policy_guard_version == 7:
+            pgc_target_object_mask = pgc_target_object_mask.to(
+                device=self.device, dtype=torch.float32, non_blocking=True
+            )
+            pgc_source_object_mask = pgc_source_object_mask.to(
+                device=self.device, dtype=torch.float32, non_blocking=True
+            )
+            pgc_aux_object_mask = pgc_aux_object_mask.to(
+                device=self.device, dtype=torch.float32, non_blocking=True
+            )
+            for name, value in (
+                ("pgc_target_mask_valid", pgc_target_mask_valid),
+                ("pgc_source_mask_valid", pgc_source_mask_valid),
+                ("pgc_aux_mask_valid", pgc_aux_mask_valid),
+            ):
+                converted = torch.as_tensor(
+                    value, device=self.device, dtype=torch.bool
+                )
+                if converted.ndim == 0:
+                    converted = converted.expand(batch_size)
+                if converted.shape != (batch_size,):
+                    raise ValueError(f"`{name}` must be [B].")
+                if name == "pgc_target_mask_valid":
+                    pgc_target_mask_valid = converted
+                elif name == "pgc_source_mask_valid":
+                    pgc_source_mask_valid = converted
+                else:
+                    pgc_aux_mask_valid = converted
+            pgc_aux_goal_id = torch.as_tensor(
+                pgc_aux_goal_id, device=self.device, dtype=torch.long
+            )
+            if pgc_aux_goal_id.ndim == 0:
+                pgc_aux_goal_id = pgc_aux_goal_id.expand(batch_size)
+            if pgc_aux_goal_id.shape != (batch_size,):
+                raise ValueError("`pgc_aux_goal_id` must be [B].")
         language_context_len = int(context.shape[1])
         has_proprio = False
         proprio_current = None
@@ -5356,6 +5870,14 @@ class FastWAM(torch.nn.Module):
                         proprio=proprio_current,
                     )
                 )
+            if pgc_aux_context is not None:
+                pgc_aux_context, pgc_aux_context_mask = (
+                    self._append_proprio_to_context(
+                        context=pgc_aux_context,
+                        context_mask=pgc_aux_context_mask,
+                        proprio=proprio_current,
+                    )
+                )
             has_proprio = True
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
@@ -5379,6 +5901,15 @@ class FastWAM(torch.nn.Module):
             "pgc_source_context_mask": pgc_source_context_mask,
             "pgc_source_goal_id": pgc_source_goal_id,
             "pgc_paired_language_valid": pgc_paired_language_valid,
+            "pgc_target_object_mask": pgc_target_object_mask,
+            "pgc_source_object_mask": pgc_source_object_mask,
+            "pgc_aux_object_mask": pgc_aux_object_mask,
+            "pgc_target_mask_valid": pgc_target_mask_valid,
+            "pgc_source_mask_valid": pgc_source_mask_valid,
+            "pgc_aux_mask_valid": pgc_aux_mask_valid,
+            "pgc_aux_context": pgc_aux_context,
+            "pgc_aux_context_mask": pgc_aux_context_mask,
+            "pgc_aux_goal_id": pgc_aux_goal_id,
             "language_context_len": language_context_len,
             "has_proprio": has_proprio,
             "proprio_current": proprio_current,
@@ -7368,20 +7899,24 @@ class FastWAM(torch.nn.Module):
                 ),
             }
             if self.policy_guard_version >= 6:
-                for metric_name, output_name in (
+                metric_prefix = (
+                    "pgc_v7" if self.policy_guard_version == 7 else "pgc_v6"
+                )
+                metric_names = (
                     (
-                        "pgc_v6_target_attention_top1_mass",
+                        f"{metric_prefix}_target_attention_top1_mass",
                         "policy_guard_target_binding_top1_mass",
                     ),
                     (
-                        "pgc_v6_target_attention_entropy",
+                        f"{metric_prefix}_target_attention_entropy",
                         "policy_guard_target_binding_entropy",
                     ),
                     (
-                        "pgc_v6_target_similarity_max",
+                        f"{metric_prefix}_target_similarity_max",
                         "policy_guard_target_binding_similarity_max",
                     ),
-                ):
+                )
+                for metric_name, output_name in metric_names:
                     value = policy_guard_goal_metrics.get(metric_name)
                     if value is not None:
                         result[output_name] = float(
@@ -7611,7 +8146,9 @@ class FastWAM(torch.nn.Module):
         is_v3 = self.policy_guard_version == 3
         is_v4 = self.policy_guard_version >= 4
         is_v5 = self.policy_guard_version >= 5
-        is_v6 = self.policy_guard_version >= 6
+        is_v6 = self.policy_guard_version == 6
+        is_v7 = self.policy_guard_version == 7
+        uses_target_binder = is_v6 or is_v7
         residual_cap = None
         if is_v3:
             residual_cap = (
@@ -7655,15 +8192,21 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "counterfactual_tuning": (
-                "visual_target_bottleneck_paired_action_residual"
-                if is_v6
+                "object_token_mask_grounded_paired_action_residual"
+                if is_v7
                 else (
-                    "paired_language_prefix_aligned_action_residual"
-                    if is_v5
+                    "visual_target_bottleneck_paired_action_residual"
+                    if is_v6
                     else (
-                        "rollout_aligned_final_action_residual"
-                        if is_v4
-                        else ("bounded_velocity_residual" if is_v3 else "lora")
+                        "paired_language_prefix_aligned_action_residual"
+                        if is_v5
+                        else (
+                            "rollout_aligned_final_action_residual"
+                            if is_v4
+                            else (
+                                "bounded_velocity_residual" if is_v3 else "lora"
+                            )
+                        )
                     )
                 )
             ),
@@ -7681,18 +8224,22 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "goal_injection": (
-                "language_selected_visual_target_to_action_chunk_residual"
-                if is_v6
+                "per_query_spatial_object_tokens_to_action_chunk_residual"
+                if is_v7
                 else (
-                    "post_sampler_temporal_action_chunk_residual"
-                    if is_v4
+                    "language_selected_visual_target_to_action_chunk_residual"
+                    if is_v6
                     else (
-                        "post_dit_bounded_velocity_residual"
-                        if is_v3
+                        "post_sampler_temporal_action_chunk_residual"
+                        if is_v4
                         else (
-                            "zero_initialized_action_token_residual"
-                            if is_v2
-                            else "latent_action_query_replacement"
+                            "post_dit_bounded_velocity_residual"
+                            if is_v3
+                            else (
+                                "zero_initialized_action_token_residual"
+                                if is_v2
+                                else "latent_action_query_replacement"
+                            )
                         )
                     )
                 )
@@ -7744,18 +8291,22 @@ class FastWAM(torch.nn.Module):
                 else "immutable_base_plus_conservative_hard_gate"
             ),
             "representation_supervision": (
-                "interaction_teacher_task_prototypes_same_state_hard_negatives"
-                if is_v6
+                "explicit_current_state_element_masks_and_cross_object_negatives"
+                if is_v7
                 else (
-                    "same_state_paired_language_plus_prefix_action_and_hard_negatives"
-                    if is_v5
+                    "interaction_teacher_task_prototypes_same_state_hard_negatives"
+                    if is_v6
                     else (
-                        "rollout_aligned_direct_action_plus_goal_action_alignment"
-                        if is_v4
+                        "same_state_paired_language_plus_prefix_action_and_hard_negatives"
+                        if is_v5
                         else (
-                            "direct_residual_action_plus_goal_action_alignment"
-                            if is_v3
-                            else "direct_goal_action_alignment"
+                            "rollout_aligned_direct_action_plus_goal_action_alignment"
+                            if is_v4
+                            else (
+                                "direct_residual_action_plus_goal_action_alignment"
+                                if is_v3
+                                else "direct_goal_action_alignment"
+                            )
                         )
                     )
                 )
@@ -7839,27 +8390,39 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_verifier_bad_candidate_weight if is_v5 else None
             ),
             "target_binding_bottleneck": (
-                "visual_only_no_direct_language_residual" if is_v6 else None
+                (
+                    "spatial_object_tokens_no_direct_language_residual"
+                    if is_v7
+                    else "visual_only_no_direct_language_residual"
+                )
+                if uses_target_binder
+                else None
             ),
             "target_binding_visual_source": (
-                "pre_dit_language_neutral_current_frame" if is_v6 else None
+                "pre_dit_language_neutral_current_frame"
+                if uses_target_binder
+                else None
             ),
             "target_prototype_bank_persisted": True if is_v6 else None,
             "target_binding_hidden_dim": (
-                self.policy_guard_target_binding_hidden_dim if is_v6 else None
+                self.policy_guard_target_binding_hidden_dim
+                if uses_target_binder
+                else None
             ),
             "target_binding_num_heads": (
                 int(self.policy_guard_modules["target_binder"].num_heads)
-                if is_v6
+                if uses_target_binder
                 else None
             ),
             "target_binding_projection_dim": (
                 int(self.policy_guard_modules["target_binder"].projection_dim)
-                if is_v6
+                if uses_target_binder
                 else None
             ),
             "target_binding_temperature": (
-                self.policy_guard_target_binding_temperature if is_v6 else None
+                self.policy_guard_target_binding_temperature
+                if uses_target_binder
+                else None
             ),
             "target_binding_teacher_topk": (
                 self.policy_guard_target_binding_teacher_topk if is_v6 else None
@@ -7887,12 +8450,12 @@ class FastWAM(torch.nn.Module):
             ),
             "target_binding_action_start_step": (
                 self.policy_guard_target_binding_action_start_step
-                if is_v6
+                if uses_target_binder
                 else None
             ),
             "target_binding_action_ramp_steps": (
                 self.policy_guard_target_binding_action_ramp_steps
-                if is_v6
+                if uses_target_binder
                 else None
             ),
             "target_binding_interaction_weight": (
@@ -7920,6 +8483,46 @@ class FastWAM(torch.nn.Module):
             "target_binding_separation_margin": (
                 self.policy_guard_target_binding_separation_margin if is_v6 else None
             ),
+            "target_mask_supervision": (
+                "robosuite_element_current_frame_training_only"
+                if is_v7
+                else None
+            ),
+            "target_binding_num_object_tokens": (
+                self.policy_guard_target_binding_num_object_tokens
+                if is_v7
+                else None
+            ),
+            "target_binding_camera_count": (
+                self.policy_guard_target_binding_camera_count if is_v7 else None
+            ),
+            "target_binding_visual_aspect_ratio": (
+                float(
+                    self.policy_guard_modules[
+                        "target_binder"
+                    ].visual_aspect_ratio
+                )
+                if is_v7
+                else None
+            ),
+            "target_mask_weight": (
+                self.policy_guard_target_mask_weight if is_v7 else None
+            ),
+            "source_mask_weight": (
+                self.policy_guard_source_mask_weight if is_v7 else None
+            ),
+            "aux_mask_weight": (
+                self.policy_guard_aux_mask_weight if is_v7 else None
+            ),
+            "mask_mass_weight": (
+                self.policy_guard_mask_mass_weight if is_v7 else None
+            ),
+            "cross_object_weight": (
+                self.policy_guard_cross_object_weight if is_v7 else None
+            ),
+            "cross_object_margin": (
+                self.policy_guard_cross_object_margin if is_v7 else None
+            ),
         }
 
     @staticmethod
@@ -7934,7 +8537,7 @@ class FastWAM(torch.nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Persist V6's online teacher state for exact weight-only resume."""
         bank = self.policy_guard_target_prototype_bank
-        if self.policy_guard_version < 6 or bank is None:
+        if self.policy_guard_version != 6 or bank is None:
             raise RuntimeError("PGC v6 target prototype bank is unavailable.")
         return {
             "task_ids": bank.task_ids.detach().to(device="cpu", dtype=torch.long),
@@ -7949,7 +8552,7 @@ class FastWAM(torch.nn.Module):
     ) -> None:
         """Restore V6's training-only prototype bank without deployment drift."""
         bank = self.policy_guard_target_prototype_bank
-        if self.policy_guard_version < 6 or bank is None:
+        if self.policy_guard_version != 6 or bank is None:
             raise RuntimeError("PGC v6 target prototype bank is unavailable.")
         if not isinstance(state, dict):
             raise ValueError(
@@ -8063,7 +8666,7 @@ class FastWAM(torch.nn.Module):
                 "step": step,
                 "torch_dtype": str(self.torch_dtype),
             }
-            if self.policy_guard_version >= 6:
+            if self.policy_guard_version == 6:
                 payload["target_prototype_bank"] = (
                     self._policy_guard_target_prototype_state_dict()
                 )
@@ -8355,13 +8958,13 @@ class FastWAM(torch.nn.Module):
         saved_policy_guard_version = int(
             metadata.get("policy_guard_version", -1)
         )
-        migrate_v5_to_v6 = (
+        migrate_v5_to_target_binder = (
             saved_policy_guard_version == 5
-            and int(self.policy_guard_version) == 6
+            and int(self.policy_guard_version) in {6, 7}
         )
         if (
             saved_policy_guard_version != int(self.policy_guard_version)
-            and not migrate_v5_to_v6
+            and not migrate_v5_to_target_binder
         ):
             raise ValueError(
                 "PGC checkpoint version mismatch: "
@@ -8389,7 +8992,7 @@ class FastWAM(torch.nn.Module):
         if not isinstance(guard_state, dict) or not guard_state:
             raise ValueError("PGC checkpoint has no Goal-Graph/Verifier state.")
         target_prototype_state = payload.get("target_prototype_bank")
-        if saved_policy_guard_version >= 6:
+        if saved_policy_guard_version == 6:
             if metadata.get("target_prototype_bank_persisted") is not True:
                 raise ValueError(
                     "PGC v6 checkpoint does not declare a persisted target "
@@ -8401,21 +9004,25 @@ class FastWAM(torch.nn.Module):
                 )
         elif target_prototype_state is not None:
             raise ValueError(
-                "A pre-v6 PGC checkpoint unexpectedly contains a target "
+                "A non-v6 PGC checkpoint unexpectedly contains a target "
                 "prototype bank."
             )
 
         if saved_policy_guard_version >= 3:
             expected_tuning = (
-                "visual_target_bottleneck_paired_action_residual"
-                if saved_policy_guard_version >= 6
+                "object_token_mask_grounded_paired_action_residual"
+                if saved_policy_guard_version == 7
                 else (
-                    "paired_language_prefix_aligned_action_residual"
-                    if saved_policy_guard_version >= 5
+                    "visual_target_bottleneck_paired_action_residual"
+                    if saved_policy_guard_version == 6
                     else (
-                        "rollout_aligned_final_action_residual"
-                        if saved_policy_guard_version >= 4
-                        else "bounded_velocity_residual"
+                        "paired_language_prefix_aligned_action_residual"
+                        if saved_policy_guard_version >= 5
+                        else (
+                            "rollout_aligned_final_action_residual"
+                            if saved_policy_guard_version >= 4
+                            else "bounded_velocity_residual"
+                        )
                     )
                 )
             )
@@ -8467,11 +9074,25 @@ class FastWAM(torch.nn.Module):
                             "target_binding_projection_dim": int(
                                 target_binder.projection_dim
                             ),
-                            "target_binding_prototype_slots": int(
-                                self.policy_guard_target_binding_prototype_slots
-                            ),
                         }
                     )
+                    if saved_policy_guard_version == 6:
+                        architecture_fields[
+                            "target_binding_prototype_slots"
+                        ] = int(
+                            self.policy_guard_target_binding_prototype_slots
+                        )
+                    else:
+                        architecture_fields.update(
+                            {
+                                "target_binding_num_object_tokens": int(
+                                    target_binder.num_object_tokens
+                                ),
+                                "target_binding_camera_count": int(
+                                    target_binder.camera_count
+                                ),
+                            }
+                        )
                 for metadata_name, expected_value in architecture_fields.items():
                     try:
                         saved_value = int(metadata[metadata_name])
@@ -8625,7 +9246,7 @@ class FastWAM(torch.nn.Module):
                         raise ValueError(
                             "PGC v5 checkpoint has negative paired-language weights."
                         )
-                    if saved_policy_guard_version >= 6:
+                    if saved_policy_guard_version == 6:
                         v6_scalar_fields = {
                             "target_binding_temperature": (
                                 "policy_guard_target_binding_temperature",
@@ -8784,6 +9405,124 @@ class FastWAM(torch.nn.Module):
                         prototype_bank.topk_fraction = (
                             self.policy_guard_target_binding_prototype_topk
                         )
+                    elif saved_policy_guard_version == 7:
+                        if (
+                            metadata.get("target_binding_bottleneck")
+                            != "spatial_object_tokens_no_direct_language_residual"
+                        ):
+                            raise ValueError(
+                                "PGC v7 checkpoint does not declare its spatial "
+                                "object-token bottleneck."
+                            )
+                        if (
+                            metadata.get("target_binding_visual_source")
+                            != "pre_dit_language_neutral_current_frame"
+                        ):
+                            raise ValueError(
+                                "PGC v7 checkpoint does not use language-neutral "
+                                "current-frame visual patches."
+                            )
+                        if (
+                            metadata.get("target_mask_supervision")
+                            != "robosuite_element_current_frame_training_only"
+                        ):
+                            raise ValueError(
+                                "PGC v7 checkpoint does not declare explicit "
+                                "training-only element-mask supervision."
+                            )
+                        v7_scalar_fields = {
+                            "target_binding_temperature": (
+                                "policy_guard_target_binding_temperature",
+                                float,
+                            ),
+                            "target_binding_action_start_step": (
+                                "policy_guard_target_binding_action_start_step",
+                                int,
+                            ),
+                            "target_binding_action_ramp_steps": (
+                                "policy_guard_target_binding_action_ramp_steps",
+                                int,
+                            ),
+                            "target_mask_weight": (
+                                "policy_guard_target_mask_weight",
+                                float,
+                            ),
+                            "source_mask_weight": (
+                                "policy_guard_source_mask_weight",
+                                float,
+                            ),
+                            "aux_mask_weight": (
+                                "policy_guard_aux_mask_weight",
+                                float,
+                            ),
+                            "mask_mass_weight": (
+                                "policy_guard_mask_mass_weight",
+                                float,
+                            ),
+                            "cross_object_weight": (
+                                "policy_guard_cross_object_weight",
+                                float,
+                            ),
+                            "cross_object_margin": (
+                                "policy_guard_cross_object_margin",
+                                float,
+                            ),
+                        }
+                        for metadata_name, (
+                            attribute_name,
+                            cast,
+                        ) in v7_scalar_fields.items():
+                            value = metadata.get(metadata_name)
+                            if value is None:
+                                raise ValueError(
+                                    "PGC v7 checkpoint is missing object-mask "
+                                    f"binding value {metadata_name!r}."
+                                )
+                            setattr(self, attribute_name, cast(value))
+                        if self.policy_guard_target_binding_temperature <= 0:
+                            raise ValueError(
+                                "PGC v7 checkpoint has non-positive binding "
+                                "temperature."
+                            )
+                        if min(
+                            self.policy_guard_target_mask_weight,
+                            self.policy_guard_source_mask_weight,
+                            self.policy_guard_aux_mask_weight,
+                            self.policy_guard_mask_mass_weight,
+                            self.policy_guard_cross_object_weight,
+                            self.policy_guard_cross_object_margin,
+                            self.policy_guard_target_binding_action_start_step,
+                            self.policy_guard_target_binding_action_ramp_steps,
+                        ) < 0:
+                            raise ValueError(
+                                "PGC v7 checkpoint has negative mask weights, "
+                                "margin, or schedule values."
+                            )
+                        target_binder = self.policy_guard_modules[
+                            "target_binder"
+                        ]
+                        try:
+                            saved_aspect_ratio = float(
+                                metadata["target_binding_visual_aspect_ratio"]
+                            )
+                        except (KeyError, TypeError, ValueError) as exc:
+                            raise ValueError(
+                                "PGC v7 checkpoint has invalid visual aspect ratio."
+                            ) from exc
+                        if not math.isclose(
+                            saved_aspect_ratio,
+                            float(target_binder.visual_aspect_ratio),
+                            rel_tol=0.0,
+                            abs_tol=1.0e-9,
+                        ):
+                            raise ValueError(
+                                "PGC v7 target-binding visual aspect ratio "
+                                f"mismatch: checkpoint={saved_aspect_ratio}, "
+                                f"model={target_binder.visual_aspect_ratio}."
+                            )
+                        target_binder.temperature = (
+                            self.policy_guard_target_binding_temperature
+                        )
             base_payload = self.load_checkpoint(resolved_base, optimizer=None)
             if base_payload.get("format") in {
                 "fastwam_policy_guard_v1",
@@ -8792,14 +9531,15 @@ class FastWAM(torch.nn.Module):
                 "fastwam_policy_guard_v4",
                 "fastwam_policy_guard_v5",
                 "fastwam_policy_guard_v6",
+                "fastwam_policy_guard_v7",
             }:
                 raise ValueError(
                     "Nested PGC checkpoints are not supported as bases."
                 )
             incompatible = self.policy_guard_modules.load_state_dict(
-                guard_state, strict=not migrate_v5_to_v6
+                guard_state, strict=not migrate_v5_to_target_binder
             )
-            if migrate_v5_to_v6:
+            if migrate_v5_to_target_binder:
                 missing = list(incompatible.missing_keys)
                 unexpected = list(incompatible.unexpected_keys)
                 disallowed_missing = [
@@ -8809,10 +9549,10 @@ class FastWAM(torch.nn.Module):
                 ]
                 if disallowed_missing or unexpected or not missing:
                     raise ValueError(
-                        "PGC v5-to-v6 warm start has incompatible sidecars: "
+                        "PGC v5 target-binder warm start has incompatible sidecars: "
                         f"missing={missing}, unexpected={unexpected}."
                     )
-            elif saved_policy_guard_version >= 6:
+            elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
                 )
@@ -8821,13 +9561,14 @@ class FastWAM(torch.nn.Module):
             if (
                 optimizer is not None
                 and "optimizer" in payload
-                and not migrate_v5_to_v6
+                and not migrate_v5_to_target_binder
             ):
                 optimizer.load_state_dict(payload["optimizer"])
-            if migrate_v5_to_v6:
+            if migrate_v5_to_target_binder:
                 logger.info(
-                    "Warm-started PGC v6 from validated PGC v5 sidecars at %s "
+                    "Warm-started PGC v%d from validated PGC v5 sidecars at %s "
                     "(base=%s restored=%d new_target_binder=%d).",
+                    self.policy_guard_version,
                     path,
                     resolved_base,
                     len(guard_state),
@@ -8871,6 +9612,7 @@ class FastWAM(torch.nn.Module):
             "fastwam_policy_guard_v4",
             "fastwam_policy_guard_v5",
             "fastwam_policy_guard_v6",
+            "fastwam_policy_guard_v7",
         }:
             raise ValueError("Nested PGC checkpoints are not supported as bases.")
 
@@ -8960,6 +9702,7 @@ class FastWAM(torch.nn.Module):
             "fastwam_policy_guard_v4",
             "fastwam_policy_guard_v5",
             "fastwam_policy_guard_v6",
+            "fastwam_policy_guard_v7",
         }:
             return self._load_policy_guard_checkpoint(
                 str(path), payload, optimizer=optimizer

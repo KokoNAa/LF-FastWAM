@@ -20,6 +20,8 @@ import numpy as np
 
 PGC_DATA_FORMAT = "pgc_counterfactual_actions_v1"
 PGC_ACTION_SUPERVISION = "executed_counterfactual_success_trajectory"
+PGC_TARGET_MASK_FORMAT = "pgc_libero_element_target_masks_v1"
+PGC_TARGET_MASK_INDEX = Path("meta/pgc_v7_target_masks/index.json")
 LIBERO_SUITES = (
     "libero_spatial",
     "libero_object",
@@ -27,6 +29,162 @@ LIBERO_SUITES = (
     "libero_10",
 )
 PGC_STATE_TRANSFER_MODES = ("flat_exact", "named_joint_remap")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def goal_subject(goal_state: Sequence[Sequence[Any]]) -> str:
+    """Return the manipulated entity from a single-object LIBERO goal.
+
+    PGC currently collects one-object manipulation goals. Keeping this parser
+    strict prevents a silently wrong segmentation label when a future suite
+    introduces a compound predicate or omits the manipulated entity.
+    """
+    if not isinstance(goal_state, Sequence) or isinstance(goal_state, (str, bytes)):
+        raise ValueError("LIBERO goal_state must be a sequence of predicates.")
+    subjects = {
+        str(predicate[1]).strip()
+        for predicate in goal_state
+        if isinstance(predicate, Sequence)
+        and not isinstance(predicate, (str, bytes))
+        and len(predicate) >= 2
+        and str(predicate[1]).strip()
+    }
+    if len(subjects) != 1:
+        raise ValueError(
+            "PGC target-mask supervision requires exactly one manipulated "
+            f"goal entity, got {sorted(subjects)} from {goal_state!r}."
+        )
+    return next(iter(subjects))
+
+
+def load_pgc_target_mask_index(
+    dataset_root: str | Path,
+) -> dict[str, Any]:
+    """Load and validate the V7 per-episode object-mask sidecar.
+
+    The sidecar is deliberately separate from the LeRobot feature table so an
+    already audited RGB/action dataset can be augmented without rewriting its
+    videos, actions, statistics, or episode hashes.
+    """
+    dataset_root = Path(dataset_root).expanduser().resolve()
+    index_path = dataset_root / PGC_TARGET_MASK_INDEX
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            f"Missing PGC V7 target-mask index: {index_path}. Run "
+            "scripts/build_pgc_libero_target_masks.py first."
+        )
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    if payload.get("format") != PGC_TARGET_MASK_FORMAT:
+        raise ValueError(
+            f"Unsupported PGC target-mask format at {index_path}: "
+            f"{payload.get('format')!r}."
+        )
+    mask_size = payload.get("mask_size")
+    if (
+        not isinstance(mask_size, list)
+        or len(mask_size) != 2
+        or any(not isinstance(value, int) or value <= 0 for value in mask_size)
+    ):
+        raise ValueError(f"Invalid PGC target-mask size in {index_path}: {mask_size!r}.")
+    if int(mask_size[1]) % 2:
+        raise ValueError("PGC two-camera target-mask width must be even.")
+    camera_names = payload.get("camera_names")
+    if camera_names != ["agentview", "robot0_eye_in_hand"]:
+        raise ValueError(
+            "PGC target masks must use the FastWAM camera order "
+            "['agentview', 'robot0_eye_in_hand']."
+        )
+    catalog = payload.get("object_catalog")
+    if not isinstance(catalog, list) or not catalog:
+        raise ValueError(f"PGC target-mask catalog is empty: {index_path}.")
+    object_names: set[str] = set()
+    instructions: set[str] = set()
+    for catalog_index, entry in enumerate(catalog):
+        if not isinstance(entry, dict):
+            raise ValueError("PGC target-mask catalog entries must be objects.")
+        if int(entry.get("catalog_index", -1)) != catalog_index:
+            raise ValueError("PGC target-mask catalog indices must be dense and ordered.")
+        object_name = str(entry.get("object_name", "")).strip()
+        instruction = str(entry.get("instruction", "")).strip()
+        if not object_name or not instruction:
+            raise ValueError("PGC target-mask catalog entries require object/instruction.")
+        if object_name in object_names or instruction.casefold() in instructions:
+            raise ValueError("PGC target-mask catalog contains duplicate labels.")
+        object_names.add(object_name)
+        instructions.add(instruction.casefold())
+
+    audited_pairs = load_pgc_episode_language_pairs(dataset_root)
+    episodes = payload.get("episodes")
+    if not isinstance(episodes, list) or len(episodes) != len(audited_pairs):
+        raise ValueError(
+            "PGC target-mask episode count does not match the audited action "
+            f"dataset: masks={len(episodes or [])} audits={len(audited_pairs)}."
+        )
+    indexed_episodes: dict[int, dict[str, Any]] = {}
+    for entry in episodes:
+        if not isinstance(entry, dict):
+            raise ValueError("PGC target-mask episode entries must be objects.")
+        episode_index = int(entry.get("episode_index", -1))
+        if episode_index in indexed_episodes or episode_index not in audited_pairs:
+            raise ValueError(
+                f"Invalid or duplicate PGC target-mask episode {episode_index}."
+            )
+        frame_count = int(entry.get("frame_count", 0))
+        if frame_count <= 0:
+            raise ValueError("PGC target-mask episodes require positive frame_count.")
+        relpath = Path(str(entry.get("file", "")))
+        if relpath.is_absolute() or ".." in relpath.parts:
+            raise ValueError("PGC target-mask episode paths must stay inside the dataset.")
+        mask_path = dataset_root / relpath
+        if not mask_path.is_file():
+            raise FileNotFoundError(f"Missing PGC target-mask episode file: {mask_path}")
+        expected_sha256 = str(entry.get("sha256", "")).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError(
+                f"PGC target-mask episode {episode_index} has no valid SHA256."
+            )
+        actual_sha256 = _file_sha256(mask_path)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                "PGC target-mask episode file hash changed for episode "
+                f"{episode_index}: expected={expected_sha256} "
+                f"actual={actual_sha256}."
+            )
+        target_index = int(entry.get("target_catalog_index", -1))
+        source_index = int(entry.get("source_catalog_index", -1))
+        if not (0 <= target_index < len(catalog)) or not (
+            0 <= source_index < len(catalog)
+        ):
+            raise ValueError("PGC target/source mask catalog index is out of range.")
+        pair = audited_pairs[episode_index]
+        if str(entry.get("pair_id", "")) != str(pair["pair_id"]):
+            raise ValueError(
+                f"PGC target-mask pair mismatch for episode {episode_index}."
+            )
+        if (
+            catalog[target_index]["instruction"].strip().casefold()
+            != str(pair["counterfactual_instruction"]).strip().casefold()
+            or catalog[source_index]["instruction"].strip().casefold()
+            != str(pair["source_instruction"]).strip().casefold()
+        ):
+            raise ValueError(
+                f"PGC target-mask language labels mismatch episode {episode_index}."
+            )
+        normalized = dict(entry)
+        normalized["mask_path"] = str(mask_path)
+        indexed_episodes[episode_index] = normalized
+
+    result = dict(payload)
+    result["index_path"] = str(index_path)
+    result["episodes_by_index"] = indexed_episodes
+    return result
 
 
 @dataclass(frozen=True)

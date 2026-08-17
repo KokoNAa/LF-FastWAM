@@ -35,6 +35,25 @@ class RobotVideoDatasetSourceTest(unittest.TestCase):
         source = source_path.read_text(encoding="utf-8")
         self.assertIn("pgc_counterfactual_dataset_dirs", source)
 
+    def test_v7_dataset_loads_training_only_mask_sidecars(self):
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / "src/fastwam/datasets/lerobot/robot_video_dataset.py"
+        )
+        source = source_path.read_text(encoding="utf-8")
+        self.assertIn("pgc_target_mask_supervision_required", source)
+        self.assertIn("load_pgc_target_mask_index", source)
+        self.assertIn('"pgc_target_object_mask"', source)
+        self.assertIn('"pgc_source_object_mask"', source)
+        self.assertIn('"pgc_aux_object_mask"', source)
+        self.assertIn('"pgc_aux_context"', source)
+        processor_path = (
+            Path(__file__).resolve().parents[1]
+            / "src/fastwam/datasets/lerobot/processors/fastwam_processor.py"
+        )
+        processor_source = processor_path.read_text(encoding="utf-8")
+        self.assertIn('sample["frame_index"]', processor_source)
+
 
 if __name__ == "__main__":
     unittest.main()

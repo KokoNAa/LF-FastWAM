@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,11 +13,14 @@ from scripts.build_pgc_libero_data import (
     _prepare_source_initial_state,
 )
 from fastwam.datasets.pgc_libero import (
+    PGC_TARGET_MASK_FORMAT,
     build_provenance,
     demo_file_candidates,
     filter_libero_noops,
     iter_libero_hdf5_demos,
     libero_lerobot_features,
+    goal_subject,
+    load_pgc_target_mask_index,
     resolve_demo_file,
     state_sha256,
     states_match,
@@ -123,6 +127,81 @@ class PGCLiberoDataBuilderTest(unittest.TestCase):
         self.assertTrue(states_match(state32, state64_be))
         self.assertFalse(states_match(state32, state64_be + 1e-3))
         self.assertRegex(state_sha256(state32), r"^[0-9a-f]{64}$")
+
+    def test_v7_goal_subject_and_target_mask_index_contract(self):
+        self.assertEqual(
+            goal_subject(
+                [["in", "cream_cheese_1", "basket_1_contain_region"]]
+            ),
+            "cream_cheese_1",
+        )
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            goal_subject([["in", "a", "basket"], ["in", "b", "basket"]])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "meta/pgc_v7_target_masks").mkdir(parents=True)
+            provenance = {
+                "format": "pgc_counterfactual_actions_v1",
+                "state_aligned": True,
+                "successful_episode_count": 1,
+                "pairs": [
+                    {
+                        "pair_id": "p0",
+                        "source_instruction": "pick source",
+                        "counterfactual_instruction": "pick target",
+                        "source_suite": "libero_object",
+                        "source_task_id": 0,
+                    }
+                ],
+            }
+            (root / "meta/pgc_provenance.json").write_text(
+                json.dumps(provenance), encoding="utf-8"
+            )
+            (root / "meta/pgc_episodes.jsonl").write_text(
+                json.dumps({"episode_index": 0, "pair_id": "p0"}) + "\n",
+                encoding="utf-8",
+            )
+            mask_path = root / "meta/pgc_v7_target_masks/episode_000000.npz"
+            mask_path.touch()
+            mask_sha256 = hashlib.sha256(mask_path.read_bytes()).hexdigest()
+            index = {
+                "format": PGC_TARGET_MASK_FORMAT,
+                "camera_names": ["agentview", "robot0_eye_in_hand"],
+                "mask_size": [56, 112],
+                "object_catalog": [
+                    {
+                        "catalog_index": 0,
+                        "object_name": "source_1",
+                        "instruction": "pick source",
+                    },
+                    {
+                        "catalog_index": 1,
+                        "object_name": "target_1",
+                        "instruction": "pick target",
+                    },
+                ],
+                "episodes": [
+                    {
+                        "episode_index": 0,
+                        "pair_id": "p0",
+                        "file": "meta/pgc_v7_target_masks/episode_000000.npz",
+                        "sha256": mask_sha256,
+                        "frame_count": 3,
+                        "target_catalog_index": 1,
+                        "source_catalog_index": 0,
+                    }
+                ],
+            }
+            (root / "meta/pgc_v7_target_masks/index.json").write_text(
+                json.dumps(index), encoding="utf-8"
+            )
+            loaded = load_pgc_target_mask_index(root)
+            self.assertEqual(loaded["mask_size"], [56, 112])
+            self.assertEqual(
+                loaded["episodes_by_index"][0]["mask_path"],
+                str(mask_path.resolve()),
+            )
 
     def test_resolves_and_reads_standard_libero_hdf5(self):
         with tempfile.TemporaryDirectory() as tmpdir:

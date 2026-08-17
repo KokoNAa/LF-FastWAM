@@ -77,3 +77,7 @@ train:
   # PGC uses an exact native/counterfactual 1:1 index mix. Disabled for
   # every non-PGC task and enabled by libero_pgc_2cam224.
   pgc_balance_native_counterfactual: false
+  # PGC V7 only. Requires a validated `meta/pgc_v7_target_masks/index.json`
+  # sidecar in every direct-counterfactual dataset and exposes current-frame
+  # target/source/auxiliary object masks as training-only supervision.
+  pgc_target_mask_supervision_required: false

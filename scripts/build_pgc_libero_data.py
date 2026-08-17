@@ -256,7 +256,11 @@ def _set_counterfactual_goal(env: Any, record: Mapping[str, Any]) -> list[list[A
 
 
 def _make_source_env(
-    record: Mapping[str, Any], *, resolution: int, seed: int
+    record: Mapping[str, Any],
+    *,
+    resolution: int,
+    seed: int,
+    camera_segmentations: str | list[str] | None = None,
 ) -> tuple[Any, Any]:
     from libero.libero import benchmark
 
@@ -273,7 +277,13 @@ def _make_source_env(
             f"Source task text changed for {suite_name}/{task_id}: "
             f"{task.language!r} != {record['correct_instruction']!r}."
         )
-    env, _ = get_libero_env(task, resolution, seed, env_num=1)
+    env, _ = get_libero_env(
+        task,
+        resolution,
+        seed,
+        env_num=1,
+        camera_segmentations=camera_segmentations,
+    )
     _set_counterfactual_goal(env, record)
     return env, task
 

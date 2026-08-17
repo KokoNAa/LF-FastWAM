@@ -416,6 +416,336 @@ class LanguageVisualTargetBinder(nn.Module):
         )
 
 
+def infer_spatial_patch_grid(
+    token_count: int, *, aspect_ratio: float
+) -> tuple[int, int]:
+    """Infer the rectangular patch grid while preserving token order."""
+    token_count = int(token_count)
+    aspect_ratio = float(aspect_ratio)
+    if token_count <= 0 or aspect_ratio <= 0:
+        raise ValueError("Patch token count and aspect ratio must be positive.")
+    candidates: list[tuple[float, int, int]] = []
+    for height in range(1, int(math.sqrt(token_count)) + 1):
+        if token_count % height:
+            continue
+        width = token_count // height
+        for candidate_height, candidate_width in (
+            (height, width),
+            (width, height),
+        ):
+            error = abs(
+                math.log((candidate_width / candidate_height) / aspect_ratio)
+            )
+            candidates.append((error, candidate_height, candidate_width))
+    if not candidates:
+        raise ValueError(f"Cannot factor patch token count {token_count}.")
+    _, grid_height, grid_width = min(candidates)
+    return int(grid_height), int(grid_width)
+
+
+def spatial_mask_to_patch_distribution(
+    mask: torch.Tensor,
+    *,
+    token_count: int,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Area-resample a current-frame object mask onto visual patch tokens."""
+    if mask.ndim == 4 and mask.shape[1] == 1:
+        mask = mask[:, 0]
+    if mask.ndim != 3:
+        raise ValueError("PGC object masks must be [B,H,W] or [B,1,H,W].")
+    if mask.shape[-2] <= 0 or mask.shape[-1] <= 0:
+        raise ValueError("PGC object masks require positive spatial dimensions.")
+    aspect_ratio = float(mask.shape[-1]) / float(mask.shape[-2])
+    grid_height, grid_width = infer_spatial_patch_grid(
+        int(token_count), aspect_ratio=aspect_ratio
+    )
+    patch_mass = F.interpolate(
+        mask.float().unsqueeze(1),
+        size=(grid_height, grid_width),
+        mode="area",
+    ).flatten(1)
+    total_mass = patch_mass.sum(dim=-1)
+    valid = total_mass > 1.0e-6
+    uniform = torch.full_like(patch_mass, 1.0 / max(1, int(token_count)))
+    distribution = torch.where(
+        valid.unsqueeze(-1),
+        patch_mass / total_mass.clamp_min(1.0e-6).unsqueeze(-1),
+        uniform,
+    )
+    metrics = {
+        "pgc_v7_mask_valid_fraction": valid.float().mean(),
+        "pgc_v7_mask_patch_fraction": (patch_mass > 0).float().mean(),
+        "pgc_v7_mask_patch_mass": patch_mass.mean(),
+        "pgc_v7_mask_grid_height": patch_mass.new_tensor(float(grid_height)),
+        "pgc_v7_mask_grid_width": patch_mass.new_tensor(float(grid_width)),
+    }
+    return distribution, valid, metrics
+
+
+class SpatialObjectTokenTargetBinder(nn.Module):
+    """PGC V7 language-to-object binding with explicit spatial object tokens.
+
+    Language only selects current-frame visual patches. The selected patch
+    values, 2-D coordinates, and camera identities form a small object-token
+    set. Every action query independently cross-attends to that set; there is
+    no broadcast language residual and no direct text edge to the Proposal.
+    """
+
+    def __init__(
+        self,
+        *,
+        text_dim: int,
+        video_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        projection_dim: int = 256,
+        num_heads: int = 8,
+        num_object_tokens: int = 8,
+        camera_count: int = 2,
+        visual_aspect_ratio: float = 2.0,
+        temperature: float = 0.07,
+    ) -> None:
+        super().__init__()
+        if min(
+            text_dim,
+            video_dim,
+            action_dim,
+            hidden_dim,
+            projection_dim,
+            num_heads,
+            num_object_tokens,
+            camera_count,
+        ) <= 0:
+            raise ValueError("PGC V7 binder dimensions must be positive.")
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"PGC V7 hidden_dim={hidden_dim} must divide heads={num_heads}."
+            )
+        if visual_aspect_ratio <= 0 or temperature <= 0:
+            raise ValueError("PGC V7 aspect ratio and temperature must be positive.")
+        self.text_dim = int(text_dim)
+        self.video_dim = int(video_dim)
+        self.action_dim = int(action_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.projection_dim = int(projection_dim)
+        self.num_heads = int(num_heads)
+        self.num_object_tokens = int(num_object_tokens)
+        self.camera_count = int(camera_count)
+        self.visual_aspect_ratio = float(visual_aspect_ratio)
+        self.temperature = float(temperature)
+
+        self.target_language_seed = nn.Parameter(
+            torch.randn(1, 1, hidden_dim) / math.sqrt(hidden_dim)
+        )
+        self.text_projection = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, hidden_dim),
+        )
+        self.language_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True
+        )
+        self.language_norm = nn.LayerNorm(hidden_dim)
+        self.visual_projection = nn.Sequential(
+            nn.LayerNorm(video_dim),
+            nn.Linear(video_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.position_projection = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.camera_embedding = nn.Embedding(camera_count, hidden_dim)
+        self.visual_norm = nn.LayerNorm(hidden_dim)
+        self.action_query_projection = nn.Sequential(
+            nn.LayerNorm(action_dim),
+            nn.Linear(action_dim, hidden_dim),
+        )
+        self.object_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True
+        )
+        self.action_query_norm = nn.LayerNorm(hidden_dim)
+        self.query_output_projection = nn.Linear(hidden_dim, action_dim)
+        nn.init.zeros_(self.query_output_projection.weight)
+        nn.init.zeros_(self.query_output_projection.bias)
+        self.binding_embedding_projection = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, projection_dim),
+        )
+
+    def _spatial_features(
+        self, current_video_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        token_count = int(current_video_hidden.shape[1])
+        grid_height, grid_width = infer_spatial_patch_grid(
+            token_count, aspect_ratio=self.visual_aspect_ratio
+        )
+        y = torch.linspace(
+            -1.0,
+            1.0,
+            grid_height,
+            device=current_video_hidden.device,
+            dtype=current_video_hidden.dtype,
+        )
+        x = torch.linspace(
+            -1.0,
+            1.0,
+            grid_width,
+            device=current_video_hidden.device,
+            dtype=current_video_hidden.dtype,
+        )
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        coordinates = torch.stack((xx, yy), dim=-1).reshape(token_count, 2)
+        column_ids = torch.arange(grid_width, device=current_video_hidden.device)
+        camera_ids = torch.div(
+            column_ids * self.camera_count,
+            grid_width,
+            rounding_mode="floor",
+        ).clamp(max=self.camera_count - 1)
+        camera_ids = camera_ids.unsqueeze(0).expand(grid_height, -1).reshape(-1)
+        visual = self.visual_projection(current_video_hidden)
+        position = self.position_projection(coordinates).unsqueeze(0)
+        camera = self.camera_embedding(camera_ids).unsqueeze(0)
+        return self.visual_norm(visual + position + camera), coordinates, camera_ids
+
+    def forward(
+        self,
+        *,
+        base_queries: torch.Tensor,
+        language_hidden: torch.Tensor,
+        language_mask: torch.Tensor,
+        current_video_hidden: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+    ]:
+        if (
+            base_queries.ndim != 3
+            or language_hidden.ndim != 3
+            or current_video_hidden.ndim != 3
+        ):
+            raise ValueError("PGC V7 binder inputs must be 3D tensors.")
+        if language_mask.shape != language_hidden.shape[:2]:
+            raise ValueError("PGC V7 language mask must be [B,L].")
+        if not (
+            base_queries.shape[0]
+            == language_hidden.shape[0]
+            == current_video_hidden.shape[0]
+        ):
+            raise ValueError("PGC V7 binder inputs must share batch size.")
+        if base_queries.shape[-1] != self.action_dim:
+            raise ValueError("PGC V7 base-query dimension mismatch.")
+        if language_hidden.shape[-1] != self.text_dim:
+            raise ValueError("PGC V7 language dimension mismatch.")
+        if current_video_hidden.shape[-1] != self.video_dim:
+            raise ValueError("PGC V7 video dimension mismatch.")
+
+        text = self.text_projection(language_hidden)
+        text, text_padding = _safe_key_padding_mask(text, language_mask)
+        seed = self.target_language_seed.expand(language_hidden.shape[0], -1, -1)
+        language_delta, language_attention = self.language_attention(
+            query=seed,
+            key=text,
+            value=text,
+            key_padding_mask=text_padding,
+            need_weights=True,
+        )
+        language_state = self.language_norm(seed + language_delta)[:, 0]
+        language_query = F.normalize(language_state.float(), dim=-1, eps=1.0e-6)
+        spatial_visual, _, camera_ids = self._spatial_features(
+            current_video_hidden
+        )
+        visual_features = F.normalize(
+            spatial_visual.float(), dim=-1, eps=1.0e-6
+        )
+        similarity = torch.einsum("bd,bnd->bn", language_query, visual_features)
+        target_attention = torch.softmax(similarity / self.temperature, dim=-1)
+
+        selected_count = min(self.num_object_tokens, int(spatial_visual.shape[1]))
+        selected_mass, selected_indices = torch.topk(
+            target_attention, k=selected_count, dim=-1, sorted=True
+        )
+        gather_index = selected_indices.unsqueeze(-1).expand(
+            -1, -1, spatial_visual.shape[-1]
+        )
+        object_tokens = torch.gather(spatial_visual, dim=1, index=gather_index)
+        # Preserve value magnitudes while exposing relative language confidence.
+        confidence = selected_mass / selected_mass.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1.0e-8)
+        object_tokens = object_tokens * (
+            1.0 + confidence.to(object_tokens.dtype).unsqueeze(-1)
+        )
+
+        action_queries = self.action_query_projection(base_queries)
+        query_delta, query_attention = self.object_attention(
+            query=action_queries,
+            key=object_tokens,
+            value=object_tokens,
+            need_weights=True,
+        )
+        query_delta = self.query_output_projection(
+            self.action_query_norm(action_queries + query_delta)
+        )
+        binding_queries = base_queries + query_delta
+        pooled_visual = torch.einsum(
+            "bn,bnd->bd",
+            target_attention.to(spatial_visual.dtype),
+            spatial_visual,
+        )
+        binding_embedding = F.normalize(
+            self.binding_embedding_projection(pooled_visual).float(),
+            dim=-1,
+            eps=1.0e-6,
+        )
+
+        visual_probs = target_attention.float().clamp_min(1.0e-8)
+        language_probs = language_attention.float().clamp_min(1.0e-8)
+        query_probs = query_attention.float().clamp_min(1.0e-8)
+        selected_camera_ids = camera_ids[selected_indices]
+        metrics = {
+            "pgc_v7_target_attention_entropy": (
+                -(visual_probs * visual_probs.log()).sum(dim=-1)
+                / math.log(max(2, visual_probs.shape[-1]))
+            ).mean(),
+            "pgc_v7_target_attention_top1_mass": visual_probs.max(
+                dim=-1
+            ).values.mean(),
+            "pgc_v7_target_attention_topk_mass": selected_mass.sum(
+                dim=-1
+            ).mean(),
+            "pgc_v7_target_similarity_max": similarity.max(dim=-1).values.mean(),
+            "pgc_v7_language_attention_entropy": (
+                -(language_probs * language_probs.log()).sum(dim=-1)
+                / math.log(max(2, language_probs.shape[-1]))
+            ).mean(),
+            "pgc_v7_action_query_object_attention_entropy": (
+                -(query_probs * query_probs.log()).sum(dim=-1)
+                / math.log(max(2, query_probs.shape[-1]))
+            ).mean(),
+            "pgc_v7_selected_camera_diversity": (
+                selected_camera_ids.float().var(dim=-1, unbiased=False).mean()
+            ),
+            "pgc_v7_binding_query_delta_norm": query_delta.float()
+            .norm(dim=-1)
+            .mean(),
+            "pgc_v7_binding_embedding_norm": binding_embedding.norm(
+                dim=-1
+            ).mean(),
+        }
+        return (
+            binding_queries,
+            binding_embedding,
+            target_attention,
+            visual_features,
+            metrics,
+        )
+
+
 class GoalResidualAdapter(nn.Module):
     """Inject goal information without replacing the pretrained visual path.
 

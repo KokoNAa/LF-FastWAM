@@ -16,7 +16,14 @@ DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 
-def get_libero_env(task, resolution, seed, env_num=1):
+def get_libero_env(
+    task,
+    resolution,
+    seed,
+    env_num=1,
+    *,
+    camera_segmentations=None,
+):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = (
@@ -29,6 +36,8 @@ def get_libero_env(task, resolution, seed, env_num=1):
         "camera_heights": resolution,
         "camera_widths": resolution,
     }
+    if camera_segmentations is not None:
+        env_args["camera_segmentations"] = camera_segmentations
     if env_num > 1:
         env = SubprocVectorEnv([lambda: OffScreenRenderEnv(**env_args) for _ in range(env_num)])
     else:
