@@ -129,6 +129,7 @@ class PGCV8DataContractTest(unittest.TestCase):
         self.assertIn("PGC_CLOSED_LOOP_TRAIN_PROPOSAL_ONLY=true", train)
         self.assertIn("target_lift_verified", builder)
         self.assertIn("target_lift_fallback", builder)
+        self.assertIn("bootstrap-incomplete", builder)
         self.assertIn("_replay_for_target_lift", builder)
         self.assertIn("closed_loop_capture_dir", evaluation)
         self.assertIn("_capture_libero_sim_state", evaluation)

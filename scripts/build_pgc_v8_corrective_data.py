@@ -525,6 +525,58 @@ def _save_episode(
     return audit
 
 
+def _quarantine_empty_incomplete_bootstrap(output: Path) -> Path | None:
+    """Preserve and replace a zero-episode LeRobot bootstrap directory.
+
+    LeRobot does not materialize tasks.jsonl / episodes.jsonl until the first
+    episode is saved. If validation fails after ``create`` but before that
+    first save, a later ``--resume`` cannot load the metadata. Such a directory
+    is safe to replace only when both the PGC audit and provenance prove that
+    zero episodes were committed. Renaming keeps the original fully
+    recoverable for diagnosis.
+    """
+    required = (
+        output / "meta/info.json",
+        output / "meta/tasks.jsonl",
+        output / "meta/episodes.jsonl",
+    )
+    missing = [path for path in required if not path.is_file()]
+    if not missing:
+        return None
+    audits = _existing_audits(output)
+    provenance_path = output / PGC_PROVENANCE
+    successful_episode_count = None
+    if provenance_path.is_file():
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        successful_episode_count = int(
+            provenance.get("successful_episode_count", -1)
+        )
+    if audits or successful_episode_count not in (None, 0):
+        raise RuntimeError(
+            "Refusing to replace an incomplete V8 dataset that may contain "
+            f"committed episodes: output={output} audits={len(audits)} "
+            f"provenance_count={successful_episode_count} "
+            f"missing={[str(path) for path in missing]}."
+        )
+    suffix = 0
+    while True:
+        label = ".bootstrap-incomplete" + (
+            "" if suffix == 0 else f"-{suffix}"
+        )
+        quarantine = output.with_name(output.name + label)
+        if not quarantine.exists():
+            break
+        suffix += 1
+    output.rename(quarantine)
+    LOGGER.warning(
+        "Quarantined zero-episode incomplete V8 bootstrap %s -> %s; "
+        "starting a clean dataset.",
+        output,
+        quarantine,
+    )
+    return quarantine
+
+
 def _main(args: argparse.Namespace) -> None:
     records = _load_manifest(args.manifest, args.suite)
     records_by_pair = {str(record["pair_id"]): record for record in records}
@@ -590,6 +642,7 @@ def _main(args: argparse.Namespace) -> None:
     output = args.output.expanduser().resolve()
     if output.exists() and args.resume:
         _recover_pending(output)
+        _quarantine_empty_incomplete_bootstrap(output)
     audits = _existing_audits(output)
     dataset, provenance = _dataset_create_or_resume(
         args, active_records, episode_audits=audits
