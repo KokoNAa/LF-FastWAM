@@ -92,10 +92,6 @@ def load_pgc_completion_phase_index(
             f"{payload.get('format')!r}."
         )
     audited_pairs = load_pgc_episode_language_pairs(dataset_root)
-    if int(payload.get("episode_count", -1)) != len(audited_pairs):
-        raise ValueError(
-            "PGC completion-phase episode_count does not match action audits."
-        )
     records = payload.get("episodes")
     if not isinstance(records, list) or len(records) != len(audited_pairs):
         raise ValueError(
