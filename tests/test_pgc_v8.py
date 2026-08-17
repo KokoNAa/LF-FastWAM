@@ -131,6 +131,8 @@ class PGCV8DataContractTest(unittest.TestCase):
         self.assertIn("target_lift_fallback", builder)
         self.assertIn("bootstrap-incomplete", builder)
         self.assertIn("_replay_for_target_lift", builder)
+        self.assertIn("stop_on_target_lift=True", builder)
+        self.assertIn("Trying V8 capture", builder)
         self.assertIn("closed_loop_capture_dir", evaluation)
         self.assertIn("_capture_libero_sim_state", evaluation)
 

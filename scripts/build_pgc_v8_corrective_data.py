@@ -280,6 +280,7 @@ def _build_reference_bank(
     state_atol: float,
     lift_threshold_m: float,
     index_stride: int,
+    post_lift_steps: int,
 ) -> list[dict[str, Any]]:
     target_objects = _target_object_names(record)
     bank: list[dict[str, Any]] = []
@@ -300,6 +301,7 @@ def _build_reference_bank(
         tracker.observe(policy_step=0)
         trajectory_features: list[np.ndarray] = []
         first_target_acquisition_step: int | None = None
+        first_target_lift_step: int | None = None
         reference_boundary_event: str | None = None
         for action_index, action in enumerate(actions):
             trajectory_features.append(
@@ -313,6 +315,8 @@ def _build_reference_bank(
                 first_target_acquisition_step = action_index + 1
                 reference_boundary_event = "grasp_contact"
             target_lifted = _target_lifted(tracker, target_objects)
+            if first_target_lift_step is None and target_lifted:
+                first_target_lift_step = action_index + 1
             if first_target_acquisition_step is None and target_lifted:
                 # Robosuite contact-name heuristics occasionally miss a valid
                 # grasp even though the object is observably lifted. The lift
@@ -322,10 +326,9 @@ def _build_reference_bank(
                 reference_boundary_event = "target_lift_fallback"
             if target_lifted or bool(done):
                 break
-        if first_target_acquisition_step is None:
+        if first_target_acquisition_step is None or first_target_lift_step is None:
             raise RuntimeError(
-                f"Reference episode {episode_index} neither grasps nor lifts "
-                "the target for "
+                f"Reference episode {episode_index} never lifts the target for "
                 f"pair {record['pair_id']}."
             )
         if reference_boundary_event == "target_lift_fallback":
@@ -341,6 +344,10 @@ def _build_reference_bank(
         candidate_indices = list(range(0, last_start + 1, index_stride))
         if last_start not in candidate_indices:
             candidate_indices.append(last_start)
+        reference_stop_step = min(
+            len(actions),
+            first_target_lift_step + int(post_lift_steps),
+        )
         for action_index in candidate_indices:
             bank.append(
                 {
@@ -348,11 +355,24 @@ def _build_reference_bank(
                     "action_index": int(action_index),
                     "reference_boundary_event": reference_boundary_event,
                     "feature": trajectory_features[action_index],
-                    "actions": actions[action_index:],
+                    # V8 repairs target acquisition only. Keeping the full
+                    # placement tail made each failed candidate replay hundreds
+                    # of unnecessary MuJoCo steps and looked like a deadlock.
+                    "actions": actions[action_index:reference_stop_step],
                 }
             )
     if not bank:
         raise RuntimeError(f"No pre-grasp reference actions for {record['pair_id']}.")
+    suffix_lengths = [len(item["actions"]) for item in bank]
+    LOGGER.info(
+        "Built V8 reference bank pair=%s episodes=%d candidates=%d "
+        "suffix_steps=%d..%d.",
+        record["pair_id"],
+        len(reference_audits),
+        len(bank),
+        min(suffix_lengths),
+        max(suffix_lengths),
+    )
     return bank
 
 
@@ -394,6 +414,7 @@ def _replay_for_target_lift(
     state_atol: float,
     lift_threshold_m: float,
     dataset: Any | None = None,
+    stop_on_target_lift: bool = False,
 ) -> dict[str, Any]:
     obs, actual_state = _reset_exact_state(
         env,
@@ -418,6 +439,8 @@ def _replay_for_target_lift(
         tracker.observe(policy_step=used_actions)
         if lifted_step is None and _target_lifted(tracker, target_objects):
             lifted_step = used_actions
+            if stop_on_target_lift:
+                break
         if bool(done):
             break
     return {
@@ -693,6 +716,7 @@ def _main(args: argparse.Namespace) -> None:
                 state_atol=args.state_atol,
                 lift_threshold_m=args.lift_threshold_m,
                 index_stride=args.reference_index_stride,
+                post_lift_steps=args.post_lift_steps,
             )
             ranked_captures: list[tuple[float, dict[str, Any], list[dict[str, Any]]]] = []
             for capture in captures[pair_id][: args.max_captures_per_pair]:
@@ -715,12 +739,47 @@ def _main(args: argparse.Namespace) -> None:
                         (float(candidates[0]["feature_mse"]), capture, candidates)
                     )
             ranked_captures.sort(key=lambda item: (item[0], str(item[1]["capture_id"])))
+            LOGGER.info(
+                "Searching V8 corrections pair=%s captures=%d "
+                "candidates_per_capture<=%d "
+                "progress=%d/%d.",
+                pair_id,
+                len(ranked_captures),
+                int(args.max_candidates_per_capture),
+                counts[pair_id],
+                required,
+            )
 
-            for _, capture, candidates in ranked_captures:
+            for capture_rank, (nearest_mse, capture, candidates) in enumerate(
+                ranked_captures, start=1
+            ):
                 if counts[pair_id] >= required:
                     break
+                LOGGER.info(
+                    "Trying V8 capture pair=%s capture=%d/%d id=%s "
+                    "nearest_mse=%.6g candidates=%d accepted=%d/%d.",
+                    pair_id,
+                    capture_rank,
+                    len(ranked_captures),
+                    capture["capture_id"],
+                    nearest_mse,
+                    len(candidates),
+                    counts[pair_id],
+                    required,
+                )
                 accepted = False
-                for candidate in candidates:
+                for candidate_rank, candidate in enumerate(candidates, start=1):
+                    if candidate_rank == 1 or candidate_rank % 10 == 0:
+                        LOGGER.info(
+                            "Validating V8 candidate pair=%s capture=%s "
+                            "candidate=%d/%d reference_episode=%d action=%d.",
+                            pair_id,
+                            capture["capture_id"],
+                            candidate_rank,
+                            len(candidates),
+                            int(candidate["episode_index"]),
+                            int(candidate["action_index"]),
+                        )
                     suffix = np.asarray(candidate["actions"], dtype=np.float32)
                     validation = _replay_for_target_lift(
                         env=env,
@@ -729,6 +788,7 @@ def _main(args: argparse.Namespace) -> None:
                         actions=suffix,
                         state_atol=args.state_atol,
                         lift_threshold_m=args.lift_threshold_m,
+                        stop_on_target_lift=True,
                     )
                     if not validation["target_lifted"]:
                         continue
