@@ -56,6 +56,7 @@ class PGCV8DataContractTest(unittest.TestCase):
                     "capture_state_sha256": initial_digest,
                     "recorded_action_count": 24,
                     "target_lift_verified": verified,
+                    "reference_boundary_event": "grasp_contact",
                     "source_initial_state_catalog": (
                         "meta/pgc_initial_states/v8_episode_000000.npy"
                     ),
@@ -79,6 +80,7 @@ class PGCV8DataContractTest(unittest.TestCase):
                             "capture_state_sha256": initial_digest,
                             "recorded_action_count": 24,
                             "target_lift_verified": verified,
+                            "reference_boundary_event": "grasp_contact",
                         }
                     ],
                 }
@@ -126,6 +128,7 @@ class PGCV8DataContractTest(unittest.TestCase):
         self.assertIn("PGC_WARM_START_V5=true", train)
         self.assertIn("PGC_CLOSED_LOOP_TRAIN_PROPOSAL_ONLY=true", train)
         self.assertIn("target_lift_verified", builder)
+        self.assertIn("target_lift_fallback", builder)
         self.assertIn("_replay_for_target_lift", builder)
         self.assertIn("closed_loop_capture_dir", evaluation)
         self.assertIn("_capture_libero_sim_state", evaluation)

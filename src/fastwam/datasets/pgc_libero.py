@@ -201,6 +201,9 @@ def load_pgc_closed_loop_corrective_index(
         pair_id = str(record.get("pair_id", "")).strip()
         state_digest = str(record.get("capture_state_sha256", "")).strip().lower()
         action_count = int(record.get("recorded_action_count", 0))
+        reference_boundary_event = str(
+            record.get("reference_boundary_event", "")
+        )
         if not capture_id or capture_id in capture_ids:
             raise ValueError(
                 f"PGC V8 episode {episode_index} has an invalid/duplicate capture_id."
@@ -217,6 +220,14 @@ def load_pgc_closed_loop_corrective_index(
             raise ValueError(
                 f"PGC V8 episode {episode_index} was not target-lift verified."
             )
+        if reference_boundary_event not in {
+            "grasp_contact",
+            "target_lift_fallback",
+        }:
+            raise ValueError(
+                f"PGC V8 episode {episode_index} has no valid reference "
+                "acquisition boundary."
+            )
         pair = audited_pairs[episode_index]
         if pair_id != str(pair["pair_id"]):
             raise ValueError(
@@ -230,6 +241,8 @@ def load_pgc_closed_loop_corrective_index(
             != state_digest
             or int(audit.get("recorded_action_count", 0)) != action_count
             or audit.get("target_lift_verified") is not True
+            or str(audit.get("reference_boundary_event", ""))
+            != reference_boundary_event
         ):
             raise ValueError(
                 f"PGC V8 index/audit mismatch for episode {episode_index}."

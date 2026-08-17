@@ -299,25 +299,45 @@ def _build_reference_bank(
         tracker = _new_tracker(env, record, lift_threshold_m)
         tracker.observe(policy_step=0)
         trajectory_features: list[np.ndarray] = []
-        first_target_grasp_step: int | None = None
+        first_target_acquisition_step: int | None = None
+        reference_boundary_event: str | None = None
         for action_index, action in enumerate(actions):
             trajectory_features.append(
                 _state_feature(env, obs, target_objects)
             )
             obs, _, done, _ = env.step(np.asarray(action).tolist())
             tracker.observe(policy_step=action_index + 1)
-            if first_target_grasp_step is None and bool(
+            if first_target_acquisition_step is None and bool(
                 target_objects & tracker.grasped_objects
             ):
-                first_target_grasp_step = action_index + 1
-            if _target_lifted(tracker, target_objects) or bool(done):
+                first_target_acquisition_step = action_index + 1
+                reference_boundary_event = "grasp_contact"
+            target_lifted = _target_lifted(tracker, target_objects)
+            if first_target_acquisition_step is None and target_lifted:
+                # Robosuite contact-name heuristics occasionally miss a valid
+                # grasp even though the object is observably lifted. The lift
+                # event is the V8 task predicate and is therefore a safe,
+                # conservative fallback for delimiting candidate starts.
+                first_target_acquisition_step = action_index + 1
+                reference_boundary_event = "target_lift_fallback"
+            if target_lifted or bool(done):
                 break
-        if first_target_grasp_step is None:
+        if first_target_acquisition_step is None:
             raise RuntimeError(
-                f"Reference episode {episode_index} never grasps target for "
+                f"Reference episode {episode_index} neither grasps nor lifts "
+                "the target for "
                 f"pair {record['pair_id']}."
             )
-        last_start = min(first_target_grasp_step, len(trajectory_features) - 1)
+        if reference_boundary_event == "target_lift_fallback":
+            LOGGER.warning(
+                "Reference episode %d uses target-lift fallback because the "
+                "contact heuristic did not report a grasp (pair=%s).",
+                episode_index,
+                record["pair_id"],
+            )
+        last_start = min(
+            first_target_acquisition_step, len(trajectory_features) - 1
+        )
         candidate_indices = list(range(0, last_start + 1, index_stride))
         if last_start not in candidate_indices:
             candidate_indices.append(last_start)
@@ -326,6 +346,7 @@ def _build_reference_bank(
                 {
                     "episode_index": episode_index,
                     "action_index": int(action_index),
+                    "reference_boundary_event": reference_boundary_event,
                     "feature": trajectory_features[action_index],
                     "actions": actions[action_index:],
                 }
@@ -420,6 +441,9 @@ def _write_v8_index(output: Path, audits: list[dict[str, Any]]) -> None:
             "target_lift_step": int(audit["target_lift_step"]),
             "reference_episode_index": int(audit["reference_episode_index"]),
             "reference_action_index": int(audit["reference_action_index"]),
+            "reference_boundary_event": str(
+                audit["reference_boundary_event"]
+            ),
             "reference_feature_mse": float(audit["reference_feature_mse"]),
         }
         for audit in sorted(audits, key=lambda item: int(item["episode_index"]))
@@ -479,6 +503,9 @@ def _save_episode(
         "recorded_action_count": int(recorded_action_count),
         "reference_episode_index": int(candidate["episode_index"]),
         "reference_action_index": int(candidate["action_index"]),
+        "reference_boundary_event": str(
+            candidate["reference_boundary_event"]
+        ),
         "reference_feature_mse": float(candidate["feature_mse"]),
         "collection_method": (
             "exact_closed_loop_state_plus_replay_verified_expert_suffix"
