@@ -20,6 +20,9 @@ MAX_POLICY_STEPS="${PGC_MAX_POLICY_STEPS:-}"
 CLOSED_LOOP_CAPTURE_DIR="${PGC_CLOSED_LOOP_CAPTURE_DIR:-}"
 CLOSED_LOOP_CAPTURE_STRIDE="${PGC_CLOSED_LOOP_CAPTURE_STRIDE_REPLANS:-1}"
 CLOSED_LOOP_CAPTURE_MAX_STATES="${PGC_CLOSED_LOOP_CAPTURE_MAX_STATES_PER_EPISODE:-12}"
+V9_ABLATION="${PGC_V9_ABLATION:-full}"
+ERAF_DIAGNOSTICS="${PGC_ERAF_DIAGNOSTICS:-true}"
+ERAF_OVERLAY_DIR="${PGC_ERAF_OVERLAY_DIR:-${OUTPUT_ROOT}/eraf_overlays}"
 
 for value_name in NUM_GPUS NUM_TRIALS NUM_INFERENCE_STEPS; do
   value="${!value_name}"
@@ -46,6 +49,13 @@ case "${GATE_MODE}" in
     exit 1
     ;;
 esac
+case "${ERAF_DIAGNOSTICS}" in
+  true|false) ;;
+  *)
+    echo "PGC_ERAF_DIAGNOSTICS must be true or false." >&2
+    exit 1
+    ;;
+esac
 if [[ ! -f "${PGC_CHECKPOINT}" ]]; then
   echo "PGC checkpoint not found: ${PGC_CHECKPOINT}" >&2
   exit 1
@@ -64,19 +74,21 @@ fi
 
 PGC_CHECKPOINT_VERSION="$("${PYTHON_BIN}" - \
   "${PGC_CHECKPOINT}" \
-  "${NUM_INFERENCE_STEPS}" <<'PY'
+  "${NUM_INFERENCE_STEPS}" \
+  "${V9_ABLATION}" <<'PY'
 import sys
 import torch
 
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 evaluation_inference_steps = int(sys.argv[2])
+v9_ablation = sys.argv[3]
 metadata = payload.get("architecture_metadata") or {}
 if metadata.get("architecture") != "pgc_fastwam":
     raise SystemExit("Checkpoint is missing PGC architecture metadata")
 version = int(metadata.get("policy_guard_version", -1))
-if version not in {2, 3, 4, 5, 6, 7, 8}:
+if version not in {2, 3, 4, 5, 6, 7, 8, 9}:
     raise SystemExit(
-        f"Only PGC versions 2 through 8 are supported, got {version}"
+        f"Only PGC versions 2 through 9 are supported, got {version}"
     )
 if payload.get("format") != f"fastwam_policy_guard_v{version}":
     raise SystemExit("PGC checkpoint format/version mismatch")
@@ -95,6 +107,7 @@ expected_tuning = {
     6: "visual_target_bottleneck_paired_action_residual",
     7: "object_token_mask_grounded_paired_action_residual",
     8: "closed_loop_replay_verified_target_acquisition_residual",
+    9: "entity_relation_affordance_grounded_paired_action_residual",
 }[version]
 if metadata.get("counterfactual_tuning") != expected_tuning:
     raise SystemExit(f"PGC v{version} tuning metadata is incompatible")
@@ -156,6 +169,27 @@ if version == 8 and (
     != "action_chunk_proposal_only"
 ):
     raise SystemExit("PGC v8 checkpoint lacks its audited corrective contract")
+if version == 9:
+    expected_ablation = {
+        "full": (False, True),
+        "entity-only": (True, False),
+        "without-anchor": (False, False),
+    }
+    if v9_ablation not in expected_ablation:
+        raise SystemExit(
+            "PGC_V9_ABLATION must be full, entity-only, or without-anchor"
+        )
+    entity_only, use_anchors = expected_ablation[v9_ablation]
+    if (
+        metadata.get("warm_start_contract") != "exact_pgc_v5_sidecars"
+        or metadata.get("grounding")
+        != "predicate_entity_relation_affordance_field"
+        or metadata.get("privileged_supervision") != "training_only"
+        or metadata.get("deployment_inputs") != "rgb_language_proprio"
+        or bool(metadata.get("eraf_entity_only", False)) != entity_only
+        or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
+    ):
+        raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
 print(version)
 PY
 )"
@@ -164,6 +198,22 @@ PGC_CLOSED_LOOP_ENABLED=false
 if [[ "${PGC_CHECKPOINT_VERSION}" == "8" ]]; then
   PGC_CLOSED_LOOP_ENABLED=true
 fi
+V9_ENTITY_ONLY=false
+V9_USE_ANCHORS=true
+case "${V9_ABLATION}" in
+  full) ;;
+  entity-only)
+    V9_ENTITY_ONLY=true
+    V9_USE_ANCHORS=false
+    ;;
+  without-anchor)
+    V9_USE_ANCHORS=false
+    ;;
+  *)
+    echo "PGC_V9_ABLATION must be full, entity-only, or without-anchor." >&2
+    exit 1
+    ;;
+esac
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   GPU_LIST=""
@@ -201,6 +251,16 @@ EXTRA_OVERRIDES=(
   # strictly restore only their policy-guard sidecar tensors.
   "model.lora.enabled=false"
 )
+if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
+  EXTRA_OVERRIDES+=(
+    "model.policy_guard.entity_relation_grounding.entity_only=${V9_ENTITY_ONLY}"
+    "model.policy_guard.entity_relation_grounding.use_anchors=${V9_USE_ANCHORS}"
+    "EVALUATION.entity_relation_diagnostics=${ERAF_DIAGNOSTICS}"
+  )
+  if [[ "${ERAF_DIAGNOSTICS}" == "true" ]]; then
+    EXTRA_OVERRIDES+=("EVALUATION.entity_relation_overlay_dir=${ERAF_OVERLAY_DIR}")
+  fi
+fi
 if [[ -n "${MANIFEST_PATH}" ]]; then
   EXTRA_OVERRIDES+=("EVALUATION.language_intervention_manifest=${MANIFEST_PATH}")
 fi
@@ -233,6 +293,10 @@ echo "  gate=${GATE_MODE} margin=${GATE_THRESHOLD} min_cf=${MIN_COUNTERFACTUAL_S
 echo "  max_policy_steps=${MAX_POLICY_STEPS:-suite_default}"
 echo "  output=${OUTPUT_ROOT}"
 echo "  closed_loop_capture=${CLOSED_LOOP_CAPTURE_DIR:-disabled}"
+if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
+  echo "  v9_ablation=${V9_ABLATION} eraf_diagnostics=${ERAF_DIAGNOSTICS}"
+  echo "  eraf_overlay_dir=${ERAF_OVERLAY_DIR}"
+fi
 
 EXP_NAME="pgc-${CONDITION}" "${PYTHON_BIN}" \
   experiments/libero/run_libero_manager.py "${EXTRA_OVERRIDES[@]}"

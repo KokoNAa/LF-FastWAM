@@ -222,6 +222,8 @@ policy_guard:
   # Stage-2 verifier negatives prevent the old shortcut "any CF row is good".
   verifier_wrong_language_weight: 0.50
   verifier_bad_candidate_weight: 0.50
+  verifier_wrong_entity_weight: 0.50
+  verifier_wrong_relation_weight: 0.50
   # PGC v6: language scores current-frame visual patches, while the Proposal
   # receives only the selected visual value plus language-independent query
   # seeds. Future demonstration frames are training-only and locate the
@@ -256,6 +258,28 @@ policy_guard:
   mask_mass_weight: 0.50
   cross_object_weight: 0.50
   cross_object_margin: 0.25
+  # PGC v9 Entity--Relation Affordance Field. Simulator masks, poses,
+  # predicate truth, and phase labels supervise this module during training;
+  # deployment continues to consume only RGB, language, and proprio.
+  entity_relation_grounding:
+    training_stage: grounding
+    hidden_dim: 256
+    num_heads: 8
+    max_clauses: 4
+    camera_count: 2
+    visual_aspect_ratio: 2.0
+    temperature: 0.07
+    entity_only: false
+    use_anchors: true
+    learning_rate: 2.0e-5
+    grounding_aux_weight: 0.25
+    mask_weight: 1.0
+    entity_weight: 1.0
+    relation_weight: 1.0
+    anchor_weight: 1.0
+    position_weight: 0.5
+    role_swap_weight: 0.5
+    phase_weight: 1.0
   # Stage A learns only language-to-visual binding. Stage B linearly enables
   # V5 action objectives; the verifier has its own later schedule below.
   target_binding_action_start_step: 1000

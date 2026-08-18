@@ -14,6 +14,8 @@ bash -n scripts/train_pgc_libero.sh scripts/train_pgc_libero_suite.sh \
   scripts/train_pgc_v6_libero_suite.sh \
   scripts/train_pgc_v7_libero_suite.sh \
   scripts/train_pgc_v8_libero_suite.sh \
+  scripts/train_pgc_v9_libero_stage.sh \
+  scripts/build_pgc_v9_libero_suite.sh \
   scripts/audit_pgc_v7_residual_gap.sh \
   scripts/eval_pgc_libero.sh \
   scripts/build_pgc_libero_datasets.sh scripts/validate_pgc_server.sh

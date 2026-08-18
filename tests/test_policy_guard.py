@@ -38,6 +38,9 @@ def tiny_pgc_fastwam(
     configure_lora: bool = True,
     version: int = 2,
     completion_phase_enabled: bool = False,
+    v9_stage: str = "grounding",
+    v9_entity_only: bool = False,
+    v9_use_anchors: bool = True,
 ) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
@@ -166,6 +169,26 @@ def tiny_pgc_fastwam(
             "verifier_margin": 0.2,
             "gate_threshold": 0.2,
             "min_counterfactual_score": 0.6,
+            "entity_relation_grounding": {
+                "training_stage": v9_stage,
+                "hidden_dim": 8,
+                "num_heads": 2,
+                "max_clauses": 4,
+                "camera_count": 2,
+                "visual_aspect_ratio": 2.0,
+                "temperature": 0.07,
+                "learning_rate": 2.0e-5,
+                "grounding_aux_weight": 0.25,
+                "mask_weight": 1.0,
+                "entity_weight": 1.0,
+                "relation_weight": 1.0,
+                "anchor_weight": 1.0,
+                "position_weight": 0.5,
+                "role_swap_weight": 0.5,
+                "phase_weight": 1.0,
+                "entity_only": v9_entity_only,
+                "use_anchors": v9_use_anchors,
+            },
         },
     )
     if configure_lora and version <= 2:

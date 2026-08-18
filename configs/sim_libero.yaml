@@ -51,6 +51,10 @@ EVALUATION:
   # the policy inputs or simulator success predicate.
   counterfactual_diagnostics: false
   counterfactual_lift_threshold_m: 0.04
+  # PGC v9 deployment diagnostics. When enabled, each replanning decision
+  # writes ERAF heatmaps/anchors as a compressed NPZ plus a human-readable PNG.
+  entity_relation_diagnostics: false
+  entity_relation_overlay_dir: null
 
   # Optional external inputs
   dataset_stats_path: null

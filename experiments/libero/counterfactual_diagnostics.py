@@ -111,6 +111,9 @@ class CounterfactualEpisodeTracker:
         self.trackable_objects = sorted(
             str(name) for name in objects_dict if name in obj_body_id
         )
+        self.counterfactual_graspable_target_objects = (
+            self.counterfactual_target_objects & set(self.trackable_objects)
+        )
         self.initial_object_z = {
             name: self._object_z(name) for name in self.trackable_objects
         }
@@ -191,6 +194,9 @@ class CounterfactualEpisodeTracker:
             "source_goal_final": bool(self.source_goal_final),
             "counterfactual_target_objects": sorted(
                 self.counterfactual_target_objects
+            ),
+            "counterfactual_graspable_target_objects": sorted(
+                self.counterfactual_graspable_target_objects
             ),
             "source_target_objects": sorted(self.source_target_objects),
             "grasped_objects": sorted(self.grasped_objects),

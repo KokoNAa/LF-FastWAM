@@ -26,6 +26,49 @@ PGC_COMPLETION_PHASE_FORMAT = "pgc_libero_completion_phases_v1"
 PGC_COMPLETION_PHASE_INDEX = Path("meta/pgc_v5_completion_phases.json")
 PGC_CLOSED_LOOP_CORRECTIVE_FORMAT = "pgc_libero_closed_loop_corrective_v1"
 PGC_CLOSED_LOOP_CORRECTIVE_INDEX = Path("meta/pgc_v8_closed_loop/index.json")
+PGC_ENTITY_RELATION_FORMAT = "pgc_libero_entity_relation_v1"
+PGC_ENTITY_RELATION_INDEX = Path("index.json")
+PGC_ENTITY_RELATION_PREDICATES = (
+    "pad",
+    "in",
+    "on",
+    "left",
+    "right",
+    "front",
+    "back",
+    "open",
+    "close",
+    "turnon",
+    "turnoff",
+)
+PGC_ENTITY_RELATION_ARRAY_NAMES = (
+    "predicate_ids",
+    "clause_valid",
+    "subject_entity_ids",
+    "reference_entity_ids",
+    "subject_masks",
+    "reference_masks",
+    "subject_mask_valid",
+    "reference_mask_valid",
+    "subject_view_visible",
+    "reference_view_visible",
+    "subject_view_centers",
+    "reference_view_centers",
+    "subject_positions",
+    "reference_positions",
+    "subject_position_valid",
+    "reference_position_valid",
+    "grasp_anchors",
+    "grasp_anchor_valid",
+    "goal_anchors",
+    "goal_anchor_valid",
+    "interaction_anchors",
+    "interaction_anchor_valid",
+    "predicate_truth",
+    "predicate_truth_valid",
+    "phase_ids",
+    "phase_valid",
+)
 LIBERO_SUITES = (
     "libero_spatial",
     "libero_object",
@@ -313,6 +356,474 @@ def goal_subject(goal_state: Sequence[Sequence[Any]]) -> str:
     return next(iter(subjects))
 
 
+def _normalize_libero_predicate(value: Any) -> str:
+    predicate = re.sub(r"[^a-z]", "", str(value).strip().casefold())
+    aliases = {
+        "inside": "in",
+        "contains": "in",
+        "leftof": "left",
+        "rightof": "right",
+        "infrontof": "front",
+        "frontof": "front",
+        "behind": "back",
+        "backof": "back",
+        "turnon": "turnon",
+        "turnoff": "turnoff",
+    }
+    return aliases.get(predicate, predicate)
+
+
+def resolve_libero_region_target(
+    value: Any,
+    regions: Mapping[str, Any],
+) -> tuple[str, str | None]:
+    """Resolve a BDDL region through ``regions[name]['target']``.
+
+    The original region name is returned separately because it defines the
+    goal anchor, while the resolved target is the reference fixture/entity.
+    String suffix guessing is intentionally forbidden.
+    """
+    name = str(value).strip()
+    region = regions.get(name)
+    if not isinstance(region, Mapping):
+        return name, None
+    target = region.get("target")
+    if isinstance(target, Sequence) and not isinstance(target, (str, bytes)):
+        target = next((item for item in target if str(item).strip()), None)
+    target_name = "" if target is None else str(target).strip()
+    if not target_name:
+        raise ValueError(f"LIBERO region {name!r} has no structural target.")
+    return target_name, name
+
+
+def libero_problem_entity_catalog(
+    problem: Mapping[str, Any],
+) -> dict[str, list[str]]:
+    """Merge structurally declared LIBERO objects and fixtures by type."""
+    result: dict[str, list[str]] = {}
+    for section_name in ("objects", "fixtures"):
+        section = problem.get(section_name, {})
+        if not isinstance(section, Mapping):
+            continue
+        for declared_type, raw_instances in section.items():
+            instances = (
+                raw_instances
+                if isinstance(raw_instances, Sequence)
+                and not isinstance(raw_instances, (str, bytes))
+                else [raw_instances]
+            )
+            bucket = result.setdefault(str(declared_type), [])
+            for raw_instance in instances:
+                instance = str(raw_instance).strip()
+                if instance and instance not in bucket:
+                    bucket.append(instance)
+    return result
+
+
+def _instruction_spatial_relation(instruction: str | None) -> str | None:
+    """Extract an explicit directional relation from task language.
+
+    LIBERO represents directional placement goals as ``on(subject, region)``.
+    The reference entity must still come from the structural BDDL
+    ``regions[name]['target']`` mapping; language is used only to label which
+    directional relation that already-resolved region denotes.
+    """
+    normalized = re.sub(
+        r"\s+", " ", str(instruction or "").strip().casefold()
+    )
+    patterns = (
+        (r"\b(?:to (?:the )?)?left of\b", "left"),
+        (r"\b(?:to (?:the )?)?right of\b", "right"),
+        (r"\b(?:in |to (?:the )?)?front of\b", "front"),
+        (r"\b(?:behind|(?:to (?:the )?)?back of)\b", "back"),
+    )
+    matches = [relation for pattern, relation in patterns if re.search(pattern, normalized)]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Ambiguous directional relations in instruction {instruction!r}: "
+            f"{matches}."
+        )
+    return matches[0] if matches else None
+
+
+def _instruction_reference_entity(
+    instruction: str | None,
+    *,
+    entity_catalog: Mapping[str, Any] | None,
+    subject: str,
+) -> str | None:
+    """Resolve a directional reference from declared BDDL entities.
+
+    The catalog constrains matching to actual scene instances, so this never
+    invents an entity from a region-name substring.  Suffix aliases handle
+    LIBERO names such as ``flat_stove_1`` -> ``stove``.
+    """
+    if not entity_catalog:
+        return None
+    normalized_instruction = re.sub(
+        r"[^a-z0-9]+", " ", str(instruction or "").casefold()
+    ).strip()
+    candidates: list[tuple[int, str]] = []
+    for declared_type, raw_instances in entity_catalog.items():
+        instances = (
+            raw_instances
+            if isinstance(raw_instances, Sequence)
+            and not isinstance(raw_instances, (str, bytes))
+            else [raw_instances]
+        )
+        for raw_instance in instances:
+            instance = str(raw_instance).strip()
+            if not instance or instance == str(subject):
+                continue
+            stems = {
+                re.sub(r"_\d+$", "", instance.casefold()),
+                re.sub(r"_\d+$", "", str(declared_type).strip().casefold()),
+            }
+            aliases: set[str] = set()
+            for stem in stems:
+                words = [word for word in re.split(r"[^a-z0-9]+", stem) if word]
+                aliases.update(" ".join(words[index:]) for index in range(len(words)))
+            matched = [
+                alias
+                for alias in aliases
+                if alias
+                and re.search(
+                    rf"\b{re.escape(alias)}\b", normalized_instruction
+                )
+            ]
+            if matched:
+                candidates.append(
+                    (max(len(alias.split()) for alias in matched), instance)
+                )
+    if not candidates:
+        return None
+    best_score = max(score for score, _ in candidates)
+    best = sorted({instance for score, instance in candidates if score == best_score})
+    return best[0] if len(best) == 1 else None
+
+
+def parse_libero_goal_clauses(
+    goal_state: Sequence[Sequence[Any]],
+    *,
+    regions: Mapping[str, Any] | None = None,
+    max_clauses: int = 4,
+    instruction: str | None = None,
+    entity_catalog: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Parse LIBERO predicates into explicit subject/reference clauses."""
+    if not isinstance(goal_state, Sequence) or isinstance(
+        goal_state, (str, bytes)
+    ):
+        raise ValueError("LIBERO goal_state must be a predicate sequence.")
+    regions = dict(regions or {})
+    clauses: list[dict[str, Any]] = []
+    for raw_clause in goal_state:
+        if not isinstance(raw_clause, Sequence) or isinstance(
+            raw_clause, (str, bytes)
+        ):
+            raise ValueError(f"Invalid LIBERO goal predicate: {raw_clause!r}.")
+        values = [str(value).strip() for value in raw_clause]
+        if len(values) < 2:
+            raise ValueError(f"Incomplete LIBERO goal predicate: {raw_clause!r}.")
+        predicate = _normalize_libero_predicate(values[0])
+        if predicate not in PGC_ENTITY_RELATION_PREDICATES[1:]:
+            raise ValueError(
+                f"Unsupported ERAF predicate {predicate!r} in {raw_clause!r}."
+            )
+        subject, subject_region = resolve_libero_region_target(
+            values[1], regions
+        )
+        reference = subject
+        reference_region = subject_region
+        reference_region_target = reference if reference_region is not None else None
+        if predicate in {"in", "on", "left", "right", "front", "back"}:
+            if len(values) < 3:
+                raise ValueError(
+                    f"Binary ERAF predicate lacks a reference: {raw_clause!r}."
+                )
+            reference, reference_region = resolve_libero_region_target(
+                values[2], regions
+            )
+            reference_region_target = (
+                reference if reference_region is not None else None
+            )
+        if predicate == "on" and reference_region is not None:
+            # Directional LIBERO goals are encoded as ON over a BDDL region.
+            # Structural parsing resolves the true reference entity; explicit
+            # task language supplies the otherwise absent relation class.
+            directional = _instruction_spatial_relation(instruction)
+            if directional is not None:
+                predicate = directional
+                reference = _instruction_reference_entity(
+                    instruction,
+                    entity_catalog=entity_catalog,
+                    subject=subject,
+                ) or reference
+        clauses.append(
+            {
+                "clause_index": len(clauses),
+                "predicate": predicate,
+                "predicate_id": PGC_ENTITY_RELATION_PREDICATES.index(
+                    predicate
+                ),
+                "subject": subject,
+                "subject_region": subject_region,
+                "reference": reference,
+                "reference_region": reference_region,
+                "reference_region_target": reference_region_target,
+                "raw": values,
+            }
+        )
+    if not clauses:
+        raise ValueError("ERAF requires at least one LIBERO goal clause.")
+    if len(clauses) > int(max_clauses):
+        raise ValueError(
+            f"ERAF supports at most {max_clauses} clauses, got {len(clauses)}."
+        )
+    return clauses
+
+
+def classify_strict_conflict(
+    source_clauses: Sequence[Mapping[str, Any]],
+    target_clauses: Sequence[Mapping[str, Any]],
+) -> str | None:
+    """Classify a candidate pair without weakening the strict-conflict rules."""
+    source = [dict(clause) for clause in source_clauses]
+    target = [dict(clause) for clause in target_clauses]
+    if not source or not target or source == target:
+        return None
+
+    def semantic_signature(clause: Mapping[str, Any]) -> tuple[str, ...]:
+        return tuple(
+            str(clause.get(field) or "")
+            for field in (
+                "predicate",
+                "subject",
+                "reference",
+                "subject_region",
+                "reference_region",
+                "reference_region_target",
+            )
+        )
+
+    # A shared clause makes either side a compatible subgoal.  Such pairs are
+    # useful as raw CIS interventions but are forbidden in strict-conflict CIS.
+    source_signatures = {semantic_signature(clause) for clause in source}
+    target_signatures = {semantic_signature(clause) for clause in target}
+    if source_signatures & target_signatures:
+        return None
+    if len(source) > 1 or len(target) > 1:
+        return "conjunction"
+    source_clause, target_clause = source[0], target[0]
+    source_predicate = str(source_clause.get("predicate", ""))
+    target_predicate = str(target_clause.get("predicate", ""))
+    source_subject = str(source_clause.get("subject", ""))
+    target_subject = str(target_clause.get("subject", ""))
+    source_reference = str(source_clause.get("reference", ""))
+    target_reference = str(target_clause.get("reference", ""))
+    source_region = str(source_clause.get("reference_region") or "")
+    target_region = str(target_clause.get("reference_region") or "")
+    articulated = {"open", "close", "turnon", "turnoff"}
+    if source_predicate in articulated or target_predicate in articulated:
+        return "articulated_state"
+    inverse_directions = {
+        ("left", "right"),
+        ("right", "left"),
+        ("front", "back"),
+        ("back", "front"),
+    }
+    if (
+        (source_predicate, target_predicate) in inverse_directions
+        and source_subject == target_subject
+        and source_reference == target_reference
+    ):
+        return "direction_swap"
+    if (
+        source_predicate != target_predicate
+        and source_subject == target_subject
+        and source_reference == target_reference
+    ):
+        return "relation_swap"
+    if (
+        source_predicate == target_predicate
+        and (
+            source_subject != target_subject
+            or source_reference != target_reference
+        )
+    ):
+        return "entity_swap"
+    if (
+        source_predicate == target_predicate
+        and source_subject == target_subject
+        and source_reference == target_reference
+        and source_region != target_region
+    ):
+        return "relation_swap"
+    # A pair can alter both entity and relation.  It is still a strict
+    # semantic conflict, but is kept separate from the cleaner ablations.
+    return "compound_conflict"
+
+
+def validate_strict_conflict_audit(
+    audit: Mapping[str, Any], *, required_demos: int = 5
+) -> dict[str, Any]:
+    """Fail closed on initial-goal and bidirectional demonstration shortcuts."""
+    required_demos = int(required_demos)
+    if required_demos <= 0:
+        raise ValueError("Strict-conflict required_demos must be positive.")
+    required_counts = {
+        "source_demo_source_success": required_demos,
+        "target_demo_target_success": required_demos,
+        "target_initially_false": required_demos,
+        "source_initially_false": required_demos,
+    }
+    forbidden_counts = {
+        "source_demo_target_success": 0,
+        "target_demo_source_success": 0,
+    }
+    normalized = {name: int(audit.get(name, -1)) for name in (*required_counts, *forbidden_counts)}
+    failures = [
+        f"{name}={normalized[name]} expected>={minimum}"
+        for name, minimum in required_counts.items()
+        if normalized[name] < minimum
+    ]
+    failures.extend(
+        f"{name}={normalized[name]} expected={expected}"
+        for name, expected in forbidden_counts.items()
+        if normalized[name] != expected
+    )
+    if failures:
+        raise ValueError("Strict-conflict audit rejected pair: " + "; ".join(failures))
+    normalized["required_demos"] = required_demos
+    normalized["strict_conflict_passed"] = True
+    return normalized
+
+
+def load_pgc_entity_relation_index(
+    sidecar_root: str | Path,
+) -> dict[str, Any]:
+    """Load the standalone, hash-audited V9 entity--relation sidecar."""
+    sidecar_root = Path(sidecar_root).expanduser().resolve()
+    index_path = sidecar_root / PGC_ENTITY_RELATION_INDEX
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            f"Missing PGC v9 entity-relation index: {index_path}. Run "
+            "scripts/build_pgc_libero_entity_relations.py first."
+        )
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    if payload.get("format") != PGC_ENTITY_RELATION_FORMAT:
+        raise ValueError(
+            f"Unsupported PGC v9 sidecar format at {index_path}: "
+            f"{payload.get('format')!r}."
+        )
+    if payload.get("privileged_supervision") != "training_only":
+        raise ValueError("PGC v9 sidecars must declare training-only privilege.")
+    if payload.get("deployment_inputs") != "rgb_language_proprio":
+        raise ValueError(
+            "PGC v9 deployment must be limited to RGB, language, and proprio."
+        )
+    if payload.get("entity_id_scheme") != "sha256_63bit":
+        raise ValueError("PGC v9 sidecar entity ID scheme is incompatible.")
+    if tuple(payload.get("predicate_vocabulary", ())) != (
+        PGC_ENTITY_RELATION_PREDICATES
+    ):
+        raise ValueError("PGC v9 sidecar predicate vocabulary is incompatible.")
+    entity_vocabulary = payload.get("entity_vocabulary")
+    if not isinstance(entity_vocabulary, Mapping) or not entity_vocabulary:
+        raise ValueError("PGC v9 sidecar entity vocabulary is empty.")
+    if any(
+        not str(name).strip() or not isinstance(entity_id, int) or entity_id < 0
+        for name, entity_id in entity_vocabulary.items()
+    ):
+        raise ValueError("PGC v9 sidecar entity vocabulary is invalid.")
+    if len(set(entity_vocabulary.values())) != len(entity_vocabulary):
+        raise ValueError("PGC v9 sidecar entity IDs must be unique.")
+    max_clauses = int(payload.get("max_clauses", 0))
+    if max_clauses != 4:
+        raise ValueError("PGC v9 sidecars must use max_clauses=4.")
+    mask_size = payload.get("mask_size")
+    if (
+        not isinstance(mask_size, list)
+        or len(mask_size) != 2
+        or any(int(value) <= 0 for value in mask_size)
+        or int(mask_size[1]) % 2
+    ):
+        raise ValueError(
+            "PGC v9 sidecar mask_size must be positive with an even width."
+        )
+    if payload.get("camera_names") != [
+        "agentview",
+        "robot0_eye_in_hand",
+    ]:
+        raise ValueError("PGC v9 sidecar camera order is incompatible.")
+    if (
+        payload.get("view_center_coordinate_system")
+        != "per_camera_normalized_xy"
+    ):
+        raise ValueError(
+            "PGC v9 sidecar per-camera center coordinate system is "
+            "incompatible."
+        )
+    try:
+        workspace_min = np.asarray(payload["workspace_min"], dtype=np.float32)
+        workspace_max = np.asarray(payload["workspace_max"], dtype=np.float32)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("PGC v9 sidecar has invalid workspace bounds.") from exc
+    if (
+        workspace_min.shape != (3,)
+        or workspace_max.shape != (3,)
+        or not np.isfinite(workspace_min).all()
+        or not np.isfinite(workspace_max).all()
+        or np.any(workspace_max <= workspace_min)
+    ):
+        raise ValueError("PGC v9 sidecar has invalid workspace bounds.")
+    episodes = payload.get("episodes")
+    if not isinstance(episodes, list) or not episodes:
+        raise ValueError("PGC v9 sidecar has no episode records.")
+    indexed: dict[int, dict[str, Any]] = {}
+    for record in episodes:
+        if not isinstance(record, Mapping):
+            raise ValueError("PGC v9 episode records must be objects.")
+        episode_index = int(record.get("episode_index", -1))
+        frame_count = int(record.get("frame_count", 0))
+        if episode_index < 0 or episode_index in indexed or frame_count <= 0:
+            raise ValueError(
+                f"Invalid/duplicate PGC v9 episode record {episode_index}."
+            )
+        relpath = Path(str(record.get("file", "")))
+        if relpath.is_absolute() or ".." in relpath.parts:
+            raise ValueError("PGC v9 episode paths must stay inside the sidecar.")
+        episode_path = sidecar_root / relpath
+        if not episode_path.is_file():
+            raise FileNotFoundError(f"Missing PGC v9 episode: {episode_path}.")
+        expected_digest = str(record.get("sha256", "")).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+            raise ValueError(
+                f"PGC v9 episode {episode_index} has no valid sidecar SHA256."
+            )
+        if _file_sha256(episode_path) != expected_digest:
+            raise ValueError(
+                f"PGC v9 episode {episode_index} sidecar hash changed."
+            )
+        for audit_name in ("state_sha256", "action_sha256"):
+            digest = str(record.get(audit_name, "")).lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError(
+                    f"PGC v9 episode {episode_index} lacks {audit_name}."
+                )
+        normalized = dict(record)
+        normalized["path"] = str(episode_path)
+        indexed[episode_index] = normalized
+    if int(payload.get("episode_count", -1)) != len(indexed):
+        raise ValueError("PGC v9 sidecar episode_count is inconsistent.")
+    if set(indexed) != set(range(len(indexed))):
+        raise ValueError("PGC v9 sidecar episode indices must be dense.")
+    result = dict(payload)
+    result["index_path"] = str(index_path)
+    result["episodes_by_index"] = indexed
+    return result
+
+
 def load_pgc_target_mask_index(
     dataset_root: str | Path,
 ) -> dict[str, Any]:
@@ -518,6 +1029,9 @@ def load_pgc_episode_language_pairs(
             "counterfactual_instruction": counterfactual_instruction,
             "source_suite": str(pair.get("source_suite", "")),
             "source_task_id": int(pair.get("source_task_id", -1)),
+            "strict_conflict": bool(pair.get("strict_conflict", False)),
+            "strict_conflict_type": pair.get("strict_conflict_type"),
+            "strict_replay_audit": pair.get("strict_replay_audit"),
         }
     if not pairs_by_id:
         raise ValueError(f"PGC provenance has no language pairs: {provenance_path}.")
@@ -601,6 +1115,22 @@ def state_sha256(state: np.ndarray | Sequence[float]) -> str:
     digest.update(header)
     digest.update(b"\0")
     digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def array_sha256(array: np.ndarray | Sequence[Any]) -> str:
+    """Hash a typed tensor with its exact dtype and shape for data audits."""
+    value = np.ascontiguousarray(np.asarray(array))
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {"dtype": str(value.dtype), "shape": list(value.shape)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    )
+    digest.update(b"\0")
+    digest.update(value.tobytes(order="C"))
     return digest.hexdigest()
 
 
@@ -799,7 +1329,7 @@ def validate_manifest_record(record: Mapping[str, Any]) -> None:
 
 def provenance_pair(record: Mapping[str, Any]) -> dict[str, Any]:
     validate_manifest_record(record)
-    return {
+    pair = {
         "pair_id": str(record["pair_id"]),
         "source_suite": str(record["task_suite_name"]),
         "source_task_id": int(record["task_id"]),
@@ -828,6 +1358,26 @@ def provenance_pair(record: Mapping[str, Any]) -> dict[str, Any]:
             record.get("counterfactual_state_changed", True)
         ),
     }
+    if bool(record.get("strict_conflict", False)):
+        conflict_type = str(record.get("strict_conflict_type", "")).strip()
+        replay_audit = record.get("strict_replay_audit")
+        if not conflict_type or not isinstance(replay_audit, Mapping):
+            raise ValueError(
+                f"Strict pair {record['pair_id']!r} lacks its conflict type or "
+                "bidirectional replay audit."
+            )
+        required_demos = int(replay_audit.get("required_demos", 5))
+        normalized_audit = validate_strict_conflict_audit(
+            replay_audit, required_demos=required_demos
+        )
+        pair.update(
+            {
+                "strict_conflict": True,
+                "strict_conflict_type": conflict_type,
+                "strict_replay_audit": normalized_audit,
+            }
+        )
+    return pair
 
 
 def build_provenance(

@@ -168,6 +168,19 @@ class Wan22Trainer:
                         "PGC v8 must preserve V5 language/gating sidecars and "
                         "train only the ActionChunkProposal."
                     )
+            if int(getattr(self.model, "policy_guard_version", 1)) == 9:
+                if not bool(
+                    getattr(
+                        self.train_dataset,
+                        "pgc_entity_relation_supervision_required",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "PGC v9 requires audited entity-relation supervision. "
+                        "Set data.train.pgc_entity_relation_supervision_required=true "
+                        "and provide one sidecar per dataset."
+                    )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # In LoRA mode only adapters plus explicitly selected small modules are
@@ -211,7 +224,28 @@ class Wan22Trainer:
             trainable_count / max(total_count, 1),
         )
         optimizer_groups = []
-        if transition_contract_enabled:
+        policy_guard_group_builder = getattr(
+            self.model, "policy_guard_optimizer_groups", None
+        )
+        policy_guard_groups = (
+            policy_guard_group_builder(self.learning_rate)
+            if callable(policy_guard_group_builder)
+            else None
+        )
+        if policy_guard_groups is not None:
+            optimizer_groups.extend(policy_guard_groups)
+            logger.info(
+                "PGC v9 optimizer groups: %s",
+                [
+                    {
+                        "name": group.get("pgc_v9_group"),
+                        "lr": float(group["lr"]),
+                        "tensors": len(group["params"]),
+                    }
+                    for group in optimizer_groups
+                ],
+            )
+        elif transition_contract_enabled:
             if policy_params:
                 optimizer_groups.append(
                     {
@@ -231,7 +265,10 @@ class Wan22Trainer:
         self._tc_optimizer_group_kinds = [
             group.get("tc_recovery_group") for group in optimizer_groups
         ]
-        self._tc_recovery_base_lrs = [self.learning_rate] * len(optimizer_groups)
+        self._tc_recovery_base_lrs = [
+            float(group.get("lr", self.learning_rate))
+            for group in optimizer_groups
+        ]
         self.optimizer = torch.optim.AdamW(
             optimizer_groups,
             lr=self.learning_rate,

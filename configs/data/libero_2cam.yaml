@@ -91,3 +91,11 @@ train:
   # transport/place, and (when present) release frames without changing RGB or
   # action data.
   pgc_completion_phase_supervision_required: false
+  # PGC V9 only. One standalone audited sidecar directory must be supplied for
+  # every native and direct-CF dataset, in exactly the dataset concatenation
+  # order. No privileged field is consumed by inference.
+  pgc_entity_relation_supervision_required: false
+  pgc_entity_relation_sidecar_dirs: []
+  # V9: exact native:CF=1:1, original:strict=1:1, with strict conflict
+  # categories balanced before the outer mixture is constructed.
+  pgc_v9_balanced_sampling: false

@@ -8,9 +8,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
+from fastwam.datasets.pgc_libero import PGC_ENTITY_RELATION_ARRAY_NAMES
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .entity_relation_affordance import (
+    ERAFLossWeights,
+    EntityRelationAffordanceField,
+    entity_relation_affordance_loss,
+)
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .lora import (
     inject_lora,
@@ -599,6 +605,49 @@ class FastWAM(torch.nn.Module):
         guard_config = dict(policy_guard_config or {})
         self.policy_guard_enabled = bool(guard_config.get("enabled", False))
         self.policy_guard_version = int(guard_config.get("version", 2))
+        eraf_config = dict(guard_config.get("entity_relation_grounding", {}) or {})
+        self.policy_guard_eraf_training_stage = str(
+            eraf_config.get("training_stage", "grounding")
+        ).strip().lower()
+        self.policy_guard_eraf_hidden_dim = int(
+            eraf_config.get("hidden_dim", 256)
+        )
+        self.policy_guard_eraf_num_heads = int(
+            eraf_config.get("num_heads", 8)
+        )
+        self.policy_guard_eraf_max_clauses = int(
+            eraf_config.get("max_clauses", 4)
+        )
+        self.policy_guard_eraf_camera_count = int(
+            eraf_config.get("camera_count", 2)
+        )
+        self.policy_guard_eraf_visual_aspect_ratio = float(
+            eraf_config.get("visual_aspect_ratio", 2.0)
+        )
+        self.policy_guard_eraf_temperature = float(
+            eraf_config.get("temperature", 0.07)
+        )
+        self.policy_guard_eraf_entity_only = bool(
+            eraf_config.get("entity_only", False)
+        )
+        self.policy_guard_eraf_use_anchors = bool(
+            eraf_config.get("use_anchors", True)
+        )
+        self.policy_guard_eraf_learning_rate = float(
+            eraf_config.get("learning_rate", 2.0e-5)
+        )
+        self.policy_guard_eraf_grounding_aux_weight = float(
+            eraf_config.get("grounding_aux_weight", 0.25)
+        )
+        self.policy_guard_eraf_loss_weights = ERAFLossWeights(
+            mask=float(eraf_config.get("mask_weight", 1.0)),
+            entity=float(eraf_config.get("entity_weight", 1.0)),
+            relation=float(eraf_config.get("relation_weight", 1.0)),
+            anchor=float(eraf_config.get("anchor_weight", 1.0)),
+            position=float(eraf_config.get("position_weight", 0.5)),
+            role_swap=float(eraf_config.get("role_swap_weight", 0.5)),
+            phase=float(eraf_config.get("phase_weight", 1.0)),
+        )
         self.policy_guard_action_weight = float(
             guard_config.get("counterfactual_action_weight", 1.0)
         )
@@ -691,6 +740,12 @@ class FastWAM(torch.nn.Module):
         )
         self.policy_guard_verifier_bad_candidate_weight = float(
             guard_config.get("verifier_bad_candidate_weight", 0.50)
+        )
+        self.policy_guard_verifier_wrong_entity_weight = float(
+            guard_config.get("verifier_wrong_entity_weight", 0.50)
+        )
+        self.policy_guard_verifier_wrong_relation_weight = float(
+            guard_config.get("verifier_wrong_relation_weight", 0.50)
         )
         self.policy_guard_target_binding_interaction_weight = float(
             guard_config.get("target_binding_interaction_weight", 1.0)
@@ -811,12 +866,15 @@ class FastWAM(torch.nn.Module):
         ] = None
         self.policy_guard_base_checkpoint: Optional[str] = None
         self.policy_guard_legacy_full_loaded = False
+        self._policy_guard_last_eraf_diagnostics: Optional[
+            dict[str, torch.Tensor]
+        ] = None
 
         if self.policy_guard_enabled:
-            if self.policy_guard_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
+            if self.policy_guard_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
                 raise ValueError(
                     "The current PGC implementation supports version=1, 2, "
-                    "3, 4, 5, 6, 7, or 8."
+                    "3, 4, 5, 6, 7, 8, or 9."
                 )
             if self.langforce_mvp_enabled or self.transition_contract_enabled:
                 raise ValueError(
@@ -856,6 +914,8 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_residual_separation_margin,
                 self.policy_guard_verifier_wrong_language_weight,
                 self.policy_guard_verifier_bad_candidate_weight,
+                self.policy_guard_verifier_wrong_entity_weight,
+                self.policy_guard_verifier_wrong_relation_weight,
                 self.policy_guard_target_binding_interaction_weight,
                 self.policy_guard_target_binding_prototype_weight,
                 self.policy_guard_target_binding_source_weight,
@@ -902,6 +962,44 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     "PGC v8 requires closed_loop_corrective_enabled=true."
                 )
+            if self.policy_guard_version == 9:
+                if self.policy_guard_eraf_training_stage not in {
+                    "grounding",
+                    "action",
+                    "verifier",
+                }:
+                    raise ValueError(
+                        "PGC v9 ERAF training_stage must be grounding, action, "
+                        "or verifier."
+                    )
+                if min(
+                    self.policy_guard_eraf_hidden_dim,
+                    self.policy_guard_eraf_num_heads,
+                    self.policy_guard_eraf_max_clauses,
+                    self.policy_guard_eraf_camera_count,
+                ) <= 0:
+                    raise ValueError("PGC v9 ERAF dimensions must be positive.")
+                if (
+                    self.policy_guard_eraf_hidden_dim
+                    % self.policy_guard_eraf_num_heads
+                ):
+                    raise ValueError(
+                        "PGC v9 ERAF hidden_dim must be divisible by num_heads."
+                    )
+                if min(
+                    self.policy_guard_eraf_visual_aspect_ratio,
+                    self.policy_guard_eraf_temperature,
+                    self.policy_guard_eraf_learning_rate,
+                ) <= 0:
+                    raise ValueError(
+                        "PGC v9 ERAF aspect ratio, temperature, and LR must "
+                        "be positive."
+                    )
+                if min(
+                    self.policy_guard_eraf_grounding_aux_weight,
+                    *self.policy_guard_eraf_loss_weights.__dict__.values(),
+                ) < 0:
+                    raise ValueError("PGC v9 ERAF loss weights must be non-negative.")
             if self.policy_guard_version in {6, 7}:
                 if (
                     self.policy_guard_target_binding_action_start_step < 0
@@ -1151,6 +1249,25 @@ class FastWAM(torch.nn.Module):
                             ),
                         )
                     )
+                    if self.policy_guard_version == 9:
+                        self.policy_guard_modules[
+                            "entity_relation_affordance"
+                        ] = EntityRelationAffordanceField(
+                            text_dim=self.text_dim,
+                            video_dim=int(self.video_expert.hidden_dim),
+                            action_dim=int(policy_action_expert.hidden_dim),
+                            projection_dim=projection_dim,
+                            hidden_dim=self.policy_guard_eraf_hidden_dim,
+                            num_heads=self.policy_guard_eraf_num_heads,
+                            max_clauses=self.policy_guard_eraf_max_clauses,
+                            camera_count=self.policy_guard_eraf_camera_count,
+                            visual_aspect_ratio=(
+                                self.policy_guard_eraf_visual_aspect_ratio
+                            ),
+                            temperature=self.policy_guard_eraf_temperature,
+                            entity_only=self.policy_guard_eraf_entity_only,
+                            use_anchors=self.policy_guard_eraf_use_anchors,
+                        )
                     if self.policy_guard_version in {6, 7}:
                         binder_kwargs = {
                             "text_dim": self.text_dim,
@@ -1241,6 +1358,8 @@ class FastWAM(torch.nn.Module):
         """Delay v3 verifier/alignment until the action residual is useful."""
         if self.policy_guard_version < 3:
             return 1.0
+        if self.policy_guard_version == 9:
+            return float(self.policy_guard_eraf_training_stage == "verifier")
         if (
             self.policy_guard_version == 8
             and self.policy_guard_closed_loop_train_proposal_only
@@ -1274,6 +1393,8 @@ class FastWAM(torch.nn.Module):
 
     def _policy_guard_target_binding_action_scale(self) -> float:
         """Keep V5 action sidecars frozen while V6 first learns its target map."""
+        if self.policy_guard_version == 9:
+            return float(self.policy_guard_eraf_training_stage == "action")
         if self.policy_guard_version not in {6, 7}:
             return 1.0
         if not self._policy_guard_training_progress_active:
@@ -1494,6 +1615,22 @@ class FastWAM(torch.nn.Module):
                     )
                 self.policy_guard_modules.train()
                 self.policy_guard_modules.requires_grad_(True)
+                if self.policy_guard_version == 9:
+                    trainable_modules = {
+                        "grounding": {"entity_relation_affordance"},
+                        "action": {
+                            "entity_relation_affordance",
+                            "action_chunk_proposal",
+                        },
+                        "verifier": {"verifier"},
+                    }[self.policy_guard_eraf_training_stage]
+                    for name, module in self.policy_guard_modules.items():
+                        if name in trainable_modules:
+                            module.train()
+                            module.requires_grad_(True)
+                        else:
+                            module.eval()
+                            module.requires_grad_(False)
                 if (
                     self.policy_guard_version == 5
                     and self.policy_guard_completion_phase_enabled
@@ -1602,6 +1739,58 @@ class FastWAM(torch.nn.Module):
             "trainable": int(trainable),
             "total": int(total),
         }
+
+    def policy_guard_optimizer_groups(
+        self, default_learning_rate: float
+    ) -> Optional[list[dict[str, Any]]]:
+        """Return the explicit V9 stage-wise optimizer contract."""
+        if not (self.policy_guard_enabled and self.policy_guard_version == 9):
+            return None
+        default_learning_rate = float(default_learning_rate)
+        if default_learning_rate <= 0:
+            raise ValueError("PGC v9 optimizer LR must be positive.")
+        groups: list[dict[str, Any]] = []
+        for module_name, learning_rate in (
+            (
+                "entity_relation_affordance",
+                (
+                    default_learning_rate
+                    if self.policy_guard_eraf_training_stage == "grounding"
+                    else self.policy_guard_eraf_learning_rate
+                ),
+            ),
+            ("action_chunk_proposal", default_learning_rate),
+            ("verifier", default_learning_rate),
+        ):
+            parameters = [
+                parameter
+                for parameter in self.policy_guard_modules[module_name].parameters()
+                if parameter.requires_grad
+            ]
+            if parameters:
+                groups.append(
+                    {
+                        "params": parameters,
+                        "lr": float(learning_rate),
+                        "pgc_v9_group": module_name,
+                    }
+                )
+        grouped_ids = {
+            id(parameter)
+            for group in groups
+            for parameter in group["params"]
+        }
+        expected_ids = {
+            id(parameter)
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        }
+        if grouped_ids != expected_ids:
+            raise RuntimeError(
+                "PGC v9 optimizer groups do not exactly cover the trainable "
+                "sidecars."
+            )
+        return groups
 
     @classmethod
     def from_wan22_pretrained(
@@ -1902,6 +2091,24 @@ class FastWAM(torch.nn.Module):
         )
         if current_token_count <= 0:
             raise ValueError("PGC requires at least one current visual token.")
+        if self.policy_guard_version == 9:
+            if current_visual_hidden is None:
+                raise ValueError(
+                    "PGC v9 requires language-neutral current visual tokens."
+                )
+            if language_context_len is None:
+                language_context_len = int(context.shape[1])
+            goal_queries, goal_embedding, _, goal_metrics = (
+                self._encode_policy_guard_eraf(
+                    final_video_hidden=final_video_hidden,
+                    current_visual_hidden=current_visual_hidden,
+                    video_tokens_per_frame=video_tokens_per_frame,
+                    context=context,
+                    context_mask=context_mask,
+                    language_context_len=int(language_context_len),
+                )
+            )
+            return goal_queries, goal_embedding, goal_metrics
         if self.policy_guard_version in {6, 7}:
             if current_visual_hidden is None:
                 raise ValueError(
@@ -1947,6 +2154,139 @@ class FastWAM(torch.nn.Module):
             language_mask=context_mask,
             current_video_hidden=final_video_hidden[:, :current_token_count].detach(),
         )
+
+    def _encode_policy_guard_eraf(
+        self,
+        *,
+        final_video_hidden: torch.Tensor,
+        current_visual_hidden: torch.Tensor,
+        video_tokens_per_frame: int,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        language_context_len: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+    ]:
+        """Encode the frozen V5 goal, then add the zero-init ERAF bridge."""
+        if not (self.policy_guard_enabled and self.policy_guard_version == 9):
+            raise RuntimeError("ERAF goal encoding requires PGC v9.")
+        current_token_count = min(
+            int(video_tokens_per_frame),
+            int(final_video_hidden.shape[1]),
+            int(current_visual_hidden.shape[1]),
+        )
+        if current_token_count <= 0:
+            raise ValueError("PGC v9 requires current-frame visual patches.")
+        language_context_len = int(language_context_len)
+        if not 0 < language_context_len <= int(context.shape[1]):
+            raise ValueError(
+                "PGC v9 language_context_len must select a non-empty language "
+                "prefix."
+            )
+        seed_module = self.policy_guard_modules["goal_query_seeds"]
+        base_queries = seed_module.weight.unsqueeze(0).expand(
+            final_video_hidden.shape[0], -1, -1
+        )
+        base_goal_queries, base_goal_embedding, base_metrics = (
+            self.policy_guard_modules["goal_graph"](
+                base_queries=base_queries,
+                language_hidden=context,
+                language_mask=context_mask,
+                current_video_hidden=(
+                    final_video_hidden[:, :current_token_count].detach()
+                ),
+            )
+        )
+        eraf_module = self.policy_guard_modules["entity_relation_affordance"]
+        (
+            routed_queries,
+            routed_embedding,
+            eraf_outputs,
+            eraf_metrics,
+        ) = eraf_module(
+            base_goal_queries=base_goal_queries.detach(),
+            base_goal_embedding=base_goal_embedding.detach(),
+            language_hidden=context[:, :language_context_len],
+            language_mask=context_mask[:, :language_context_len],
+            current_video_hidden=(
+                current_visual_hidden[:, :current_token_count].detach()
+            ),
+        )
+        # ``prepare_trainable_parameters`` intentionally leaves the frozen root
+        # model in eval mode and toggles only the active sidecar module.  Root
+        # ``self.training`` is therefore false during every PGC stage; use the
+        # autograd context to distinguish verifier fitting from rollout.
+        if (
+            self.policy_guard_eraf_training_stage == "verifier"
+            and torch.is_grad_enabled()
+        ):
+            for negative_kind in ("entity", "relation"):
+                negative_queries, negative_embedding = (
+                    eraf_module.negative_goal_queries(
+                        base_goal_queries=base_goal_queries.detach(),
+                        base_goal_embedding=base_goal_embedding.detach(),
+                        outputs=eraf_outputs,
+                        kind=negative_kind,
+                    )
+                )
+                eraf_outputs[f"wrong_{negative_kind}_goal_queries"] = (
+                    negative_queries
+                )
+                eraf_outputs[f"wrong_{negative_kind}_goal_embedding"] = (
+                    negative_embedding
+                )
+        metrics = dict(base_metrics)
+        metrics.update(eraf_metrics)
+        metrics.update(
+            {
+                "pgc_v9_predicate_id_mean": eraf_outputs[
+                    "predicate_logits"
+                ].argmax(dim=-1).float().mean(),
+                "pgc_v9_subject_anchor_norm": eraf_outputs[
+                    "subject_position"
+                ].float().norm(dim=-1).mean(),
+                "pgc_v9_grasp_anchor_norm": eraf_outputs[
+                    "grasp_anchor"
+                ].float().norm(dim=-1).mean(),
+                "pgc_v9_goal_anchor_norm": eraf_outputs[
+                    "goal_anchor"
+                ].float().norm(dim=-1).mean(),
+                "pgc_v9_phase_id_mean": eraf_outputs[
+                    "phase_logits"
+                ].argmax(dim=-1).float().mean(),
+            }
+        )
+        if not torch.is_grad_enabled():
+            diagnostic_names = (
+                "active_logits",
+                "predicate_logits",
+                "subject_attention",
+                "reference_attention",
+                "subject_position",
+                "reference_position",
+                "subject_view_visibility_logits",
+                "reference_view_visibility_logits",
+                "subject_view_centers",
+                "reference_view_centers",
+                "subject_view_attention_mass",
+                "reference_view_attention_mass",
+                "grasp_anchor",
+                "goal_anchor",
+                "interaction_anchor",
+                "phase_logits",
+                "spatial_coordinates",
+                "camera_ids",
+            )
+            self._policy_guard_last_eraf_diagnostics = {
+                name: eraf_outputs[name].detach().float().cpu()
+                if eraf_outputs[name].is_floating_point()
+                else eraf_outputs[name].detach().cpu()
+                for name in diagnostic_names
+            }
+        return routed_queries, routed_embedding, eraf_outputs, metrics
 
     def _encode_policy_guard_target_binding(
         self,
@@ -2843,9 +3183,9 @@ class FastWAM(torch.nn.Module):
         dict[str, torch.Tensor],
     ]:
         """PGC v5 paired-language and execution-prefix proposal objectives."""
-        if self.policy_guard_version not in {5, 6, 7, 8}:
+        if self.policy_guard_version not in {5, 6, 7, 8, 9}:
             raise RuntimeError(
-                "PGC paired action losses require version 5, 6, 7, or 8."
+                "PGC paired action losses require version 5, 6, 7, 8, or 9."
             )
         if not (
             proposed_action.shape
@@ -3175,11 +3515,13 @@ class FastWAM(torch.nn.Module):
         direct_action_valid: torch.Tensor,
         paired_language_valid: torch.Tensor,
         goal_ids: Optional[torch.Tensor],
+        wrong_entity_candidate_action: Optional[torch.Tensor] = None,
+        wrong_relation_candidate_action: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Train v5 on the deployed proposal plus wrong-language/bad negatives."""
-        if self.policy_guard_version not in {5, 6, 7, 8}:
+        if self.policy_guard_version not in {5, 6, 7, 8, 9}:
             raise RuntimeError(
-                "PGC paired verifier loss requires version 5, 6, 7, or 8."
+                "PGC paired verifier loss requires version 5, 6, 7, 8, or 9."
             )
         prefix = min(
             self.policy_guard_execution_prefix_steps,
@@ -3291,6 +3633,36 @@ class FastWAM(torch.nn.Module):
             + self.policy_guard_verifier_bad_candidate_weight
             * bad_candidate_loss
         )
+        if (
+            self.policy_guard_version == 9
+            and self.policy_guard_eraf_training_stage == "verifier"
+        ):
+            if wrong_entity_candidate_action is None or (
+                wrong_relation_candidate_action is None
+            ):
+                raise ValueError(
+                    "PGC v9 verifier calibration requires explicit wrong-entity "
+                    "and wrong-relation action candidates."
+                )
+            wrong_entity_loss, wrong_entity_metrics = _auxiliary_candidate_loss(
+                wrong_entity_candidate_action,
+                "pgc_v9_wrong_entity",
+            )
+            wrong_relation_loss, wrong_relation_metrics = (
+                _auxiliary_candidate_loss(
+                    wrong_relation_candidate_action,
+                    "pgc_v9_wrong_relation",
+                )
+            )
+            verifier_loss = (
+                verifier_loss
+                + self.policy_guard_verifier_wrong_entity_weight
+                * wrong_entity_loss
+                + self.policy_guard_verifier_wrong_relation_weight
+                * wrong_relation_loss
+            )
+            metrics.update(wrong_entity_metrics)
+            metrics.update(wrong_relation_metrics)
         metrics.update(wrong_metrics)
         metrics.update(bad_metrics)
         metrics["loss_pgc_v5_verifier_primary"] = primary_loss.detach()
@@ -4114,6 +4486,30 @@ class FastWAM(torch.nn.Module):
             metrics,
         )
 
+    def _policy_guard_v9_labels(
+        self,
+        inputs: dict[str, Any],
+        *,
+        prefix: str = "",
+    ) -> dict[str, torch.Tensor]:
+        if self.policy_guard_version != 9:
+            raise RuntimeError("ERAF labels are only defined for PGC v9.")
+        labels: dict[str, torch.Tensor] = {}
+        missing: list[str] = []
+        for name in PGC_ENTITY_RELATION_ARRAY_NAMES:
+            input_name = f"pgc_eraf_{prefix}{name}"
+            value = inputs.get(input_name)
+            if value is None:
+                missing.append(input_name)
+            else:
+                labels[name] = value
+        if missing:
+            raise ValueError(
+                "PGC v9 requires audited entity-relation labels: "
+                f"{missing}."
+            )
+        return labels
+
     def _training_loss_policy_guard_v5(
         self,
         *,
@@ -4122,9 +4518,9 @@ class FastWAM(torch.nn.Module):
         state_only_context_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Train a language-identifiable, prefix-aligned protected proposal."""
-        if self.policy_guard_version not in {5, 6, 7, 8}:
+        if self.policy_guard_version not in {5, 6, 7, 8, 9}:
             raise RuntimeError(
-                "Paired-language training requires PGC v5/v6/v7/v8."
+                "Paired-language training requires PGC v5/v6/v7/v8/v9."
             )
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
@@ -4170,7 +4566,67 @@ class FastWAM(torch.nn.Module):
         )
         binding_metrics: dict[str, torch.Tensor] = {}
         prototype_metrics: dict[str, torch.Tensor] = {}
-        if self.policy_guard_version == 6:
+        eraf_loss_metrics: dict[str, torch.Tensor] = {}
+        eraf_binding_loss = base_action.sum() * 0.0
+        if self.policy_guard_version == 9:
+            language_context_len = int(inputs["language_context_len"])
+            (
+                goal_queries,
+                goal_embedding,
+                eraf_outputs,
+                goal_metrics,
+            ) = self._encode_policy_guard_eraf(
+                final_video_hidden=final_video_hidden,
+                current_visual_hidden=neutral_visual_hidden,
+                video_tokens_per_frame=video_tokens_per_frame,
+                context=inputs["context"],
+                context_mask=full_context_mask,
+                language_context_len=language_context_len,
+            )
+            (
+                source_goal_queries,
+                source_goal_embedding,
+                source_eraf_outputs,
+                source_goal_metrics,
+            ) = self._encode_policy_guard_eraf(
+                final_video_hidden=final_video_hidden,
+                current_visual_hidden=neutral_visual_hidden,
+                video_tokens_per_frame=video_tokens_per_frame,
+                context=source_context,
+                context_mask=source_context_mask,
+                language_context_len=language_context_len,
+            )
+            target_labels = self._policy_guard_v9_labels(inputs)
+            source_labels = self._policy_guard_v9_labels(
+                inputs, prefix="source_"
+            )
+            target_eraf_loss, target_eraf_metrics = (
+                entity_relation_affordance_loss(
+                    eraf_outputs,
+                    target_labels,
+                    weights=self.policy_guard_eraf_loss_weights,
+                )
+            )
+            source_eraf_loss, source_eraf_metrics = (
+                entity_relation_affordance_loss(
+                    source_eraf_outputs,
+                    source_labels,
+                    weights=self.policy_guard_eraf_loss_weights,
+                )
+            )
+            eraf_binding_loss = target_eraf_loss + 0.5 * source_eraf_loss
+            eraf_loss_metrics.update(target_eraf_metrics)
+            for name, value in source_eraf_metrics.items():
+                eraf_loss_metrics[
+                    f"pgc_v9_source_{name.removeprefix('pgc_v9_')}"
+                ] = value
+            zero = goal_embedding.sum() * 0.0
+            binding_interaction_loss = zero
+            binding_prototype_loss = zero
+            binding_source_loss = zero
+            binding_hard_negative_loss = zero
+            binding_separation_loss = zero
+        elif self.policy_guard_version == 6:
             language_context_len = int(inputs["language_context_len"])
             (
                 goal_queries,
@@ -4451,6 +4907,22 @@ class FastWAM(torch.nn.Module):
                 action_is_pad=action_is_pad,
             )
         )
+        wrong_entity_candidate_action = None
+        wrong_relation_candidate_action = None
+        if (
+            self.policy_guard_version == 9
+            and self.policy_guard_eraf_training_stage == "verifier"
+        ):
+            wrong_entity_candidate_action, _, _ = proposal_module(
+                base_action=base_action,
+                goal_queries=eraf_outputs["wrong_entity_goal_queries"],
+                action_is_pad=action_is_pad,
+            )
+            wrong_relation_candidate_action, _, _ = proposal_module(
+                base_action=base_action,
+                goal_queries=eraf_outputs["wrong_relation_goal_queries"],
+                action_is_pad=action_is_pad,
+            )
         (
             counterfactual_action_loss,
             native_zero_loss,
@@ -4539,7 +5011,7 @@ class FastWAM(torch.nn.Module):
             + self.policy_guard_native_distillation_weight
             * (
                 self.policy_guard_native_guard_weight
-                if self.policy_guard_version == 8
+                if self.policy_guard_version in {8, 9}
                 else 1.0
             )
             * native_zero_loss
@@ -4553,7 +5025,18 @@ class FastWAM(torch.nn.Module):
             + self.policy_guard_residual_smoothness_weight
             * residual_smoothness_loss
         )
-        if self.policy_guard_version == 7:
+        if self.policy_guard_version == 9:
+            grounding_scale = {
+                "grounding": 1.0,
+                "action": self.policy_guard_eraf_grounding_aux_weight,
+                "verifier": 0.0,
+            }[self.policy_guard_eraf_training_stage]
+            binding_objective = (
+                eraf_binding_loss.detach() * 0.0
+                if grounding_scale <= 0.0
+                else grounding_scale * eraf_binding_loss
+            )
+        elif self.policy_guard_version == 7:
             binding_objective = (
                 self.policy_guard_target_mask_weight
                 * binding_interaction_loss
@@ -4600,6 +5083,8 @@ class FastWAM(torch.nn.Module):
             "direct_action_valid": direct_action_valid,
             "paired_language_valid": paired_language_valid,
             "goal_ids": inputs["pgc_goal_id"],
+            "wrong_entity_candidate_action": wrong_entity_candidate_action,
+            "wrong_relation_candidate_action": wrong_relation_candidate_action,
         }
         if verifier_scale > 0.0:
             verifier_loss, alignment_loss, verifier_metrics = (
@@ -4652,7 +5137,7 @@ class FastWAM(torch.nn.Module):
                 * self.policy_guard_native_distillation_weight
                 * (
                     self.policy_guard_native_guard_weight
-                    if self.policy_guard_version == 8
+                    if self.policy_guard_version in {8, 9}
                     else 1.0
                 )
             ),
@@ -4754,6 +5239,30 @@ class FastWAM(torch.nn.Module):
             "pgc_base_policy_frozen": 1.0,
             "pgc_video_loss_optimization_weight": 0.0,
         }
+        if self.policy_guard_version == 9:
+            loss_dict.update(
+                {
+                    "loss_pgc_v9_eraf": float(
+                        eraf_binding_loss.detach().item()
+                    ),
+                    "pgc_v9_grounding_effective_weight": float(
+                        {
+                            "grounding": 1.0,
+                            "action": self.policy_guard_eraf_grounding_aux_weight,
+                            "verifier": 0.0,
+                        }[self.policy_guard_eraf_training_stage]
+                    ),
+                    "pgc_v9_stage_grounding": float(
+                        self.policy_guard_eraf_training_stage == "grounding"
+                    ),
+                    "pgc_v9_stage_action": float(
+                        self.policy_guard_eraf_training_stage == "action"
+                    ),
+                    "pgc_v9_stage_verifier": float(
+                        self.policy_guard_eraf_training_stage == "verifier"
+                    ),
+                }
+            )
         if self.policy_guard_version == 6:
             loss_dict.update(
                 {
@@ -4823,6 +5332,7 @@ class FastWAM(torch.nn.Module):
         loss_dict.update(detached_policy_guard_metrics(verifier_metrics))
         loss_dict.update(detached_policy_guard_metrics(binding_metrics))
         loss_dict.update(detached_policy_guard_metrics(prototype_metrics))
+        loss_dict.update(detached_policy_guard_metrics(eraf_loss_metrics))
         for name, value in detached_policy_guard_metrics(
             source_goal_metrics
         ).items():
@@ -5740,6 +6250,13 @@ class FastWAM(torch.nn.Module):
         pgc_aux_context = sample.get("pgc_aux_context")
         pgc_aux_context_mask = sample.get("pgc_aux_context_mask")
         pgc_aux_goal_id = sample.get("pgc_aux_goal_id")
+        pgc_eraf_labels = {
+            f"pgc_eraf_{prefix}{name}": sample.get(
+                f"pgc_eraf_{prefix}{name}"
+            )
+            for prefix in ("", "source_")
+            for name in PGC_ENTITY_RELATION_ARRAY_NAMES
+        }
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
             raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
@@ -5829,6 +6346,17 @@ class FastWAM(torch.nn.Module):
                         "PGC v7 requires explicit current-state object masks "
                         f"and auxiliary language fields: {missing_v7}. Build "
                         "the audited mask sidecar before training."
+                    )
+            if self.policy_guard_version == 9:
+                missing_v9 = [
+                    name
+                    for name, value in pgc_eraf_labels.items()
+                    if value is None
+                ]
+                if missing_v9:
+                    raise ValueError(
+                        "PGC v9 requires the audited entity-relation sidecar: "
+                        f"{missing_v9}."
                     )
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(
@@ -6173,6 +6701,49 @@ class FastWAM(torch.nn.Module):
                 pgc_aux_goal_id = pgc_aux_goal_id.expand(batch_size)
             if pgc_aux_goal_id.shape != (batch_size,):
                 raise ValueError("`pgc_aux_goal_id` must be [B].")
+        if self.policy_guard_version == 9:
+            bool_suffixes = (
+                "clause_valid",
+                "subject_mask_valid",
+                "reference_mask_valid",
+                "subject_view_visible",
+                "reference_view_visible",
+                "subject_position_valid",
+                "reference_position_valid",
+                "grasp_anchor_valid",
+                "goal_anchor_valid",
+                "interaction_anchor_valid",
+                "predicate_truth_valid",
+                "phase_valid",
+            )
+            long_suffixes = (
+                "predicate_ids",
+                "phase_ids",
+                "subject_entity_ids",
+                "reference_entity_ids",
+            )
+            for name, value in tuple(pgc_eraf_labels.items()):
+                if name.endswith(bool_suffixes):
+                    dtype = torch.bool
+                elif name.endswith(long_suffixes):
+                    dtype = torch.long
+                else:
+                    dtype = torch.float32
+                converted = torch.as_tensor(
+                    value,
+                    device=self.device,
+                    dtype=dtype,
+                )
+                if converted.ndim < 2 or converted.shape[:2] != (
+                    batch_size,
+                    self.policy_guard_eraf_max_clauses,
+                ):
+                    raise ValueError(
+                        f"`{name}` must start with [B,max_clauses]="
+                        f"[{batch_size},{self.policy_guard_eraf_max_clauses}], "
+                        f"got {tuple(converted.shape)}."
+                    )
+                pgc_eraf_labels[name] = converted
         language_context_len = int(context.shape[1])
         has_proprio = False
         proprio_current = None
@@ -6267,6 +6838,7 @@ class FastWAM(torch.nn.Module):
             "action": action,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
+            **pgc_eraf_labels,
         }
 
     @torch.no_grad()
@@ -8062,6 +8634,8 @@ class FastWAM(torch.nn.Module):
         policy_guard_goal_embedding = None
         policy_guard_current_video_hidden = None
         policy_guard_goal_metrics: dict[str, torch.Tensor] = {}
+        if self.policy_guard_enabled and self.policy_guard_version == 9:
+            self._policy_guard_last_eraf_diagnostics = None
         if self.policy_guard_enabled:
             if final_video_hidden is None:
                 raise RuntimeError("PGC inference requires final Video hidden tokens.")
@@ -8267,6 +8841,14 @@ class FastWAM(torch.nn.Module):
                         result[output_name] = float(
                             value.detach().float().item()
                         )
+            if self.policy_guard_version == 9:
+                if self._policy_guard_last_eraf_diagnostics is None:
+                    raise RuntimeError(
+                        "PGC v9 inference did not retain ERAF diagnostics."
+                    )
+                result["policy_guard_eraf_diagnostics"] = (
+                    self._policy_guard_last_eraf_diagnostics
+                )
             return result
 
         if (
@@ -8494,6 +9076,7 @@ class FastWAM(torch.nn.Module):
         is_v6 = self.policy_guard_version == 6
         is_v7 = self.policy_guard_version == 7
         is_v8 = self.policy_guard_version == 8
+        is_v9 = self.policy_guard_version == 9
         uses_target_binder = is_v6 or is_v7
         residual_cap = None
         if is_v3:
@@ -8522,6 +9105,13 @@ class FastWAM(torch.nn.Module):
         return {
             "architecture": "pgc_fastwam",
             "policy_guard_version": self.policy_guard_version,
+            "grounding": (
+                "predicate_entity_relation_affordance_field"
+                if is_v9
+                else None
+            ),
+            "privileged_supervision": "training_only" if is_v9 else None,
+            "deployment_inputs": "rgb_language_proprio" if is_v9 else None,
             "base_policy": "frozen_released_fastwam",
             "base_action_interface": "query_free_joint_mot",
             "counterfactual_policy": (
@@ -8538,24 +9128,28 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "counterfactual_tuning": (
-                "closed_loop_replay_verified_target_acquisition_residual"
-                if is_v8
+                "entity_relation_affordance_grounded_paired_action_residual"
+                if is_v9
                 else (
-                    "object_token_mask_grounded_paired_action_residual"
-                    if is_v7
+                    "closed_loop_replay_verified_target_acquisition_residual"
+                    if is_v8
                     else (
-                        "visual_target_bottleneck_paired_action_residual"
-                        if is_v6
+                        "object_token_mask_grounded_paired_action_residual"
+                        if is_v7
                         else (
-                            "paired_language_prefix_aligned_action_residual"
-                            if is_v5
+                            "visual_target_bottleneck_paired_action_residual"
+                            if is_v6
                             else (
-                                "rollout_aligned_final_action_residual"
-                                if is_v4
+                                "paired_language_prefix_aligned_action_residual"
+                                if is_v5
                                 else (
-                                    "bounded_velocity_residual"
-                                    if is_v3
-                                    else "lora"
+                                    "rollout_aligned_final_action_residual"
+                                    if is_v4
+                                    else (
+                                        "bounded_velocity_residual"
+                                        if is_v3
+                                        else "lora"
+                                    )
                                 )
                             )
                         )
@@ -8576,21 +9170,25 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "goal_injection": (
-                "per_query_spatial_object_tokens_to_action_chunk_residual"
-                if is_v7
+                "eraf_clause_tokens_cross_attention_to_v5_proposal"
+                if is_v9
                 else (
-                    "language_selected_visual_target_to_action_chunk_residual"
-                    if is_v6
+                    "per_query_spatial_object_tokens_to_action_chunk_residual"
+                    if is_v7
                     else (
-                        "post_sampler_temporal_action_chunk_residual"
-                        if is_v4
+                        "language_selected_visual_target_to_action_chunk_residual"
+                        if is_v6
                         else (
-                            "post_dit_bounded_velocity_residual"
-                            if is_v3
+                            "post_sampler_temporal_action_chunk_residual"
+                            if is_v4
                             else (
-                                "zero_initialized_action_token_residual"
-                                if is_v2
-                                else "latent_action_query_replacement"
+                                "post_dit_bounded_velocity_residual"
+                                if is_v3
+                                else (
+                                    "zero_initialized_action_token_residual"
+                                    if is_v2
+                                    else "latent_action_query_replacement"
+                                )
                             )
                         )
                     )
@@ -8643,24 +9241,28 @@ class FastWAM(torch.nn.Module):
                 else "immutable_base_plus_conservative_hard_gate"
             ),
             "representation_supervision": (
-                "frozen_v5_language_plus_exact_closed_loop_state_corrective_actions"
-                if is_v8
+                "predicate_roles_multiview_masks_3d_anchors_state_and_phase"
+                if is_v9
                 else (
-                    "explicit_current_state_element_masks_and_cross_object_negatives"
-                    if is_v7
+                    "frozen_v5_language_plus_exact_closed_loop_state_corrective_actions"
+                    if is_v8
                     else (
-                        "interaction_teacher_task_prototypes_same_state_hard_negatives"
-                        if is_v6
+                        "explicit_current_state_element_masks_and_cross_object_negatives"
+                        if is_v7
                         else (
-                            "same_state_paired_language_plus_prefix_action_and_hard_negatives"
-                            if is_v5
+                            "interaction_teacher_task_prototypes_same_state_hard_negatives"
+                            if is_v6
                             else (
-                                "rollout_aligned_direct_action_plus_goal_action_alignment"
-                                if is_v4
+                                "same_state_paired_language_plus_prefix_action_and_hard_negatives"
+                                if is_v5
                                 else (
-                                    "direct_residual_action_plus_goal_action_alignment"
-                                    if is_v3
-                                    else "direct_goal_action_alignment"
+                                    "rollout_aligned_direct_action_plus_goal_action_alignment"
+                                    if is_v4
+                                    else (
+                                        "direct_residual_action_plus_goal_action_alignment"
+                                        if is_v3
+                                        else "direct_goal_action_alignment"
+                                    )
                                 )
                             )
                         )
@@ -8923,7 +9525,7 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "native_guard_weight": (
-                self.policy_guard_native_guard_weight if is_v8 else None
+                self.policy_guard_native_guard_weight if (is_v8 or is_v9) else None
             ),
             "acquisition_only": (
                 self.policy_guard_acquisition_only if is_v8 else None
@@ -8935,7 +9537,40 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "warm_start_contract": (
-                "exact_pgc_v5_sidecars" if is_v8 else None
+                "exact_pgc_v5_sidecars" if (is_v8 or is_v9) else None
+            ),
+            "eraf_training_stage": (
+                self.policy_guard_eraf_training_stage if is_v9 else None
+            ),
+            "eraf_hidden_dim": (
+                self.policy_guard_eraf_hidden_dim if is_v9 else None
+            ),
+            "eraf_num_heads": (
+                self.policy_guard_eraf_num_heads if is_v9 else None
+            ),
+            "eraf_max_clauses": (
+                self.policy_guard_eraf_max_clauses if is_v9 else None
+            ),
+            "eraf_camera_count": (
+                self.policy_guard_eraf_camera_count if is_v9 else None
+            ),
+            "eraf_visual_aspect_ratio": (
+                self.policy_guard_eraf_visual_aspect_ratio if is_v9 else None
+            ),
+            "eraf_temperature": (
+                self.policy_guard_eraf_temperature if is_v9 else None
+            ),
+            "eraf_learning_rate": (
+                self.policy_guard_eraf_learning_rate if is_v9 else None
+            ),
+            "eraf_grounding_aux_weight": (
+                self.policy_guard_eraf_grounding_aux_weight if is_v9 else None
+            ),
+            "eraf_entity_only": (
+                self.policy_guard_eraf_entity_only if is_v9 else None
+            ),
+            "eraf_use_anchors": (
+                self.policy_guard_eraf_use_anchors if is_v9 else None
             ),
         }
 
@@ -9380,10 +10015,15 @@ class FastWAM(torch.nn.Module):
             saved_policy_guard_version == 5
             and int(self.policy_guard_version) == 8
         )
+        migrate_v5_to_v9 = (
+            saved_policy_guard_version == 5
+            and int(self.policy_guard_version) == 9
+        )
         if (
             saved_policy_guard_version != int(self.policy_guard_version)
             and not migrate_v5_to_target_binder
             and not migrate_v5_to_v8
+            and not migrate_v5_to_v9
         ):
             raise ValueError(
                 "PGC checkpoint version mismatch: "
@@ -9429,21 +10069,25 @@ class FastWAM(torch.nn.Module):
 
         if saved_policy_guard_version >= 3:
             expected_tuning = (
-                "closed_loop_replay_verified_target_acquisition_residual"
-                if saved_policy_guard_version == 8
+                "entity_relation_affordance_grounded_paired_action_residual"
+                if saved_policy_guard_version == 9
                 else (
-                    "object_token_mask_grounded_paired_action_residual"
-                    if saved_policy_guard_version == 7
+                    "closed_loop_replay_verified_target_acquisition_residual"
+                    if saved_policy_guard_version == 8
                     else (
-                        "visual_target_bottleneck_paired_action_residual"
-                        if saved_policy_guard_version == 6
+                        "object_token_mask_grounded_paired_action_residual"
+                        if saved_policy_guard_version == 7
                         else (
-                            "paired_language_prefix_aligned_action_residual"
-                            if saved_policy_guard_version >= 5
+                            "visual_target_bottleneck_paired_action_residual"
+                            if saved_policy_guard_version == 6
                             else (
-                                "rollout_aligned_final_action_residual"
-                                if saved_policy_guard_version >= 4
-                                else "bounded_velocity_residual"
+                                "paired_language_prefix_aligned_action_residual"
+                                if saved_policy_guard_version >= 5
+                                else (
+                                    "rollout_aligned_final_action_residual"
+                                    if saved_policy_guard_version >= 4
+                                    else "bounded_velocity_residual"
+                                )
                             )
                         )
                     )
@@ -9516,6 +10160,18 @@ class FastWAM(torch.nn.Module):
                                 ),
                             }
                         )
+                elif saved_policy_guard_version == 9:
+                    eraf = self.policy_guard_modules[
+                        "entity_relation_affordance"
+                    ]
+                    architecture_fields.update(
+                        {
+                            "eraf_hidden_dim": int(eraf.hidden_dim),
+                            "eraf_num_heads": int(eraf.num_heads),
+                            "eraf_max_clauses": int(eraf.max_clauses),
+                            "eraf_camera_count": int(eraf.camera_count),
+                        }
+                    )
                 for metadata_name, expected_value in architecture_fields.items():
                     try:
                         saved_value = int(metadata[metadata_name])
@@ -9993,6 +10649,66 @@ class FastWAM(torch.nn.Module):
                             raise ValueError(
                                 "PGC v8 checkpoint has negative corrective weights."
                             )
+                    elif saved_policy_guard_version == 9:
+                        if (
+                            metadata.get("warm_start_contract")
+                            != "exact_pgc_v5_sidecars"
+                            or metadata.get("grounding")
+                            != "predicate_entity_relation_affordance_field"
+                            or metadata.get("privileged_supervision")
+                            != "training_only"
+                            or metadata.get("deployment_inputs")
+                            != "rgb_language_proprio"
+                        ):
+                            raise ValueError(
+                                "PGC v9 checkpoint does not declare its ERAF "
+                                "deployment and supervision contract."
+                            )
+                        if (
+                            bool(metadata.get("eraf_entity_only", False))
+                            != self.policy_guard_eraf_entity_only
+                            or bool(metadata.get("eraf_use_anchors", True))
+                            != self.policy_guard_eraf_use_anchors
+                        ):
+                            raise ValueError(
+                                "PGC v9 ERAF ablation configuration does not "
+                                "match the checkpoint."
+                            )
+                        saved_stage = str(metadata.get("eraf_training_stage", ""))
+                        if saved_stage not in {"grounding", "action", "verifier"}:
+                            raise ValueError(
+                                "PGC v9 checkpoint has an invalid ERAF training stage: "
+                                f"{saved_stage!r}."
+                            )
+                        eraf = self.policy_guard_modules[
+                            "entity_relation_affordance"
+                        ]
+                        for metadata_name, expected_value in {
+                            "eraf_visual_aspect_ratio": float(
+                                eraf.entity_grounder.visual_aspect_ratio
+                            ),
+                            "eraf_temperature": float(
+                                eraf.entity_grounder.temperature
+                            ),
+                        }.items():
+                            try:
+                                saved_value = float(metadata[metadata_name])
+                            except (KeyError, TypeError, ValueError) as exc:
+                                raise ValueError(
+                                    "PGC v9 checkpoint is missing valid ERAF value "
+                                    f"{metadata_name!r}."
+                                ) from exc
+                            if not math.isclose(
+                                saved_value,
+                                expected_value,
+                                rel_tol=0.0,
+                                abs_tol=1.0e-9,
+                            ):
+                                raise ValueError(
+                                    f"PGC v9 {metadata_name} mismatch: "
+                                    f"checkpoint={saved_value}, "
+                                    f"model={expected_value}."
+                                )
             base_payload = self.load_checkpoint(resolved_base, optimizer=None)
             if base_payload.get("format") in {
                 "fastwam_policy_guard_v1",
@@ -10003,12 +10719,16 @@ class FastWAM(torch.nn.Module):
                 "fastwam_policy_guard_v6",
                 "fastwam_policy_guard_v7",
                 "fastwam_policy_guard_v8",
+                "fastwam_policy_guard_v9",
             }:
                 raise ValueError(
                     "Nested PGC checkpoints are not supported as bases."
                 )
+            migrate_with_new_modules = (
+                migrate_v5_to_target_binder or migrate_v5_to_v9
+            )
             incompatible = self.policy_guard_modules.load_state_dict(
-                guard_state, strict=not migrate_v5_to_target_binder
+                guard_state, strict=not migrate_with_new_modules
             )
             if migrate_v5_to_target_binder:
                 missing = list(incompatible.missing_keys)
@@ -10023,6 +10743,19 @@ class FastWAM(torch.nn.Module):
                         "PGC v5 target-binder warm start has incompatible sidecars: "
                         f"missing={missing}, unexpected={unexpected}."
                     )
+            elif migrate_v5_to_v9:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                disallowed_missing = [
+                    key
+                    for key in missing
+                    if not key.startswith("entity_relation_affordance.")
+                ]
+                if disallowed_missing or unexpected or not missing:
+                    raise ValueError(
+                        "PGC v5 -> v9 warm start has incompatible sidecars: "
+                        f"missing={missing}, unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -10034,6 +10767,7 @@ class FastWAM(torch.nn.Module):
                 and "optimizer" in payload
                 and not migrate_v5_to_target_binder
                 and not migrate_v5_to_v8
+                and not migrate_v5_to_v9
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -10053,6 +10787,15 @@ class FastWAM(torch.nn.Module):
                     path,
                     resolved_base,
                     len(guard_state),
+                )
+            elif migrate_v5_to_v9:
+                logger.info(
+                    "Warm-started PGC v9 from exact validated PGC v5 "
+                    "sidecars at %s (base=%s restored=%d new_eraf=%d).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
+                    len(incompatible.missing_keys),
                 )
             else:
                 logger.info(
@@ -10094,6 +10837,7 @@ class FastWAM(torch.nn.Module):
             "fastwam_policy_guard_v6",
             "fastwam_policy_guard_v7",
             "fastwam_policy_guard_v8",
+            "fastwam_policy_guard_v9",
         }:
             raise ValueError("Nested PGC checkpoints are not supported as bases.")
 
@@ -10185,6 +10929,7 @@ class FastWAM(torch.nn.Module):
             "fastwam_policy_guard_v6",
             "fastwam_policy_guard_v7",
             "fastwam_policy_guard_v8",
+            "fastwam_policy_guard_v9",
         }:
             return self._load_policy_guard_checkpoint(
                 str(path), payload, optimizer=optimizer

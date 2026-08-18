@@ -85,8 +85,27 @@ class CounterfactualEpisodeTrackerTest(unittest.TestCase):
         self.assertFalse(result["counterfactual_goal_achieved"])
         self.assertEqual(result["grasped_objects"], ["source_1"])
         self.assertEqual(result["lifted_objects"], ["source_1"])
+        self.assertEqual(
+            result["counterfactual_graspable_target_objects"], ["target_1"]
+        )
         self.assertEqual(result["first_grasp_step"], {"source_1": 12})
         self.assertAlmostEqual(result["max_lift_delta_m"]["source_1"], 0.06)
+
+    def test_unary_fixture_goal_is_not_counted_as_graspable(self):
+        tracker = CounterfactualEpisodeTracker(
+            self.env,
+            source_goal_state=self.source_goal,
+            counterfactual_goal_state=[["open", "cabinet_1_middle_region"]],
+            lift_threshold_m=0.04,
+        )
+        tracker.observe(policy_step=0)
+        result = tracker.result(episode_idx=0)
+
+        self.assertEqual(
+            result["counterfactual_target_objects"],
+            ["cabinet_1_middle_region"],
+        )
+        self.assertEqual(result["counterfactual_graspable_target_objects"], [])
 
     def test_classifies_target_manipulation_without_goal(self):
         tracker = CounterfactualEpisodeTracker(

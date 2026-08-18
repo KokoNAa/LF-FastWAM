@@ -1,5 +1,6 @@
 import hashlib
 import os
+from pathlib import Path
 from typing import Optional
 import time
 import numpy as np
@@ -18,10 +19,16 @@ from ..counterfactual import (
     stable_instruction_id,
 )
 from ..pgc_libero import (
+    PGC_ENTITY_RELATION_ARRAY_NAMES,
+    array_sha256,
+    classify_strict_conflict,
     load_pgc_closed_loop_corrective_index,
     load_pgc_completion_phase_index,
+    load_pgc_entity_relation_index,
     load_pgc_episode_language_pairs,
     load_pgc_target_mask_index,
+    read_jsonl,
+    state_sha256,
 )
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
@@ -132,6 +139,75 @@ def build_pgc_v8_sample_indices(
     )
 
 
+def _repeat_indices(values: list[int], count: int) -> list[int]:
+    if not values:
+        raise ValueError("Cannot repeat an empty PGC sample pool.")
+    repeats = (int(count) + len(values) - 1) // len(values)
+    return (list(values) * repeats)[: int(count)]
+
+
+def build_pgc_v9_sample_indices(
+    *,
+    native_indices: list[int],
+    original_counterfactual_indices: list[int],
+    strict_counterfactual_indices: list[int],
+    strict_relation_categories: list[str],
+) -> list[int]:
+    """Build the exact V9 native/original/strict training mixture.
+
+    The returned deterministic pool has native:counterfactual=1:1 and, inside
+    the counterfactual half, original:strict=1:1.  Strict samples are first
+    balanced over their audited conflict categories.  DistributedSampler may
+    shuffle this pool later without changing any of those multiplicities.
+    """
+    native = [int(index) for index in native_indices]
+    original = [int(index) for index in original_counterfactual_indices]
+    strict = [int(index) for index in strict_counterfactual_indices]
+    categories = [str(value).strip() for value in strict_relation_categories]
+    if not native or not original or not strict:
+        raise ValueError(
+            "PGC v9 requires non-empty native, original-CF, and strict-CF pools."
+        )
+    if len(strict) != len(categories) or any(not value for value in categories):
+        raise ValueError(
+            "PGC v9 strict relation labels must cover every strict-CF sample."
+        )
+    if len(set(native + original + strict)) != len(native) + len(original) + len(strict):
+        raise ValueError("PGC v9 sample pools must be disjoint.")
+
+    grouped: dict[str, list[int]] = {}
+    for index, category in zip(strict, categories, strict=True):
+        grouped.setdefault(category, []).append(index)
+    category_count = max(len(values) for values in grouped.values())
+    balanced_groups = {
+        category: _repeat_indices(values, category_count)
+        for category, values in sorted(grouped.items())
+    }
+    strict_balanced = [
+        balanced_groups[category][position]
+        for position in range(category_count)
+        for category in sorted(balanced_groups)
+    ]
+
+    # Choose a common CF-subset size that is also a multiple of the number of
+    # strict categories.  This preserves all three ratios exactly even when
+    # the native dataset is much larger than either CF dataset:
+    # native:CF=1:1, original:strict=1:1, and equal strict-category counts.
+    minimum_subset_count = max(
+        len(original),
+        len(strict_balanced),
+        (len(native) + 1) // 2,
+    )
+    category_total = len(balanced_groups)
+    counterfactual_subset_count = (
+        (minimum_subset_count + category_total - 1) // category_total
+    ) * category_total
+    original_balanced = _repeat_indices(original, counterfactual_subset_count)
+    strict_balanced = _repeat_indices(strict_balanced, counterfactual_subset_count)
+    counterfactual = original_balanced + strict_balanced
+    return _repeat_indices(native, len(counterfactual)) + counterfactual
+
+
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -161,6 +237,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_balance_native_counterfactual: bool = False,
         pgc_target_mask_supervision_required: bool = False,
         pgc_completion_phase_supervision_required: bool = False,
+        pgc_entity_relation_supervision_required: bool = False,
+        pgc_entity_relation_sidecar_dirs: Optional[list[str]] = None,
+        pgc_v9_balanced_sampling: bool = False,
     ):
         native_dataset_dirs = [str(path) for path in dataset_dirs]
         pgc_counterfactual_dataset_dirs = [
@@ -245,6 +324,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.pgc_completion_phase_supervision_required = bool(
             pgc_completion_phase_supervision_required
         )
+        self.pgc_entity_relation_supervision_required = bool(
+            pgc_entity_relation_supervision_required
+        )
+        self.pgc_v9_balanced_sampling = bool(pgc_v9_balanced_sampling)
         if self.pgc_completion_phase_supervision_required and not (
             self.pgc_counterfactual_dataset_dirs
         ):
@@ -297,11 +380,60 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             tuple[int, int], tuple[np.ndarray, np.ndarray]
         ] = OrderedDict()
         self._pgc_target_mask_cache_size = 4
-        self.pgc_balance_native_counterfactual = bool(
-            pgc_balance_native_counterfactual
-        )
         combined_dataset_dirs = (
             native_dataset_dirs + self.pgc_counterfactual_dataset_dirs
+        )
+        pgc_entity_relation_sidecar_dirs = [
+            str(path)
+            for path in (pgc_entity_relation_sidecar_dirs or [])
+        ]
+        if self.pgc_entity_relation_supervision_required and len(
+            pgc_entity_relation_sidecar_dirs
+        ) != len(combined_dataset_dirs):
+            raise ValueError(
+                "PGC v9 requires one entity-relation sidecar per native/CF "
+                "dataset in the same order: "
+                f"datasets={len(combined_dataset_dirs)} "
+                f"sidecars={len(pgc_entity_relation_sidecar_dirs)}."
+            )
+        self.pgc_entity_relation_indices: dict[int, dict[str, object]] = {}
+        if self.pgc_entity_relation_supervision_required:
+            self.pgc_entity_relation_indices = {
+                dataset_index: load_pgc_entity_relation_index(path)
+                for dataset_index, path in enumerate(
+                    pgc_entity_relation_sidecar_dirs
+                )
+            }
+            for dataset_index, dataset_dir in enumerate(combined_dataset_dirs):
+                audited_dataset = os.path.realpath(
+                    str(self.pgc_entity_relation_indices[dataset_index]["dataset"])
+                )
+                if audited_dataset != os.path.realpath(dataset_dir):
+                    raise ValueError(
+                        "PGC v9 sidecar/dataset order mismatch at index "
+                        f"{dataset_index}: sidecar={audited_dataset} "
+                        f"dataset={os.path.realpath(dataset_dir)}."
+                    )
+            eraf_mask_shapes = {
+                tuple(index["mask_size"])
+                for index in self.pgc_entity_relation_indices.values()
+            }
+            if len(eraf_mask_shapes) != 1:
+                raise ValueError(
+                    "PGC v9 sidecars disagree on mask size: "
+                    f"{sorted(eraf_mask_shapes)}."
+                )
+            self.pgc_entity_relation_mask_shape = next(
+                iter(eraf_mask_shapes)
+            )
+        else:
+            self.pgc_entity_relation_mask_shape = (56, 112)
+        self._pgc_entity_relation_cache: OrderedDict[
+            tuple[int, int], dict[str, np.ndarray]
+        ] = OrderedDict()
+        self._pgc_entity_relation_cache_size = 2
+        self.pgc_balance_native_counterfactual = bool(
+            pgc_balance_native_counterfactual
         )
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=combined_dataset_dirs,
@@ -313,6 +445,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             global_sample_stride=global_sample_stride,
         )
         underlying = self.lerobot_dataset.multi_dataset._datasets
+        if self.pgc_entity_relation_supervision_required:
+            self._validate_pgc_entity_relation_dataset_audits(
+                underlying=underlying,
+                combined_dataset_dirs=combined_dataset_dirs,
+            )
         self.pgc_native_frame_count = sum(
             int(dataset.num_frames)
             for dataset in underlying[: self.pgc_native_dataset_count]
@@ -326,7 +463,89 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             for dataset in underlying[:offline_dataset_end]
         )
         total_frame_count = sum(int(dataset.num_frames) for dataset in underlying)
-        if self.pgc_has_closed_loop_corrective_data:
+        if self.pgc_v9_balanced_sampling:
+            if not self.pgc_entity_relation_supervision_required:
+                raise ValueError(
+                    "PGC v9 balanced sampling requires audited ERAF sidecars."
+                )
+            if self.pgc_has_closed_loop_corrective_data:
+                raise ValueError(
+                    "PGC v9 strict sampling cannot mix V8 corrective datasets."
+                )
+            if self.pgc_offline_counterfactual_dataset_count != 2:
+                raise ValueError(
+                    "PGC v9 requires exactly two CF datasets ordered as "
+                    "[original, strict]."
+                )
+            dataset_offsets: list[int] = []
+            offset = 0
+            for dataset in underlying:
+                dataset_offsets.append(offset)
+                offset += int(dataset.num_frames)
+            original_dataset_index = self.pgc_native_dataset_count
+            strict_dataset_index = original_dataset_index + 1
+            original_start = dataset_offsets[original_dataset_index]
+            strict_start = dataset_offsets[strict_dataset_index]
+            original = list(range(original_start, strict_start))
+            strict_dataset = underlying[strict_dataset_index]
+            strict = list(range(strict_start, total_frame_count))
+            episode_column = strict_dataset.hf_dataset["episode_index"]
+            strict_categories: list[str] = []
+            strict_index = self.pgc_entity_relation_indices[strict_dataset_index]
+            strict_pairs = self.pgc_episode_language_pairs[strict_dataset_index]
+            strict_covered_tasks = {
+                int(pair["source_task_id"]) for pair in strict_pairs.values()
+            }
+            if len(strict_covered_tasks) < 8:
+                raise ValueError(
+                    "PGC v9 strict-conflict training requires audited coverage "
+                    f"of at least 8/10 source tasks, got "
+                    f"{len(strict_covered_tasks)}/10."
+                )
+            for raw_episode_index in episode_column:
+                episode_index = int(
+                    torch.as_tensor(raw_episode_index).reshape(-1)[0].item()
+                )
+                try:
+                    episode_record = strict_index["episodes_by_index"][episode_index]
+                    pair_audit = strict_pairs[episode_index]
+                except KeyError as exc:
+                    raise KeyError(
+                        "PGC v9 strict sidecar does not cover episode "
+                        f"{episode_index}."
+                    ) from exc
+                category = classify_strict_conflict(
+                    episode_record["source_clauses"],
+                    episode_record["target_clauses"],
+                )
+                if category is None:
+                    raise ValueError(
+                        "PGC v9 strict dataset contains a non-conflicting pair: "
+                        f"{episode_record.get('pair_id')}."
+                    )
+                if (
+                    pair_audit.get("strict_conflict") is not True
+                    or pair_audit.get("strict_conflict_type") != category
+                    or not isinstance(
+                        pair_audit.get("strict_replay_audit"), dict
+                    )
+                    or pair_audit["strict_replay_audit"].get(
+                        "strict_conflict_passed"
+                    )
+                    is not True
+                ):
+                    raise ValueError(
+                        "PGC v9 strict dataset lacks a matching successful "
+                        f"bidirectional audit for episode {episode_index}."
+                    )
+                strict_categories.append(category)
+            self._sample_indices = build_pgc_v9_sample_indices(
+                native_indices=list(range(self.pgc_native_frame_count)),
+                original_counterfactual_indices=original,
+                strict_counterfactual_indices=strict,
+                strict_relation_categories=strict_categories,
+            )
+        elif self.pgc_has_closed_loop_corrective_data:
             if self.pgc_counterfactual_oversample_factor != 1:
                 raise ValueError(
                     "PGC V8 uses its dedicated closed-loop oversample factor; "
@@ -469,6 +688,145 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self._sample_indices)
 
+    def _validate_pgc_entity_relation_dataset_audits(
+        self,
+        *,
+        underlying,
+        combined_dataset_dirs: list[str],
+    ) -> None:
+        """Cross-check every ERAF sidecar against the loaded policy dataset.
+
+        The standalone sidecar loader protects each NPZ with a file digest.
+        This second audit binds those labels to the actual LeRobot action rows
+        and, for collected PGC datasets, to the exact saved simulator state and
+        pair provenance.  It runs once before any optimizer step and never on
+        the deployment path.
+        """
+        for dataset_index, (dataset, dataset_dir) in enumerate(
+            zip(underlying, combined_dataset_dirs, strict=True)
+        ):
+            index = self.pgc_entity_relation_indices[dataset_index]
+            records = index["episodes_by_index"]
+            expected_episode_count = int(dataset.meta.total_episodes)
+            if int(index.get("episode_count", -1)) != expected_episode_count:
+                raise ValueError(
+                    "PGC v9 ERAF sidecar episode_count does not match the "
+                    f"LeRobot dataset at index {dataset_index}: "
+                    f"sidecar={index.get('episode_count')} "
+                    f"dataset={expected_episode_count}."
+                )
+            if set(records) != set(range(expected_episode_count)):
+                raise ValueError(
+                    "PGC v9 ERAF sidecar episode indices must be dense and "
+                    f"complete at dataset index {dataset_index}."
+                )
+
+            selected_episode_ids = (
+                list(dataset.episodes)
+                if dataset.episodes is not None
+                else list(range(expected_episode_count))
+            )
+            pgc_audits: dict[int, dict[str, object]] | None = None
+            dataset_root = Path(dataset_dir).expanduser().resolve()
+            audit_path = dataset_root / "meta/pgc_episodes.jsonl"
+            if dataset_index >= self.pgc_native_dataset_count:
+                if not audit_path.is_file():
+                    raise FileNotFoundError(
+                        f"PGC v9 counterfactual audit is missing: {audit_path}."
+                    )
+                pgc_audits = {
+                    int(record["episode_index"]): dict(record)
+                    for record in read_jsonl(audit_path)
+                }
+                if set(pgc_audits) != set(range(expected_episode_count)):
+                    raise ValueError(
+                        "PGC v9 counterfactual episode audit must be dense and "
+                        f"complete at dataset index {dataset_index}."
+                    )
+
+            for local_episode_index, episode_index in enumerate(
+                selected_episode_ids
+            ):
+                episode_index = int(episode_index)
+                record = records[episode_index]
+                episode = dataset.get_episode_data(local_episode_index)
+                if "action" not in episode:
+                    raise KeyError(
+                        "PGC v9 dataset episode has no raw `action` column at "
+                        f"dataset/episode {dataset_index}/{episode_index}."
+                    )
+                action = episode["action"]
+                if hasattr(action, "detach"):
+                    action = action.detach().cpu().numpy()
+                action = np.ascontiguousarray(
+                    np.asarray(action, dtype=np.float32)
+                )
+                if action.ndim != 2 or action.shape[1] != 7:
+                    raise ValueError(
+                        "PGC v9 audited actions must be [T,7], got "
+                        f"{action.shape} at dataset/episode "
+                        f"{dataset_index}/{episode_index}."
+                    )
+                if int(record["frame_count"]) != int(action.shape[0]):
+                    raise ValueError(
+                        "PGC v9 ERAF frame/action count mismatch at "
+                        f"dataset/episode {dataset_index}/{episode_index}."
+                    )
+                if array_sha256(action) != str(record["action_sha256"]):
+                    raise ValueError(
+                        "PGC v9 ERAF action hash does not match the loaded "
+                        f"LeRobot episode {dataset_index}/{episode_index}."
+                    )
+
+                if pgc_audits is None:
+                    continue
+                audit = pgc_audits[episode_index]
+                if str(audit.get("pair_id", "")) != str(
+                    record.get("pair_id", "")
+                ):
+                    raise ValueError(
+                        "PGC v9 ERAF pair audit mismatch at dataset/episode "
+                        f"{dataset_index}/{episode_index}."
+                    )
+                expected_state_digest = str(
+                    record.get("initial_state_sha256", "")
+                )
+                if expected_state_digest != str(
+                    audit.get("initial_state_sha256", "")
+                ):
+                    raise ValueError(
+                        "PGC v9 ERAF initial-state provenance mismatch at "
+                        f"dataset/episode {dataset_index}/{episode_index}."
+                    )
+                state_relpath = Path(
+                    str(audit.get("source_initial_state_catalog", ""))
+                )
+                if (
+                    not str(state_relpath)
+                    or state_relpath.is_absolute()
+                    or ".." in state_relpath.parts
+                ):
+                    raise ValueError(
+                        "PGC v9 initial-state audit path is unsafe at "
+                        f"dataset/episode {dataset_index}/{episode_index}."
+                    )
+                state_path = dataset_root / state_relpath
+                if not state_path.is_file():
+                    raise FileNotFoundError(
+                        f"PGC v9 initial-state audit is missing: {state_path}."
+                    )
+                initial_state = np.load(state_path, allow_pickle=False)
+                if state_sha256(initial_state) != expected_state_digest:
+                    raise ValueError(
+                        "PGC v9 initial-state file hash changed at "
+                        f"dataset/episode {dataset_index}/{episode_index}."
+                    )
+
+        logger.info(
+            "Validated PGC v9 ERAF action/state/hash audits for %d datasets.",
+            len(combined_dataset_dirs),
+        )
+
     def _load_pgc_target_mask_episode(
         self,
         *,
@@ -564,6 +922,228 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "aux_instruction": str(catalog[aux_index]["instruction"]),
             "aux_goal_id": int(catalog[aux_index]["goal_id"]),
         }
+
+    def _load_pgc_entity_relation_episode(
+        self,
+        *,
+        dataset_index: int,
+        episode_index: int,
+    ) -> dict[str, np.ndarray]:
+        try:
+            index = self.pgc_entity_relation_indices[int(dataset_index)]
+            episode = index["episodes_by_index"][int(episode_index)]
+        except KeyError as exc:
+            raise KeyError(
+                "No PGC v9 entity-relation audit for dataset/episode "
+                f"{dataset_index}/{episode_index}."
+            ) from exc
+        cache_key = (int(dataset_index), int(episode_index))
+        cached = self._pgc_entity_relation_cache.get(cache_key)
+        if cached is None:
+            with np.load(str(episode["path"]), allow_pickle=False) as payload:
+                cached = {
+                    name: np.asarray(payload[name]).copy()
+                    for name in payload.files
+                }
+            required = {
+                f"{role}_{name}"
+                for role in ("target", "source")
+                for name in PGC_ENTITY_RELATION_ARRAY_NAMES
+            }
+            missing = sorted(required - set(cached))
+            if missing:
+                raise ValueError(
+                    "PGC v9 episode is missing ERAF arrays: "
+                    f"{missing}."
+                )
+            frame_count = int(episode["frame_count"])
+            max_clauses = int(index["max_clauses"])
+            mask_height, mask_width = map(int, index["mask_size"])
+            for name, array in cached.items():
+                if name in required and array.shape[:2] != (
+                    frame_count,
+                    max_clauses,
+                ):
+                    raise ValueError(
+                        f"PGC v9 {name} must start with "
+                        f"[{frame_count},{max_clauses}], got {array.shape}."
+                    )
+            for role in ("target", "source"):
+                expected_scalar_shape = (frame_count, max_clauses)
+                expected_vector_shape = (*expected_scalar_shape, 3)
+                expected_view_visible_shape = (*expected_scalar_shape, 2)
+                expected_view_center_shape = (*expected_scalar_shape, 2, 2)
+                expected_mask_shape = (
+                    *expected_scalar_shape,
+                    mask_height,
+                    mask_width,
+                )
+                for entity_role in ("subject", "reference"):
+                    mask = cached[f"{role}_{entity_role}_masks"]
+                    if mask.shape != expected_mask_shape or mask.dtype != np.bool_:
+                        raise ValueError(
+                            f"PGC v9 {role}_{entity_role}_masks has "
+                            f"incompatible shape/dtype {mask.shape}/{mask.dtype}."
+                        )
+                    view_visible = cached[
+                        f"{role}_{entity_role}_view_visible"
+                    ]
+                    if (
+                        view_visible.shape != expected_view_visible_shape
+                        or view_visible.dtype != np.bool_
+                    ):
+                        raise ValueError(
+                            f"PGC v9 {role}_{entity_role}_view_visible must be "
+                            f"bool {expected_view_visible_shape}, got "
+                            f"{view_visible.shape}/{view_visible.dtype}."
+                        )
+                    view_centers = cached[
+                        f"{role}_{entity_role}_view_centers"
+                    ]
+                    if (
+                        view_centers.shape != expected_view_center_shape
+                        or not np.issubdtype(
+                            view_centers.dtype, np.floating
+                        )
+                        or not np.isfinite(view_centers).all()
+                        or bool((np.abs(view_centers) > 1.00001).any())
+                    ):
+                        raise ValueError(
+                            f"PGC v9 {role}_{entity_role}_view_centers must "
+                            f"be finite normalized {expected_view_center_shape}, "
+                            f"got {view_centers.shape}/{view_centers.dtype}."
+                        )
+                    if bool(
+                        (
+                            np.abs(view_centers[~view_visible]) > 1.0e-7
+                        ).any()
+                    ):
+                        raise ValueError(
+                            f"PGC v9 {role}_{entity_role}_view_centers must be "
+                            "zero for invisible camera views."
+                        )
+                for suffix in (
+                    "clause_valid",
+                    "subject_mask_valid",
+                    "reference_mask_valid",
+                    "subject_position_valid",
+                    "reference_position_valid",
+                    "grasp_anchor_valid",
+                    "goal_anchor_valid",
+                    "interaction_anchor_valid",
+                    "predicate_truth_valid",
+                    "phase_valid",
+                ):
+                    value = cached[f"{role}_{suffix}"]
+                    if value.shape != expected_scalar_shape or value.dtype != np.bool_:
+                        raise ValueError(
+                            f"PGC v9 {role}_{suffix} must be bool "
+                            f"{expected_scalar_shape}, got {value.shape}/{value.dtype}."
+                        )
+                for suffix in (
+                    "subject_positions",
+                    "reference_positions",
+                    "grasp_anchors",
+                    "goal_anchors",
+                    "interaction_anchors",
+                ):
+                    value = cached[f"{role}_{suffix}"]
+                    if (
+                        value.shape != expected_vector_shape
+                        or not np.issubdtype(value.dtype, np.floating)
+                        or not np.isfinite(value).all()
+                        or bool((np.abs(value) > 1.00001).any())
+                    ):
+                        raise ValueError(
+                            f"PGC v9 {role}_{suffix} must be finite normalized "
+                            f"{expected_vector_shape}, got {value.shape}/{value.dtype}."
+                        )
+                clause_valid = cached[f"{role}_clause_valid"]
+                predicate_ids = cached[f"{role}_predicate_ids"]
+                phase_ids = cached[f"{role}_phase_ids"]
+                subject_ids = cached[f"{role}_subject_entity_ids"]
+                reference_ids = cached[f"{role}_reference_entity_ids"]
+                if (
+                    predicate_ids.shape != expected_scalar_shape
+                    or not np.issubdtype(predicate_ids.dtype, np.integer)
+                    or bool((predicate_ids < 0).any())
+                    or bool(
+                        (
+                            predicate_ids
+                            >= len(index["predicate_vocabulary"])
+                        ).any()
+                    )
+                    or bool((predicate_ids[clause_valid] == 0).any())
+                    or bool((predicate_ids[~clause_valid] != 0).any())
+                ):
+                    raise ValueError(
+                        f"PGC v9 {role}_predicate_ids violate the clause schema."
+                    )
+                if (
+                    phase_ids.shape != expected_scalar_shape
+                    or not np.issubdtype(phase_ids.dtype, np.integer)
+                    or bool(((phase_ids < 0) | (phase_ids > 2)).any())
+                ):
+                    raise ValueError(
+                        f"PGC v9 {role}_phase_ids must contain only 0, 1, or 2."
+                    )
+                for suffix, value in (
+                    ("subject_entity_ids", subject_ids),
+                    ("reference_entity_ids", reference_ids),
+                ):
+                    if (
+                        value.shape != expected_scalar_shape
+                        or not np.issubdtype(value.dtype, np.integer)
+                        or bool((value[clause_valid] < 0).any())
+                    ):
+                        raise ValueError(
+                            f"PGC v9 {role}_{suffix} violates the entity schema."
+                        )
+                truth = cached[f"{role}_predicate_truth"]
+                if (
+                    truth.shape != expected_scalar_shape
+                    or not np.issubdtype(truth.dtype, np.floating)
+                    or not np.isfinite(truth).all()
+                    or bool(((truth < 0.0) | (truth > 1.0)).any())
+                ):
+                    raise ValueError(
+                        f"PGC v9 {role}_predicate_truth must be finite in [0,1]."
+                    )
+            self._pgc_entity_relation_cache[cache_key] = cached
+            self._pgc_entity_relation_cache.move_to_end(cache_key)
+            while (
+                len(self._pgc_entity_relation_cache)
+                > self._pgc_entity_relation_cache_size
+            ):
+                self._pgc_entity_relation_cache.popitem(last=False)
+        else:
+            self._pgc_entity_relation_cache.move_to_end(cache_key)
+        return cached
+
+    def _get_pgc_entity_relation_sample(
+        self,
+        *,
+        dataset_index: int,
+        episode_index: int,
+        frame_index: int,
+    ) -> dict[str, torch.Tensor]:
+        payload = self._load_pgc_entity_relation_episode(
+            dataset_index=dataset_index,
+            episode_index=episode_index,
+        )
+        frame_count = next(iter(payload.values())).shape[0]
+        if not 0 <= int(frame_index) < int(frame_count):
+            raise IndexError(
+                f"PGC v9 frame {frame_index} is outside episode "
+                f"{episode_index} with {frame_count} frames."
+            )
+        result: dict[str, torch.Tensor] = {}
+        for role, output_prefix in (("target", ""), ("source", "source_")):
+            for name in PGC_ENTITY_RELATION_ARRAY_NAMES:
+                result[f"pgc_eraf_{output_prefix}{name}"] = torch.from_numpy(
+                    np.asarray(payload[f"{role}_{name}"][int(frame_index)]).copy()
+                )
+        return result
 
     def _get(self, idx):
         if not 0 <= int(idx) < len(self._sample_indices):
@@ -678,17 +1258,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_pair_valid = False
         pgc_completion_phase = 0
         pgc_completion_phase_valid = False
-        episode_index = -1
-        frame_index = -1
+        episode_index = (
+            int(torch.as_tensor(sample["episode_index"]).reshape(-1)[0].item())
+            if "episode_index" in sample
+            else -1
+        )
+        frame_index = (
+            int(torch.as_tensor(sample["frame_index"]).reshape(-1)[0].item())
+            if "frame_index" in sample
+            else -1
+        )
         if pgc_is_counterfactual:
             if "episode_index" not in sample:
                 raise KeyError(
                     "PGC counterfactual samples require `episode_index` to "
                     "recover their paired source instruction."
                 )
-            episode_index = int(
-                torch.as_tensor(sample["episode_index"]).reshape(-1)[0].item()
-            )
             if (
                 (
                     self.pgc_target_mask_supervision_required
@@ -699,12 +1284,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 raise KeyError(
                     "PGC counterfactual samples require `frame_index` for "
                     "V7 masks or V8 corrective audit boundaries."
-                )
-            if "frame_index" in sample:
-                frame_index = int(
-                    torch.as_tensor(sample["frame_index"])
-                    .reshape(-1)[0]
-                    .item()
                 )
             try:
                 pair = self.pgc_episode_language_pairs[dataset_index][
@@ -770,6 +1349,19 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 ):
                     pgc_completion_phase = 2
                 pgc_completion_phase_valid = True
+
+        pgc_eraf_sample: dict[str, torch.Tensor] = {}
+        if self.pgc_entity_relation_supervision_required:
+            if episode_index < 0 or frame_index < 0:
+                raise KeyError(
+                    "PGC v9 entity-relation supervision requires episode_index "
+                    "and frame_index for every native and counterfactual row."
+                )
+            pgc_eraf_sample = self._get_pgc_entity_relation_sample(
+                dataset_index=dataset_index,
+                episode_index=episode_index,
+                frame_index=frame_index,
+            )
         
         # FIXME
         if self.override_instruction is not None:
@@ -916,6 +1508,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "pgc_aux_goal_id": torch.tensor(pgc_aux_goal_id, dtype=torch.long),
             "pgc_dataset_index": torch.tensor(dataset_index, dtype=torch.long),
         }
+        data.update(pgc_eraf_sample)
         if negative_context is not None:
             data.update(
                 {

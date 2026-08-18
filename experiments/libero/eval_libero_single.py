@@ -13,7 +13,7 @@ import torch
 from accelerate import PartialState
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-from PIL import Image
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 
 # try:
@@ -48,6 +48,7 @@ from experiments.libero.language_interventions import (
 )
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.pgc_libero import state_sha256 as _canonical_state_sha256
+from fastwam.models.wan22.entity_relation_affordance import ERAF_PREDICATES
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
@@ -70,6 +71,164 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super().default(obj)
+
+
+def _save_eraf_diagnostics(
+    *,
+    cfg: DictConfig,
+    images: dict[str, np.ndarray],
+    diagnostics: dict[str, Any],
+    episode_idx: int,
+    replan_idx: int,
+) -> dict[str, Any]:
+    """Persist V9 heatmaps and a two-camera subject/reference overlay."""
+    output_value = cfg.EVALUATION.get("entity_relation_overlay_dir")
+    if output_value in (None, "", "null"):
+        raise ValueError(
+            "EVALUATION.entity_relation_diagnostics=true requires "
+            "EVALUATION.entity_relation_overlay_dir."
+        )
+    output_dir = (
+        Path(str(output_value)).expanduser().resolve()
+        / str(cfg.EVALUATION.task_suite_name)
+        / f"task_{int(cfg.EVALUATION.task_id):02d}"
+        / f"trial_{int(episode_idx):03d}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"replan_{int(replan_idx):04d}"
+    arrays = {name: np.asarray(value) for name, value in diagnostics.items()}
+    npz_path = output_dir / f"{stem}.npz"
+    np.savez_compressed(npz_path, **arrays)
+
+    subject = np.asarray(arrays["subject_attention"])[0]
+    reference = np.asarray(arrays["reference_attention"])[0]
+    coordinates = np.asarray(arrays["spatial_coordinates"])
+    grid_height = len(np.unique(np.round(coordinates[:, 1], decimals=6)))
+    grid_width = len(np.unique(np.round(coordinates[:, 0], decimals=6)))
+    if grid_height * grid_width != subject.shape[-1] or grid_width % 2:
+        raise ValueError(
+            "PGC v9 ERAF diagnostics do not form a two-camera spatial grid."
+        )
+    predicate_ids = np.asarray(arrays["predicate_logits"])[0].argmax(axis=-1)
+    active_probability = 1.0 / (
+        1.0 + np.exp(-np.asarray(arrays["active_logits"])[0])
+    )
+    phase_ids = np.asarray(arrays["phase_logits"])[0].argmax(axis=-1)
+    active_indices = np.flatnonzero(active_probability >= 0.5)
+    if active_indices.size == 0:
+        active_indices = np.asarray([int(active_probability.argmax())])
+
+    camera_images = (
+        np.asarray(images["image"], dtype=np.uint8),
+        np.asarray(images["wrist_image"], dtype=np.uint8),
+    )
+
+    def _overlay(base: np.ndarray, heat: np.ndarray) -> Image.Image:
+        base_image = Image.fromarray(base).convert("RGB").resize((224, 224))
+        heat_image = Image.fromarray(
+            np.uint8(255.0 * heat / max(1.0e-8, float(heat.max())))
+        ).resize((224, 224), resample=Image.Resampling.BILINEAR)
+        heat_array = np.asarray(heat_image, dtype=np.float32) / 255.0
+        base_array = np.asarray(base_image, dtype=np.float32)
+        color = np.zeros_like(base_array)
+        color[..., 0] = 255.0
+        alpha = (0.65 * heat_array)[..., None]
+        blended = base_array * (1.0 - alpha) + color * alpha
+        return Image.fromarray(np.uint8(np.clip(blended, 0, 255)))
+
+    clause_rows: list[Image.Image] = []
+    half_width = grid_width // 2
+    for clause_index in active_indices.tolist():
+        role_rows = []
+        for role_name, role_attention in (
+            ("subject", subject),
+            ("reference", reference),
+        ):
+            grid = role_attention[clause_index].reshape(grid_height, grid_width)
+            view_overlays = [
+                _overlay(camera_images[0], grid[:, :half_width]),
+                _overlay(camera_images[1], grid[:, half_width:]),
+            ]
+            row = Image.new("RGB", (448, 246), "white")
+            row.paste(view_overlays[0], (0, 22))
+            row.paste(view_overlays[1], (224, 22))
+            ImageDraw.Draw(row).text(
+                (4, 4),
+                f"clause {clause_index} {role_name}",
+                fill="black",
+            )
+            role_rows.append(row)
+        predicate_id = int(predicate_ids[clause_index])
+        predicate = (
+            ERAF_PREDICATES[predicate_id]
+            if 0 <= predicate_id < len(ERAF_PREDICATES)
+            else f"unknown:{predicate_id}"
+        )
+        header = Image.new("RGB", (448, 42), "white")
+        grasp_anchor = np.asarray(arrays["grasp_anchor"])[0, clause_index]
+        goal_anchor = np.asarray(arrays["goal_anchor"])[0, clause_index]
+        interaction_anchor = np.asarray(arrays["interaction_anchor"])[
+            0, clause_index
+        ]
+        header_draw = ImageDraw.Draw(header)
+        header_draw.text(
+            (4, 3),
+            f"predicate={predicate} phase={int(phase_ids[clause_index])}",
+            fill="black",
+        )
+        header_draw.text(
+            (4, 20),
+            f"grasp={np.round(grasp_anchor, 2).tolist()} "
+            f"goal={np.round(goal_anchor, 2).tolist()} "
+            f"op={np.round(interaction_anchor, 2).tolist()}",
+            fill="black",
+        )
+        clause = Image.new("RGB", (448, 534), "white")
+        clause.paste(header, (0, 0))
+        clause.paste(role_rows[0], (0, 42))
+        clause.paste(role_rows[1], (0, 288))
+        clause_rows.append(clause)
+    canvas = Image.new("RGB", (448, 534 * len(clause_rows)), "white")
+    for index, row in enumerate(clause_rows):
+        canvas.paste(row, (0, 534 * index))
+    png_path = output_dir / f"{stem}.png"
+    canvas.save(png_path)
+    return {
+        "predicate_ids": predicate_ids.tolist(),
+        "active_probability": active_probability.tolist(),
+        "phase_ids": phase_ids.tolist(),
+        "subject_positions": np.asarray(arrays["subject_position"])[0].tolist(),
+        "reference_positions": np.asarray(arrays["reference_position"])[0].tolist(),
+        "subject_view_visibility": (
+            1.0
+            / (
+                1.0
+                + np.exp(
+                    -np.asarray(arrays["subject_view_visibility_logits"])[0]
+                )
+            )
+        ).tolist(),
+        "reference_view_visibility": (
+            1.0
+            / (
+                1.0
+                + np.exp(
+                    -np.asarray(arrays["reference_view_visibility_logits"])[0]
+                )
+            )
+        ).tolist(),
+        "subject_view_centers": np.asarray(
+            arrays["subject_view_centers"]
+        )[0].tolist(),
+        "reference_view_centers": np.asarray(
+            arrays["reference_view_centers"]
+        )[0].tolist(),
+        "grasp_anchors": np.asarray(arrays["grasp_anchor"])[0].tolist(),
+        "goal_anchors": np.asarray(arrays["goal_anchor"])[0].tolist(),
+        "interaction_anchors": np.asarray(arrays["interaction_anchor"])[0].tolist(),
+        "npz": str(npz_path),
+        "overlay": str(png_path),
+    }
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
@@ -693,6 +852,18 @@ def _predict_action_chunk(
         ):
             if source_key in pred:
                 policy_guard_diagnostics[output_key] = converter(pred[source_key])
+        if bool(cfg.EVALUATION.get("entity_relation_diagnostics", False)):
+            eraf = pred.get("policy_guard_eraf_diagnostics")
+            if eraf is None:
+                raise RuntimeError(
+                    "ERAF diagnostics were requested from a non-V9 checkpoint."
+                )
+            policy_guard_diagnostics["_entity_relation_raw"] = {
+                name: value.detach().cpu().numpy()
+                if torch.is_tensor(value)
+                else np.asarray(value)
+                for name, value in eraf.items()
+            }
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
@@ -981,6 +1152,19 @@ def run_single_episode(
             )
             inference_latencies_ms.append(inference_latency_ms)
             if policy_guard_diagnostics is not None:
+                eraf_raw = policy_guard_diagnostics.pop(
+                    "_entity_relation_raw", None
+                )
+                if eraf_raw is not None:
+                    policy_guard_diagnostics["entity_relation"] = (
+                        _save_eraf_diagnostics(
+                            cfg=cfg,
+                            images=imgs,
+                            diagnostics=eraf_raw,
+                            episode_idx=episode_idx,
+                            replan_idx=inference_replan_index,
+                        )
+                    )
                 policy_guard_decisions.append(policy_guard_diagnostics)
             if predicted_future_frames is not None:
                 current_replan_idx += 1

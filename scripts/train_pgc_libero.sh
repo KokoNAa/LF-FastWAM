@@ -594,6 +594,7 @@ if payload.get("format") in {
     "fastwam_policy_guard_v6",
     "fastwam_policy_guard_v7",
     "fastwam_policy_guard_v8",
+    "fastwam_policy_guard_v9",
 }:
     raise SystemExit("PGC base must be the immutable full FastWAM release, not an adapter")
 print(f"Validated protected base: format={payload.get('format', 'legacy_full')} tensors={len(payload['mot'])}")

@@ -45,6 +45,9 @@ data:
     pgc_balance_native_counterfactual: true
     counterfactual_manifest_path: null
     counterfactual_negative_probability: 0.0
+    pgc_entity_relation_supervision_required: false
+    pgc_entity_relation_sidecar_dirs: []
+    pgc_v9_balanced_sampling: false
 
 lr_scheduler_type: cosine
 learning_rate: 1.0e-5
