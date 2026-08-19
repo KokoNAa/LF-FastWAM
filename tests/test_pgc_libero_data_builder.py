@@ -227,6 +227,26 @@ class PGCLiberoDataBuilderTest(unittest.TestCase):
             self.assertEqual(demos[0].initial_state.shape, (8,))
             self.assertEqual(demos[0].actions.shape, (3, 7))
 
+    def test_prefers_canonical_suite_directory_for_demo_resolution(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            suite_root = root / "libero_object"
+            legacy_root = root / "legacy"
+            suite_root.mkdir()
+            legacy_root.mkdir()
+            filename = "pick_up_the_cream_cheese_demo.hdf5"
+            canonical = suite_root / filename
+            canonical.touch()
+            (legacy_root / filename).touch()
+
+            self.assertEqual(
+                demo_file_candidates(root, self.record),
+                [canonical.resolve()],
+            )
+            self.assertEqual(
+                resolve_demo_file(root, self.record), canonical.resolve()
+            )
+
     def test_ambiguous_demo_files_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -1202,6 +1202,29 @@ def demo_file_candidates(
             f"Manifest pair {record.get('pair_id')!r} has no target BDDL/task name."
         )
 
+    # Prefer the canonical ``<root>/<suite>/<task>_demo.hdf5`` layout used by
+    # the official LIBERO HDF5 release. Apart from being substantially cheaper
+    # than recursively scanning a large, partially downloaded LIBERO-90 tree,
+    # this deterministic lookup avoids depending on recursive-discovery
+    # semantics across storage backends. Fall back to the recursive search for
+    # legacy or flattened layouts.
+    target_suite = str(
+        record.get("counterfactual_task_suite_name", "")
+    ).casefold()
+    suite_root = root / target_suite if target_suite else None
+    if suite_root is not None and suite_root.is_dir():
+        suite_matches = sorted(
+            {
+                path.resolve()
+                for path in suite_root.iterdir()
+                if path.is_file()
+                and path.suffix.casefold() in {".hdf5", ".h5"}
+                and _normalise_stem(path.name) in desired_stems
+            }
+        )
+        if suite_matches:
+            return suite_matches
+
     matches = []
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.casefold() not in {".hdf5", ".h5"}:
@@ -1210,7 +1233,6 @@ def demo_file_candidates(
         if candidate_stem in desired_stems:
             matches.append(path.resolve())
     matches = sorted(set(matches))
-    target_suite = str(record.get("counterfactual_task_suite_name", "")).casefold()
     if len(matches) > 1 and target_suite:
         suite_matches = [
             path
@@ -1228,10 +1250,31 @@ def resolve_demo_file(
 ) -> Path:
     matches = demo_file_candidates(demo_root, record)
     if len(matches) != 1:
+        root = Path(demo_root).expanduser().resolve()
+        desired_stems = sorted(
+            {
+                stem
+                for stem in (
+                    _normalise_stem(
+                        str(record.get("counterfactual_bddl_file", ""))
+                    ),
+                    _normalise_stem(
+                        str(record.get("counterfactual_task_name", ""))
+                    ),
+                    _normalise_stem(
+                        str(record.get("counterfactual_instruction", ""))
+                    ),
+                )
+                if stem
+            }
+        )
         raise ValueError(
             f"Expected exactly one target demo file for pair "
             f"{record.get('pair_id')!r}, found {len(matches)}: "
-            f"{[str(path) for path in matches]}"
+            f"{[str(path) for path in matches]}; demo_root={str(root)!r}; "
+            f"target_suite="
+            f"{str(record.get('counterfactual_task_suite_name', ''))!r}; "
+            f"desired_stems={desired_stems!r}"
         )
     return matches[0]
 
