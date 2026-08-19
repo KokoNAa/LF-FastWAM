@@ -597,13 +597,13 @@ class EntityRelationAffordanceField(nn.Module):
             subject_token = torch.where(
                 is_binary.unsqueeze(-1), reference_token, fallback_subject
             )
-            fallback_position = self.entity_grounder.position_head(
-                fallback_subject
+            predicted_subject_position = self.entity_grounder.position_head(
+                subject_token
             ).float()
             subject_position = torch.where(
                 is_binary.unsqueeze(-1),
                 reference_position,
-                fallback_position,
+                predicted_subject_position,
             )
         elif kind == "relation":
             probabilities = torch.softmax(
