@@ -50,6 +50,11 @@ if ! [[ "${STAGE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "PGC_V9_STAGE_STEPS must be a positive integer." >&2
   exit 1
 fi
+GRADIENT_ACCUMULATION_STEPS="${PGC_V9_GRADIENT_ACCUMULATION_STEPS:-4}"
+if ! [[ "${GRADIENT_ACCUMULATION_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PGC_V9_GRADIENT_ACCUMULATION_STEPS must be a positive integer." >&2
+  exit 1
+fi
 MAX_STEPS=$((STAGE_START_STEP + STAGE_STEPS))
 case "${ABLATION}" in
   full)
@@ -228,7 +233,7 @@ RUN_TAG="${RUN_TAG:-${SUITE}-pgc-v9-eraf-${ABLATION}-${STAGE}-seed${TRAIN_SEED}-
 echo "[PGC-FastWAM] V9 ERAF ${STAGE} training"
 echo "  suite=${SUITE} cumulative_steps=${MAX_STEPS} start_step=${START_STEP} stage_steps=${STAGE_STEPS}"
 echo "  ablation=${ABLATION} entity_only=${ENTITY_ONLY} use_anchors=${USE_ANCHORS}"
-echo "  effective_batch=$((NPROC_PER_NODE * 4)) (${NPROC_PER_NODE} GPUs x batch1 x grad_accum4)"
+echo "  effective_batch=$((NPROC_PER_NODE * GRADIENT_ACCUMULATION_STEPS)) (${NPROC_PER_NODE} GPUs x batch1 x grad_accum${GRADIENT_ACCUMULATION_STEPS})"
 echo "  mixture=native:CF 1:1; CF=historical:strict 1:1; strict=relation-balanced"
 echo "  init=${INIT_CHECKPOINT}"
 echo "  native=${NATIVE_DATASET}"
@@ -253,6 +258,7 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "max_steps=${MAX_STEPS}" \
   num_epochs=1 \
   "learning_rate=${LEARNING_RATE}" \
+  "gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}" \
   save_every=500 \
   save_training_state=false \
   model.action_dit_config.use_latent_action_queries=false \

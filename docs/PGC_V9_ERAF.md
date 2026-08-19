@@ -143,6 +143,11 @@ STRICT_SIDECAR=$V9_DATA_ROOT/sidecars/libero_10_strict_cf_eraf
 
 ### 5.2 Stage 1：ERAF grounding，1500 steps
 
+默认使用四卡与 `gradient_accumulation_steps=4`，有效 batch 为 16。若当前只
+有三卡，可设置 `PGC_V9_GRADIENT_ACCUMULATION_STEPS=5`，得到最接近的有效
+batch 15；这不会改变累计 step/checkpoint 合同。V9 仍保持 `model.lora.enabled=false`，
+因为 grounding/action 阶段只训练 ERAF/Proposal sidecar，Base 与 V5 主体必须冻结。
+
 ```bash
 GROUND_TAG=v9-libero10-eraf-grounding-1500-seed42-v1
 GROUND_LOG=/root/gpufree-data/pgc_v9_libero10_grounding.log
