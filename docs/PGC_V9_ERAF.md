@@ -225,6 +225,20 @@ echo "GROUNDING_GATE_EXIT=$?"
 
 Gate 同时要求 subject/reference top-1 ≥80%、relation macro-F1 ≥90%、role-swap ≥90%、可见 goal anchor 中位误差 ≤5 cm、多 clause exact match ≥80%。失败返回码为 2。
 
+Gate 报告还包含 `role_residual_audit`，但该审计不会放宽上述准入标准。它使用
+subject/reference mask 的逐 patch 交集构造 exclusive evidence，并分别报告：
+
+- 完整 mask 和 exclusive mask 的 role-swap accuracy；
+- 完整 mask 失败中有多少被 exclusive 判据恢复、仍然错误或缺少可分证据；
+- mask IoU、subject/reference overlap fraction 和两种判据下的 margin 分布；
+- 按 native/counterfactual、predicate 和任务指令拆分的同类指标。
+
+`diagnosis=overlap_sensitive_full_mask_gate` 表示实体定位正确，但完整 mask 判据受到
+物体/容器重叠影响；此时应对齐训练目标和 gate，而不是继续堆训练步数。
+`diagnosis=role_binding_generalization_failure` 表示 exclusive evidence 下仍会交换角色；
+此时应增加显式 subject/reference assignment loss 和均衡 hard role-swap 采样，且不得
+进入 Stage 2。
+
 ### 5.3 Stage 2：Grounding–Action，新增 4000 steps
 
 Stage 2 从累计 step 1500 开始，最终 checkpoint 为 step 5500。ERAF LR 为 `2e-5`，Proposal LR 为 `1e-4`。

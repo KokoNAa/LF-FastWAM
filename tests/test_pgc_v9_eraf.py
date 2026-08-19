@@ -1078,6 +1078,70 @@ class PGCERAFGroundingGateTest(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertFalse(report["checks"]["relation_macro_f1_at_least_90pct"])
 
+    def test_role_residual_audit_separates_overlap_from_binding_failure(self):
+        base = {
+            "subject_top1_hits": [True],
+            "reference_top1_hits": [True],
+            "role_swap_correct": [False],
+            "relation_targets": [1],
+            "relation_predictions": [1],
+            "goal_anchor_errors_m": [0.01],
+            "clause_exact": False,
+            "clause_count": 2,
+        }
+
+        def clause(*, exclusive_correct, predicate="in", task="task-a"):
+            return {
+                "full_mask_correct": False,
+                "exclusive_mask_valid": True,
+                "exclusive_mask_correct": exclusive_correct,
+                "mask_overlap_iou": 0.75,
+                "subject_overlap_fraction": 0.80,
+                "reference_overlap_fraction": 0.70,
+                "full_subject_margin": -0.10,
+                "full_reference_margin": -0.05,
+                "exclusive_subject_margin": 0.20 if exclusive_correct else -0.20,
+                "exclusive_reference_margin": 0.30 if exclusive_correct else -0.30,
+                "dataset_kind": "counterfactual",
+                "predicate": predicate,
+                "task": task,
+            }
+
+        overlap_records = [
+            dict(base, role_audit_clauses=[clause(exclusive_correct=True)])
+            for _ in range(5)
+        ]
+        audit = compute_grounding_gate_report(overlap_records)[
+            "role_residual_audit"
+        ]
+        self.assertEqual(audit["diagnosis"], "overlap_sensitive_full_mask_gate")
+        self.assertEqual(
+            audit["overall"]["full_mask_failure_partition"][
+                "exclusive_recovers"
+            ],
+            5,
+        )
+        self.assertIn("counterfactual", audit["by_dataset_kind"])
+        self.assertIn("in", audit["by_predicate"])
+        self.assertIn("task-a", audit["by_task"])
+
+        binding_records = [
+            dict(base, role_audit_clauses=[clause(exclusive_correct=False)])
+            for _ in range(5)
+        ]
+        audit = compute_grounding_gate_report(binding_records)[
+            "role_residual_audit"
+        ]
+        self.assertEqual(
+            audit["diagnosis"], "role_binding_generalization_failure"
+        )
+        self.assertEqual(
+            audit["overall"]["full_mask_failure_partition"][
+                "exclusive_still_wrong"
+            ],
+            5,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

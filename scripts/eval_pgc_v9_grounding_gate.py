@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import json
 import sys
 from pathlib import Path
@@ -34,6 +35,160 @@ def _macro_f1(targets: Iterable[int], predictions: Iterable[int]) -> float:
 
 def _safe_rate(values: list[bool]) -> float:
     return float(np.mean(values)) if values else 0.0
+
+
+def _optional_rate(values: list[bool]) -> float | None:
+    return float(np.mean(values)) if values else None
+
+
+def _distribution(values: Iterable[float]) -> dict[str, float | int | None]:
+    array = np.asarray(list(values), dtype=np.float64)
+    if array.size == 0:
+        return {
+            "count": 0,
+            "mean": None,
+            "median": None,
+            "p05": None,
+            "p95": None,
+            "min": None,
+            "max": None,
+        }
+    return {
+        "count": int(array.size),
+        "mean": float(array.mean()),
+        "median": float(np.median(array)),
+        "p05": float(np.quantile(array, 0.05)),
+        "p95": float(np.quantile(array, 0.95)),
+        "min": float(array.min()),
+        "max": float(array.max()),
+    }
+
+
+def _role_group_summary(
+    clauses: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    full = [bool(item["full_mask_correct"]) for item in clauses]
+    exclusive_items = [
+        item for item in clauses if bool(item["exclusive_mask_valid"])
+    ]
+    exclusive = [
+        bool(item["exclusive_mask_correct"]) for item in exclusive_items
+    ]
+    full_failures = [item for item in clauses if not item["full_mask_correct"]]
+    recovered = [
+        item
+        for item in full_failures
+        if item["exclusive_mask_valid"] and item["exclusive_mask_correct"]
+    ]
+    remains_wrong = [
+        item
+        for item in full_failures
+        if item["exclusive_mask_valid"] and not item["exclusive_mask_correct"]
+    ]
+    ambiguous = [
+        item for item in full_failures if not item["exclusive_mask_valid"]
+    ]
+    return {
+        "clauses": len(clauses),
+        "full_mask": {
+            "correct": int(sum(full)),
+            "accuracy": _optional_rate(full),
+        },
+        "exclusive_mask": {
+            "eligible": len(exclusive_items),
+            "coverage": (
+                float(len(exclusive_items) / len(clauses)) if clauses else None
+            ),
+            "correct": int(sum(exclusive)),
+            "accuracy": _optional_rate(exclusive),
+        },
+        "full_mask_failure_partition": {
+            "total": len(full_failures),
+            "exclusive_recovers": len(recovered),
+            "exclusive_still_wrong": len(remains_wrong),
+            "exclusive_ambiguous": len(ambiguous),
+        },
+        "mask_overlap_iou": _distribution(
+            float(item["mask_overlap_iou"]) for item in clauses
+        ),
+        "subject_overlap_fraction": _distribution(
+            float(item["subject_overlap_fraction"]) for item in clauses
+        ),
+        "reference_overlap_fraction": _distribution(
+            float(item["reference_overlap_fraction"]) for item in clauses
+        ),
+        "full_subject_margin": _distribution(
+            float(item["full_subject_margin"]) for item in clauses
+        ),
+        "full_reference_margin": _distribution(
+            float(item["full_reference_margin"]) for item in clauses
+        ),
+        "exclusive_subject_margin": _distribution(
+            float(item["exclusive_subject_margin"])
+            for item in exclusive_items
+        ),
+        "exclusive_reference_margin": _distribution(
+            float(item["exclusive_reference_margin"])
+            for item in exclusive_items
+        ),
+    }
+
+
+def _role_residual_audit(records: list[Mapping[str, Any]]) -> dict[str, Any]:
+    clauses = [
+        dict(clause)
+        for record in records
+        for clause in record.get("role_audit_clauses", ())
+    ]
+    if not clauses:
+        return {
+            "format": "pgc_v9_eraf_role_residual_audit_v1",
+            "available": False,
+            "diagnosis": "missing_per_clause_role_audit",
+        }
+    overall = _role_group_summary(clauses)
+    grouped: dict[str, dict[str, Any]] = {}
+    for field in ("dataset_kind", "predicate", "task"):
+        values: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+        for clause in clauses:
+            values[str(clause.get(field, "unknown"))].append(clause)
+        grouped[f"by_{field}"] = {
+            key: _role_group_summary(items)
+            for key, items in sorted(values.items())
+        }
+
+    full_accuracy = overall["full_mask"]["accuracy"]
+    exclusive_accuracy = overall["exclusive_mask"]["accuracy"]
+    exclusive_coverage = overall["exclusive_mask"]["coverage"]
+    if full_accuracy is not None and full_accuracy >= 0.90:
+        diagnosis = "role_gate_pass"
+        recommendation = "Proceed only if every other grounding gate passes."
+    elif exclusive_coverage is None or exclusive_coverage < 0.50:
+        diagnosis = "insufficient_exclusive_role_support"
+        recommendation = (
+            "Inspect mask construction or add higher-resolution role labels before "
+            "changing the role objective."
+        )
+    elif exclusive_accuracy is not None and exclusive_accuracy >= 0.90:
+        diagnosis = "overlap_sensitive_full_mask_gate"
+        recommendation = (
+            "Align the role objective and gate to exclusive evidence while retaining "
+            "full-mask top-1 localization checks."
+        )
+    else:
+        diagnosis = "role_binding_generalization_failure"
+        recommendation = (
+            "Train an explicit subject/reference assignment objective with balanced "
+            "hard role-swap examples; do not enter action training yet."
+        )
+    return {
+        "format": "pgc_v9_eraf_role_residual_audit_v1",
+        "available": True,
+        "overall": overall,
+        **grouped,
+        "diagnosis": diagnosis,
+        "recommendation": recommendation,
+    }
 
 
 def compute_grounding_gate_report(
@@ -105,6 +260,7 @@ def compute_grounding_gate_report(
         "metrics": metrics,
         "checks": checks,
         "passed": all(checks.values()),
+        "role_residual_audit": _role_residual_audit(records),
     }
 
 
@@ -145,6 +301,10 @@ def _sample_record(
     sample: Mapping[str, Any],
     workspace_min: np.ndarray,
     workspace_max: np.ndarray,
+    *,
+    dataset_kind: str = "unknown",
+    dataset_label: str = "unknown",
+    predicate_vocabulary: Iterable[str] = (),
 ) -> dict[str, Any]:
     import torch
 
@@ -197,6 +357,14 @@ def _sample_record(
         & (subject_entity_ids != reference_entity_ids)
     )
     role_swap_correct = []
+    role_audit_clauses = []
+    predicate_names = tuple(str(value) for value in predicate_vocabulary)
+    prompt = str(sample.get("prompt", "unknown"))
+    prompt_prefix = (
+        "A video recorded from a robot's point of view executing the "
+        "following instruction: "
+    )
+    task = prompt[len(prompt_prefix) :] if prompt.startswith(prompt_prefix) else prompt
     for index in np.flatnonzero(role_valid):
         subject_own = float(
             (subject_attention[index] * subject_target[index]).sum()
@@ -210,8 +378,82 @@ def _sample_record(
         reference_wrong = float(
             (reference_attention[index] * subject_target[index]).sum()
         )
-        role_swap_correct.append(
+        full_correct = (
             subject_own > subject_wrong and reference_own > reference_wrong
+        )
+        role_swap_correct.append(full_correct)
+
+        subject_mask = subject_target[index]
+        reference_mask = reference_target[index]
+        shared = np.minimum(subject_mask, reference_mask)
+        union = np.maximum(subject_mask, reference_mask)
+        subject_exclusive = np.clip(subject_mask - shared, 0.0, None)
+        reference_exclusive = np.clip(reference_mask - shared, 0.0, None)
+        subject_support = float(subject_mask.sum())
+        reference_support = float(reference_mask.sum())
+        shared_support = float(shared.sum())
+        exclusive_valid = bool(
+            float(subject_exclusive.sum()) > 1e-8
+            and float(reference_exclusive.sum()) > 1e-8
+        )
+        subject_exclusive_own = float(
+            (subject_attention[index] * subject_exclusive).sum()
+        )
+        subject_exclusive_wrong = float(
+            (subject_attention[index] * reference_exclusive).sum()
+        )
+        reference_exclusive_own = float(
+            (reference_attention[index] * reference_exclusive).sum()
+        )
+        reference_exclusive_wrong = float(
+            (reference_attention[index] * subject_exclusive).sum()
+        )
+        exclusive_correct = bool(
+            exclusive_valid
+            and subject_exclusive_own > subject_exclusive_wrong
+            and reference_exclusive_own > reference_exclusive_wrong
+        )
+        predicate_id = int(predicate_ids[index])
+        predicate_name = (
+            predicate_names[predicate_id]
+            if 0 <= predicate_id < len(predicate_names)
+            else str(predicate_id)
+        )
+        role_audit_clauses.append(
+            {
+                "clause_index": int(index),
+                "predicate_id": predicate_id,
+                "predicate": predicate_name,
+                "dataset_kind": str(dataset_kind),
+                "dataset": str(dataset_label),
+                "task": task,
+                "full_mask_correct": bool(full_correct),
+                "exclusive_mask_valid": exclusive_valid,
+                "exclusive_mask_correct": exclusive_correct,
+                "mask_overlap_iou": (
+                    float(shared_support / float(union.sum()))
+                    if float(union.sum()) > 0
+                    else 0.0
+                ),
+                "subject_overlap_fraction": (
+                    float(shared_support / subject_support)
+                    if subject_support > 0
+                    else 0.0
+                ),
+                "reference_overlap_fraction": (
+                    float(shared_support / reference_support)
+                    if reference_support > 0
+                    else 0.0
+                ),
+                "full_subject_margin": subject_own - subject_wrong,
+                "full_reference_margin": reference_own - reference_wrong,
+                "exclusive_subject_margin": (
+                    subject_exclusive_own - subject_exclusive_wrong
+                ),
+                "exclusive_reference_margin": (
+                    reference_exclusive_own - reference_exclusive_wrong
+                ),
+            }
         )
 
     goal_valid = (
@@ -242,6 +484,7 @@ def _sample_record(
         "subject_top1_hits": subject_hits,
         "reference_top1_hits": reference_hits,
         "role_swap_correct": role_swap_correct,
+        "role_audit_clauses": role_audit_clauses,
         "relation_targets": predicate_ids[clause_valid].tolist(),
         "relation_predictions": predicate_prediction[clause_valid].tolist(),
         "goal_anchor_errors_m": anchor_errors[goal_valid].tolist(),
@@ -340,12 +583,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 rand_device="cpu",
                 tiled=False,
             )
+        dataset_index = int(
+            torch.as_tensor(sample["pgc_dataset_index"]).item()
+        )
+        sidecar = dataset.pgc_entity_relation_indices[dataset_index]
         records.append(
             _sample_record(
                 prediction["policy_guard_eraf_diagnostics"],
                 sample,
                 workspace_min,
                 workspace_max,
+                dataset_kind=str(sidecar["dataset_kind"]),
+                dataset_label=Path(str(sidecar["dataset"])).name,
+                predicate_vocabulary=sidecar["predicate_vocabulary"],
             )
         )
         print(f"ERAF_GATE {ordinal + 1}/{len(selected)}", flush=True)
