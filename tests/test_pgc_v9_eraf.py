@@ -6,6 +6,7 @@ from collections import Counter, OrderedDict
 from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -30,7 +31,12 @@ from fastwam.models.wan22.entity_relation_affordance import (
     entity_relation_affordance_loss,
 )
 from fastwam.models.wan22.policy_guard import infer_spatial_patch_grid
-from scripts.build_pgc_libero_entity_relations import ARRAY_NAMES, _region_anchor
+import scripts.build_pgc_libero_entity_relations as eraf_builder
+from scripts.build_pgc_libero_entity_relations import (
+    ARRAY_NAMES,
+    _match_native_demo,
+    _region_anchor,
+)
 from scripts.eval_pgc_v9_grounding_gate import compute_grounding_gate_report
 from tests.test_policy_guard import tiny_pgc_fastwam
 
@@ -340,6 +346,63 @@ class PGCERAFSamplingTest(unittest.TestCase):
 
 
 class PGCERAFDatasetAuditTest(unittest.TestCase):
+    def test_native_demo_lookup_uses_source_suite_for_cross_suite_pair(self):
+        actions = np.asarray(
+            [
+                [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+                [0.0, 0.1, 0.0, 0.0, 0.0, 0.0, -1.0],
+            ],
+            dtype=np.float32,
+        )
+        record = {
+            "pair_id": "libero_10_02_to_libero_90_18",
+            "task_suite_name": "libero_10",
+            "task_id": 2,
+            "correct_instruction": "turn on the stove and put the moka pot on it",
+            "counterfactual_task_suite_name": "libero_90",
+            "counterfactual_task_id": 18,
+            "counterfactual_instruction": "put the frying pan on the stove",
+            "counterfactual_bddl_file": "/demo/libero_90/target.bddl",
+        }
+        demo = SimpleNamespace(
+            actions=actions,
+            initial_state=np.asarray([1.0, 2.0], dtype=np.float64),
+            group_name="demo_0",
+        )
+        captured = {}
+
+        def resolve(_root, lookup):
+            captured.update(lookup)
+            return Path("/demo/libero_10/source_demo.hdf5")
+
+        with (
+            patch.object(
+                eraf_builder,
+                "_problem_for_task",
+                return_value=(None, None, Path("/bddl/libero_10/source.bddl")),
+            ),
+            patch.object(eraf_builder, "resolve_demo_file", side_effect=resolve),
+            patch.object(
+                eraf_builder,
+                "iter_libero_hdf5_demos",
+                return_value=iter([demo]),
+            ),
+        ):
+            state, demo_path, group_name = _match_native_demo(
+                record=record,
+                actions=actions,
+                hdf5_root=Path("/demo"),
+                used=set(),
+            )
+
+        self.assertEqual(captured["counterfactual_task_suite_name"], "libero_10")
+        self.assertEqual(captured["counterfactual_task_id"], 2)
+        self.assertEqual(captured["counterfactual_instruction"], record["correct_instruction"])
+        self.assertEqual(captured["counterfactual_bddl_file"], "/bddl/libero_10/source.bddl")
+        np.testing.assert_array_equal(state, demo.initial_state)
+        self.assertEqual(demo_path, "/demo/libero_10/source_demo.hdf5")
+        self.assertEqual(group_name, "demo_0")
+
     class _Metadata:
         total_episodes = 1
 

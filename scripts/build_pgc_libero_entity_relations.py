@@ -190,6 +190,13 @@ def _match_native_demo(
     used: set[tuple[str, str]],
 ) -> tuple[np.ndarray, str, str]:
     lookup = dict(record)
+    # ``record`` may describe a cross-suite counterfactual pair (for example a
+    # LIBERO-10 source with a LIBERO-90 donor).  Native episodes must always be
+    # audited against the *source* suite/task.  Leaving the counterfactual
+    # suite in the lookup can resolve an identically named LIBERO-90 task and
+    # then make every otherwise-valid native action audit fail.
+    lookup["counterfactual_task_suite_name"] = str(record["task_suite_name"])
+    lookup["counterfactual_task_id"] = int(record["task_id"])
     lookup["counterfactual_task_name"] = str(record["correct_instruction"])
     lookup["counterfactual_instruction"] = str(record["correct_instruction"])
     _, _, source_bddl = _problem_for_task(
