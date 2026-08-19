@@ -177,7 +177,26 @@ if saved_base_path.resolve() != pathlib.Path(base_checkpoint).resolve():
         f"{saved_base_path.resolve()}, but the command supplied "
         f"{pathlib.Path(base_checkpoint).resolve()}."
     )
-for dataset, sidecar in zip(paths[:3], paths[3:], strict=True):
+expected_action_contracts = (
+    (
+        "native",
+        "fastwam_gripper_open_1_close_0",
+        "fastwam_to_libero_env",
+    ),
+    (
+        "counterfactual",
+        "libero_env_gripper_open_minus1_close_plus1",
+        "identity",
+    ),
+    (
+        "counterfactual",
+        "libero_env_gripper_open_minus1_close_plus1",
+        "identity",
+    ),
+)
+for dataset, sidecar, expected_contract in zip(
+    paths[:3], paths[3:], expected_action_contracts, strict=True
+):
     index_path = pathlib.Path(sidecar) / "index.json"
     index = json.loads(index_path.read_text(encoding="utf-8"))
     if index.get("format") != "pgc_libero_entity_relation_v1":
@@ -185,6 +204,16 @@ for dataset, sidecar in zip(paths[:3], paths[3:], strict=True):
     if pathlib.Path(index["dataset"]).resolve() != pathlib.Path(dataset).resolve():
         raise SystemExit(
             f"Sidecar order mismatch: {index['dataset']} does not audit {dataset}."
+        )
+    actual_contract = (
+        index.get("dataset_kind"),
+        index.get("dataset_action_convention"),
+        index.get("simulator_replay_action_transform"),
+    )
+    if actual_contract != expected_contract:
+        raise SystemExit(
+            f"Sidecar action contract mismatch at {index_path}: "
+            f"expected={expected_contract} got={actual_contract}."
         )
 PY
 

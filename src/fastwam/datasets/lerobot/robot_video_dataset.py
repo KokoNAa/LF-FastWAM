@@ -19,6 +19,7 @@ from ..counterfactual import (
     stable_instruction_id,
 )
 from ..pgc_libero import (
+    PGC_ACTION_CONVENTION_FASTWAM,
     PGC_ENTITY_RELATION_ARRAY_NAMES,
     array_sha256,
     classify_strict_conflict,
@@ -444,6 +445,24 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
         )
+        if self.pgc_entity_relation_supervision_required:
+            action_conventions = {
+                dataset_index: str(index["dataset_action_convention"])
+                for dataset_index, index in self.pgc_entity_relation_indices.items()
+            }
+            self.lerobot_dataset.set_action_conventions_by_dataset_index(
+                action_conventions
+            )
+            aligned_count = sum(
+                convention != PGC_ACTION_CONVENTION_FASTWAM
+                for convention in action_conventions.values()
+            )
+            logger.info(
+                "Configured PGC v9 action conventions for %d datasets "
+                "(%d aligned to FastWAM before preprocessing).",
+                len(action_conventions),
+                aligned_count,
+            )
         underlying = self.lerobot_dataset.multi_dataset._datasets
         if self.pgc_entity_relation_supervision_required:
             self._validate_pgc_entity_relation_dataset_audits(

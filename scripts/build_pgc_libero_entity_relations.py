@@ -23,14 +23,20 @@ for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
         sys.path.insert(0, str(import_root))
 
 from fastwam.datasets.pgc_libero import (  # noqa: E402
+    PGC_ACTION_CONVENTION_FASTWAM,
+    PGC_ACTION_CONVENTION_LIBERO_ENV,
+    PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV,
+    PGC_ACTION_REPLAY_IDENTITY,
     PGC_ENTITY_RELATION_ARRAY_NAMES,
     PGC_ENTITY_RELATION_FORMAT,
     PGC_ENTITY_RELATION_INDEX,
     array_sha256,
     atomic_write_json,
     canonical_state_array,
+    fastwam_actions_to_libero_env,
     filter_libero_noops,
     iter_libero_hdf5_demos,
+    libero_env_actions_to_fastwam,
     libero_problem_entity_catalog,
     parse_libero_goal_clauses,
     read_jsonl,
@@ -206,7 +212,13 @@ def _match_native_demo(
     demo_path = resolve_demo_file(hdf5_root, lookup)
     candidates: list[tuple[np.ndarray, str]] = []
     for demo in iter_libero_hdf5_demos(demo_path):
-        filtered = filter_libero_noops(demo.actions)
+        # Raw LIBERO HDF5 actions use the MuJoCo convention
+        # (open=-1, close=+1), while the released FastWAM LeRobot dataset uses
+        # open=1, close=0.  The first six dimensions are identical; align only
+        # the gripper before the exact action/provenance audit.
+        filtered = libero_env_actions_to_fastwam(
+            filter_libero_noops(demo.actions)
+        )
         if filtered.shape == actions.shape and np.allclose(
             filtered, actions, rtol=0.0, atol=2.0e-5
         ):
@@ -655,7 +667,7 @@ def main() -> None:
     workspace_min = np.asarray(args.workspace_min, dtype=np.float32)
     workspace_max = np.asarray(args.workspace_max, dtype=np.float32)
     for episode_index in range(episode_count):
-        actions = _episode_actions(dataset, episode_index)
+        dataset_actions = _episode_actions(dataset, episode_index)
         if audits is not None:
             audit = audits[episode_index]
             if int(audit["episode_index"]) != episode_index:
@@ -677,10 +689,19 @@ def main() -> None:
             pair_id = str(record["pair_id"])
             initial_state, demo_source, demo_group = _match_native_demo(
                 record=record,
-                actions=actions,
+                actions=dataset_actions,
                 hdf5_root=args.hdf5_root.expanduser().resolve(),
                 used=used_native_demos,
             )
+        # Counterfactual PGC trajectories were recorded directly from donor
+        # HDF5 actions and therefore already use the MuJoCo convention. Native
+        # FastWAM actions require the inverse affine gripper transform before
+        # simulator replay. Raw dataset_actions remain untouched for hashes.
+        replay_actions = (
+            dataset_actions
+            if is_counterfactual
+            else fastwam_actions_to_libero_env(dataset_actions)
+        )
         target_clauses, source_clauses, target_problem, source_problem = _record_roles(
             record, max_clauses=args.max_clauses
         )
@@ -701,7 +722,7 @@ def main() -> None:
             arrays, replay_state_sha = _replay_labels(
                 env,
                 initial_state=initial_state,
-                actions=actions,
+                actions=replay_actions,
                 target_clauses=target_clauses,
                 source_clauses=source_clauses,
                 target_problem=target_problem,
@@ -732,8 +753,8 @@ def main() -> None:
                 "sha256": _sha256(episode_path),
                 "state_sha256": replay_state_sha,
                 "initial_state_sha256": state_sha256(initial_state),
-                "action_sha256": array_sha256(actions),
-                "frame_count": int(actions.shape[0]),
+                "action_sha256": array_sha256(dataset_actions),
+                "frame_count": int(dataset_actions.shape[0]),
                 "source_demo": demo_source,
                 "source_demo_group": demo_group,
                 "target_clauses": target_clauses,
@@ -748,6 +769,16 @@ def main() -> None:
                 "suite": args.suite,
                 "dataset": str(dataset_root),
                 "dataset_kind": "counterfactual" if is_counterfactual else "native",
+                "dataset_action_convention": (
+                    PGC_ACTION_CONVENTION_LIBERO_ENV
+                    if is_counterfactual
+                    else PGC_ACTION_CONVENTION_FASTWAM
+                ),
+                "simulator_replay_action_transform": (
+                    PGC_ACTION_REPLAY_IDENTITY
+                    if is_counterfactual
+                    else PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV
+                ),
                 "privileged_supervision": "training_only",
                 "deployment_inputs": "rgb_language_proprio",
                 "max_clauses": args.max_clauses,
@@ -768,7 +799,8 @@ def main() -> None:
         )
         print(
             f"SAVED ERAF episode={episode_index} pair={pair_id} "
-            f"frames={len(actions)} progress={len(entries)}/{episode_count}",
+            f"frames={len(dataset_actions)} "
+            f"progress={len(entries)}/{episode_count}",
             flush=True,
         )
     if len(entries) != episode_count:

@@ -28,6 +28,12 @@ PGC_CLOSED_LOOP_CORRECTIVE_FORMAT = "pgc_libero_closed_loop_corrective_v1"
 PGC_CLOSED_LOOP_CORRECTIVE_INDEX = Path("meta/pgc_v8_closed_loop/index.json")
 PGC_ENTITY_RELATION_FORMAT = "pgc_libero_entity_relation_v1"
 PGC_ENTITY_RELATION_INDEX = Path("index.json")
+PGC_ACTION_CONVENTION_FASTWAM = "fastwam_gripper_open_1_close_0"
+PGC_ACTION_CONVENTION_LIBERO_ENV = (
+    "libero_env_gripper_open_minus1_close_plus1"
+)
+PGC_ACTION_REPLAY_IDENTITY = "identity"
+PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV = "fastwam_to_libero_env"
 PGC_ENTITY_RELATION_PREDICATES = (
     "pad",
     "in",
@@ -76,6 +82,37 @@ LIBERO_SUITES = (
     "libero_10",
 )
 PGC_STATE_TRANSFER_MODES = ("flat_exact", "named_joint_remap")
+
+
+def _validated_libero_actions(actions: np.ndarray) -> np.ndarray:
+    """Return a finite float32 copy of an action array ending in 7 dims."""
+    result = np.asarray(actions, dtype=np.float32)
+    if result.ndim < 1 or result.shape[-1] != 7:
+        raise ValueError(
+            f"LIBERO actions must have final dimension 7, got {result.shape}."
+        )
+    if not np.isfinite(result).all():
+        raise ValueError("LIBERO actions must be finite.")
+    return np.array(result, dtype=np.float32, copy=True, order="C")
+
+
+def libero_env_actions_to_fastwam(actions: np.ndarray) -> np.ndarray:
+    """Convert MuJoCo gripper ``open=-1/close=+1`` to FastWAM ``1/0``.
+
+    The first six action dimensions are already identical. This conversion
+    deliberately remains affine instead of thresholding so action audits can
+    detect unexpected intermediate gripper values rather than hiding them.
+    """
+    result = _validated_libero_actions(actions)
+    result[..., -1] = (1.0 - result[..., -1]) * 0.5
+    return result
+
+
+def fastwam_actions_to_libero_env(actions: np.ndarray) -> np.ndarray:
+    """Convert FastWAM gripper ``open=1/close=0`` to MuJoCo ``-1/+1``."""
+    result = _validated_libero_actions(actions)
+    result[..., -1] = 1.0 - 2.0 * result[..., -1]
+    return result
 
 
 def detect_pgc_completion_phase(
@@ -721,6 +758,39 @@ def load_pgc_entity_relation_index(
     if payload.get("deployment_inputs") != "rgb_language_proprio":
         raise ValueError(
             "PGC v9 deployment must be limited to RGB, language, and proprio."
+        )
+    dataset_kind = str(payload.get("dataset_kind", ""))
+    action_convention = str(payload.get("dataset_action_convention", ""))
+    replay_transform = str(
+        payload.get("simulator_replay_action_transform", "")
+    )
+    expected_action_contract = {
+        "native": (
+            PGC_ACTION_CONVENTION_FASTWAM,
+            PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV,
+        ),
+        "counterfactual": (
+            PGC_ACTION_CONVENTION_LIBERO_ENV,
+            PGC_ACTION_REPLAY_IDENTITY,
+        ),
+    }
+    if dataset_kind not in expected_action_contract:
+        raise ValueError(
+            "PGC v9 sidecars must declare dataset_kind as native or "
+            "counterfactual."
+        )
+    expected_convention, expected_replay = expected_action_contract[
+        dataset_kind
+    ]
+    if action_convention != expected_convention:
+        raise ValueError(
+            "PGC v9 sidecar action convention is incompatible with "
+            f"dataset_kind={dataset_kind!r}: {action_convention!r}."
+        )
+    if replay_transform != expected_replay:
+        raise ValueError(
+            "PGC v9 sidecar simulator replay transform is incompatible with "
+            f"dataset_kind={dataset_kind!r}: {replay_transform!r}."
         )
     if payload.get("entity_id_scheme") != "sha256_63bit":
         raise ValueError("PGC v9 sidecar entity ID scheme is incompatible.")

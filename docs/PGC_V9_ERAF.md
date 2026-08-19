@@ -52,6 +52,15 @@ ERAF 到 V5 Goal Query/Embedding 的两个 bridge 都是零初始化，因此 V5
 - predicate truth 与 phase；
 - episode/frame 对齐信息以及 state、action、sidecar SHA256。
 
+sidecar 还必须声明并校验原始动作编码。release FastWAM native LeRobot
+数据使用夹爪 `open=1/close=0`，而从 LIBERO HDF5 回放采集的 historical/strict
+PGC 数据保留 MuJoCo 的 `open=-1/close=+1`。native sidecar 构建时先用
+`g_env=1-2*g_fastwam` 回放；historical/strict 保持原值回放。训练加载器则只在
+processor/normalizer 之前把 counterfactual 数据按
+`g_fastwam=(1-g_env)/2` 对齐，原始 LeRobot 文件和 action SHA256 始终不改写。
+因此三套数据进入 Action Proposal 时具有同一个 FastWAM 动作合同，同时仍可追溯
+到磁盘上的原始采集记录。
+
 BDDL region 必须从 `regions[name].target` 解析。加载训练数据时会再次校验 sidecar 文件 hash、LeRobot action hash、PGC 初始状态 hash、数组 shape/dtype/range、pair ID 和 strict 双向回放审计。
 
 对于 LIBERO 将方向目标编码为 `on(subject, structural_region)` 的情况，V9 仍以 `regions[name].target` 确定真实 fixture 与 goal anchor，只使用指令中的显式 `left/right/front/back` 词恢复关系类别，并且只在 BDDL 已声明的 object/fixture catalog 中解析语义 reference；不会从 region 名称猜实体。

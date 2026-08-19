@@ -15,10 +15,16 @@ from fastwam.datasets.lerobot.robot_video_dataset import (
     RobotVideoDataset,
     build_pgc_v9_sample_indices,
 )
+from fastwam.datasets.lerobot.base_lerobot_dataset import BaseLerobotDataset
 from fastwam.datasets.pgc_libero import (
+    PGC_ACTION_CONVENTION_FASTWAM,
+    PGC_ACTION_CONVENTION_LIBERO_ENV,
+    PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV,
     PGC_ENTITY_RELATION_ARRAY_NAMES,
     array_sha256,
     classify_strict_conflict,
+    fastwam_actions_to_libero_env,
+    libero_env_actions_to_fastwam,
     load_pgc_entity_relation_index,
     parse_libero_goal_clauses,
     provenance_pair,
@@ -347,13 +353,14 @@ class PGCERAFSamplingTest(unittest.TestCase):
 
 class PGCERAFDatasetAuditTest(unittest.TestCase):
     def test_native_demo_lookup_uses_source_suite_for_cross_suite_pair(self):
-        actions = np.asarray(
+        hdf5_actions = np.asarray(
             [
                 [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
-                [0.0, 0.1, 0.0, 0.0, 0.0, 0.0, -1.0],
+                [0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 1.0],
             ],
             dtype=np.float32,
         )
+        actions = libero_env_actions_to_fastwam(hdf5_actions)
         record = {
             "pair_id": "libero_10_02_to_libero_90_18",
             "task_suite_name": "libero_10",
@@ -365,7 +372,7 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
             "counterfactual_bddl_file": "/demo/libero_90/target.bddl",
         }
         demo = SimpleNamespace(
-            actions=actions,
+            actions=hdf5_actions,
             initial_state=np.asarray([1.0, 2.0], dtype=np.float64),
             group_name="demo_0",
         )
@@ -402,6 +409,53 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
         np.testing.assert_array_equal(state, demo.initial_state)
         self.assertEqual(demo_path, "/demo/libero_10/source_demo.hdf5")
         self.assertEqual(group_name, "demo_0")
+
+    def test_libero_and_fastwam_gripper_conventions_round_trip(self):
+        env_actions = np.asarray(
+            [
+                [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, -1.0],
+                [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        fastwam_actions = libero_env_actions_to_fastwam(env_actions)
+        np.testing.assert_array_equal(fastwam_actions[:, :6], env_actions[:, :6])
+        np.testing.assert_array_equal(fastwam_actions[:, -1], [1.0, 0.0])
+        np.testing.assert_array_equal(
+            fastwam_actions_to_libero_env(fastwam_actions), env_actions
+        )
+
+    def test_base_dataset_aligns_only_authenticated_counterfactual_actions(self):
+        dataset = object.__new__(BaseLerobotDataset)
+        dataset.multi_dataset = SimpleNamespace(_datasets=[object(), object()])
+        dataset.action_conventions_by_dataset_index = {}
+        dataset.set_action_conventions_by_dataset_index(
+            {
+                0: PGC_ACTION_CONVENTION_FASTWAM,
+                1: PGC_ACTION_CONVENTION_LIBERO_ENV,
+            }
+        )
+        meta = {"key": "default", "lerobot_key": "action", "raw_shape": 7}
+        native = torch.tensor(
+            [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], dtype=torch.float32
+        )
+        counterfactual = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        native_result = dataset._get_action(
+            meta, {"action": native, "dataset_index": torch.tensor(0)}
+        )
+        cf_result = dataset._get_action(
+            meta,
+            {"action": counterfactual, "dataset_index": torch.tensor(1)},
+        )
+        self.assertTrue(torch.equal(native_result, native))
+        self.assertTrue(torch.equal(cf_result[:, -1], torch.tensor([1.0, 0.0])))
+        self.assertTrue(torch.equal(counterfactual[:, -1], torch.tensor([-1.0, 1.0])))
 
     class _Metadata:
         total_episodes = 1
@@ -531,6 +585,11 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
             index = {
                 "format": "pgc_libero_entity_relation_v1",
                 "dataset": str(root / "dataset"),
+                "dataset_kind": "native",
+                "dataset_action_convention": PGC_ACTION_CONVENTION_FASTWAM,
+                "simulator_replay_action_transform": (
+                    PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV
+                ),
                 "privileged_supervision": "training_only",
                 "deployment_inputs": "rgb_language_proprio",
                 "max_clauses": 4,
@@ -573,6 +632,19 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
                 payload["target_subject_view_centers"].shape, (1, 4, 2, 2)
             )
             self.assertTrue(payload["target_subject_view_visible"][0, 0, 0])
+
+            incompatible = dict(index)
+            incompatible["dataset_action_convention"] = (
+                PGC_ACTION_CONVENTION_LIBERO_ENV
+            )
+            (root / "index.json").write_text(
+                json.dumps(incompatible), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "action convention"):
+                load_pgc_entity_relation_index(root)
+            (root / "index.json").write_text(
+                json.dumps(index), encoding="utf-8"
+            )
 
             with episode_path.open("ab") as handle:
                 handle.write(b"corruption")

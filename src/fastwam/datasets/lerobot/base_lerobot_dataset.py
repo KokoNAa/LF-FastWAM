@@ -9,6 +9,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from fastwam.utils.logging_config import get_logger
 from .processors.base_processor import BaseProcessor
+from ..pgc_libero import (
+    PGC_ACTION_CONVENTION_FASTWAM,
+    PGC_ACTION_CONVENTION_LIBERO_ENV,
+)
 
 logger = get_logger(__name__)
 
@@ -106,6 +110,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             episodes=episodes,
             delta_timestamps=delta_timestamps,
         )
+        # Empty for every historical training path. PGC v9 configures this
+        # only after its ERAF sidecars have authenticated each dataset's raw
+        # action convention.
+        self.action_conventions_by_dataset_index: dict[int, str] = {}
         
         # HACK: lerobot 3.0 will fix this
         episode_data_index = []
@@ -123,12 +131,71 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             "to": torch.cat([dataset["to"] for dataset in episode_data_index]),
         }
 
+    def set_action_conventions_by_dataset_index(
+        self, conventions: Dict[int, str]
+    ) -> "BaseLerobotDataset":
+        """Declare authenticated per-dataset gripper encodings.
+
+        All actions exposed to processors and normalization use FastWAM's
+        ``open=1, close=0`` contract. Raw LeRobot tables remain untouched so
+        V9 action SHA256 audits continue to bind the original files.
+        """
+        normalized = {int(index): str(value) for index, value in conventions.items()}
+        expected_indices = set(range(len(self.multi_dataset._datasets)))
+        if set(normalized) != expected_indices:
+            raise ValueError(
+                "Action conventions must cover every loaded dataset exactly: "
+                f"expected={sorted(expected_indices)} got={sorted(normalized)}."
+            )
+        allowed = {
+            PGC_ACTION_CONVENTION_FASTWAM,
+            PGC_ACTION_CONVENTION_LIBERO_ENV,
+        }
+        unknown = sorted(set(normalized.values()) - allowed)
+        if unknown:
+            raise ValueError(f"Unsupported action conventions: {unknown}.")
+        self.action_conventions_by_dataset_index = normalized
+        return self
+
+    def _dataset_index_for_episode(self, episode_index: int) -> int:
+        remaining = int(episode_index)
+        for dataset_index, dataset in enumerate(self.multi_dataset._datasets):
+            if remaining < int(dataset.num_episodes):
+                return dataset_index
+            remaining -= int(dataset.num_episodes)
+        raise IndexError(f"Episode index {episode_index} is out of bounds.")
+
+    def _sample_dataset_index(self, lerobot_sample: Dict[str, Any]) -> int:
+        raw_index = lerobot_sample.get("dataset_index")
+        if raw_index is None:
+            if self.action_conventions_by_dataset_index:
+                raise ValueError(
+                    "Dataset index is required when action conventions are configured."
+                )
+            return 0
+        index_tensor = torch.as_tensor(raw_index)
+        if index_tensor.numel() != 1:
+            raise ValueError("Dataset index must be scalar.")
+        return int(index_tensor.item())
+
     def _get_action(self, meta, lerobot_sample) -> torch.Tensor:
         key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
         action: torch.Tensor = lerobot_sample[lerobot_key] # [T, action_dim]
         if action.ndim == 1: # for shape of 1, like gripper
             action = action.unsqueeze(-1)
         assert action.shape[-1] == raw_shape, f"Action '{key}' shape {action.shape[-1]} mismatch with meta {raw_shape}."
+        dataset_index = self._sample_dataset_index(lerobot_sample)
+        convention = self.action_conventions_by_dataset_index.get(dataset_index)
+        if convention == PGC_ACTION_CONVENTION_LIBERO_ENV:
+            action = action.clone()
+            action[..., -1] = (1.0 - action[..., -1]) * 0.5
+        elif (
+            self.action_conventions_by_dataset_index
+            and convention != PGC_ACTION_CONVENTION_FASTWAM
+        ):
+            raise ValueError(
+                f"No authenticated action convention for dataset {dataset_index}."
+            )
         return action
 
     def _get_state(self, meta, lerobot_sample) -> torch.Tensor:
@@ -155,6 +222,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
     
     def _get_episode_data(self, episode_idx):
         lerobot_sample = self.multi_dataset.get_episode_data(episode_idx)
+        lerobot_sample["dataset_index"] = torch.tensor(
+            self._dataset_index_for_episode(episode_idx), dtype=torch.long
+        )
         lerobot_sample = self._split_lerobot_sample(lerobot_sample)
         state, action = {}, {}
         for meta in self.state_meta:
