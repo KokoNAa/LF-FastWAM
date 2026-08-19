@@ -261,6 +261,7 @@ def _make_source_env(
     resolution: int,
     seed: int,
     camera_segmentations: str | list[str] | None = None,
+    apply_counterfactual_goal: bool = True,
 ) -> tuple[Any, Any]:
     from libero.libero import benchmark
 
@@ -284,7 +285,8 @@ def _make_source_env(
         env_num=1,
         camera_segmentations=camera_segmentations,
     )
-    _set_counterfactual_goal(env, record)
+    if apply_counterfactual_goal:
+        _set_counterfactual_goal(env, record)
     return env, task
 
 

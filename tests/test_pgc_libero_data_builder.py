@@ -3,11 +3,14 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import h5py
 import numpy as np
 
 from scripts.build_pgc_libero_data import (
+    _make_source_env,
     _merge_resume_provenance_pairs,
     _named_joint_transfer_state,
     _prepare_source_initial_state,
@@ -119,6 +122,41 @@ class PGCLiberoDataBuilderTest(unittest.TestCase):
                 ["in", "cream_cheese_1", "basket_1_contain_region"]
             ],
         }
+
+    def test_source_env_can_skip_counterfactual_goal_for_native_replay(self):
+        task = SimpleNamespace(language=self.record["correct_instruction"])
+        suite = SimpleNamespace(get_task=lambda _task_id: task)
+        fake_env = object()
+        with (
+            patch(
+                "libero.libero.benchmark.get_benchmark_dict",
+                return_value={"libero_object": lambda: suite},
+            ),
+            patch(
+                "experiments.libero.libero_utils.get_libero_env",
+                return_value=(fake_env, None),
+            ),
+            patch(
+                "scripts.build_pgc_libero_data._set_counterfactual_goal"
+            ) as set_goal,
+        ):
+            env, resolved_task = _make_source_env(
+                self.record,
+                resolution=64,
+                seed=42,
+                apply_counterfactual_goal=False,
+            )
+            self.assertIs(env, fake_env)
+            self.assertIs(resolved_task, task)
+            set_goal.assert_not_called()
+
+            _make_source_env(
+                self.record,
+                resolution=64,
+                seed=43,
+                apply_counterfactual_goal=True,
+            )
+            set_goal.assert_called_once_with(fake_env, self.record)
 
     def test_state_hash_is_dtype_and_byte_order_stable(self):
         state32 = np.array([1.0, -2.5, 3.25], dtype=np.float32)

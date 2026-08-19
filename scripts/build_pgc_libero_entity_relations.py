@@ -50,7 +50,6 @@ from scripts.build_pgc_libero_data import (  # noqa: E402
     _load_suite_manifest,
     _make_source_env,
     _reset_exact_state,
-    _set_counterfactual_goal,
 )
 
 
@@ -716,9 +715,8 @@ def main() -> None:
                 resolution=512,
                 seed=args.seed + episode_index,
                 camera_segmentations="element",
+                apply_counterfactual_goal=is_counterfactual,
             )
-            if is_counterfactual:
-                _set_counterfactual_goal(env, record)
             arrays, replay_state_sha = _replay_labels(
                 env,
                 initial_state=initial_state,
