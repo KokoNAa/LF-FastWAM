@@ -239,9 +239,57 @@ subject/reference mask 的逐 patch 交集构造 exclusive evidence，并分别�
 此时应增加显式 subject/reference assignment loss 和均衡 hard role-swap 采样，且不得
 进入 Stage 2。
 
+#### V9.2-B role-assignment repair
+
+当 500-sample 审计确认 `role_binding_generalization_failure` 后，从 V9.1 step 1500
+继续 1000 个纯 grounding steps，而不是回到 V5 重训。V9.2 使用 objective v3：
+
+- 对 `subject-query → subject-entity`、`reference-query → reference-entity` 做 row CE；
+- 对每个实体反向比较两个 query，增加 column CE，防止两个 query 塌缩到同一实体；
+- 当前 assignment 错误的 clause 在线加权为普通 clause 的 3 倍；
+- 保留 V9.1 attention-mask、role margin、mask、relation、anchor、position 和 phase
+  监督；Base、V5 GoalGraph 和 Action Proposal 继续冻结；
+- checkpoint 从 objective v2 单向迁移到 v3，禁止在 action/verifier 阶段偷偷改变
+  grounding objective。
+
+三卡正式续训：
+
+```bash
+V9R1_CKPT=/root/gpufree-data/LF-FastWAM/runs/libero_pgc_2cam224/pgc-v9r1-libero10-eraf-grounding-1500-3gpu-seed42-v1/checkpoints/weights/step_001500.pt
+ROLE_TAG=v9r2-libero10-role-assignment-1000-3gpu-seed42-v1
+ROLE_LOG=/root/gpufree-data/pgc_v9r2_libero10_role_assignment_1000_3gpu.log
+
+nohup env \
+  CUDA_VISIBLE_DEVICES=0,1,2 \
+  PGC_V9_GRADIENT_ACCUMULATION_STEPS=5 \
+  PGC_V9_GROUNDING_OBJECTIVE_VERSION=3 \
+  PGC_V9_ROLE_ASSIGNMENT_WEIGHT=4.0 \
+  PGC_V9_ROLE_ASSIGNMENT_TEMPERATURE=0.10 \
+  PGC_V9_ROLE_ASSIGNMENT_HARD_WEIGHT=2.0 \
+  RUN_TAG="$ROLE_TAG" \
+  bash scripts/train_pgc_v9_libero_stage.sh \
+    libero_10 grounding-role 3 \
+    "$BASE" "$V9R1_CKPT" \
+    "$HISTORICAL_CF" "$STRICT_DATASET" \
+    "$NATIVE_SIDECAR" "$HISTORICAL_SIDECAR" "$STRICT_SIDECAR" \
+    42 full \
+  > "$ROLE_LOG" 2>&1 &
+
+echo $! | tee /root/gpufree-data/pgc_v9r2_libero10_role_assignment.pid
+tail -f "$ROLE_LOG"
+```
+
+V9.2 grounding checkpoint 的累计 step 为 2500。训练时必须同时监控
+`loss_pgc_v9_role_assignment`、assignment row/column/total accuracy、hard fraction、
+原 `pgc_v9_role_swap_accuracy`、两个 top-1 hit 和 anchor loss。之后仍运行相同的
+500-sample grounding gate；objective v3 gate 只接受 step 2500。
+
 ### 5.3 Stage 2：Grounding–Action，新增 4000 steps
 
-Stage 2 从累计 step 1500 开始，最终 checkpoint 为 step 5500。ERAF LR 为 `2e-5`，Proposal LR 为 `1e-4`。
+V9.1 Stage 2 从累计 step 1500 开始，最终 checkpoint 为 step 5500。若采用 V9.2
+objective v3，则从 step 2500 开始并最终保存为 step 6500。ERAF LR 为 `2e-5`，
+Proposal LR 为 `1e-4`，且启动命令必须显式设置
+`PGC_V9_GROUNDING_OBJECTIVE_VERSION=3`。
 
 ```bash
 ACTION_TAG=v9-libero10-eraf-action-4000-seed42-v1

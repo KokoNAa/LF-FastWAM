@@ -742,6 +742,9 @@ class ERAFLossWeights:
     role_swap: float = 0.5
     role_overlap: float = 0.0
     role_swap_margin: float = 0.20
+    role_assignment: float = 0.0
+    role_assignment_temperature: float = 0.10
+    role_assignment_hard_weight: float = 0.0
     phase: float = 0.25
 
 
@@ -750,6 +753,22 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     if not bool(mask.any()):
         return values.sum() * 0.0
     return values[mask].mean()
+
+
+def _masked_weighted_mean(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    sample_weights: torch.Tensor,
+) -> torch.Tensor:
+    mask = mask.to(device=values.device, dtype=torch.bool)
+    if not bool(mask.any()):
+        return values.sum() * 0.0
+    selected_weights = sample_weights.to(
+        device=values.device, dtype=values.dtype
+    )[mask]
+    return (
+        values[mask] * selected_weights
+    ).sum() / selected_weights.sum().clamp_min(1.0e-8)
 
 
 def _supervised_role_contrastive_loss(
@@ -1008,6 +1027,47 @@ def entity_relation_affordance_loss(
         ),
         role_swap_valid,
     )
+    # V9.2 adds an explicit two-query/two-entity assignment objective.  The
+    # row terms require each semantic query to prefer its own entity; the
+    # column terms prevent both queries from collapsing onto the same entity.
+    # Incorrect clauses are upweighted online, which preserves the audited
+    # native/CF data mixture while concentrating gradient on hard role swaps.
+    assignment_temperature = float(weights.role_assignment_temperature)
+    if assignment_temperature <= 0:
+        raise ValueError("ERAF role-assignment temperature must be positive.")
+    assignment_target = torch.zeros_like(subject_own, dtype=torch.long)
+
+    def assignment_ce(own: torch.Tensor, wrong: torch.Tensor) -> torch.Tensor:
+        logits = torch.stack((own, wrong), dim=-1) / assignment_temperature
+        return F.cross_entropy(
+            logits.reshape(-1, 2),
+            assignment_target.reshape(-1),
+            reduction="none",
+        ).reshape_as(own)
+
+    assignment_per_clause = 0.25 * (
+        assignment_ce(subject_own, subject_wrong)
+        + assignment_ce(reference_own, reference_wrong)
+        + assignment_ce(subject_own, reference_wrong)
+        + assignment_ce(reference_own, subject_wrong)
+    )
+    row_correct = (subject_own > subject_wrong) & (
+        reference_own > reference_wrong
+    )
+    column_correct = (subject_own > reference_wrong) & (
+        reference_own > subject_wrong
+    )
+    assignment_correct = row_correct & column_correct
+    hard_assignment = (~assignment_correct).float().detach()
+    hard_weight = float(weights.role_assignment_hard_weight)
+    if hard_weight < 0:
+        raise ValueError("ERAF role-assignment hard weight must be non-negative.")
+    assignment_sample_weights = 1.0 + hard_weight * hard_assignment
+    role_assignment_loss = _masked_weighted_mean(
+        assignment_per_clause,
+        role_swap_valid,
+        assignment_sample_weights,
+    )
     # Penalize attention assigned exclusively to the other semantic role.
     # Pixels shared by overlapping objects/containers are excluded so an
     # object entering a basket is not trained as a false negative.
@@ -1037,6 +1097,7 @@ def entity_relation_affordance_loss(
         + weights.position * position_loss
         + weights.role_swap * role_swap_loss
         + weights.role_overlap * role_overlap_loss
+        + weights.role_assignment * role_assignment_loss
         + weights.phase * phase_loss
     )
     predicate_prediction = outputs["predicate_logits"].argmax(dim=-1)
@@ -1059,6 +1120,7 @@ def entity_relation_affordance_loss(
         "loss_pgc_v9_position": position_loss.detach(),
         "loss_pgc_v9_role_swap": role_swap_loss.detach(),
         "loss_pgc_v9_role_overlap": role_overlap_loss.detach(),
+        "loss_pgc_v9_role_assignment": role_assignment_loss.detach(),
         "loss_pgc_v9_phase": phase_loss.detach(),
         "loss_pgc_v9_predicate": predicate_loss.detach(),
         "loss_pgc_v9_role_entity_contrastive": role_entity_loss.detach(),
@@ -1092,6 +1154,18 @@ def entity_relation_affordance_loss(
         ).detach(),
         "pgc_v9_role_swap_valid_fraction": _masked_mean(
             role_swap_valid.float(), clause_valid
+        ).detach(),
+        "pgc_v9_role_assignment_accuracy": _masked_mean(
+            assignment_correct.float(), role_swap_valid
+        ).detach(),
+        "pgc_v9_role_assignment_row_accuracy": _masked_mean(
+            row_correct.float(), role_swap_valid
+        ).detach(),
+        "pgc_v9_role_assignment_column_accuracy": _masked_mean(
+            column_correct.float(), role_swap_valid
+        ).detach(),
+        "pgc_v9_role_assignment_hard_fraction": _masked_mean(
+            hard_assignment, role_swap_valid
         ).detach(),
         "pgc_v9_subject_entity_retrieval_acc": entity_accuracies[0].detach(),
         "pgc_v9_reference_entity_retrieval_acc": entity_accuracies[1].detach(),

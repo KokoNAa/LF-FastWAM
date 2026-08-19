@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
+SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
 STAGE="${2:?Missing V9 training stage}"
 NPROC_PER_NODE="${3:?Missing GPU count}"
 BASE_CHECKPOINT="${4:?Missing released FastWAM checkpoint}"
@@ -13,6 +13,7 @@ ORIGINAL_CF_SIDECAR="${9:?Missing historical-CF ERAF sidecar}"
 STRICT_CF_SIDECAR="${10:?Missing strict-CF ERAF sidecar}"
 TRAIN_SEED="${11:-42}"
 ABLATION="${12:-full}"
+REQUESTED_GROUNDING_OBJECTIVE_VERSION="${PGC_V9_GROUNDING_OBJECTIVE_VERSION:-}"
 
 case "${SUITE}" in
   libero_spatial|libero_object|libero_goal|libero_10) ;;
@@ -27,21 +28,45 @@ case "${STAGE}" in
     STAGE_START_STEP=0
     DEFAULT_STAGE_STEPS=1500
     LEARNING_RATE="1.0e-4"
+    CONFIG_STAGE="grounding"
+    DEFAULT_GROUNDING_OBJECTIVE_VERSION=2
     ;;
-  action)
+  grounding-role)
     START_STEP=1500
     STAGE_START_STEP=1500
+    DEFAULT_STAGE_STEPS=1000
+    LEARNING_RATE="2.0e-5"
+    CONFIG_STAGE="grounding"
+    DEFAULT_GROUNDING_OBJECTIVE_VERSION=3
+    ;;
+  action)
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "3" ]]; then
+      START_STEP=2500
+      STAGE_START_STEP=2500
+    else
+      START_STEP=1500
+      STAGE_START_STEP=1500
+    fi
     DEFAULT_STAGE_STEPS=4000
     LEARNING_RATE="1.0e-4"
+    CONFIG_STAGE="action"
+    DEFAULT_GROUNDING_OBJECTIVE_VERSION=2
     ;;
   verifier)
-    START_STEP=5500
-    STAGE_START_STEP=5500
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "3" ]]; then
+      START_STEP=6500
+      STAGE_START_STEP=6500
+    else
+      START_STEP=5500
+      STAGE_START_STEP=5500
+    fi
     DEFAULT_STAGE_STEPS=1000
     LEARNING_RATE="1.0e-4"
+    CONFIG_STAGE="verifier"
+    DEFAULT_GROUNDING_OBJECTIVE_VERSION=2
     ;;
   *)
-    echo "Stage must be grounding, action, or verifier; got ${STAGE}." >&2
+    echo "Stage must be grounding, grounding-role, action, or verifier; got ${STAGE}." >&2
     exit 1
     ;;
 esac
@@ -55,15 +80,41 @@ if ! [[ "${GRADIENT_ACCUMULATION_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "PGC_V9_GRADIENT_ACCUMULATION_STEPS must be a positive integer." >&2
   exit 1
 fi
-GROUNDING_OBJECTIVE_VERSION="${PGC_V9_GROUNDING_OBJECTIVE_VERSION:-2}"
+GROUNDING_OBJECTIVE_VERSION="${REQUESTED_GROUNDING_OBJECTIVE_VERSION:-${DEFAULT_GROUNDING_OBJECTIVE_VERSION}}"
 ATTENTION_MASK_WEIGHT="${PGC_V9_ATTENTION_MASK_WEIGHT:-2.0}"
 ROLE_SWAP_WEIGHT="${PGC_V9_ROLE_SWAP_WEIGHT:-2.0}"
 ROLE_OVERLAP_WEIGHT="${PGC_V9_ROLE_OVERLAP_WEIGHT:-1.0}"
 ROLE_SWAP_MARGIN="${PGC_V9_ROLE_SWAP_MARGIN:-0.20}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" ]]; then
-  echo "Formal V9.1 training requires PGC_V9_GROUNDING_OBJECTIVE_VERSION=2." >&2
-  exit 1
+ROLE_ASSIGNMENT_TEMPERATURE="${PGC_V9_ROLE_ASSIGNMENT_TEMPERATURE:-0.10}"
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "3" ]]; then
+  DEFAULT_ROLE_ASSIGNMENT_WEIGHT=4.0
+  DEFAULT_ROLE_ASSIGNMENT_HARD_WEIGHT=2.0
+else
+  DEFAULT_ROLE_ASSIGNMENT_WEIGHT=0.0
+  DEFAULT_ROLE_ASSIGNMENT_HARD_WEIGHT=0.0
 fi
+ROLE_ASSIGNMENT_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_WEIGHT:-${DEFAULT_ROLE_ASSIGNMENT_WEIGHT}}"
+ROLE_ASSIGNMENT_HARD_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_HARD_WEIGHT:-${DEFAULT_ROLE_ASSIGNMENT_HARD_WEIGHT}}"
+case "${STAGE}" in
+  grounding)
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" ]]; then
+      echo "Formal V9.1 grounding requires objective version 2." >&2
+      exit 1
+    fi
+    ;;
+  grounding-role)
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "3" ]]; then
+      echo "Formal V9.2 role repair requires objective version 3." >&2
+      exit 1
+    fi
+    ;;
+  action|verifier)
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" && "${GROUNDING_OBJECTIVE_VERSION}" != "3" ]]; then
+      echo "V9 action/verifier requires grounding objective version 2 or 3." >&2
+      exit 1
+    fi
+    ;;
+esac
 MAX_STEPS=$((STAGE_START_STEP + STAGE_STEPS))
 case "${ABLATION}" in
   full)
@@ -144,7 +195,8 @@ ORIGINAL_CF_SIDECAR="$(cd -- "${ORIGINAL_CF_SIDECAR}" && pwd -P)"
 STRICT_CF_SIDECAR="$(cd -- "${STRICT_CF_SIDECAR}" && pwd -P)"
 
 "${PYTHON_BIN}" - \
-  "${STAGE}" "${START_STEP}" "${BASE_CHECKPOINT}" "${INIT_CHECKPOINT}" \
+  "${STAGE}" "${START_STEP}" "${GROUNDING_OBJECTIVE_VERSION}" \
+  "${BASE_CHECKPOINT}" "${INIT_CHECKPOINT}" \
   "${NATIVE_DATASET}" "${ORIGINAL_CF_DATASET}" "${STRICT_CF_DATASET}" \
   "${NATIVE_SIDECAR}" "${ORIGINAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}" <<'PY'
 import json
@@ -152,7 +204,7 @@ import pathlib
 import sys
 import torch
 
-stage, expected_step, base_checkpoint, checkpoint, *paths = sys.argv[1:]
+stage, expected_step, requested_objective, base_checkpoint, checkpoint, *paths = sys.argv[1:]
 payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
 fmt = str(payload.get("format", ""))
 version = int((payload.get("architecture_metadata") or {}).get("policy_guard_version", 0))
@@ -161,6 +213,23 @@ if stage == "grounding":
         raise SystemExit(
             "V9 grounding must warm-start from an exact suite-specific PGC V5 checkpoint."
         )
+elif stage == "grounding-role":
+    metadata = payload.get("architecture_metadata") or {}
+    if fmt != "fastwam_policy_guard_v9" or version != 9:
+        raise SystemExit("V9.2 role repair must resume from a V9 checkpoint.")
+    if int(metadata.get("eraf_grounding_objective_version", -1)) != 2:
+        raise SystemExit(
+            "V9.2 role repair requires the completed V9.1 objective-v2 checkpoint."
+        )
+    if int(payload.get("step", -1)) != int(expected_step):
+        raise SystemExit(
+            f"V9.2 role repair requires checkpoint step {expected_step}; "
+            f"got {payload.get('step')}."
+        )
+    if metadata.get("eraf_training_stage") != "grounding":
+        raise SystemExit("V9.2 role repair requires a grounding-stage checkpoint.")
+    if int(requested_objective) != 3:
+        raise SystemExit("V9.2 role repair must configure objective version 3.")
 else:
     if fmt != "fastwam_policy_guard_v9" or version != 9:
         raise SystemExit(f"V9 {stage} must resume from a V9 checkpoint.")
@@ -169,10 +238,10 @@ else:
             "eraf_grounding_objective_version", 1
         )
     )
-    if grounding_objective_version != 2:
+    if grounding_objective_version != int(requested_objective):
         raise SystemExit(
-            f"V9.1 {stage} requires a completed gate-aligned grounding "
-            f"checkpoint (objective version 2); got {grounding_objective_version}."
+            f"V9 {stage} grounding objective mismatch: checkpoint="
+            f"{grounding_objective_version}, requested={requested_objective}."
         )
     if int(payload.get("step", -1)) != int(expected_step):
         raise SystemExit(
@@ -254,6 +323,7 @@ echo "  suite=${SUITE} cumulative_steps=${MAX_STEPS} start_step=${START_STEP} st
 echo "  ablation=${ABLATION} entity_only=${ENTITY_ONLY} use_anchors=${USE_ANCHORS}"
 echo "  effective_batch=$((NPROC_PER_NODE * GRADIENT_ACCUMULATION_STEPS)) (${NPROC_PER_NODE} GPUs x batch1 x grad_accum${GRADIENT_ACCUMULATION_STEPS})"
 echo "  grounding_objective=v${GROUNDING_OBJECTIVE_VERSION} attention_mask=${ATTENTION_MASK_WEIGHT} role_swap=${ROLE_SWAP_WEIGHT} role_overlap=${ROLE_OVERLAP_WEIGHT} margin=${ROLE_SWAP_MARGIN}"
+echo "  role_assignment=${ROLE_ASSIGNMENT_WEIGHT} temperature=${ROLE_ASSIGNMENT_TEMPERATURE} hard_weight=${ROLE_ASSIGNMENT_HARD_WEIGHT}"
 echo "  mixture=native:CF 1:1; CF=historical:strict 1:1; strict=relation-balanced"
 echo "  init=${INIT_CHECKPOINT}"
 echo "  native=${NATIVE_DATASET}"
@@ -288,7 +358,7 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   model.transition_contract.enabled=false \
   model.policy_guard.enabled=true \
   model.policy_guard.version=9 \
-  "model.policy_guard.entity_relation_grounding.training_stage=${STAGE}" \
+  "model.policy_guard.entity_relation_grounding.training_stage=${CONFIG_STAGE}" \
   "model.policy_guard.entity_relation_grounding.grounding_objective_version=${GROUNDING_OBJECTIVE_VERSION}" \
   "model.policy_guard.entity_relation_grounding.entity_only=${ENTITY_ONLY}" \
   "model.policy_guard.entity_relation_grounding.use_anchors=${USE_ANCHORS}" \
@@ -303,6 +373,9 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.entity_relation_grounding.role_swap_weight=${ROLE_SWAP_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.role_overlap_weight=${ROLE_OVERLAP_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.role_swap_margin=${ROLE_SWAP_MARGIN}" \
+  "model.policy_guard.entity_relation_grounding.role_assignment_weight=${ROLE_ASSIGNMENT_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.role_assignment_temperature=${ROLE_ASSIGNMENT_TEMPERATURE}" \
+  "model.policy_guard.entity_relation_grounding.role_assignment_hard_weight=${ROLE_ASSIGNMENT_HARD_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.phase_weight=${PHASE_WEIGHT}" \
   model.policy_guard.counterfactual_action_weight=1.0 \
   model.policy_guard.execution_prefix_steps=10 \

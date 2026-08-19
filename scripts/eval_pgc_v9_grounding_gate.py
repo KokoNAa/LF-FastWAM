@@ -530,12 +530,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if payload.get("format") != "fastwam_policy_guard_v9":
         raise ValueError("Grounding gate requires a PGC v9 checkpoint.")
     metadata = payload.get("architecture_metadata") or {}
-    if int(payload.get("step", -1)) != 1500 or metadata.get(
-        "eraf_training_stage"
-    ) != "grounding":
+    objective_version = int(
+        metadata.get("eraf_grounding_objective_version", 1)
+    )
+    expected_step = {2: 1500, 3: 2500}.get(objective_version)
+    if (
+        expected_step is None
+        or int(payload.get("step", -1)) != expected_step
+        or metadata.get("eraf_training_stage") != "grounding"
+    ):
         raise ValueError(
-            "The pre-action grounding gate requires the V9 grounding-stage "
-            "checkpoint at cumulative step 1500."
+            "The pre-action grounding gate requires the completed V9 "
+            "grounding-stage checkpoint: objective v2 at step 1500 or "
+            "objective v3 at step 2500."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())

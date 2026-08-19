@@ -265,7 +265,8 @@ policy_guard:
     training_stage: grounding
     # v2 aligns every spatial objective with the normalized attention used by
     # deployment and by eval_pgc_v9_grounding_gate.py. Version 1 remains
-    # loadable only for reproducing historical V9 checkpoints.
+    # loadable only for reproducing historical V9 checkpoints. Version 3 adds
+    # bidirectional subject/reference assignment with online hard mining.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -286,6 +287,9 @@ policy_guard:
     role_swap_weight: 2.0
     role_overlap_weight: 1.0
     role_swap_margin: 0.20
+    role_assignment_weight: 0.0
+    role_assignment_temperature: 0.10
+    role_assignment_hard_weight: 0.0
     phase_weight: 1.0
   # Stage A learns only language-to-visual binding. Stage B linearly enables
   # V5 action objectives; the verifier has its own later schedule below.

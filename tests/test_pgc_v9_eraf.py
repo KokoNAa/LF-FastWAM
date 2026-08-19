@@ -730,10 +730,13 @@ class PGCERAFModuleTest(unittest.TestCase):
             "loss_pgc_v9_spatial_bce",
             "loss_pgc_v9_spatial_dice",
             "loss_pgc_v9_role_overlap",
+            "loss_pgc_v9_role_assignment",
             "pgc_v9_subject_gt_attention_mass",
             "pgc_v9_reference_gt_attention_mass",
             "pgc_v9_role_swap_accuracy",
             "pgc_v9_role_swap_valid_fraction",
+            "pgc_v9_role_assignment_accuracy",
+            "pgc_v9_role_assignment_hard_fraction",
         ):
             self.assertIn(name, metrics)
         loss.backward()
@@ -822,7 +825,7 @@ class PGCERAFModuleTest(unittest.TestCase):
             )
 
         weights = ERAFLossWeights(
-            objective_version=2,
+            objective_version=3,
             mask=0.0,
             attention_mask=2.0,
             entity=0.0,
@@ -832,6 +835,9 @@ class PGCERAFModuleTest(unittest.TestCase):
             role_swap=2.0,
             role_overlap=1.0,
             role_swap_margin=0.20,
+            role_assignment=4.0,
+            role_assignment_temperature=0.10,
+            role_assignment_hard_weight=2.0,
             phase=0.0,
         )
         correct_outputs = outputs(
@@ -851,6 +857,16 @@ class PGCERAFModuleTest(unittest.TestCase):
         self.assertLess(correct_loss.item(), swapped_loss.item())
         self.assertEqual(correct_metrics["pgc_v9_role_swap_accuracy"].item(), 1.0)
         self.assertEqual(swapped_metrics["pgc_v9_role_swap_accuracy"].item(), 0.0)
+        self.assertEqual(
+            correct_metrics["pgc_v9_role_assignment_accuracy"].item(), 1.0
+        )
+        self.assertEqual(
+            swapped_metrics["pgc_v9_role_assignment_accuracy"].item(), 0.0
+        )
+        self.assertLess(
+            correct_metrics["loss_pgc_v9_role_assignment"].item(),
+            swapped_metrics["loss_pgc_v9_role_assignment"].item(),
+        )
         self.assertLess(
             correct_metrics["loss_pgc_v9_attention_mask"].item(),
             swapped_metrics["loss_pgc_v9_attention_mask"].item(),
@@ -995,6 +1011,66 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                     ),
                     key,
                 )
+
+    def test_v9r1_grounding_can_upgrade_to_v9r2_assignment_objective(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v5_path = root / "v5.pt"
+            v9r1_path = root / "v9r1.pt"
+            v9r2_path = root / "v9r2.pt"
+            base = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": base.mot.state_dict()},
+                base_path,
+            )
+            base.load_checkpoint(base_path)
+            base.save_checkpoint(v5_path, step=4000)
+
+            v9r1 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=2,
+            )
+            v9r1.load_checkpoint(v5_path)
+            v9r1.save_checkpoint(v9r1_path, step=1500)
+
+            v9r2 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=3,
+            )
+            v9r2.load_checkpoint(v9r1_path)
+            self.assertEqual(
+                v9r2.policy_guard_eraf_grounding_objective_version, 3
+            )
+            for key, value in v9r1.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(
+                        value,
+                        v9r2.policy_guard_modules.state_dict()[key],
+                    ),
+                    key,
+                )
+            v9r2.save_checkpoint(v9r2_path, step=2500)
+            metadata = torch.load(
+                v9r2_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 3)
+            self.assertEqual(metadata["eraf_role_assignment_weight"], 4.0)
+            self.assertEqual(
+                metadata["eraf_role_assignment_temperature"], 0.10
+            )
+            self.assertEqual(
+                metadata["eraf_role_assignment_hard_weight"], 2.0
+            )
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=3,
+            )
+            restored.load_checkpoint(v9r2_path)
 
     def test_stage_trainability_optimizer_contract_and_deployment_inputs(self):
         expected_modules = {

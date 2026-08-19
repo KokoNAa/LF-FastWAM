@@ -41,6 +41,7 @@ def tiny_pgc_fastwam(
     v9_stage: str = "grounding",
     v9_entity_only: bool = False,
     v9_use_anchors: bool = True,
+    v9_grounding_objective_version: int = 2,
 ) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
@@ -171,7 +172,7 @@ def tiny_pgc_fastwam(
             "min_counterfactual_score": 0.6,
             "entity_relation_grounding": {
                 "training_stage": v9_stage,
-                "grounding_objective_version": 2,
+                "grounding_objective_version": v9_grounding_objective_version,
                 "hidden_dim": 8,
                 "num_heads": 2,
                 "max_clauses": 4,
@@ -189,6 +190,13 @@ def tiny_pgc_fastwam(
                 "role_swap_weight": 2.0,
                 "role_overlap_weight": 1.0,
                 "role_swap_margin": 0.20,
+                "role_assignment_weight": (
+                    4.0 if v9_grounding_objective_version >= 3 else 0.0
+                ),
+                "role_assignment_temperature": 0.10,
+                "role_assignment_hard_weight": (
+                    2.0 if v9_grounding_objective_version >= 3 else 0.0
+                ),
                 "phase_weight": 1.0,
                 "entity_only": v9_entity_only,
                 "use_anchors": v9_use_anchors,

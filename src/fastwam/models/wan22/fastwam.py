@@ -645,6 +645,9 @@ class FastWAM(torch.nn.Module):
         gate_aligned_grounding = (
             self.policy_guard_eraf_grounding_objective_version >= 2
         )
+        assignment_grounding = (
+            self.policy_guard_eraf_grounding_objective_version >= 3
+        )
         self.policy_guard_eraf_loss_weights = ERAFLossWeights(
             objective_version=(
                 self.policy_guard_eraf_grounding_objective_version
@@ -673,6 +676,21 @@ class FastWAM(torch.nn.Module):
             ),
             role_swap_margin=float(
                 eraf_config.get("role_swap_margin", 0.20)
+            ),
+            role_assignment=float(
+                eraf_config.get(
+                    "role_assignment_weight",
+                    4.0 if assignment_grounding else 0.0,
+                )
+            ),
+            role_assignment_temperature=float(
+                eraf_config.get("role_assignment_temperature", 0.10)
+            ),
+            role_assignment_hard_weight=float(
+                eraf_config.get(
+                    "role_assignment_hard_weight",
+                    2.0 if assignment_grounding else 0.0,
+                )
             ),
             phase=float(eraf_config.get("phase_weight", 1.0)),
         )
@@ -994,9 +1012,24 @@ class FastWAM(torch.nn.Module):
                 if self.policy_guard_eraf_grounding_objective_version not in {
                     1,
                     2,
+                    3,
                 }:
                     raise ValueError(
-                        "PGC v9 ERAF grounding_objective_version must be 1 or 2."
+                        "PGC v9 ERAF grounding_objective_version must be 1, 2, or 3."
+                    )
+                if min(
+                    self.policy_guard_eraf_loss_weights.role_assignment,
+                    self.policy_guard_eraf_loss_weights.role_assignment_hard_weight,
+                ) < 0:
+                    raise ValueError(
+                        "PGC v9 ERAF role-assignment weights must be non-negative."
+                    )
+                if (
+                    self.policy_guard_eraf_loss_weights.role_assignment_temperature
+                    <= 0
+                ):
+                    raise ValueError(
+                        "PGC v9 ERAF role-assignment temperature must be positive."
                     )
                 if self.policy_guard_eraf_training_stage not in {
                     "grounding",
@@ -9277,10 +9310,21 @@ class FastWAM(torch.nn.Module):
             ),
             "representation_supervision": (
                 (
-                    "gate_aligned_attention_mass_role_swap_multiview_masks_"
-                    "3d_anchors_state_and_phase"
-                    if self.policy_guard_eraf_grounding_objective_version >= 2
-                    else "predicate_roles_multiview_masks_3d_anchors_state_and_phase"
+                    (
+                        "bidirectional_role_assignment_hard_mining_"
+                        "gate_aligned_attention_multiview_masks_3d_anchors_"
+                        "state_and_phase"
+                    )
+                    if self.policy_guard_eraf_grounding_objective_version >= 3
+                    else (
+                        "gate_aligned_attention_mass_role_swap_multiview_masks_"
+                        "3d_anchors_state_and_phase"
+                        if self.policy_guard_eraf_grounding_objective_version >= 2
+                        else (
+                            "predicate_roles_multiview_masks_3d_anchors_"
+                            "state_and_phase"
+                        )
+                    )
                 )
                 if is_v9
                 else (
@@ -9628,6 +9672,21 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_role_swap_margin": (
                 self.policy_guard_eraf_loss_weights.role_swap_margin
+                if is_v9
+                else None
+            ),
+            "eraf_role_assignment_weight": (
+                self.policy_guard_eraf_loss_weights.role_assignment
+                if is_v9
+                else None
+            ),
+            "eraf_role_assignment_temperature": (
+                self.policy_guard_eraf_loss_weights.role_assignment_temperature
+                if is_v9
+                else None
+            ),
+            "eraf_role_assignment_hard_weight": (
+                self.policy_guard_eraf_loss_weights.role_assignment_hard_weight
                 if is_v9
                 else None
             ),
@@ -10740,9 +10799,17 @@ class FastWAM(torch.nn.Module):
                                 "PGC v9 checkpoint has an invalid ERAF "
                                 "grounding objective version."
                             ) from exc
+                        objective_upgrade = (
+                            saved_grounding_objective == 2
+                            and self.policy_guard_eraf_grounding_objective_version
+                            == 3
+                            and self.policy_guard_eraf_training_stage == "grounding"
+                            and metadata.get("eraf_training_stage") == "grounding"
+                        )
                         if (
                             saved_grounding_objective
                             != self.policy_guard_eraf_grounding_objective_version
+                            and not objective_upgrade
                         ):
                             raise ValueError(
                                 "PGC v9 ERAF grounding objective mismatch: "
@@ -10763,6 +10830,36 @@ class FastWAM(torch.nn.Module):
                                 ),
                                 "eraf_role_swap_margin": (
                                     self.policy_guard_eraf_loss_weights.role_swap_margin
+                                ),
+                            }.items():
+                                try:
+                                    saved_value = float(metadata[metadata_name])
+                                except (KeyError, TypeError, ValueError) as exc:
+                                    raise ValueError(
+                                        "PGC v9 checkpoint is missing valid "
+                                        f"grounding value {metadata_name!r}."
+                                    ) from exc
+                                if not math.isclose(
+                                    saved_value,
+                                    float(expected_value),
+                                    rel_tol=0.0,
+                                    abs_tol=1.0e-9,
+                                ):
+                                    raise ValueError(
+                                        f"PGC v9 {metadata_name} mismatch: "
+                                        f"checkpoint={saved_value}, "
+                                        f"model={expected_value}."
+                                    )
+                        if saved_grounding_objective >= 3:
+                            for metadata_name, expected_value in {
+                                "eraf_role_assignment_weight": (
+                                    self.policy_guard_eraf_loss_weights.role_assignment
+                                ),
+                                "eraf_role_assignment_temperature": (
+                                    self.policy_guard_eraf_loss_weights.role_assignment_temperature
+                                ),
+                                "eraf_role_assignment_hard_weight": (
+                                    self.policy_guard_eraf_loss_weights.role_assignment_hard_weight
                                 ),
                             }.items():
                                 try:
