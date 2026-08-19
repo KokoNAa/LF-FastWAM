@@ -428,7 +428,11 @@ class RelationAffordanceReasoner(nn.Module):
         relation = relation + self.relation_refinement(
             relation
             + self.predicate_state_projection(
-                truth_probability.unsqueeze(-1)
+                # predicate_truth_head already preserves a singleton feature
+                # axis: [batch, clauses, 1].  Adding another axis would turn
+                # this into [batch, clauses, 1, 1] and accidentally broadcast
+                # the batch axis against the clause axis whenever B != C.
+                truth_probability
             )
         )
         active_probability = torch.sigmoid(active_logits.float()).to(relation.dtype)
