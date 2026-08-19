@@ -148,20 +148,48 @@ STRICT_SIDECAR=$V9_DATA_ROOT/sidecars/libero_10_strict_cf_eraf
 batch 15；这不会改变累计 step/checkpoint 合同。V9 仍保持 `model.lora.enabled=false`，
 因为 grounding/action 阶段只训练 ERAF/Proposal sidecar，Base 与 V5 主体必须冻结。
 
-```bash
-GROUND_TAG=v9-libero10-eraf-grounding-1500-seed42-v1
-GROUND_LOG=/root/gpufree-data/pgc_v9_libero10_grounding.log
+#### V9.1 gate-aligned grounding objective
 
-nohup env CUDA_VISIBLE_DEVICES=0,1,2,3 RUN_TAG="$GROUND_TAG" \
+最初的 V9 Stage 1 同时计算 sigmoid heatmap BCE/Dice 和 role-swap loss，但
+role-swap 使用的是独立 sigmoid 响应的区域平均值；grounding gate 与部署端实际
+使用的却是 temperature-softmax 后的 attention。两者不等价，因此可能出现训练
+日志中的 mask/entity loss 已下降，但离线 gate 的 subject/reference top-1、
+role-swap 和 multi-clause exact match 仍失败。
+
+V9.1 将空间监督与 gate 的决策量严格对齐：
+
+- 对 subject/reference 的 normalized attention 直接最小化 GT mask 内总概率质量的
+  负对数；
+- 使用同一 normalized attention 比较 own-role 与 wrong-role mask，并施加 `0.20`
+  margin；
+- 额外惩罚落在另一个角色独占区域的注意力，重叠区域不作为负样本；
+- 将 BCE、Dice、visibility、view visibility 与 center loss 分开记录，避免聚合的
+  `loss_pgc_v9_mask` 掩盖空间定位失败；
+- checkpoint 记录 `grounding_objective_version=2` 及各空间权重，禁止与旧目标静默
+  混用。
+
+正式 V9.1 Stage 1 必须从相同的 V5 checkpoint 重新训练，不能从旧
+`grounding_objective_version=1` 的 step 1500 继续。旧 checkpoint 仍可在显式使用
+旧配置时加载，只用于复现实验。
+
+```bash
+GROUND_TAG=v9r1-libero10-eraf-grounding-1500-3gpu-seed42-v1
+GROUND_LOG=/root/gpufree-data/pgc_v9r1_libero10_grounding_1500_3gpu.log
+
+nohup env \
+  CUDA_VISIBLE_DEVICES=0,1,2 \
+  PGC_V9_GRADIENT_ACCUMULATION_STEPS=5 \
+  PGC_V9_GROUNDING_OBJECTIVE_VERSION=2 \
+  RUN_TAG="$GROUND_TAG" \
   bash scripts/train_pgc_v9_libero_stage.sh \
-    libero_10 grounding 4 \
+    libero_10 grounding 3 \
     "$BASE" "$V5_CKPT" \
     "$HISTORICAL_CF" "$STRICT_DATASET" \
     "$NATIVE_SIDECAR" "$HISTORICAL_SIDECAR" "$STRICT_SIDECAR" \
     42 full \
   > "$GROUND_LOG" 2>&1 &
 
-echo $! | tee /root/gpufree-data/pgc_v9_libero10_grounding.pid
+echo $! | tee /root/gpufree-data/pgc_v9r1_libero10_grounding_1500_3gpu.pid
 tail -f "$GROUND_LOG"
 ```
 
@@ -170,6 +198,14 @@ tail -f "$GROUND_LOG"
 ```bash
 GROUND_CKPT=/root/gpufree-data/LF-FastWAM/runs/libero_pgc_2cam224/pgc-$GROUND_TAG/checkpoints/weights/step_001500.pt
 ```
+
+训练中除原有指标外，还应持续检查：
+
+- `loss_pgc_v9_attention_mask` 与 `loss_pgc_v9_role_overlap` 下降；
+- `pgc_v9_subject_gt_attention_mass`、`pgc_v9_reference_gt_attention_mass` 上升；
+- 两个 `pgc_v9_*_role_attention_margin` 转正并增大；
+- `pgc_v9_role_swap_accuracy` 上升；
+- `pgc_v9_role_swap_valid_fraction` 非零，确认该监督确实覆盖当前 batch。
 
 Stage 1 结束后必须先过 grounding gate，失败时不得进入动作训练：
 

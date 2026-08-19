@@ -732,12 +732,16 @@ class EntityRelationAffordanceField(nn.Module):
 
 @dataclass(frozen=True)
 class ERAFLossWeights:
+    objective_version: int = 1
     mask: float = 1.0
+    attention_mask: float = 0.0
     entity: float = 1.0
     relation: float = 1.0
     anchor: float = 1.0
     position: float = 0.5
     role_swap: float = 0.5
+    role_overlap: float = 0.0
+    role_swap_margin: float = 0.20
     phase: float = 0.25
 
 
@@ -808,10 +812,18 @@ def entity_relation_affordance_loss(
         clause_valid,
     )
 
-    mask_losses: list[torch.Tensor] = []
+    spatial_bce_losses: list[torch.Tensor] = []
+    spatial_dice_losses: list[torch.Tensor] = []
+    visibility_losses: list[torch.Tensor] = []
+    view_visibility_losses: list[torch.Tensor] = []
+    view_center_losses: list[torch.Tensor] = []
+    attention_mask_losses: list[torch.Tensor] = []
     hit_metrics: list[torch.Tensor] = []
-    role_predictions: dict[str, torch.Tensor] = {}
+    role_heatmap_predictions: dict[str, torch.Tensor] = {}
+    role_attentions: dict[str, torch.Tensor] = {}
     role_targets: dict[str, torch.Tensor] = {}
+    role_mask_valid: dict[str, torch.Tensor] = {}
+    role_attention_masses: dict[str, torch.Tensor] = {}
     for role in ("subject", "reference"):
         target, teacher_valid = masks_to_patch_targets(
             labels[f"{role}_masks"],
@@ -829,18 +841,35 @@ def entity_relation_affordance_loss(
         ) / (
             prediction.sum(dim=-1) + target.float().sum(dim=-1) + 1.0
         )
-        mask_losses.append(_masked_mean(bce + dice, valid))
-        top1 = outputs[f"{role}_attention"].float().argmax(dim=-1)
-        hit = torch.gather((target > 0).float(), -1, top1.unsqueeze(-1)).squeeze(-1)
+        spatial_bce_losses.append(_masked_mean(bce, valid))
+        spatial_dice_losses.append(_masked_mean(dice, valid))
+        attention = outputs[f"{role}_attention"].float()
+        # Deployment chooses entities from this normalized attention, not the
+        # independent sigmoid heatmap above.  Optimizing its probability mass
+        # inside the audited mask closes the old train/deploy objective gap.
+        support = target > 0
+        attention_mass = (
+            attention * support.to(attention.dtype)
+        ).sum(dim=-1)
+        attention_mask_losses.append(
+            _masked_mean(-attention_mass.clamp_min(1.0e-8).log(), valid)
+        )
+        top1 = attention.argmax(dim=-1)
+        hit = torch.gather(
+            (target > 0).float(), -1, top1.unsqueeze(-1)
+        ).squeeze(-1)
         hit_metrics.append(_masked_mean(hit, valid))
-        role_predictions[role] = prediction
+        role_heatmap_predictions[role] = prediction
+        role_attentions[role] = attention
         role_targets[role] = target.float()
+        role_mask_valid[role] = valid
+        role_attention_masses[role] = attention_mass
         visibility_loss = F.binary_cross_entropy_with_logits(
             outputs[f"{role}_visibility_logits"].float(),
             labels[f"{role}_mask_valid"].float(),
             reduction="none",
         )
-        mask_losses.append(_masked_mean(visibility_loss, clause_valid))
+        visibility_losses.append(_masked_mean(visibility_loss, clause_valid))
         view_visible = labels[f"{role}_view_visible"].bool()
         view_valid = clause_valid.unsqueeze(-1).expand_as(view_visible)
         view_visibility_loss = F.binary_cross_entropy_with_logits(
@@ -853,11 +882,27 @@ def entity_relation_affordance_loss(
             labels[f"{role}_view_centers"].float(),
             reduction="none",
         ).mean(dim=-1)
-        mask_losses.append(
+        view_visibility_losses.append(
             _masked_mean(view_visibility_loss, view_valid)
-            + _masked_mean(center_loss, view_valid & view_visible)
         )
-    mask_loss = torch.stack(mask_losses).mean()
+        view_center_losses.append(
+            _masked_mean(center_loss, view_valid & view_visible)
+        )
+    spatial_bce_loss = torch.stack(spatial_bce_losses).mean()
+    spatial_dice_loss = torch.stack(spatial_dice_losses).mean()
+    visibility_loss = torch.stack(visibility_losses).mean()
+    view_visibility_loss = torch.stack(view_visibility_losses).mean()
+    view_center_loss = torch.stack(view_center_losses).mean()
+    # Preserve the original composite mask-loss scale: the previous code
+    # averaged three terms per role, where two terms were themselves sums.
+    mask_loss = (
+        spatial_bce_loss
+        + spatial_dice_loss
+        + visibility_loss
+        + view_visibility_loss
+        + view_center_loss
+    ) / 3.0
+    attention_mask_loss = torch.stack(attention_mask_losses).mean()
 
     position_losses = []
     for role in ("subject", "reference"):
@@ -900,7 +945,7 @@ def entity_relation_affordance_loss(
     entity_losses = []
     entity_accuracies = []
     for role in ("subject", "reference"):
-        role_valid = clause_valid & labels[f"{role}_mask_valid"].bool()
+        role_valid = role_mask_valid[role]
         role_loss, role_accuracy = _supervised_role_contrastive_loss(
             outputs[f"{role}_queries"],
             outputs[f"{role}_token"],
@@ -911,46 +956,87 @@ def entity_relation_affordance_loss(
         entity_accuracies.append(role_accuracy)
     role_entity_loss = torch.stack(entity_losses).mean()
 
-    # Same-state role-swap negative: each role's heatmap must place more mass
-    # on its own GT mask than on the other role's GT mask.
+    # Same-state role-swap negative.  V9.1 uses the exact normalized attention
+    # and occupancy-weighted mass consumed by the offline gate.  Historical v1
+    # remains available below only for explicit reproduction.
     role_swap_valid = (
-        clause_valid
-        & labels["subject_mask_valid"].bool()
-        & labels["reference_mask_valid"].bool()
+        role_mask_valid["subject"]
+        & role_mask_valid["reference"]
         & (
             labels["subject_entity_ids"].long()
             != labels["reference_entity_ids"].long()
         )
     )
-    subject_own = (
-        role_predictions["subject"] * role_targets["subject"]
-    ).sum(dim=-1) / role_targets["subject"].sum(dim=-1).clamp_min(1.0)
-    subject_wrong = (
-        role_predictions["subject"] * role_targets["reference"]
-    ).sum(dim=-1) / role_targets["reference"].sum(dim=-1).clamp_min(1.0)
-    reference_own = (
-        role_predictions["reference"] * role_targets["reference"]
-    ).sum(dim=-1) / role_targets["reference"].sum(dim=-1).clamp_min(1.0)
-    reference_wrong = (
-        role_predictions["reference"] * role_targets["subject"]
-    ).sum(dim=-1) / role_targets["subject"].sum(dim=-1).clamp_min(1.0)
+    subject_attention_own = (
+        role_attentions["subject"] * role_targets["subject"]
+    ).sum(dim=-1)
+    subject_attention_wrong = (
+        role_attentions["subject"] * role_targets["reference"]
+    ).sum(dim=-1)
+    reference_attention_own = (
+        role_attentions["reference"] * role_targets["reference"]
+    ).sum(dim=-1)
+    reference_attention_wrong = (
+        role_attentions["reference"] * role_targets["subject"]
+    ).sum(dim=-1)
+    if int(weights.objective_version) >= 2:
+        subject_own = subject_attention_own
+        subject_wrong = subject_attention_wrong
+        reference_own = reference_attention_own
+        reference_wrong = reference_attention_wrong
+    else:
+        # Preserve the historical V9 objective for explicit reproduction.
+        # Formal V9.1 runs set objective_version=2 and never take this branch.
+        subject_own = (
+            role_heatmap_predictions["subject"] * role_targets["subject"]
+        ).sum(dim=-1) / role_targets["subject"].sum(dim=-1).clamp_min(1.0)
+        subject_wrong = (
+            role_heatmap_predictions["subject"] * role_targets["reference"]
+        ).sum(dim=-1) / role_targets["reference"].sum(dim=-1).clamp_min(1.0)
+        reference_own = (
+            role_heatmap_predictions["reference"] * role_targets["reference"]
+        ).sum(dim=-1) / role_targets["reference"].sum(dim=-1).clamp_min(1.0)
+        reference_wrong = (
+            role_heatmap_predictions["reference"] * role_targets["subject"]
+        ).sum(dim=-1) / role_targets["subject"].sum(dim=-1).clamp_min(1.0)
+    role_swap_margin = float(weights.role_swap_margin)
     role_swap_loss = _masked_mean(
         0.5
         * (
-            torch.relu(0.20 + subject_wrong - subject_own)
-            + torch.relu(0.20 + reference_wrong - reference_own)
+            torch.relu(role_swap_margin + subject_wrong - subject_own)
+            + torch.relu(role_swap_margin + reference_wrong - reference_own)
         ),
         role_swap_valid,
+    )
+    # Penalize attention assigned exclusively to the other semantic role.
+    # Pixels shared by overlapping objects/containers are excluded so an
+    # object entering a basket is not trained as a false negative.
+    subject_exclusive_wrong = role_targets["reference"] * (
+        role_targets["subject"] <= 0
+    ).to(role_targets["reference"].dtype)
+    reference_exclusive_wrong = role_targets["subject"] * (
+        role_targets["reference"] <= 0
+    ).to(role_targets["subject"].dtype)
+    subject_overlap = (
+        role_attentions["subject"] * subject_exclusive_wrong
+    ).sum(dim=-1)
+    reference_overlap = (
+        role_attentions["reference"] * reference_exclusive_wrong
+    ).sum(dim=-1)
+    role_overlap_loss = _masked_mean(
+        0.5 * (subject_overlap + reference_overlap), role_swap_valid
     )
     entity_loss = active_loss + role_entity_loss
     relation_loss = predicate_loss + truth_loss
     total = (
         weights.mask * mask_loss
+        + weights.attention_mask * attention_mask_loss
         + weights.entity * entity_loss
         + weights.relation * relation_loss
         + weights.anchor * anchor_loss
         + weights.position * position_loss
         + weights.role_swap * role_swap_loss
+        + weights.role_overlap * role_overlap_loss
         + weights.phase * phase_loss
     )
     predicate_prediction = outputs["predicate_logits"].argmax(dim=-1)
@@ -961,16 +1047,52 @@ def entity_relation_affordance_loss(
     ).all(dim=-1)
     metrics = {
         "loss_pgc_v9_mask": mask_loss.detach(),
+        "loss_pgc_v9_spatial_bce": spatial_bce_loss.detach(),
+        "loss_pgc_v9_spatial_dice": spatial_dice_loss.detach(),
+        "loss_pgc_v9_visibility": visibility_loss.detach(),
+        "loss_pgc_v9_view_visibility": view_visibility_loss.detach(),
+        "loss_pgc_v9_view_center": view_center_loss.detach(),
+        "loss_pgc_v9_attention_mask": attention_mask_loss.detach(),
         "loss_pgc_v9_entity": entity_loss.detach(),
         "loss_pgc_v9_relation": relation_loss.detach(),
         "loss_pgc_v9_anchor": anchor_loss.detach(),
         "loss_pgc_v9_position": position_loss.detach(),
         "loss_pgc_v9_role_swap": role_swap_loss.detach(),
+        "loss_pgc_v9_role_overlap": role_overlap_loss.detach(),
         "loss_pgc_v9_phase": phase_loss.detach(),
         "loss_pgc_v9_predicate": predicate_loss.detach(),
         "loss_pgc_v9_role_entity_contrastive": role_entity_loss.detach(),
         "pgc_v9_subject_top1_hit": hit_metrics[0].detach(),
         "pgc_v9_reference_top1_hit": hit_metrics[1].detach(),
+        "pgc_v9_subject_gt_attention_mass": _masked_mean(
+            role_attention_masses["subject"], role_mask_valid["subject"]
+        ).detach(),
+        "pgc_v9_reference_gt_attention_mass": _masked_mean(
+            role_attention_masses["reference"], role_mask_valid["reference"]
+        ).detach(),
+        "pgc_v9_subject_wrong_role_attention_mass": _masked_mean(
+            subject_attention_wrong, role_swap_valid
+        ).detach(),
+        "pgc_v9_reference_wrong_role_attention_mass": _masked_mean(
+            reference_attention_wrong, role_swap_valid
+        ).detach(),
+        "pgc_v9_subject_role_attention_margin": _masked_mean(
+            subject_attention_own - subject_attention_wrong, role_swap_valid
+        ).detach(),
+        "pgc_v9_reference_role_attention_margin": _masked_mean(
+            reference_attention_own - reference_attention_wrong,
+            role_swap_valid,
+        ).detach(),
+        "pgc_v9_role_swap_accuracy": _masked_mean(
+            (
+                (subject_attention_own > subject_attention_wrong)
+                & (reference_attention_own > reference_attention_wrong)
+            ).float(),
+            role_swap_valid,
+        ).detach(),
+        "pgc_v9_role_swap_valid_fraction": _masked_mean(
+            role_swap_valid.float(), clause_valid
+        ).detach(),
         "pgc_v9_subject_entity_retrieval_acc": entity_accuracies[0].detach(),
         "pgc_v9_reference_entity_retrieval_acc": entity_accuracies[1].detach(),
         "pgc_v9_relation_accuracy": _masked_mean(

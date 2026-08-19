@@ -639,13 +639,41 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_grounding_aux_weight = float(
             eraf_config.get("grounding_aux_weight", 0.25)
         )
+        self.policy_guard_eraf_grounding_objective_version = int(
+            eraf_config.get("grounding_objective_version", 1)
+        )
+        gate_aligned_grounding = (
+            self.policy_guard_eraf_grounding_objective_version >= 2
+        )
         self.policy_guard_eraf_loss_weights = ERAFLossWeights(
+            objective_version=(
+                self.policy_guard_eraf_grounding_objective_version
+            ),
             mask=float(eraf_config.get("mask_weight", 1.0)),
+            attention_mask=float(
+                eraf_config.get(
+                    "attention_mask_weight",
+                    2.0 if gate_aligned_grounding else 0.0,
+                )
+            ),
             entity=float(eraf_config.get("entity_weight", 1.0)),
             relation=float(eraf_config.get("relation_weight", 1.0)),
             anchor=float(eraf_config.get("anchor_weight", 1.0)),
             position=float(eraf_config.get("position_weight", 0.5)),
-            role_swap=float(eraf_config.get("role_swap_weight", 0.5)),
+            role_swap=float(
+                eraf_config.get(
+                    "role_swap_weight", 2.0 if gate_aligned_grounding else 0.5
+                )
+            ),
+            role_overlap=float(
+                eraf_config.get(
+                    "role_overlap_weight",
+                    1.0 if gate_aligned_grounding else 0.0,
+                )
+            ),
+            role_swap_margin=float(
+                eraf_config.get("role_swap_margin", 0.20)
+            ),
             phase=float(eraf_config.get("phase_weight", 1.0)),
         )
         self.policy_guard_action_weight = float(
@@ -963,6 +991,13 @@ class FastWAM(torch.nn.Module):
                     "PGC v8 requires closed_loop_corrective_enabled=true."
                 )
             if self.policy_guard_version == 9:
+                if self.policy_guard_eraf_grounding_objective_version not in {
+                    1,
+                    2,
+                }:
+                    raise ValueError(
+                        "PGC v9 ERAF grounding_objective_version must be 1 or 2."
+                    )
                 if self.policy_guard_eraf_training_stage not in {
                     "grounding",
                     "action",
@@ -9241,7 +9276,12 @@ class FastWAM(torch.nn.Module):
                 else "immutable_base_plus_conservative_hard_gate"
             ),
             "representation_supervision": (
-                "predicate_roles_multiview_masks_3d_anchors_state_and_phase"
+                (
+                    "gate_aligned_attention_mass_role_swap_multiview_masks_"
+                    "3d_anchors_state_and_phase"
+                    if self.policy_guard_eraf_grounding_objective_version >= 2
+                    else "predicate_roles_multiview_masks_3d_anchors_state_and_phase"
+                )
                 if is_v9
                 else (
                     "frozen_v5_language_plus_exact_closed_loop_state_corrective_actions"
@@ -9565,6 +9605,31 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_grounding_aux_weight": (
                 self.policy_guard_eraf_grounding_aux_weight if is_v9 else None
+            ),
+            "eraf_grounding_objective_version": (
+                self.policy_guard_eraf_grounding_objective_version
+                if is_v9
+                else None
+            ),
+            "eraf_attention_mask_weight": (
+                self.policy_guard_eraf_loss_weights.attention_mask
+                if is_v9
+                else None
+            ),
+            "eraf_role_swap_weight": (
+                self.policy_guard_eraf_loss_weights.role_swap
+                if is_v9
+                else None
+            ),
+            "eraf_role_overlap_weight": (
+                self.policy_guard_eraf_loss_weights.role_overlap
+                if is_v9
+                else None
+            ),
+            "eraf_role_swap_margin": (
+                self.policy_guard_eraf_loss_weights.role_swap_margin
+                if is_v9
+                else None
             ),
             "eraf_entity_only": (
                 self.policy_guard_eraf_entity_only if is_v9 else None
@@ -10664,6 +10729,60 @@ class FastWAM(torch.nn.Module):
                                 "PGC v9 checkpoint does not declare its ERAF "
                                 "deployment and supervision contract."
                             )
+                        try:
+                            saved_grounding_objective = int(
+                                metadata.get(
+                                    "eraf_grounding_objective_version", 1
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                "PGC v9 checkpoint has an invalid ERAF "
+                                "grounding objective version."
+                            ) from exc
+                        if (
+                            saved_grounding_objective
+                            != self.policy_guard_eraf_grounding_objective_version
+                        ):
+                            raise ValueError(
+                                "PGC v9 ERAF grounding objective mismatch: "
+                                f"checkpoint={saved_grounding_objective}, "
+                                "model="
+                                f"{self.policy_guard_eraf_grounding_objective_version}."
+                            )
+                        if saved_grounding_objective >= 2:
+                            for metadata_name, expected_value in {
+                                "eraf_attention_mask_weight": (
+                                    self.policy_guard_eraf_loss_weights.attention_mask
+                                ),
+                                "eraf_role_swap_weight": (
+                                    self.policy_guard_eraf_loss_weights.role_swap
+                                ),
+                                "eraf_role_overlap_weight": (
+                                    self.policy_guard_eraf_loss_weights.role_overlap
+                                ),
+                                "eraf_role_swap_margin": (
+                                    self.policy_guard_eraf_loss_weights.role_swap_margin
+                                ),
+                            }.items():
+                                try:
+                                    saved_value = float(metadata[metadata_name])
+                                except (KeyError, TypeError, ValueError) as exc:
+                                    raise ValueError(
+                                        "PGC v9 checkpoint is missing valid "
+                                        f"grounding value {metadata_name!r}."
+                                    ) from exc
+                                if not math.isclose(
+                                    saved_value,
+                                    float(expected_value),
+                                    rel_tol=0.0,
+                                    abs_tol=1.0e-9,
+                                ):
+                                    raise ValueError(
+                                        f"PGC v9 {metadata_name} mismatch: "
+                                        f"checkpoint={saved_value}, "
+                                        f"model={expected_value}."
+                                    )
                         if (
                             bool(metadata.get("eraf_entity_only", False))
                             != self.policy_guard_eraf_entity_only

@@ -698,7 +698,10 @@ class PGCERAFModuleTest(unittest.TestCase):
         labels["clause_valid"] = torch.tensor([[True, False, False, False]] * 2)
         for role, entity_ids in (("subject", [11, 11]), ("reference", [21, 21])):
             masks = torch.zeros(2, 4, 8, 16)
-            masks[:, 0, :4, :4] = 1
+            if role == "subject":
+                masks[:, 0, :4, :4] = 1
+            else:
+                masks[:, 0, 4:, 12:] = 1
             labels[f"{role}_masks"] = masks
             labels[f"{role}_mask_valid"] = labels["clause_valid"].clone()
             labels[f"{role}_view_visible"] = torch.zeros(
@@ -722,7 +725,17 @@ class PGCERAFModuleTest(unittest.TestCase):
             outputs, labels, weights=ERAFLossWeights()
         )
         self.assertTrue(torch.isfinite(loss))
-        self.assertIn("pgc_v9_subject_top1_hit", metrics)
+        for name in (
+            "loss_pgc_v9_attention_mask",
+            "loss_pgc_v9_spatial_bce",
+            "loss_pgc_v9_spatial_dice",
+            "loss_pgc_v9_role_overlap",
+            "pgc_v9_subject_gt_attention_mass",
+            "pgc_v9_reference_gt_attention_mass",
+            "pgc_v9_role_swap_accuracy",
+            "pgc_v9_role_swap_valid_fraction",
+        ):
+            self.assertIn(name, metrics)
         loss.backward()
         self.assertIsNotNone(self.module.role_decoder.predicate_head.weight.grad)
         self.assertIsNotNone(self.module.entity_grounder.visual_projection[1].weight.grad)
@@ -740,6 +753,115 @@ class PGCERAFModuleTest(unittest.TestCase):
             outputs, unary_labels, weights=ERAFLossWeights()
         )
         self.assertEqual(unary_metrics["loss_pgc_v9_role_swap"].item(), 0.0)
+        self.assertEqual(unary_metrics["loss_pgc_v9_role_overlap"].item(), 0.0)
+
+    def test_gate_aligned_attention_loss_rejects_role_swaps(self):
+        def outputs(subject_logits, reference_logits):
+            subject_logits = subject_logits.reshape(1, 1, 4).requires_grad_()
+            reference_logits = reference_logits.reshape(1, 1, 4).requires_grad_()
+            return {
+                "active_logits": torch.full((1, 1), 5.0),
+                "predicate_logits": torch.nn.functional.one_hot(
+                    torch.ones(1, 1, dtype=torch.long), num_classes=11
+                ).float()
+                * 5.0,
+                "subject_similarity": subject_logits,
+                "reference_similarity": reference_logits,
+                "subject_attention": subject_logits.softmax(dim=-1),
+                "reference_attention": reference_logits.softmax(dim=-1),
+                "subject_visibility_logits": torch.full((1, 1), 5.0),
+                "reference_visibility_logits": torch.full((1, 1), 5.0),
+                "subject_view_visibility_logits": torch.full((1, 1, 2), 5.0),
+                "reference_view_visibility_logits": torch.full((1, 1, 2), 5.0),
+                "subject_view_centers": torch.zeros(1, 1, 2, 2),
+                "reference_view_centers": torch.zeros(1, 1, 2, 2),
+                "subject_position": torch.zeros(1, 1, 3),
+                "reference_position": torch.zeros(1, 1, 3),
+                "subject_queries": torch.zeros(1, 1, 4),
+                "reference_queries": torch.zeros(1, 1, 4),
+                "subject_token": torch.zeros(1, 1, 4),
+                "reference_token": torch.zeros(1, 1, 4),
+                "predicate_truth_logits": torch.zeros(1, 1),
+                "phase_logits": torch.zeros(1, 1, 3),
+                "grasp_anchor": torch.zeros(1, 1, 3),
+                "goal_anchor": torch.zeros(1, 1, 3),
+                "interaction_anchor": torch.zeros(1, 1, 3),
+            }
+
+        labels = {
+            "predicate_ids": torch.ones(1, 1, dtype=torch.long),
+            "clause_valid": torch.ones(1, 1, dtype=torch.bool),
+            "predicate_truth": torch.zeros(1, 1),
+            "predicate_truth_valid": torch.ones(1, 1, dtype=torch.bool),
+            "phase_ids": torch.zeros(1, 1, dtype=torch.long),
+            "phase_valid": torch.ones(1, 1, dtype=torch.bool),
+        }
+        for role, entity_id in (("subject", 11), ("reference", 21)):
+            mask = torch.zeros(1, 1, 2, 4)
+            if role == "subject":
+                mask[..., :2] = 1.0
+            else:
+                mask[..., 2:] = 1.0
+            labels[f"{role}_masks"] = mask
+            labels[f"{role}_mask_valid"] = torch.ones(1, 1, dtype=torch.bool)
+            labels[f"{role}_view_visible"] = torch.ones(
+                1, 1, 2, dtype=torch.bool
+            )
+            labels[f"{role}_view_centers"] = torch.zeros(1, 1, 2, 2)
+            labels[f"{role}_positions"] = torch.zeros(1, 1, 3)
+            labels[f"{role}_position_valid"] = torch.ones(
+                1, 1, dtype=torch.bool
+            )
+            labels[f"{role}_entity_ids"] = torch.full(
+                (1, 1), entity_id, dtype=torch.long
+            )
+        for name in ("grasp", "goal", "interaction"):
+            labels[f"{name}_anchors"] = torch.zeros(1, 1, 3)
+            labels[f"{name}_anchor_valid"] = torch.ones(
+                1, 1, dtype=torch.bool
+            )
+
+        weights = ERAFLossWeights(
+            objective_version=2,
+            mask=0.0,
+            attention_mask=2.0,
+            entity=0.0,
+            relation=0.0,
+            anchor=0.0,
+            position=0.0,
+            role_swap=2.0,
+            role_overlap=1.0,
+            role_swap_margin=0.20,
+            phase=0.0,
+        )
+        correct_outputs = outputs(
+            torch.tensor([5.0, 5.0, -5.0, -5.0]),
+            torch.tensor([-5.0, -5.0, 5.0, 5.0]),
+        )
+        swapped_outputs = outputs(
+            torch.tensor([-5.0, -5.0, 5.0, 5.0]),
+            torch.tensor([5.0, 5.0, -5.0, -5.0]),
+        )
+        correct_loss, correct_metrics = entity_relation_affordance_loss(
+            correct_outputs, labels, weights=weights
+        )
+        swapped_loss, swapped_metrics = entity_relation_affordance_loss(
+            swapped_outputs, labels, weights=weights
+        )
+        self.assertLess(correct_loss.item(), swapped_loss.item())
+        self.assertEqual(correct_metrics["pgc_v9_role_swap_accuracy"].item(), 1.0)
+        self.assertEqual(swapped_metrics["pgc_v9_role_swap_accuracy"].item(), 0.0)
+        self.assertLess(
+            correct_metrics["loss_pgc_v9_attention_mask"].item(),
+            swapped_metrics["loss_pgc_v9_attention_mask"].item(),
+        )
+        swapped_loss.backward()
+        subject_gradient = swapped_outputs["subject_similarity"].grad
+        reference_gradient = swapped_outputs["reference_similarity"].grad
+        self.assertLess(subject_gradient[..., :2].mean().item(), 0.0)
+        self.assertGreater(subject_gradient[..., 2:].mean().item(), 0.0)
+        self.assertGreater(reference_gradient[..., :2].mean().item(), 0.0)
+        self.assertLess(reference_gradient[..., 2:].mean().item(), 0.0)
 
     def test_wrong_entity_candidate_uses_same_state_entity_or_fallback_patch(self):
         base_queries, base_embedding, (_, _, outputs, _) = self._forward()
@@ -858,6 +980,11 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(metadata["privileged_supervision"], "training_only")
             self.assertEqual(metadata["deployment_inputs"], "rgb_language_proprio")
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 2)
+            self.assertEqual(metadata["eraf_attention_mask_weight"], 2.0)
+            self.assertEqual(metadata["eraf_role_swap_weight"], 2.0)
+            self.assertEqual(metadata["eraf_role_overlap_weight"], 1.0)
+            self.assertEqual(metadata["eraf_role_swap_margin"], 0.20)
             restored = tiny_pgc_fastwam(version=9, v9_stage="action")
             restored.load_checkpoint(v9_path)
             for key, value in v9.policy_guard_modules.state_dict().items():
