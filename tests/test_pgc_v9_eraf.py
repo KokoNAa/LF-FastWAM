@@ -2135,13 +2135,55 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 v9_grounding_objective_version=9,
             )
             v9r8.load_checkpoint(v9r7_path)
+            # The migration contract is exact for every pre-existing V9.7
+            # sidecar tensor.  Check that contract directly before comparing
+            # forward paths so an actual checkpoint-loading regression cannot
+            # be hidden by a numerical tolerance below.
+            v97_state = v9r7.policy_guard_modules.state_dict()
+            v98_state = v9r8.policy_guard_modules.state_dict()
+            for key, value in v97_state.items():
+                self.assertTrue(torch.equal(value, v98_state[key]), key)
+            clause_adapter = v9r8.policy_guard_modules[
+                "entity_relation_affordance"
+            ].clause_activation_adapter
+            self.assertIsNotNone(clause_adapter)
+            self.assertEqual(
+                int(clause_adapter.active_output.weight.count_nonzero().item()),
+                0,
+            )
+            self.assertEqual(
+                int(clause_adapter.active_output.bias.count_nonzero().item()),
+                0,
+            )
             v9r7.eval()
             v9r8.eval()
             final_video = torch.randn(2, 8, 16)
             current_video = torch.randn(2, 8, 16)
             context = torch.randn(2, 5, 10)
             context_mask = torch.ones(2, 5, dtype=torch.bool)
+            base_goal_queries = torch.randn(2, 3, 12)
+            base_goal_embedding = torch.randn(2, 8)
+            eraf_inputs = {
+                "base_goal_queries": base_goal_queries,
+                "base_goal_embedding": base_goal_embedding,
+                "language_hidden": context,
+                "language_mask": context_mask,
+                "current_video_hidden": current_video,
+            }
             with torch.no_grad():
+                base_roles = v9r7.policy_guard_modules[
+                    "entity_relation_affordance"
+                ].role_decoder(context, context_mask)
+                calibrated_roles = clause_adapter(
+                    clause_hidden=base_roles["clause_hidden"],
+                    active_logits=base_roles["active_logits"],
+                )
+                v97_eraf = v9r7.policy_guard_modules[
+                    "entity_relation_affordance"
+                ](**eraf_inputs)
+                v98_eraf = v9r8.policy_guard_modules[
+                    "entity_relation_affordance"
+                ](**eraf_inputs)
                 v97_encoded = v9r7._encode_policy_guard_eraf(
                     final_video_hidden=final_video,
                     current_visual_hidden=current_video,
@@ -2158,8 +2200,22 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                     context_mask=context_mask,
                     language_context_len=5,
                 )
-            self.assertTrue(torch.equal(v97_encoded[0], v98_encoded[0]))
-            self.assertTrue(torch.equal(v97_encoded[1], v98_encoded[1]))
+            # The newly inserted adapter itself is an exact identity.  The
+            # enclosing attention stack is checked numerically because two
+            # independently constructed MHA modules are not guaranteed to be
+            # bitwise reproducible on every PyTorch backend.
+            self.assertTrue(
+                torch.equal(
+                    calibrated_roles["active_logits"],
+                    base_roles["active_logits"],
+                )
+            )
+            torch.testing.assert_close(
+                v97_eraf[0], v98_eraf[0], rtol=1.0e-6, atol=1.0e-7
+            )
+            torch.testing.assert_close(
+                v97_eraf[1], v98_eraf[1], rtol=1.0e-6, atol=1.0e-7
+            )
             for name in (
                 "active_logits",
                 "subject_attention",
@@ -2168,9 +2224,30 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 "goal_anchor",
                 "interaction_anchor",
             ):
-                self.assertTrue(
-                    torch.equal(v97_encoded[2][name], v98_encoded[2][name])
+                torch.testing.assert_close(
+                    v97_eraf[2][name],
+                    v98_eraf[2][name],
+                    rtol=1.0e-6,
+                    atol=1.0e-7,
+                    msg=name,
                 )
+            self.assertTrue(
+                torch.equal(
+                    v98_eraf[2]["clause_active_residual"],
+                    torch.zeros_like(v98_eraf[2]["clause_active_residual"]),
+                )
+            )
+            # The full helper also recomputes the frozen V5 GoalGraph in two
+            # separately constructed models.  CPU/GPU attention kernels are
+            # not required to be bitwise reproducible across those calls, so
+            # enforce strict numerical equivalence after the exact state and
+            # adapter-boundary checks above.
+            torch.testing.assert_close(
+                v97_encoded[0], v98_encoded[0], rtol=1.0e-6, atol=1.0e-7
+            )
+            torch.testing.assert_close(
+                v97_encoded[1], v98_encoded[1], rtol=1.0e-6, atol=1.0e-7
+            )
             v9r8.prepare_trainable_parameters()
             trainable = {
                 name
