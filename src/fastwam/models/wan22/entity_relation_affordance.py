@@ -1009,8 +1009,9 @@ class EntityRelationAffordanceField(nn.Module):
         teacher_subject: dict[str, torch.Tensor] | None = None
         teacher_reference: dict[str, torch.Tensor] | None = None
         needs_visual_candidates = self.balanced_role_binding_adapter is not None
+        needs_teacher_outputs = torch.is_grad_enabled()
         if self.role_adapter_teacher_enabled and (
-            torch.is_grad_enabled() or needs_visual_candidates
+            needs_teacher_outputs or needs_visual_candidates
         ):
             # V9.3 preserves the exact V9.1 path before its local adapter.
             # V9.4 layers a second adapter on top and instead freezes the
@@ -1040,7 +1041,7 @@ class EntityRelationAffordanceField(nn.Module):
                         reference_position=teacher_reference["position"],
                         active_logits=roles["active_logits"],
                     )
-                    if torch.is_grad_enabled()
+                    if needs_teacher_outputs
                     else None
                 )
             if teacher_affordance is not None:
@@ -1865,7 +1866,7 @@ def entity_relation_affordance_loss(
         missing_teacher = sorted(required_teacher.difference(outputs))
         if missing_teacher:
             raise ValueError(
-                "V9.3 role-adapter training requires the frozen V9.1 teacher "
+                "V9.3+ role-adapter training requires its frozen teacher "
                 f"bypass outputs; missing={missing_teacher}."
             )
         teacher_subject_attention = outputs["teacher_subject_attention"].float()
