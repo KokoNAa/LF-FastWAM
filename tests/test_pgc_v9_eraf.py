@@ -33,10 +33,12 @@ from fastwam.datasets.pgc_libero import (
     validate_strict_conflict_audit,
 )
 from fastwam.models.wan22.entity_relation_affordance import (
+    ClauseActivationCalibrationAdapter,
     ERAFLossWeights,
     EntityRelationAffordanceField,
     _balanced_bipartite_assignment_loss,
     _balanced_exclusive_role_assignment_loss,
+    _clause_activation_calibration_loss,
     _structured_all_entity_assignment_loss,
     entity_relation_affordance_loss,
 )
@@ -1175,6 +1177,69 @@ class PGCERAFModuleTest(unittest.TestCase):
         self.assertEqual(ambiguous_loss.item(), 0.0)
         self.assertEqual(ambiguous_metrics["exclusive_coverage"].item(), 0.0)
 
+    def test_v98_zero_init_clause_adapter_preserves_active_logits(self):
+        torch.manual_seed(98)
+        adapter = ClauseActivationCalibrationAdapter(
+            hidden_dim=8,
+            adapter_hidden_dim=8,
+            num_heads=2,
+            max_clauses=4,
+            residual_max_abs=4.0,
+        )
+        clause_hidden = torch.randn(3, 4, 8)
+        active_logits = torch.randn(3, 4)
+        outputs = adapter(
+            clause_hidden=clause_hidden,
+            active_logits=active_logits,
+        )
+        self.assertTrue(torch.equal(outputs["active_logits"], active_logits))
+        self.assertEqual(tuple(outputs["cardinality_logits"].shape), (3, 5))
+        self.assertEqual(outputs["active_residual"].abs().max().item(), 0.0)
+        (
+            outputs["active_logits"].sum()
+            + outputs["cardinality_logits"].sum()
+        ).backward()
+        self.assertIsNotNone(adapter.active_output.weight.grad)
+        self.assertIsNotNone(adapter.cardinality_output.weight.grad)
+
+    def test_v98_clause_objective_targets_exact_multi_clause_activity(self):
+        clause_valid = torch.tensor(
+            [[True, True, False, False], [True, False, False, False]]
+        )
+        good_active = torch.tensor(
+            [[5.0, 5.0, -5.0, -5.0], [5.0, -5.0, -5.0, -5.0]],
+            requires_grad=True,
+        )
+        bad_active = torch.tensor(
+            [[5.0, -5.0, 5.0, -5.0], [-5.0, 5.0, -5.0, -5.0]],
+            requires_grad=True,
+        )
+        good_cardinality = torch.full((2, 5), -5.0)
+        good_cardinality[0, 2] = 5.0
+        good_cardinality[1, 1] = 5.0
+        bad_cardinality = -good_cardinality
+        good = _clause_activation_calibration_loss(
+            active_logits=good_active,
+            cardinality_logits=good_cardinality,
+            clause_valid=clause_valid,
+            multi_group_weight=1.0,
+        )
+        bad = _clause_activation_calibration_loss(
+            active_logits=bad_active,
+            cardinality_logits=bad_cardinality,
+            clause_valid=clause_valid,
+            multi_group_weight=1.0,
+        )
+        good_total = good[0] + good[1] + good[2]
+        bad_total = bad[0] + bad[1] + bad[2]
+        self.assertLess(good_total.item(), bad_total.item())
+        self.assertEqual(good[3]["exact"].item(), 1.0)
+        self.assertEqual(good[3]["multi_exact"].item(), 1.0)
+        self.assertEqual(good[3]["cardinality_accuracy"].item(), 1.0)
+        self.assertEqual(good[3]["multi_gradient_fraction"].item(), 0.5)
+        bad_total.backward()
+        self.assertIsNotNone(bad_active.grad)
+
     def test_v95_zero_init_visual_binding_adapter_matches_v93_teacher(self):
         torch.manual_seed(95)
         module = EntityRelationAffordanceField(
@@ -1983,7 +2048,7 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             )
             restored.load_checkpoint(v9r6_path)
 
-    def test_v96_can_upgrade_to_v97_exclusive_role_evidence(self):
+    def test_v96_to_v97_to_v98_checkpoint_upgrade_contract(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             base_path = root / "base.pt"
@@ -1992,6 +2057,7 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             v9r3_path = root / "v9r3.pt"
             v9r6_path = root / "v9r6.pt"
             v9r7_path = root / "v9r7.pt"
+            v9r8_path = root / "v9r8.pt"
             base = tiny_pgc_fastwam(version=5)
             torch.save(
                 {"format": "fastwam_full_v1", "mot": base.mot.state_dict()},
@@ -2062,6 +2128,86 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 v9_grounding_objective_version=8,
             )
             restored.load_checkpoint(v9r7_path)
+
+            v9r8 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=9,
+            )
+            v9r8.load_checkpoint(v9r7_path)
+            v9r7.eval()
+            v9r8.eval()
+            final_video = torch.randn(2, 8, 16)
+            current_video = torch.randn(2, 8, 16)
+            context = torch.randn(2, 5, 10)
+            context_mask = torch.ones(2, 5, dtype=torch.bool)
+            with torch.no_grad():
+                v97_encoded = v9r7._encode_policy_guard_eraf(
+                    final_video_hidden=final_video,
+                    current_visual_hidden=current_video,
+                    video_tokens_per_frame=8,
+                    context=context,
+                    context_mask=context_mask,
+                    language_context_len=5,
+                )
+                v98_encoded = v9r8._encode_policy_guard_eraf(
+                    final_video_hidden=final_video,
+                    current_visual_hidden=current_video,
+                    video_tokens_per_frame=8,
+                    context=context,
+                    context_mask=context_mask,
+                    language_context_len=5,
+                )
+            self.assertTrue(torch.equal(v97_encoded[0], v98_encoded[0]))
+            self.assertTrue(torch.equal(v97_encoded[1], v98_encoded[1]))
+            for name in (
+                "active_logits",
+                "subject_attention",
+                "reference_attention",
+                "grasp_anchor",
+                "goal_anchor",
+                "interaction_anchor",
+            ):
+                self.assertTrue(
+                    torch.equal(v97_encoded[2][name], v98_encoded[2][name])
+                )
+            v9r8.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v9r8.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all("clause_activation_adapter" in name for name in trainable)
+            )
+            v9r8.save_checkpoint(v9r8_path, step=3750)
+            metadata = torch.load(
+                v9r8_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 9)
+            self.assertEqual(
+                metadata["eraf_clause_activation_contract"],
+                "zero_init_cross_clause_active_logit_residual",
+            )
+            self.assertEqual(
+                metadata["eraf_clause_cardinality_supervision"],
+                "balanced_active_bce_plus_count_ce_plus_multi_worst_slot",
+            )
+            self.assertEqual(
+                metadata["eraf_clause_gate"],
+                "multi_clause_exact_at_least_80pct",
+            )
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "clause_activation_calibration_adapter_only",
+            )
+            restored_v98 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=9,
+            )
+            restored_v98.load_checkpoint(v9r8_path)
 
     def test_stage_trainability_optimizer_contract_and_deployment_inputs(self):
         expected_modules = {
@@ -2161,6 +2307,11 @@ class PGCERAFGroundingGateTest(unittest.TestCase):
         }
         report = compute_grounding_gate_report([good] * 5)
         self.assertTrue(report["passed"])
+        self.assertEqual(report["diagnosis"], "grounding_gate_pass")
+        clause_bad = dict(good, clause_exact=False)
+        report = compute_grounding_gate_report([clause_bad] * 5)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["diagnosis"], "multi_clause_activation_failure")
         bad = dict(good, relation_predictions=[2, 1, 2, 1])
         report = compute_grounding_gate_report([bad] * 5)
         self.assertFalse(report["passed"])

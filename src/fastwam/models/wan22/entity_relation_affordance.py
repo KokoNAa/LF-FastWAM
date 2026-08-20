@@ -732,6 +732,105 @@ class BalancedRoleBindingAdapter(nn.Module):
         }
 
 
+class ClauseActivationCalibrationAdapter(nn.Module):
+    """Zero-init V9.8 calibration for clause activity and cardinality.
+
+    V9.7 fixes subject/reference binding but deliberately freezes the
+    ``PredicateRoleDecoder``.  Consequently its multi-clause gate cannot move:
+    that gate is computed from the decoder's active logits, not from the role
+    adapter.  This sidecar reads the frozen clause states and base active logits,
+    exchanges information across clause slots, and predicts a residual on the
+    active logits plus an auxiliary clause-count distribution.
+
+    Only the final projections are zero initialized.  A freshly migrated V9.8
+    therefore has exactly the V9.7 deployment output while still receiving
+    gradients on the first optimizer step.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        adapter_hidden_dim: int,
+        num_heads: int,
+        max_clauses: int,
+        residual_max_abs: float = 4.0,
+    ) -> None:
+        super().__init__()
+        if min(hidden_dim, adapter_hidden_dim, num_heads, max_clauses) <= 0:
+            raise ValueError("ERAF clause-calibration dimensions must be positive.")
+        if adapter_hidden_dim % num_heads:
+            raise ValueError(
+                "ERAF clause-calibration hidden dimension must be divisible by heads."
+            )
+        if residual_max_abs <= 0:
+            raise ValueError(
+                "ERAF clause-calibration residual bound must be positive."
+            )
+        self.hidden_dim = int(hidden_dim)
+        self.adapter_hidden_dim = int(adapter_hidden_dim)
+        self.max_clauses = int(max_clauses)
+        self.residual_max_abs = float(residual_max_abs)
+        self.input_norm = nn.LayerNorm(hidden_dim + 1)
+        self.input_projection = nn.Linear(hidden_dim + 1, adapter_hidden_dim)
+        self.clause_embedding = nn.Parameter(
+            torch.zeros(max_clauses, adapter_hidden_dim)
+        )
+        nn.init.normal_(self.clause_embedding, std=0.02)
+        self.encoder = nn.TransformerEncoderLayer(
+            d_model=adapter_hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=adapter_hidden_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.output_norm = nn.LayerNorm(adapter_hidden_dim)
+        self.active_output = nn.Linear(adapter_hidden_dim, 1)
+        self.cardinality_output = nn.Linear(adapter_hidden_dim, max_clauses + 1)
+        nn.init.zeros_(self.active_output.weight)
+        nn.init.zeros_(self.active_output.bias)
+        nn.init.zeros_(self.cardinality_output.weight)
+        nn.init.zeros_(self.cardinality_output.bias)
+
+    def forward(
+        self,
+        *,
+        clause_hidden: torch.Tensor,
+        active_logits: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if clause_hidden.ndim != 3 or clause_hidden.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                "ERAF clause-calibration hidden states must be [B,C,hidden_dim]."
+            )
+        if clause_hidden.shape[1] != self.max_clauses:
+            raise ValueError(
+                "ERAF clause-calibration input does not match configured clauses."
+            )
+        if active_logits.shape != clause_hidden.shape[:2]:
+            raise ValueError(
+                "ERAF clause-calibration active logits must match [B,clauses]."
+            )
+        base_active = active_logits.to(clause_hidden.dtype).unsqueeze(-1)
+        hidden = self.input_projection(
+            self.input_norm(torch.cat((clause_hidden, base_active), dim=-1))
+        )
+        hidden = hidden + self.clause_embedding.unsqueeze(0)
+        hidden = self.output_norm(self.encoder(hidden))
+        raw_residual = self.active_output(hidden).squeeze(-1)
+        active_residual = (
+            torch.tanh(raw_residual.float()) * self.residual_max_abs
+        ).to(active_logits.dtype)
+        cardinality_logits = self.cardinality_output(hidden.mean(dim=1))
+        return {
+            "active_logits": active_logits + active_residual,
+            "base_active_logits": active_logits,
+            "active_residual": active_residual,
+            "cardinality_logits": cardinality_logits,
+        }
+
+
 class EntityRelationAffordanceField(nn.Module):
     """Complete RGB+language ERAF deployment path used by PGC V9."""
 
@@ -757,6 +856,9 @@ class EntityRelationAffordanceField(nn.Module):
         structured_role_adapter_hidden_dim: int = 256,
         balanced_role_adapter_enabled: bool = False,
         balanced_role_adapter_hidden_dim: int = 256,
+        clause_activation_adapter_enabled: bool = False,
+        clause_activation_adapter_hidden_dim: int = 256,
+        clause_activation_residual_max_abs: float = 4.0,
     ) -> None:
         super().__init__()
         self.text_dim = int(text_dim)
@@ -778,6 +880,15 @@ class EntityRelationAffordanceField(nn.Module):
         )
         self.balanced_role_adapter_enabled = bool(balanced_role_adapter_enabled)
         self.balanced_role_adapter_hidden_dim = int(balanced_role_adapter_hidden_dim)
+        self.clause_activation_adapter_enabled = bool(
+            clause_activation_adapter_enabled
+        )
+        self.clause_activation_adapter_hidden_dim = int(
+            clause_activation_adapter_hidden_dim
+        )
+        self.clause_activation_residual_max_abs = float(
+            clause_activation_residual_max_abs
+        )
         self.role_decoder = PredicateRoleDecoder(
             text_dim=text_dim,
             hidden_dim=hidden_dim,
@@ -822,6 +933,17 @@ class EntityRelationAffordanceField(nn.Module):
                 max_clauses=max_clauses,
             )
             if self.balanced_role_adapter_enabled
+            else None
+        )
+        self.clause_activation_adapter = (
+            ClauseActivationCalibrationAdapter(
+                hidden_dim=hidden_dim,
+                adapter_hidden_dim=clause_activation_adapter_hidden_dim,
+                num_heads=num_heads,
+                max_clauses=max_clauses,
+                residual_max_abs=clause_activation_residual_max_abs,
+            )
+            if self.clause_activation_adapter_enabled
             else None
         )
         self.entity_only_projection = nn.Sequential(
@@ -1099,6 +1221,25 @@ class EntityRelationAffordanceField(nn.Module):
         else:
             balanced_subject_role_delta = torch.zeros_like(base_subject_queries)
             balanced_reference_role_delta = torch.zeros_like(base_reference_queries)
+        # V9.8 calibrates clause activity only after every frozen role adapter
+        # has produced its visual query.  This prevents the new clause loss
+        # from moving the V9.7 subject/reference heatmaps that already passed
+        # their localization and exclusive-role gates.
+        if self.clause_activation_adapter is not None:
+            calibrated = self.clause_activation_adapter(
+                clause_hidden=roles["clause_hidden"],
+                active_logits=roles["active_logits"],
+            )
+            roles = {**roles, "active_logits": calibrated["active_logits"]}
+            base_active_logits = calibrated["base_active_logits"]
+            clause_active_residual = calibrated["active_residual"]
+            clause_cardinality_logits = calibrated["cardinality_logits"]
+        else:
+            base_active_logits = roles["active_logits"]
+            clause_active_residual = torch.zeros_like(roles["active_logits"])
+            clause_cardinality_logits = roles["active_logits"].new_zeros(
+                roles["active_logits"].shape[0], self.max_clauses + 1
+            )
         subject = self.entity_grounder.ground(
             roles["subject_queries"], current_video_hidden
         )
@@ -1164,9 +1305,26 @@ class EntityRelationAffordanceField(nn.Module):
             "pgc_v9_balanced_role_adapter_reference_delta_norm": (
                 balanced_reference_role_delta.float().norm(dim=-1).mean()
             ),
+            "pgc_v9_clause_active_residual_rms": (
+                clause_active_residual.float().pow(2).mean().sqrt()
+            ),
+            "pgc_v9_clause_active_residual_max_abs": (
+                clause_active_residual.float().abs().max()
+            ),
+            "pgc_v9_clause_active_residual_saturation": (
+                (
+                    clause_active_residual.float().abs()
+                    >= 0.95 * self.clause_activation_residual_max_abs
+                )
+                .float()
+                .mean()
+            ),
         }
         outputs = {
             **roles,
+            "base_active_logits": base_active_logits,
+            "clause_active_residual": clause_active_residual,
+            "clause_cardinality_logits": clause_cardinality_logits,
             "subject_attention": subject["attention"],
             "reference_attention": reference["attention"],
             "subject_similarity": subject["similarity"],
@@ -1225,6 +1383,11 @@ class ERAFLossWeights:
     structured_assignment_temperature: float = 0.10
     structured_assignment_hard_weight: float = 0.0
     multi_clause_consistency: float = 0.0
+    clause_activation_balance: float = 0.0
+    clause_cardinality: float = 0.0
+    clause_worst_slot: float = 0.0
+    clause_multi_group_weight: float = 1.0
+    clause_adapter_energy: float = 0.0
     phase: float = 0.25
 
 
@@ -1483,6 +1646,80 @@ def _balanced_group_mean(
     if easy_present:
         return easy_mean, values.new_tensor(0.0), global_easy_count, global_hard_count
     return graph_zero, graph_zero.detach(), global_easy_count, global_hard_count
+
+
+def _clause_activation_calibration_loss(
+    *,
+    active_logits: torch.Tensor,
+    cardinality_logits: torch.Tensor,
+    clause_valid: torch.Tensor,
+    multi_group_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Train V9.8 against clause activity, count, and exact-match failures.
+
+    Single-clause and multi-clause samples receive fixed global DDP mass, so a
+    large native single-clause pool cannot drown out the conjunction examples
+    that define the hard gate.  The worst-slot term directly targets the
+    all-slots-correct metric instead of allowing easy inactive padding slots to
+    dominate mean BCE.
+    """
+    if active_logits.shape != clause_valid.shape:
+        raise ValueError("ERAF clause activity must match clause_valid.")
+    expected_cardinality_shape = (
+        active_logits.shape[0],
+        active_logits.shape[1] + 1,
+    )
+    if cardinality_logits.shape != expected_cardinality_shape:
+        raise ValueError(
+            "ERAF cardinality logits must be [B,max_clauses+1]."
+        )
+    if multi_group_weight <= 0:
+        raise ValueError("ERAF multi-clause group weight must be positive.")
+    target = clause_valid.bool()
+    count_target = target.sum(dim=-1).long()
+    sample_valid = count_target > 0
+    multi_sample = count_target > 1
+    slot_bce = F.binary_cross_entropy_with_logits(
+        active_logits.float(), target.float(), reduction="none"
+    )
+    sample_bce = slot_bce.mean(dim=-1)
+    balanced_active, multi_gradient_fraction, single_count, multi_count = (
+        _balanced_group_mean(
+            sample_bce,
+            correct=~multi_sample,
+            valid=sample_valid,
+            hard_group_weight=float(multi_group_weight),
+        )
+    )
+    cardinality_loss = _masked_mean(
+        F.cross_entropy(
+            cardinality_logits.float(), count_target, reduction="none"
+        ),
+        sample_valid,
+    )
+    worst_slot_loss = _masked_mean(slot_bce.amax(dim=-1), multi_sample)
+    prediction = active_logits > 0
+    exact = (prediction == target).all(dim=-1)
+    cardinality_prediction = cardinality_logits.argmax(dim=-1)
+    zero = active_logits.sum() * 0.0
+    metrics = {
+        "exact": _masked_mean(exact.float(), sample_valid).detach(),
+        "multi_exact": (
+            _masked_mean(exact.float(), multi_sample).detach()
+            if bool(multi_sample.any())
+            else zero.detach()
+        ),
+        "cardinality_accuracy": _masked_mean(
+            (cardinality_prediction == count_target).float(), sample_valid
+        ).detach(),
+        "multi_fraction": _masked_mean(
+            multi_sample.float(), sample_valid
+        ).detach(),
+        "multi_gradient_fraction": multi_gradient_fraction.detach(),
+        "global_single_count": single_count.detach(),
+        "global_multi_count": multi_count.detach(),
+    }
+    return balanced_active, cardinality_loss, worst_slot_loss, metrics
 
 
 def _balanced_bipartite_assignment_loss(
@@ -2099,6 +2336,66 @@ def entity_relation_affordance_loss(
             temperature=float(weights.structured_assignment_temperature),
             hard_weight=float(weights.structured_assignment_hard_weight),
         )
+    clause_activation_balance_loss = zero
+    clause_cardinality_loss = zero
+    clause_worst_slot_loss = zero
+    clause_adapter_energy_loss = zero
+    clause_metrics = {
+        "exact": zero.detach(),
+        "multi_exact": zero.detach(),
+        "cardinality_accuracy": zero.detach(),
+        "multi_fraction": zero.detach(),
+        "multi_gradient_fraction": zero.detach(),
+        "global_single_count": zero.detach(),
+        "global_multi_count": zero.detach(),
+        "base_exact": zero.detach(),
+        "base_multi_exact": zero.detach(),
+        "exact_gain": zero.detach(),
+        "multi_exact_gain": zero.detach(),
+    }
+    if int(weights.objective_version) >= 9:
+        required_clause_outputs = {
+            "base_active_logits",
+            "clause_active_residual",
+            "clause_cardinality_logits",
+        }
+        missing_clause_outputs = sorted(required_clause_outputs.difference(outputs))
+        if missing_clause_outputs:
+            raise ValueError(
+                "V9.8 clause calibration requires its zero-init adapter outputs; "
+                f"missing={missing_clause_outputs}."
+            )
+        (
+            clause_activation_balance_loss,
+            clause_cardinality_loss,
+            clause_worst_slot_loss,
+            clause_metrics,
+        ) = _clause_activation_calibration_loss(
+            active_logits=outputs["active_logits"],
+            cardinality_logits=outputs["clause_cardinality_logits"],
+            clause_valid=clause_valid,
+            multi_group_weight=float(weights.clause_multi_group_weight),
+        )
+        clause_adapter_energy_loss = outputs["clause_active_residual"].float().pow(
+            2
+        ).mean()
+        base_exact = (
+            (outputs["base_active_logits"] > 0) == clause_valid
+        ).all(dim=-1)
+        base_multi = clause_valid.sum(dim=-1) > 1
+        sample_valid = clause_valid.any(dim=-1)
+        clause_metrics["base_exact"] = _masked_mean(
+            base_exact.float(), sample_valid
+        ).detach()
+        clause_metrics["base_multi_exact"] = _masked_mean(
+            base_exact.float(), base_multi
+        ).detach()
+        clause_metrics["exact_gain"] = (
+            clause_metrics["exact"] - clause_metrics["base_exact"]
+        ).detach()
+        clause_metrics["multi_exact_gain"] = (
+            clause_metrics["multi_exact"] - clause_metrics["base_multi_exact"]
+        ).detach()
     # Penalize attention assigned exclusively to the other semantic role.
     # Pixels shared by overlapping objects/containers are excluded so an
     # object entering a basket is not trained as a false negative.
@@ -2315,6 +2612,10 @@ def entity_relation_affordance_loss(
         + weights.role_adapter_energy * role_adapter_energy_loss
         + weights.structured_assignment * structured_assignment_loss
         + weights.multi_clause_consistency * multi_clause_consistency_loss
+        + weights.clause_activation_balance * clause_activation_balance_loss
+        + weights.clause_cardinality * clause_cardinality_loss
+        + weights.clause_worst_slot * clause_worst_slot_loss
+        + weights.clause_adapter_energy * clause_adapter_energy_loss
         + weights.phase * phase_loss
     )
     predicate_prediction = outputs["predicate_logits"].argmax(dim=-1)
@@ -2355,6 +2656,12 @@ def entity_relation_affordance_loss(
         "loss_pgc_v9_multi_clause_consistency": (
             multi_clause_consistency_loss.detach()
         ),
+        "loss_pgc_v9_clause_activation_balance": (
+            clause_activation_balance_loss.detach()
+        ),
+        "loss_pgc_v9_clause_cardinality": clause_cardinality_loss.detach(),
+        "loss_pgc_v9_clause_worst_slot": clause_worst_slot_loss.detach(),
+        "loss_pgc_v9_clause_adapter_energy": clause_adapter_energy_loss.detach(),
         "loss_pgc_v9_phase": phase_loss.detach(),
         "loss_pgc_v9_predicate": predicate_loss.detach(),
         "loss_pgc_v9_role_entity_contrastive": role_entity_loss.detach(),
@@ -2447,6 +2754,29 @@ def entity_relation_affordance_loss(
         ],
         "pgc_v9_structured_exclusive_coverage": structured_metrics[
             "exclusive_coverage"
+        ],
+        "pgc_v9_clause_activation_exact": clause_metrics["exact"],
+        "pgc_v9_clause_activation_multi_exact": clause_metrics["multi_exact"],
+        "pgc_v9_clause_cardinality_accuracy": clause_metrics[
+            "cardinality_accuracy"
+        ],
+        "pgc_v9_clause_multi_fraction": clause_metrics["multi_fraction"],
+        "pgc_v9_clause_multi_gradient_fraction": clause_metrics[
+            "multi_gradient_fraction"
+        ],
+        "pgc_v9_clause_global_single_count": clause_metrics[
+            "global_single_count"
+        ],
+        "pgc_v9_clause_global_multi_count": clause_metrics[
+            "global_multi_count"
+        ],
+        "pgc_v9_base_clause_activation_exact": clause_metrics["base_exact"],
+        "pgc_v9_base_clause_activation_multi_exact": clause_metrics[
+            "base_multi_exact"
+        ],
+        "pgc_v9_clause_activation_exact_gain": clause_metrics["exact_gain"],
+        "pgc_v9_clause_activation_multi_exact_gain": clause_metrics[
+            "multi_exact_gain"
         ],
         "pgc_v9_teacher_preservation_fraction": teacher_preservation_fraction,
         "pgc_v9_teacher_predicate_max_abs_error": (teacher_predicate_max_abs_error),

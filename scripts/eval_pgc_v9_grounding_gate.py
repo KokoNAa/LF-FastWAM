@@ -254,11 +254,28 @@ def compute_grounding_gate_report(
             bool(multi_clause_exact) and metrics["multi_clause_exact_match"] >= 0.80
         ),
     }
+    failed_checks = [name for name, passed in checks.items() if not passed]
+    if failed_checks == ["multi_clause_exact_at_least_80pct"]:
+        diagnosis = "multi_clause_activation_failure"
+        recommendation = (
+            "Calibrate frozen clause active logits/cardinality without updating "
+            "the validated entity, relation, role, or anchor paths."
+        )
+    elif not failed_checks:
+        diagnosis = "grounding_gate_pass"
+        recommendation = "Proceed to grounding-action joint training."
+    else:
+        diagnosis = "grounding_gate_failure"
+        recommendation = (
+            "Do not enter action training; inspect the failed grounding checks."
+        )
     return {
         "format": "pgc_v9_eraf_grounding_gate_v2",
         "metrics": metrics,
         "checks": checks,
         "passed": all(checks.values()),
+        "diagnosis": diagnosis,
+        "recommendation": recommendation,
         "diagnostics": {
             "full_mask_role_swap_at_least_90pct": (
                 metrics["full_mask_role_swap_accuracy"] >= 0.90
@@ -537,12 +554,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         6: 3500,
         7: 3000,
         8: 3250,
+        9: 3750,
     }.get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
     intermediate_checkpoint = bool(args.allow_intermediate) and (
         (objective_version == 4 and checkpoint_step in {1750, 2000, 2250})
         or (objective_version in {5, 6} and checkpoint_step in {2750, 3000, 3250})
         or (objective_version == 7 and checkpoint_step == 2750)
+        or (objective_version == 9 and checkpoint_step == 3500)
     )
     if (
         expected_step is None

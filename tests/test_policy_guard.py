@@ -226,6 +226,21 @@ def tiny_pgc_fastwam(
                 ),
                 "structured_role_adapter_hidden_dim": 8,
                 "balanced_role_adapter_hidden_dim": 8,
+                "clause_activation_adapter_hidden_dim": 8,
+                "clause_activation_residual_max_abs": 4.0,
+                "clause_activation_balance_weight": (
+                    1.0 if v9_grounding_objective_version >= 9 else 0.0
+                ),
+                "clause_cardinality_weight": (
+                    1.0 if v9_grounding_objective_version >= 9 else 0.0
+                ),
+                "clause_worst_slot_weight": (
+                    2.0 if v9_grounding_objective_version >= 9 else 0.0
+                ),
+                "clause_multi_group_weight": 1.0,
+                "clause_adapter_energy_weight": (
+                    0.01 if v9_grounding_objective_version >= 9 else 0.0
+                ),
                 "role_attention_preservation_weight": (
                     (
                         5.0

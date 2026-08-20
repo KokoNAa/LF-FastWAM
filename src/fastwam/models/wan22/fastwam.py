@@ -657,6 +657,9 @@ class FastWAM(torch.nn.Module):
         balanced_role_grounding = (
             self.policy_guard_eraf_grounding_objective_version >= 6
         )
+        clause_activation_grounding = (
+            self.policy_guard_eraf_grounding_objective_version >= 9
+        )
         self.policy_guard_eraf_role_adapter_hidden_dim = int(
             eraf_config.get("role_adapter_hidden_dim", 256)
         )
@@ -665,6 +668,12 @@ class FastWAM(torch.nn.Module):
         )
         self.policy_guard_eraf_balanced_role_adapter_hidden_dim = int(
             eraf_config.get("balanced_role_adapter_hidden_dim", 256)
+        )
+        self.policy_guard_eraf_clause_activation_adapter_hidden_dim = int(
+            eraf_config.get("clause_activation_adapter_hidden_dim", 256)
+        )
+        self.policy_guard_eraf_clause_activation_residual_max_abs = float(
+            eraf_config.get("clause_activation_residual_max_abs", 4.0)
         )
         self.policy_guard_eraf_loss_weights = ERAFLossWeights(
             objective_version=(
@@ -783,6 +792,33 @@ class FastWAM(torch.nn.Module):
                 eraf_config.get(
                     "multi_clause_consistency_weight",
                     1.0 if structured_role_grounding else 0.0,
+                )
+            ),
+            clause_activation_balance=float(
+                eraf_config.get(
+                    "clause_activation_balance_weight",
+                    1.0 if clause_activation_grounding else 0.0,
+                )
+            ),
+            clause_cardinality=float(
+                eraf_config.get(
+                    "clause_cardinality_weight",
+                    1.0 if clause_activation_grounding else 0.0,
+                )
+            ),
+            clause_worst_slot=float(
+                eraf_config.get(
+                    "clause_worst_slot_weight",
+                    2.0 if clause_activation_grounding else 0.0,
+                )
+            ),
+            clause_multi_group_weight=float(
+                eraf_config.get("clause_multi_group_weight", 1.0)
+            ),
+            clause_adapter_energy=float(
+                eraf_config.get(
+                    "clause_adapter_energy_weight",
+                    0.01 if clause_activation_grounding else 0.0,
                 )
             ),
             phase=float(eraf_config.get("phase_weight", 1.0)),
@@ -1111,10 +1147,11 @@ class FastWAM(torch.nn.Module):
                     6,
                     7,
                     8,
+                    9,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "1, 2, 3, 4, 5, 6, 7, or 8."
+                        "1, 2, 3, 4, 5, 6, 7, 8, or 9."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1122,9 +1159,21 @@ class FastWAM(torch.nn.Module):
                     self.policy_guard_eraf_loss_weights.structured_assignment,
                     self.policy_guard_eraf_loss_weights.structured_assignment_hard_weight,
                     self.policy_guard_eraf_loss_weights.multi_clause_consistency,
+                    self.policy_guard_eraf_loss_weights.clause_activation_balance,
+                    self.policy_guard_eraf_loss_weights.clause_cardinality,
+                    self.policy_guard_eraf_loss_weights.clause_worst_slot,
+                    self.policy_guard_eraf_loss_weights.clause_adapter_energy,
                 ) < 0:
                     raise ValueError(
                         "PGC v9 ERAF role-assignment weights must be non-negative."
+                    )
+                if self.policy_guard_eraf_loss_weights.clause_multi_group_weight <= 0:
+                    raise ValueError(
+                        "PGC v9 ERAF clause multi-group weight must be positive."
+                    )
+                if self.policy_guard_eraf_clause_activation_residual_max_abs <= 0:
+                    raise ValueError(
+                        "PGC v9 ERAF clause activation residual bound must be positive."
                     )
                 if (
                     self.policy_guard_eraf_loss_weights.role_assignment_temperature
@@ -1471,6 +1520,16 @@ class FastWAM(torch.nn.Module):
                             ),
                             balanced_role_adapter_hidden_dim=(
                                 self.policy_guard_eraf_balanced_role_adapter_hidden_dim
+                            ),
+                            clause_activation_adapter_enabled=(
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 9
+                            ),
+                            clause_activation_adapter_hidden_dim=(
+                                self.policy_guard_eraf_clause_activation_adapter_hidden_dim
+                            ),
+                            clause_activation_residual_max_abs=(
+                                self.policy_guard_eraf_clause_activation_residual_max_abs
                             ),
                         )
                     if self.policy_guard_version in {6, 7}:
@@ -1833,6 +1892,16 @@ class FastWAM(torch.nn.Module):
                                 "entity_relation_affordance"
                             ]
                             if (
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 9
+                            ):
+                                role_adapter = eraf.clause_activation_adapter
+                                if role_adapter is None:
+                                    raise RuntimeError(
+                                        "V9.8 grounding requires its clause "
+                                        "activation calibration adapter."
+                                    )
+                            elif (
                                 self.policy_guard_eraf_grounding_objective_version
                                 >= 6
                             ):
@@ -9920,6 +9989,24 @@ class FastWAM(torch.nn.Module):
                 and self.policy_guard_eraf_grounding_objective_version >= 8
                 else None
             ),
+            "eraf_clause_activation_contract": (
+                "zero_init_cross_clause_active_logit_residual"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 9
+                else None
+            ),
+            "eraf_clause_cardinality_supervision": (
+                "balanced_active_bce_plus_count_ce_plus_multi_worst_slot"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 9
+                else None
+            ),
+            "eraf_clause_gate": (
+                "multi_clause_exact_at_least_80pct"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 9
+                else None
+            ),
             "eraf_attention_mask_weight": (
                 self.policy_guard_eraf_loss_weights.attention_mask
                 if is_v9
@@ -9975,6 +10062,31 @@ class FastWAM(torch.nn.Module):
                 if is_v9
                 else None
             ),
+            "eraf_clause_activation_balance_weight": (
+                self.policy_guard_eraf_loss_weights.clause_activation_balance
+                if is_v9
+                else None
+            ),
+            "eraf_clause_cardinality_weight": (
+                self.policy_guard_eraf_loss_weights.clause_cardinality
+                if is_v9
+                else None
+            ),
+            "eraf_clause_worst_slot_weight": (
+                self.policy_guard_eraf_loss_weights.clause_worst_slot
+                if is_v9
+                else None
+            ),
+            "eraf_clause_multi_group_weight": (
+                self.policy_guard_eraf_loss_weights.clause_multi_group_weight
+                if is_v9
+                else None
+            ),
+            "eraf_clause_adapter_energy_weight": (
+                self.policy_guard_eraf_loss_weights.clause_adapter_energy
+                if is_v9
+                else None
+            ),
             "eraf_role_adapter_hidden_dim": (
                 self.policy_guard_eraf_role_adapter_hidden_dim
                 if is_v9
@@ -9983,7 +10095,9 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_role_adapter_trainable_scope": (
                 (
-                    (
+                    "clause_activation_calibration_adapter_only"
+                    if self.policy_guard_eraf_grounding_objective_version >= 9
+                    else (
                         (
                             "exclusive_evidence_global_hard_curriculum_"
                             "balanced_visual_role_binding_adapter_only"
@@ -10017,6 +10131,18 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_eraf_balanced_role_adapter_hidden_dim
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 6
+                else None
+            ),
+            "eraf_clause_activation_adapter_hidden_dim": (
+                self.policy_guard_eraf_clause_activation_adapter_hidden_dim
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 9
+                else None
+            ),
+            "eraf_clause_activation_residual_max_abs": (
+                self.policy_guard_eraf_clause_activation_residual_max_abs
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 9
                 else None
             ),
             "eraf_role_attention_preservation_weight": (
@@ -10523,6 +10649,14 @@ class FastWAM(torch.nn.Module):
             and int(self.policy_guard_version) == 9
             and saved_eraf_grounding_objective == 4
             and self.policy_guard_eraf_grounding_objective_version in {6, 7}
+            and self.policy_guard_eraf_training_stage == "grounding"
+            and metadata.get("eraf_training_stage") == "grounding"
+        )
+        migrate_v9_to_clause_activation_adapter = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 8
+            and self.policy_guard_eraf_grounding_objective_version == 9
             and self.policy_guard_eraf_training_stage == "grounding"
             and metadata.get("eraf_training_stage") == "grounding"
         )
@@ -11202,6 +11336,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 8
                             )
+                            or (
+                                saved_grounding_objective == 8
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 9
+                            )
                         )
                         objective_upgrade = (
                             objective_upgrade
@@ -11284,7 +11423,9 @@ class FastWAM(torch.nn.Module):
                                     )
                         if saved_grounding_objective >= 4 and not objective_upgrade:
                             expected_scope = (
-                                (
+                                "clause_activation_calibration_adapter_only"
+                                if saved_grounding_objective >= 9
+                                else (
                                     (
                                         "exclusive_evidence_global_hard_curriculum_"
                                         "balanced_visual_role_binding_adapter_only"
@@ -11456,6 +11597,85 @@ class FastWAM(torch.nn.Module):
                                         f"{name}={metadata.get(name)!r}, "
                                         f"expected={expected!r}."
                                     )
+                        if saved_grounding_objective >= 9 and not objective_upgrade:
+                            expected_v98_contract = {
+                                "eraf_clause_activation_contract": (
+                                    "zero_init_cross_clause_active_logit_residual"
+                                ),
+                                "eraf_clause_cardinality_supervision": (
+                                    "balanced_active_bce_plus_count_ce_plus_"
+                                    "multi_worst_slot"
+                                ),
+                                "eraf_clause_gate": (
+                                    "multi_clause_exact_at_least_80pct"
+                                ),
+                            }
+                            for name, expected in expected_v98_contract.items():
+                                if metadata.get(name) != expected:
+                                    raise ValueError(
+                                        "PGC V9.8 checkpoint contract mismatch: "
+                                        f"{name}={metadata.get(name)!r}, "
+                                        f"expected={expected!r}."
+                                    )
+                            for metadata_name, expected_value in {
+                                "eraf_clause_activation_balance_weight": (
+                                    self.policy_guard_eraf_loss_weights.clause_activation_balance
+                                ),
+                                "eraf_clause_cardinality_weight": (
+                                    self.policy_guard_eraf_loss_weights.clause_cardinality
+                                ),
+                                "eraf_clause_worst_slot_weight": (
+                                    self.policy_guard_eraf_loss_weights.clause_worst_slot
+                                ),
+                                "eraf_clause_multi_group_weight": (
+                                    self.policy_guard_eraf_loss_weights.clause_multi_group_weight
+                                ),
+                                "eraf_clause_adapter_energy_weight": (
+                                    self.policy_guard_eraf_loss_weights.clause_adapter_energy
+                                ),
+                                "eraf_clause_activation_residual_max_abs": (
+                                    self.policy_guard_eraf_clause_activation_residual_max_abs
+                                ),
+                            }.items():
+                                try:
+                                    saved_value = float(metadata[metadata_name])
+                                except (KeyError, TypeError, ValueError) as exc:
+                                    raise ValueError(
+                                        "PGC V9.8 checkpoint is missing valid "
+                                        f"clause calibration value {metadata_name!r}."
+                                    ) from exc
+                                if not math.isclose(
+                                    saved_value,
+                                    float(expected_value),
+                                    rel_tol=0.0,
+                                    abs_tol=1.0e-9,
+                                ):
+                                    raise ValueError(
+                                        f"PGC V9.8 {metadata_name} mismatch: "
+                                        f"checkpoint={saved_value}, "
+                                        f"model={expected_value}."
+                                    )
+                            try:
+                                saved_clause_hidden_dim = int(
+                                    metadata[
+                                        "eraf_clause_activation_adapter_hidden_dim"
+                                    ]
+                                )
+                            except (KeyError, TypeError, ValueError) as exc:
+                                raise ValueError(
+                                    "PGC V9.8 checkpoint is missing its clause "
+                                    "activation adapter hidden dimension."
+                                ) from exc
+                            if (
+                                saved_clause_hidden_dim
+                                != self.policy_guard_eraf_clause_activation_adapter_hidden_dim
+                            ):
+                                raise ValueError(
+                                    "PGC V9.8 clause activation adapter hidden "
+                                    "dimension mismatch: checkpoint="
+                                    f"{saved_clause_hidden_dim}, model="
+                                    f"{self.policy_guard_eraf_clause_activation_adapter_hidden_dim}."
+                                )
                         if (
                             bool(metadata.get("eraf_entity_only", False))
                             != self.policy_guard_eraf_entity_only
@@ -11522,6 +11742,7 @@ class FastWAM(torch.nn.Module):
                 or migrate_v9_to_role_adapter
                 or migrate_v9_to_structured_role_adapter
                 or migrate_v9_to_balanced_role_adapter
+                or migrate_v9_to_clause_activation_adapter
             )
             incompatible = self.policy_guard_modules.load_state_dict(
                 guard_state, strict=not migrate_with_new_modules
@@ -11602,6 +11823,23 @@ class FastWAM(torch.nn.Module):
                         f"has incompatible sidecars: missing={missing}, "
                         f"unexpected={unexpected}."
                     )
+            elif migrate_v9_to_clause_activation_adapter:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                disallowed_missing = [
+                    key
+                    for key in missing
+                    if not key.startswith(
+                        "entity_relation_affordance."
+                        "clause_activation_adapter."
+                    )
+                ]
+                if disallowed_missing or unexpected or not missing:
+                    raise ValueError(
+                        "PGC v9.7 -> v9.8 clause-activation warm start has "
+                        f"incompatible sidecars: missing={missing}, "
+                        f"unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -11617,6 +11855,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v9_to_role_adapter
                 and not migrate_v9_to_structured_role_adapter
                 and not migrate_v9_to_balanced_role_adapter
+                and not migrate_v9_to_clause_activation_adapter
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -11668,6 +11907,15 @@ class FastWAM(torch.nn.Module):
                 logger.info(
                     "Warm-started PGC v9.5 from frozen V9.3 ERAF at %s "
                     "(base=%s restored=%d new_balanced_role_adapter=%d).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
+                    len(incompatible.missing_keys),
+                )
+            elif migrate_v9_to_clause_activation_adapter:
+                logger.info(
+                    "Warm-started PGC v9.8 from frozen V9.7 ERAF at %s "
+                    "(base=%s restored=%d new_clause_adapter=%d).",
                     path,
                     resolved_base,
                     len(guard_state),

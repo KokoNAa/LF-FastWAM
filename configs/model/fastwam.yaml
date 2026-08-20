@@ -280,6 +280,8 @@ policy_guard:
     # V9.3 position/relation/anchor geometry on every active clause.
     # Version 8 (V9.7) removes subject/reference mask intersections from role
     # competition while preserving full-mask localization supervision.
+    # Version 9 (V9.8) freezes the validated V9.7 visual path and calibrates
+    # only clause activity/cardinality with a zero-init cross-clause adapter.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -310,6 +312,13 @@ policy_guard:
     multi_clause_consistency_weight: 0.0
     structured_role_adapter_hidden_dim: 256
     balanced_role_adapter_hidden_dim: 256
+    clause_activation_adapter_hidden_dim: 256
+    clause_activation_residual_max_abs: 4.0
+    clause_activation_balance_weight: 0.0
+    clause_cardinality_weight: 0.0
+    clause_worst_slot_weight: 0.0
+    clause_multi_group_weight: 1.0
+    clause_adapter_energy_weight: 0.0
     role_attention_preservation_weight: 0.0
     role_position_preservation_weight: 0.0
     role_anchor_preservation_weight: 0.0

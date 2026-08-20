@@ -72,7 +72,7 @@ if [[ "${CONDITION}" == "shuffled" || "${CONDITION}" == "counterfactual" ]]; the
   "${PYTHON_BIN}" scripts/validate_language_intervention_manifest.py "${MANIFEST_PATH}"
 fi
 
-PGC_CHECKPOINT_VERSION="$("${PYTHON_BIN}" - \
+PGC_CHECKPOINT_INFO="$("${PYTHON_BIN}" - \
   "${PGC_CHECKPOINT}" \
   "${NUM_INFERENCE_STEPS}" \
   "${V9_ABLATION}" <<'PY'
@@ -190,9 +190,33 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-print(version)
+    objective = int(metadata.get("eraf_grounding_objective_version", -1))
+    if objective not in set(range(1, 10)):
+        raise SystemExit(
+            f"PGC v9 checkpoint has invalid grounding objective {objective}"
+        )
+    training_stage = str(metadata.get("eraf_training_stage", ""))
+    if training_stage not in {"grounding", "action", "verifier"}:
+        raise SystemExit(
+            f"PGC v9 checkpoint has invalid ERAF stage {training_stage!r}"
+        )
+    if objective >= 9 and (
+        metadata.get("eraf_clause_activation_contract")
+        != "zero_init_cross_clause_active_logit_residual"
+        or metadata.get("eraf_clause_gate")
+        != "multi_clause_exact_at_least_80pct"
+    ):
+        raise SystemExit("PGC v9.8 checkpoint lacks clause calibration contract")
+else:
+    objective = 0
+    training_stage = "grounding"
+print(f"{version}:{objective}:{training_stage}")
 PY
 )"
+PGC_CHECKPOINT_VERSION="${PGC_CHECKPOINT_INFO%%:*}"
+PGC_CHECKPOINT_REST="${PGC_CHECKPOINT_INFO#*:}"
+PGC_V9_GROUNDING_OBJECTIVE_VERSION="${PGC_CHECKPOINT_REST%%:*}"
+PGC_V9_TRAINING_STAGE="${PGC_CHECKPOINT_REST#*:}"
 echo "Validated PGC v${PGC_CHECKPOINT_VERSION} checkpoint: ${PGC_CHECKPOINT}"
 PGC_CLOSED_LOOP_ENABLED=false
 if [[ "${PGC_CHECKPOINT_VERSION}" == "8" ]]; then
@@ -253,12 +277,35 @@ EXTRA_OVERRIDES=(
 )
 if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
   EXTRA_OVERRIDES+=(
+    "model.policy_guard.entity_relation_grounding.training_stage=${PGC_V9_TRAINING_STAGE}"
+    "model.policy_guard.entity_relation_grounding.grounding_objective_version=${PGC_V9_GROUNDING_OBJECTIVE_VERSION}"
     "model.policy_guard.entity_relation_grounding.entity_only=${V9_ENTITY_ONLY}"
     "model.policy_guard.entity_relation_grounding.use_anchors=${V9_USE_ANCHORS}"
     "EVALUATION.entity_relation_diagnostics=${ERAF_DIAGNOSTICS}"
   )
   if [[ "${ERAF_DIAGNOSTICS}" == "true" ]]; then
     EXTRA_OVERRIDES+=("EVALUATION.entity_relation_overlay_dir=${ERAF_OVERLAY_DIR}")
+  fi
+  if (( PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 9 )); then
+    EXTRA_OVERRIDES+=(
+      "model.policy_guard.entity_relation_grounding.role_assignment_weight=1.0"
+      "model.policy_guard.entity_relation_grounding.role_assignment_hard_weight=0.5"
+      "model.policy_guard.entity_relation_grounding.structured_assignment_weight=2.0"
+      "model.policy_guard.entity_relation_grounding.structured_assignment_hard_weight=1.0"
+      "model.policy_guard.entity_relation_grounding.multi_clause_consistency_weight=2.0"
+      "model.policy_guard.entity_relation_grounding.role_attention_preservation_weight=5.0"
+      "model.policy_guard.entity_relation_grounding.role_position_preservation_weight=2.0"
+      "model.policy_guard.entity_relation_grounding.role_anchor_preservation_weight=10.0"
+      "model.policy_guard.entity_relation_grounding.role_relation_preservation_weight=2.0"
+      "model.policy_guard.entity_relation_grounding.role_adapter_energy_weight=0.01"
+      "model.policy_guard.entity_relation_grounding.clause_activation_adapter_hidden_dim=256"
+      "model.policy_guard.entity_relation_grounding.clause_activation_residual_max_abs=4.0"
+      "model.policy_guard.entity_relation_grounding.clause_activation_balance_weight=1.0"
+      "model.policy_guard.entity_relation_grounding.clause_cardinality_weight=1.0"
+      "model.policy_guard.entity_relation_grounding.clause_worst_slot_weight=2.0"
+      "model.policy_guard.entity_relation_grounding.clause_multi_group_weight=1.0"
+      "model.policy_guard.entity_relation_grounding.clause_adapter_energy_weight=0.01"
+    )
   fi
 fi
 if [[ -n "${MANIFEST_PATH}" ]]; then
