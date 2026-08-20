@@ -1231,7 +1231,9 @@ class ERAFLossWeights:
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask = mask.to(device=values.device, dtype=torch.bool)
     if not bool(mask.any()):
-        return values.sum() * 0.0
+        return torch.nan_to_num(
+            values, nan=0.0, posinf=0.0, neginf=0.0
+        ).sum() * 0.0
     return values[mask].mean()
 
 
@@ -1242,7 +1244,9 @@ def _masked_weighted_mean(
 ) -> torch.Tensor:
     mask = mask.to(device=values.device, dtype=torch.bool)
     if not bool(mask.any()):
-        return values.sum() * 0.0
+        return torch.nan_to_num(
+            values, nan=0.0, posinf=0.0, neginf=0.0
+        ).sum() * 0.0
     selected_weights = sample_weights.to(device=values.device, dtype=values.dtype)[mask]
     return (values[mask] * selected_weights).sum() / selected_weights.sum().clamp_min(
         1.0e-8
@@ -1390,6 +1394,8 @@ def _structured_all_entity_assignment_loss(
         ),
         "multi_clause_fraction": multi_sample.float().mean().detach(),
         "hard_gradient_fraction": zero.detach(),
+        "global_easy_count": zero.detach(),
+        "global_hard_count": zero.detach(),
     }
     return assignment_loss, multi_clause_loss, metrics
 
@@ -1400,30 +1406,82 @@ def _balanced_group_mean(
     correct: torch.Tensor,
     *,
     hard_group_weight: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Give correct and incorrect groups explicit, count-independent mass."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Give easy/hard groups exact global DDP mass without NaN empty groups.
+
+    DDP averages gradients across ranks.  Scaling each local sum by
+    ``world_size / global_count`` therefore produces the gradient of the true
+    global group mean, even when a rank has no member of that group.  The
+    straight-through detached all-reduce keeps the forward loss identical on
+    every rank while preserving that local autograd path.
+    """
     if hard_group_weight <= 0:
         raise ValueError("ERAF balanced hard-group weight must be positive.")
     easy_valid = valid.bool() & correct.bool()
     hard_valid = valid.bool() & ~correct.bool()
-    easy_present = bool(easy_valid.any())
-    hard_present = bool(hard_valid.any())
+    graph_zero = torch.nan_to_num(
+        values, nan=0.0, posinf=0.0, neginf=0.0
+    ).sum() * 0.0
+
+    def global_group_mean(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        local_count = mask.sum().to(dtype=values.dtype)
+        global_count = local_count.detach().clone()
+        distributed = (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+        world_size = 1
+        if distributed:
+            torch.distributed.all_reduce(
+                global_count, op=torch.distributed.ReduceOp.SUM
+            )
+            world_size = torch.distributed.get_world_size()
+        if float(global_count.item()) <= 0.0:
+            return graph_zero, global_count
+        if bool(mask.any()) and not bool(torch.isfinite(values[mask]).all()):
+            raise FloatingPointError(
+                "ERAF V9.6 received NaN/Inf in a valid assignment group."
+            )
+        local_sum = torch.where(
+            mask,
+            torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0),
+            torch.zeros_like(values),
+        ).sum()
+        local_contribution = (
+            local_sum * float(world_size) / global_count.clamp_min(1.0)
+        )
+        if not distributed:
+            return local_contribution, global_count
+        detached_global_sum = local_sum.detach().clone()
+        torch.distributed.all_reduce(
+            detached_global_sum, op=torch.distributed.ReduceOp.SUM
+        )
+        detached_global_mean = detached_global_sum / global_count.clamp_min(1.0)
+        return (
+            local_contribution
+            + detached_global_mean
+            - local_contribution.detach(),
+            global_count,
+        )
+
+    easy_mean, global_easy_count = global_group_mean(easy_valid)
+    hard_mean, global_hard_count = global_group_mean(hard_valid)
+    easy_present = float(global_easy_count.item()) > 0.0
+    hard_present = float(global_hard_count.item()) > 0.0
     if easy_present and hard_present:
         denominator = 1.0 + float(hard_group_weight)
         value = (
-            _masked_mean(values, easy_valid)
-            + float(hard_group_weight) * _masked_mean(values, hard_valid)
+            easy_mean + float(hard_group_weight) * hard_mean
         ) / denominator
         hard_gradient_fraction = values.new_tensor(
             float(hard_group_weight) / denominator
         )
-        return value, hard_gradient_fraction
+        return value, hard_gradient_fraction, global_easy_count, global_hard_count
     if hard_present:
-        return _masked_mean(values, hard_valid), values.new_tensor(1.0)
+        return hard_mean, values.new_tensor(1.0), global_easy_count, global_hard_count
     if easy_present:
-        return _masked_mean(values, easy_valid), values.new_tensor(0.0)
-    zero = values.sum() * 0.0
-    return zero, zero.detach()
+        return easy_mean, values.new_tensor(0.0), global_easy_count, global_hard_count
+    return graph_zero, graph_zero.detach(), global_easy_count, global_hard_count
 
 
 def _balanced_bipartite_assignment_loss(
@@ -1496,7 +1554,12 @@ def _balanced_bipartite_assignment_loss(
     # Balance all row and column decisions together.  Balancing each direction
     # separately would silently reduce the hard mass when one direction has no
     # mistakes, which is exactly the long-tail failure V9.5 is meant to repair.
-    assignment_loss, hard_gradient_fraction = _balanced_group_mean(
+    (
+        assignment_loss,
+        hard_gradient_fraction,
+        global_easy_count,
+        global_hard_count,
+    ) = _balanced_group_mean(
         torch.cat((row_loss, column_loss), dim=1),
         torch.cat((row_valid, column_valid), dim=1),
         torch.cat((row_correct, column_correct), dim=1),
@@ -1506,8 +1569,12 @@ def _balanced_bipartite_assignment_loss(
     # The gate requires every active role in a conjunction to be right.  Use
     # the worst row and worst column rather than an average over easy clauses.
     multi_sample = (clause_valid.bool().sum(dim=-1) > 1) & row_valid.any(dim=-1)
-    worst_row = row_loss.masked_fill(~row_valid, -torch.inf).amax(dim=-1)
-    worst_column = column_loss.masked_fill(~column_valid, -torch.inf).amax(dim=-1)
+    worst_row = torch.where(row_valid, row_loss, torch.zeros_like(row_loss)).amax(
+        dim=-1
+    )
+    worst_column = torch.where(
+        column_valid, column_loss, torch.zeros_like(column_loss)
+    ).amax(dim=-1)
     worst_row = torch.where(
         row_valid.any(dim=-1), worst_row, torch.zeros_like(worst_row)
     )
@@ -1532,6 +1599,8 @@ def _balanced_bipartite_assignment_loss(
         ),
         "multi_clause_fraction": multi_sample.float().mean().detach(),
         "hard_gradient_fraction": hard_gradient_fraction.detach(),
+        "global_easy_count": global_easy_count.detach(),
+        "global_hard_count": global_hard_count.detach(),
     }
     return assignment_loss, multi_clause_loss, metrics
 
@@ -1791,6 +1860,8 @@ def entity_relation_affordance_loss(
         "multi_clause_accuracy": zero.detach(),
         "multi_clause_fraction": zero.detach(),
         "hard_gradient_fraction": zero.detach(),
+        "global_easy_count": zero.detach(),
+        "global_hard_count": zero.detach(),
     }
     if int(weights.objective_version) >= 6:
         (
@@ -1899,6 +1970,16 @@ def entity_relation_affordance_loss(
         teacher_preservation_fraction = _masked_mean(
             teacher_preservation_valid.float(), role_pair_valid
         ).detach()
+        # V9.6 separates identity correction from geometry preservation. Hard
+        # role queries may change their attention, but position/relation and
+        # all affordance anchors retain the clean V9.3 teacher on every active
+        # clause. This prevents a binding repair from moving a correct goal
+        # anchor beyond the 5 cm gate.
+        geometry_preservation_valid = (
+            clause_valid
+            if int(weights.objective_version) >= 7
+            else teacher_preservation_valid
+        )
 
         attention_preservation_terms = []
         for role, teacher_attention in (
@@ -1929,7 +2010,7 @@ def entity_relation_affordance_loss(
                 reduction="none",
             ).mean(dim=-1)
             position_preservation_terms.append(
-                _masked_mean(value, teacher_preservation_valid)
+                _masked_mean(value, geometry_preservation_valid)
             )
         role_position_preservation_loss = torch.stack(
             position_preservation_terms
@@ -1943,7 +2024,7 @@ def entity_relation_affordance_loss(
                 reduction="none",
             ).mean(dim=-1)
             anchor_preservation_terms.append(
-                _masked_mean(value, teacher_preservation_valid)
+                _masked_mean(value, geometry_preservation_valid)
             )
         role_anchor_preservation_loss = torch.stack(anchor_preservation_terms).mean()
         role_relation_preservation_loss = _masked_mean(
@@ -1952,7 +2033,7 @@ def entity_relation_affordance_loss(
                 outputs["teacher_relation_hidden"].float(),
                 reduction="none",
             ).mean(dim=-1),
-            teacher_preservation_valid,
+            geometry_preservation_valid,
         )
         if int(weights.objective_version) >= 6:
             required_balanced = {
@@ -2133,6 +2214,12 @@ def entity_relation_affordance_loss(
         ],
         "pgc_v9_structured_hard_gradient_fraction": structured_metrics[
             "hard_gradient_fraction"
+        ],
+        "pgc_v9_structured_global_easy_count": structured_metrics[
+            "global_easy_count"
+        ],
+        "pgc_v9_structured_global_hard_count": structured_metrics[
+            "global_hard_count"
         ],
         "pgc_v9_teacher_preservation_fraction": teacher_preservation_fraction,
         "pgc_v9_teacher_predicate_max_abs_error": (teacher_predicate_max_abs_error),

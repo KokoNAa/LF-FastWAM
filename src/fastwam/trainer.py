@@ -181,6 +181,39 @@ class Wan22Trainer:
                         "Set data.train.pgc_entity_relation_supervision_required=true "
                         "and provide one sidecar per dataset."
                     )
+                objective_version = int(
+                    getattr(
+                        self.model,
+                        "policy_guard_eraf_grounding_objective_version",
+                        1,
+                    )
+                )
+                hard_curriculum = bool(
+                    getattr(
+                        self.train_dataset,
+                        "pgc_v9_hard_role_curriculum",
+                        False,
+                    )
+                )
+                training_stage = str(
+                    getattr(
+                        self.model,
+                        "policy_guard_eraf_training_stage",
+                        "",
+                    )
+                )
+                if objective_version == 7 and training_stage == "grounding" and not hard_curriculum:
+                    raise ValueError(
+                        "PGC V9.6 grounding requires its audited native hard/easy "
+                        "curriculum."
+                    )
+                if hard_curriculum and not (
+                    objective_version == 7 and training_stage == "grounding"
+                ):
+                    raise ValueError(
+                        "PGC V9.6 hard-role curriculum is valid only for "
+                        "objective-v7 grounding repair."
+                    )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # In LoRA mode only adapters plus explicitly selected small modules are
@@ -389,6 +422,7 @@ class Wan22Trainer:
             seed=self.seed,
             batch_size=self.batch_size,
             num_processes=self.accelerator.num_processes,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
         )
         return DataLoader(
             dataset,

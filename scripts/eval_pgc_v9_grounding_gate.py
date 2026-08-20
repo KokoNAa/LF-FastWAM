@@ -507,11 +507,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Grounding gate requires a PGC v9 checkpoint.")
     metadata = payload.get("architecture_metadata") or {}
     objective_version = int(metadata.get("eraf_grounding_objective_version", 1))
-    expected_step = {2: 1500, 3: 2500, 4: 2500, 5: 3500, 6: 3500}.get(objective_version)
+    expected_step = {
+        2: 1500,
+        3: 2500,
+        4: 2500,
+        5: 3500,
+        6: 3500,
+        7: 3000,
+    }.get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
     intermediate_checkpoint = bool(args.allow_intermediate) and (
         (objective_version == 4 and checkpoint_step in {1750, 2000, 2250})
         or (objective_version in {5, 6} and checkpoint_step in {2750, 3000, 3250})
+        or (objective_version == 7 and checkpoint_step == 2750)
     )
     if (
         expected_step is None
@@ -521,7 +529,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(
             "The pre-action grounding gate requires the completed V9 "
             "grounding-stage checkpoint: objective v2 at step 1500 or "
-            "objective v3/v4 at step 2500 or objective v5/v6 at step 3500."
+            "objective v3/v4 at step 2500, objective v5/v6 at step 3500, "
+            "or objective v7 at step 3000."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())
@@ -582,6 +591,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 predicate_vocabulary=sidecar["predicate_vocabulary"],
             )
         )
+        records[-1]["_raw_index"] = int(dataset._sample_indices[position])
+        records[-1]["_dataset_index"] = dataset_index
+        records[-1]["_dataset_kind"] = str(sidecar["dataset_kind"])
         print(f"ERAF_GATE {ordinal + 1}/{len(selected)}", flush=True)
     report = compute_grounding_gate_report(records)
     report.update(
@@ -594,8 +606,61 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
     )
     output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if args.hard_index_output is not None:
+        if objective_version != 4 or checkpoint_step != 2500:
+            raise ValueError(
+                "PGC V9.6 hard-role mining requires the completed clean V9.3 "
+                "objective-v4 step-2500 checkpoint."
+            )
+        audited_native = sorted(
+            {
+                int(record["_raw_index"])
+                for record in records
+                if record["_dataset_kind"] == "native"
+            }
+        )
+        hard_native = sorted(
+            {
+                int(record["_raw_index"])
+                for record in records
+                if record["_dataset_kind"] == "native"
+                and record["role_swap_correct"]
+                and not all(bool(value) for value in record["role_swap_correct"])
+            }
+        )
+        if not hard_native:
+            raise ValueError(
+                "V9.3 hard-role mining found no native role-swap failures; "
+                "increase --num-samples or inspect the audit inputs."
+            )
+        hard_payload = {
+            "format": "pgc_v9_hard_role_index_v1",
+            "teacher_checkpoint": str(checkpoint),
+            "teacher_objective_version": objective_version,
+            "teacher_step": checkpoint_step,
+            "seed": args.seed,
+            "audited_native_raw_indices": audited_native,
+            "hard_native_raw_indices": hard_native,
+            "audited_native_count": len(audited_native),
+            "hard_native_count": len(hard_native),
+            "hard_native_fraction": float(len(hard_native) / len(audited_native)),
+            "criterion": "any_valid_full_mask_role_swap_failure",
+            "native_datasets": sorted(
+                str(Path(str(index["dataset"])).expanduser().resolve())
+                for index in sidecars
+                if str(index["dataset_kind"]) == "native"
+            ),
+            "native_frame_count": int(dataset.pgc_native_frame_count),
+        }
+        hard_output = args.hard_index_output.expanduser().resolve()
+        hard_output.parent.mkdir(parents=True, exist_ok=True)
+        hard_output.write_text(
+            json.dumps(hard_payload, indent=2) + "\n", encoding="utf-8"
+        )
+        report["hard_role_index"] = str(hard_output)
+        output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
-    if not report["passed"]:
+    if not report["passed"] and args.hard_index_output is None:
         raise SystemExit(2)
     return report
 
@@ -605,6 +670,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--training-config", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--hard-index-output",
+        type=Path,
+        help=(
+            "Write audited native V9.3 role-swap failures for the V9.6 "
+            "four-way curriculum."
+        ),
+    )
     parser.add_argument("--num-samples", type=int, default=500)
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
@@ -612,8 +685,9 @@ def parse_args() -> argparse.Namespace:
         "--allow-intermediate",
         action="store_true",
         help=(
-            "Audit V9.3 steps 1750/2000/2250 or V9.4/V9.5 steps "
-            "2750/3000/3250 without treating them as final action inputs."
+            "Audit V9.3 steps 1750/2000/2250, V9.4/V9.5 steps "
+            "2750/3000/3250, or V9.6 step 2750 without treating them as "
+            "final action inputs."
         ),
     )
     parser.add_argument("--device", default="cuda:0")

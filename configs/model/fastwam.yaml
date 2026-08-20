@@ -275,6 +275,9 @@ policy_guard:
     # Version 6 (V9.5) returns to the clean V9.3 checkpoint and trains a
     # visual-candidate-aware bipartite binding adapter. Hard/easy assignment
     # groups receive fixed 1:1 gradient mass and geometry is teacher protected.
+    # Version 7 (V9.6) fixes that balance globally across DDP ranks, samples
+    # audited native hard/easy rows in every optimizer window, and protects
+    # V9.3 position/relation/anchor geometry on every active clause.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8

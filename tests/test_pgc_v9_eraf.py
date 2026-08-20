@@ -13,6 +13,7 @@ import torch
 
 from fastwam.datasets.lerobot.robot_video_dataset import (
     RobotVideoDataset,
+    build_pgc_v96_sample_plan,
     build_pgc_v9_sample_indices,
 )
 from fastwam.datasets.lerobot.base_lerobot_dataset import BaseLerobotDataset
@@ -47,6 +48,7 @@ from scripts.build_pgc_libero_entity_relations import (
 )
 from scripts.eval_pgc_v9_grounding_gate import compute_grounding_gate_report
 from tests.test_policy_guard import tiny_pgc_fastwam
+from fastwam.utils.samplers import ResumableEpochSampler
 
 
 class PGCERAFParsingTest(unittest.TestCase):
@@ -371,6 +373,59 @@ class PGCERAFSamplingTest(unittest.TestCase):
                 strict_relation_categories=["entity"],
                 native_role_categories=["native"],
             )
+
+    def test_v96_builds_equal_four_way_curriculum(self):
+        indices, groups = build_pgc_v96_sample_plan(
+            native_indices=list(range(8)),
+            hard_native_indices=[1, 5],
+            original_counterfactual_indices=[8, 9],
+            strict_counterfactual_indices=[10, 11],
+            strict_relation_categories=["entity", "relation"],
+            native_role_categories=["a", "a", "a", "a", "b", "b", "b", "b"],
+            original_role_categories=["original_a", "original_b"],
+            strict_role_categories=["strict_a", "strict_b"],
+        )
+        self.assertEqual(len(indices), len(groups))
+        counts = Counter(groups)
+        self.assertEqual(counts, Counter({0: 6, 1: 6, 2: 6, 3: 6}))
+        for index, group in zip(indices, groups, strict=True):
+            if group == 0:
+                self.assertIn(index, {1, 5})
+            elif group == 1:
+                self.assertIn(index, {0, 2, 3, 4, 6, 7})
+            elif group == 2:
+                self.assertIn(index, {8, 9})
+            else:
+                self.assertIn(index, {10, 11})
+
+    def test_v96_sampler_balances_every_global_optimizer_window(self):
+        class CurriculumDataset:
+            pgc_v9_hard_curriculum_group_ids = [0, 1, 2, 3] * 12
+
+            def __len__(self):
+                return len(self.pgc_v9_hard_curriculum_group_ids)
+
+        dataset = CurriculumDataset()
+        sampler = ResumableEpochSampler(
+            dataset=dataset,
+            seed=42,
+            batch_size=1,
+            num_processes=3,
+            gradient_accumulation_steps=4,
+        )
+        order = list(sampler)
+        labels = [dataset.pgc_v9_hard_curriculum_group_ids[index] for index in order]
+        for start in range(0, len(labels), 12):
+            self.assertEqual(
+                Counter(labels[start : start + 12]),
+                Counter({0: 3, 1: 3, 2: 3, 3: 3}),
+            )
+            window = labels[start : start + 12]
+            for process in range(3):
+                self.assertEqual(
+                    Counter(window[process::3]),
+                    Counter({0: 1, 1: 1, 2: 1, 3: 1}),
+                )
 
     def test_rejects_missing_or_overlapping_pools(self):
         with self.assertRaisesRegex(ValueError, "non-empty"):
@@ -1018,6 +1073,43 @@ class PGCERAFModuleTest(unittest.TestCase):
         (loss + multi_loss).backward()
         self.assertIsNotNone(subject_attention.grad)
         self.assertIsNotNone(reference_attention.grad)
+
+    def test_v96_empty_assignment_group_is_finite_and_differentiable(self):
+        subject_attention = torch.tensor(
+            [[[0.8, 0.2]]], requires_grad=True
+        )
+        reference_attention = torch.tensor(
+            [[[0.2, 0.8]]], requires_grad=True
+        )
+        # Unary clauses have no different-entity negative, so both assignment
+        # groups are globally empty. V9.5's values.sum()*0 path could inherit
+        # NaN from the masked logsumexp; V9.6 must return an exact finite zero.
+        target = torch.tensor([[[1.0, 0.0]]])
+        loss, multi_loss, metrics = _balanced_bipartite_assignment_loss(
+            role_attentions={
+                "subject": subject_attention,
+                "reference": reference_attention,
+            },
+            role_targets={"subject": target, "reference": target},
+            role_entity_ids={
+                "subject": torch.tensor([[1]]),
+                "reference": torch.tensor([[1]]),
+            },
+            role_valid={
+                "subject": torch.ones(1, 1, dtype=torch.bool),
+                "reference": torch.ones(1, 1, dtype=torch.bool),
+            },
+            clause_valid=torch.ones(1, 1, dtype=torch.bool),
+            temperature=0.10,
+            hard_group_weight=1.0,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(multi_loss))
+        self.assertEqual(loss.item(), 0.0)
+        self.assertEqual(metrics["global_easy_count"].item(), 0.0)
+        self.assertEqual(metrics["global_hard_count"].item(), 0.0)
+        (loss + multi_loss).backward()
+        self.assertIsNotNone(subject_attention.grad)
 
     def test_v95_zero_init_visual_binding_adapter_matches_v93_teacher(self):
         torch.manual_seed(95)
@@ -1756,6 +1848,76 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 v9_grounding_objective_version=6,
             )
             restored.load_checkpoint(v9r5_path)
+
+    def test_v93_can_upgrade_to_v96_global_hard_curriculum(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v5_path = root / "v5.pt"
+            v9r1_path = root / "v9r1.pt"
+            v9r3_path = root / "v9r3.pt"
+            v9r6_path = root / "v9r6.pt"
+            base = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": base.mot.state_dict()},
+                base_path,
+            )
+            base.load_checkpoint(base_path)
+            base.save_checkpoint(v5_path, step=4000)
+            v9r1 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=2,
+            )
+            v9r1.load_checkpoint(v5_path)
+            v9r1.save_checkpoint(v9r1_path, step=1500)
+            v9r3 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=4,
+            )
+            v9r3.load_checkpoint(v9r1_path)
+            v9r3.save_checkpoint(v9r3_path, step=2500)
+
+            v9r6 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=7,
+            )
+            v9r6.load_checkpoint(v9r3_path)
+            v9r6.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v9r6.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all("balanced_role_binding_adapter" in name for name in trainable)
+            )
+            v9r6.save_checkpoint(v9r6_path, step=3000)
+            payload = torch.load(v9r6_path, map_location="cpu", weights_only=False)
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 7)
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "global_hard_curriculum_balanced_visual_role_binding_adapter_only",
+            )
+            self.assertEqual(
+                metadata["eraf_hard_role_curriculum"],
+                "v9_3_audited_native_hard_easy_1_1",
+            )
+            self.assertEqual(metadata["eraf_ddp_group_balance"], "global_count_exact")
+            self.assertEqual(
+                metadata["eraf_geometry_preservation_scope"],
+                "all_active_clauses",
+            )
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=7,
+            )
+            restored.load_checkpoint(v9r6_path)
 
     def test_stage_trainability_optimizer_contract_and_deployment_inputs(self):
         expected_modules = {

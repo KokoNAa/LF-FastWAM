@@ -1109,10 +1109,11 @@ class FastWAM(torch.nn.Module):
                     4,
                     5,
                     6,
+                    7,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "1, 2, 3, 4, 5, or 6."
+                        "1, 2, 3, 4, 5, 6, or 7."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1837,7 +1838,7 @@ class FastWAM(torch.nn.Module):
                                 role_adapter = eraf.balanced_role_binding_adapter
                                 if role_adapter is None:
                                     raise RuntimeError(
-                                        "V9.5 grounding requires its balanced "
+                                        "V9.5/V9.6 grounding requires its balanced "
                                         "visual role-binding adapter."
                                     )
                             elif (
@@ -9500,11 +9501,19 @@ class FastWAM(torch.nn.Module):
                     (
                         (
                             (
-                                "frozen_v9_3_visual_candidate_bipartite_role_"
-                                "binding_with_balanced_hard_easy_gradients"
+                                (
+                                    "frozen_v9_3_native_hard_curriculum_global_"
+                                    "ddp_bipartite_binding_with_all_clause_"
+                                    "geometry_preservation"
+                                )
+                                if self.policy_guard_eraf_grounding_objective_version
+                                >= 7
+                                else (
+                                    "frozen_v9_3_visual_candidate_bipartite_role_"
+                                    "binding_with_balanced_hard_easy_gradients"
+                                )
                             )
-                            if self.policy_guard_eraf_grounding_objective_version
-                            >= 6
+                            if self.policy_guard_eraf_grounding_objective_version >= 6
                             else (
                                 "frozen_v9_3_cross_clause_structured_role_"
                                 "assignment_with_same_state_entity_negatives"
@@ -9866,6 +9875,24 @@ class FastWAM(torch.nn.Module):
                 if is_v9
                 else None
             ),
+            "eraf_hard_role_curriculum": (
+                "v9_3_audited_native_hard_easy_1_1"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 7
+                else None
+            ),
+            "eraf_ddp_group_balance": (
+                "global_count_exact"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 7
+                else None
+            ),
+            "eraf_geometry_preservation_scope": (
+                "all_active_clauses"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 7
+                else None
+            ),
             "eraf_attention_mask_weight": (
                 self.policy_guard_eraf_loss_weights.attention_mask
                 if is_v9
@@ -9929,7 +9956,11 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_role_adapter_trainable_scope": (
                 (
-                    "balanced_visual_role_binding_adapter_only"
+                    (
+                        "global_hard_curriculum_balanced_visual_role_binding_adapter_only"
+                        if self.policy_guard_eraf_grounding_objective_version >= 7
+                        else "balanced_visual_role_binding_adapter_only"
+                    )
                     if self.policy_guard_eraf_grounding_objective_version >= 6
                     else (
                         "structured_role_assignment_adapter_only"
@@ -10456,7 +10487,7 @@ class FastWAM(torch.nn.Module):
             saved_policy_guard_version == 9
             and int(self.policy_guard_version) == 9
             and saved_eraf_grounding_objective == 4
-            and self.policy_guard_eraf_grounding_objective_version == 6
+            and self.policy_guard_eraf_grounding_objective_version in {6, 7}
             and self.policy_guard_eraf_training_stage == "grounding"
             and metadata.get("eraf_training_stage") == "grounding"
         )
@@ -11129,7 +11160,7 @@ class FastWAM(torch.nn.Module):
                             or (
                                 saved_grounding_objective == 4
                                 and self.policy_guard_eraf_grounding_objective_version
-                                in {5, 6}
+                                in {5, 6, 7}
                             )
                         )
                         objective_upgrade = (
@@ -11213,7 +11244,11 @@ class FastWAM(torch.nn.Module):
                                     )
                         if saved_grounding_objective >= 4 and not objective_upgrade:
                             expected_scope = (
-                                "balanced_visual_role_binding_adapter_only"
+                                (
+                                    "global_hard_curriculum_balanced_visual_role_binding_adapter_only"
+                                    if saved_grounding_objective >= 7
+                                    else "balanced_visual_role_binding_adapter_only"
+                                )
                                 if saved_grounding_objective >= 6
                                 else (
                                     "structured_role_assignment_adapter_only"
@@ -11339,6 +11374,23 @@ class FastWAM(torch.nn.Module):
                                     f"{saved_balanced_hidden_dim}, model="
                                     f"{self.policy_guard_eraf_balanced_role_adapter_hidden_dim}."
                                 )
+                        if saved_grounding_objective >= 7 and not objective_upgrade:
+                            expected_v96_contract = {
+                                "eraf_hard_role_curriculum": (
+                                    "v9_3_audited_native_hard_easy_1_1"
+                                ),
+                                "eraf_ddp_group_balance": "global_count_exact",
+                                "eraf_geometry_preservation_scope": (
+                                    "all_active_clauses"
+                                ),
+                            }
+                            for name, expected in expected_v96_contract.items():
+                                if metadata.get(name) != expected:
+                                    raise ValueError(
+                                        "PGC V9.6 checkpoint contract mismatch: "
+                                        f"{name}={metadata.get(name)!r}, "
+                                        f"expected={expected!r}."
+                                    )
                         if (
                             bool(metadata.get("eraf_entity_only", False))
                             != self.policy_guard_eraf_entity_only

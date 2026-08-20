@@ -1,4 +1,5 @@
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -264,6 +265,71 @@ def build_pgc_v9_sample_indices(
     return _repeat_indices(native, len(counterfactual)) + counterfactual
 
 
+def build_pgc_v96_sample_plan(
+    *,
+    native_indices: list[int],
+    hard_native_indices: list[int],
+    original_counterfactual_indices: list[int],
+    strict_counterfactual_indices: list[int],
+    strict_relation_categories: list[str],
+    native_role_categories: list[str],
+    original_role_categories: list[str],
+    strict_role_categories: list[str],
+) -> tuple[list[int], list[int]]:
+    """Build V9.6's four-way native-hard curriculum.
+
+    Each returned group has the same cardinality: native V9.3 failures,
+    native non-failures, historical counterfactual, and strict counterfactual.
+    The resumable sampler shuffles within each group while retaining complete
+    four-way cycles across every global optimizer window.
+    """
+    native = [int(index) for index in native_indices]
+    hard_set = {int(index) for index in hard_native_indices}
+    if not hard_set or not hard_set.issubset(set(native)):
+        raise ValueError(
+            "PGC V9.6 hard-role indices must be a non-empty subset of native data."
+        )
+    if len(native) != len(native_role_categories):
+        raise ValueError("PGC V9.6 native role categories do not cover native rows.")
+    easy = [index for index in native if index not in hard_set]
+    if not easy:
+        raise ValueError("PGC V9.6 requires both native hard and easy rows.")
+    category_by_native = dict(zip(native, native_role_categories, strict=True))
+    hard, _ = _balance_indices_by_category(
+        sorted(hard_set), [category_by_native[index] for index in sorted(hard_set)]
+    )
+    easy, _ = _balance_indices_by_category(
+        easy, [category_by_native[index] for index in easy]
+    )
+    original, _ = _balance_indices_by_category(
+        [int(index) for index in original_counterfactual_indices],
+        [str(value) for value in original_role_categories],
+    )
+    strict_composite = [
+        f"{role}::{relation}"
+        for role, relation in zip(
+            strict_role_categories, strict_relation_categories, strict=True
+        )
+    ]
+    strict, _ = _balance_indices_by_category(
+        [int(index) for index in strict_counterfactual_indices], strict_composite
+    )
+    target_count = max(len(hard), len(easy), len(original), len(strict))
+    groups = [
+        _repeat_indices(hard, target_count),
+        _repeat_indices(easy, target_count),
+        _repeat_indices(original, target_count),
+        _repeat_indices(strict, target_count),
+    ]
+    sample_indices = [
+        groups[group][position]
+        for position in range(target_count)
+        for group in range(4)
+    ]
+    group_ids = [group for _ in range(target_count) for group in range(4)]
+    return sample_indices, group_ids
+
+
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -299,6 +365,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_entity_relation_sidecar_dirs: Optional[list[str]] = None,
         pgc_v9_balanced_sampling: bool = False,
         pgc_v9_structured_role_sampling: bool = False,
+        pgc_v9_hard_role_curriculum: bool = False,
+        pgc_v9_hard_role_index_path: Optional[str] = None,
     ):
         native_dataset_dirs = [str(path) for path in dataset_dirs]
         pgc_counterfactual_dataset_dirs = [
@@ -379,9 +447,26 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         )
         self.pgc_v9_balanced_sampling = bool(pgc_v9_balanced_sampling)
         self.pgc_v9_structured_role_sampling = bool(pgc_v9_structured_role_sampling)
+        self.pgc_v9_hard_role_curriculum = bool(pgc_v9_hard_role_curriculum)
+        self.pgc_v9_hard_role_index_path = (
+            None
+            if pgc_v9_hard_role_index_path in (None, "")
+            else str(pgc_v9_hard_role_index_path)
+        )
         if self.pgc_v9_structured_role_sampling and not self.pgc_v9_balanced_sampling:
             raise ValueError(
                 "PGC v9.4 structured role sampling requires v9 balanced sampling."
+            )
+        if self.pgc_v9_hard_role_curriculum and not (
+            self.pgc_v9_balanced_sampling and self.pgc_v9_structured_role_sampling
+        ):
+            raise ValueError(
+                "PGC V9.6 hard-role curriculum requires balanced and structured "
+                "V9 sampling."
+            )
+        if self.pgc_v9_hard_role_curriculum and not self.pgc_v9_hard_role_index_path:
+            raise ValueError(
+                "PGC V9.6 hard-role curriculum requires a V9.3 hard index."
             )
         if self.pgc_completion_phase_supervision_required and not (
             self.pgc_counterfactual_dataset_dirs
@@ -625,7 +710,27 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                                 "PGC v9.4 structured sampling requires a pair_id "
                                 f"for dataset {dataset_index}, episode {episode_index}."
                             )
-                        result.append(pair_id)
+                        if self.pgc_v9_hard_role_curriculum:
+                            clauses = list(record.get("target_clauses") or [])
+                            predicates = sorted(
+                                {
+                                    str(clause.get("predicate", "unknown"))
+                                    for clause in clauses
+                                    if isinstance(clause, dict)
+                                }
+                            )
+                            if not predicates:
+                                raise ValueError(
+                                    "PGC V9.6 curriculum requires target clauses "
+                                    f"for dataset {dataset_index}, episode "
+                                    f"{episode_index}."
+                                )
+                            complexity = "multi" if len(clauses) > 1 else "single"
+                            result.append(
+                                f"{pair_id}::{'-'.join(predicates)}::{complexity}"
+                            )
+                        else:
+                            result.append(pair_id)
                     if len(result) != int(dataset.num_frames):
                         raise ValueError(
                             "PGC v9.4 structured category/frame mismatch for "
@@ -643,15 +748,99 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     original_dataset_index
                 )
                 strict_role_categories = _dataset_pair_categories(strict_dataset_index)
-            self._sample_indices = build_pgc_v9_sample_indices(
-                native_indices=list(range(self.pgc_native_frame_count)),
-                original_counterfactual_indices=original,
-                strict_counterfactual_indices=strict,
-                strict_relation_categories=strict_categories,
-                native_role_categories=native_role_categories,
-                original_role_categories=original_role_categories,
-                strict_role_categories=strict_role_categories,
-            )
+            if self.pgc_v9_hard_role_curriculum:
+                hard_index_path = Path(
+                    str(self.pgc_v9_hard_role_index_path)
+                ).expanduser().resolve()
+                if not hard_index_path.is_file():
+                    raise FileNotFoundError(
+                        f"PGC V9.6 hard-role index not found: {hard_index_path}."
+                    )
+                hard_index = json.loads(hard_index_path.read_text(encoding="utf-8"))
+                if hard_index.get("format") != "pgc_v9_hard_role_index_v1":
+                    raise ValueError(
+                        f"Unsupported PGC V9.6 hard-role index: {hard_index_path}."
+                    )
+                if int(hard_index.get("teacher_objective_version", -1)) != 4:
+                    raise ValueError(
+                        "PGC V9.6 curriculum must be mined from the clean V9.3 "
+                        "objective-v4 teacher."
+                    )
+                expected_native_datasets = sorted(
+                    str(Path(path).expanduser().resolve())
+                    for path in combined_dataset_dirs[: self.pgc_native_dataset_count]
+                )
+                actual_native_datasets = sorted(
+                    str(Path(path).expanduser().resolve())
+                    for path in hard_index.get("native_datasets", [])
+                )
+                if actual_native_datasets != expected_native_datasets:
+                    raise ValueError(
+                        "PGC V9.6 hard-role index was mined from different native "
+                        f"datasets: expected={expected_native_datasets} "
+                        f"got={actual_native_datasets}."
+                    )
+                if int(hard_index.get("native_frame_count", -1)) != int(
+                    self.pgc_native_frame_count
+                ):
+                    raise ValueError(
+                        "PGC V9.6 hard-role index native frame count mismatch."
+                    )
+                hard_native_indices = [
+                    int(index) for index in hard_index.get("hard_native_raw_indices", [])
+                ]
+                audited_native_indices = [
+                    int(index)
+                    for index in hard_index.get("audited_native_raw_indices", [])
+                ]
+                all_native_indices = list(range(self.pgc_native_frame_count))
+                if not set(hard_native_indices).issubset(set(audited_native_indices)):
+                    raise ValueError(
+                        "PGC V9.6 hard rows must be a subset of audited native rows."
+                    )
+                if not set(audited_native_indices).issubset(set(all_native_indices)):
+                    raise ValueError(
+                        "PGC V9.6 audited native rows are outside the loaded dataset."
+                    )
+                native_category_by_index = dict(
+                    zip(
+                        all_native_indices,
+                        list(native_role_categories or []),
+                        strict=True,
+                    )
+                )
+                (
+                    self._sample_indices,
+                    self.pgc_v9_hard_curriculum_group_ids,
+                ) = build_pgc_v96_sample_plan(
+                    native_indices=audited_native_indices,
+                    hard_native_indices=hard_native_indices,
+                    original_counterfactual_indices=original,
+                    strict_counterfactual_indices=strict,
+                    strict_relation_categories=strict_categories,
+                    native_role_categories=[
+                        native_category_by_index[index]
+                        for index in audited_native_indices
+                    ],
+                    original_role_categories=list(original_role_categories or []),
+                    strict_role_categories=list(strict_role_categories or []),
+                )
+                logger.info(
+                    "PGC V9.6 curriculum: native_hard=%d native_easy=%d "
+                    "historical_cf=%d strict_cf=%d source=%s",
+                    *(self.pgc_v9_hard_curriculum_group_ids.count(group) for group in range(4)),
+                    hard_index_path,
+                )
+            else:
+                self._sample_indices = build_pgc_v9_sample_indices(
+                    native_indices=list(range(self.pgc_native_frame_count)),
+                    original_counterfactual_indices=original,
+                    strict_counterfactual_indices=strict,
+                    strict_relation_categories=strict_categories,
+                    native_role_categories=native_role_categories,
+                    original_role_categories=original_role_categories,
+                    strict_role_categories=strict_role_categories,
+                )
         elif self.pgc_has_closed_loop_corrective_data:
             if self.pgc_counterfactual_oversample_factor != 1:
                 raise ValueError(

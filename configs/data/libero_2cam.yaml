@@ -100,3 +100,7 @@ train:
   # categories balanced before the outer mixture is constructed.
   pgc_v9_balanced_sampling: false
   pgc_v9_structured_role_sampling: false
+  # V9.6 only: an audited V9.3 role-failure index drives equal native-hard,
+  # native-easy, historical-CF, and strict-CF optimizer-window sampling.
+  pgc_v9_hard_role_curriculum: false
+  pgc_v9_hard_role_index_path: null
