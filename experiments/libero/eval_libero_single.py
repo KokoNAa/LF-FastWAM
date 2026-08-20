@@ -40,6 +40,12 @@ from experiments.libero.counterfactual_diagnostics import (
     CounterfactualEpisodeTracker,
     empty_behavior_counts,
 )
+from experiments.libero.eraf_shadow_audit import (
+    ERAFShadowAuditor,
+    ERAFShadowContract,
+    summarize_eraf_shadow_records,
+    verify_shadow_action_integrity,
+)
 from experiments.libero.language_condition import normalize_instruction_condition
 from experiments.libero.language_interventions import (
     load_language_intervention_manifest,
@@ -110,9 +116,7 @@ def _save_eraf_diagnostics(
             "PGC v9 ERAF diagnostics do not form a two-camera spatial grid."
         )
     predicate_ids = np.asarray(arrays["predicate_logits"])[0].argmax(axis=-1)
-    active_probability = 1.0 / (
-        1.0 + np.exp(-np.asarray(arrays["active_logits"])[0])
-    )
+    active_probability = 1.0 / (1.0 + np.exp(-np.asarray(arrays["active_logits"])[0]))
     phase_ids = np.asarray(arrays["phase_logits"])[0].argmax(axis=-1)
     active_indices = np.flatnonzero(active_probability >= 0.5)
     if active_indices.size == 0:
@@ -167,9 +171,7 @@ def _save_eraf_diagnostics(
         header = Image.new("RGB", (448, 42), "white")
         grasp_anchor = np.asarray(arrays["grasp_anchor"])[0, clause_index]
         goal_anchor = np.asarray(arrays["goal_anchor"])[0, clause_index]
-        interaction_anchor = np.asarray(arrays["interaction_anchor"])[
-            0, clause_index
-        ]
+        interaction_anchor = np.asarray(arrays["interaction_anchor"])[0, clause_index]
         header_draw = ImageDraw.Draw(header)
         header_draw.text(
             (4, 3),
@@ -201,28 +203,16 @@ def _save_eraf_diagnostics(
         "reference_positions": np.asarray(arrays["reference_position"])[0].tolist(),
         "subject_view_visibility": (
             1.0
-            / (
-                1.0
-                + np.exp(
-                    -np.asarray(arrays["subject_view_visibility_logits"])[0]
-                )
-            )
+            / (1.0 + np.exp(-np.asarray(arrays["subject_view_visibility_logits"])[0]))
         ).tolist(),
         "reference_view_visibility": (
             1.0
-            / (
-                1.0
-                + np.exp(
-                    -np.asarray(arrays["reference_view_visibility_logits"])[0]
-                )
-            )
+            / (1.0 + np.exp(-np.asarray(arrays["reference_view_visibility_logits"])[0]))
         ).tolist(),
-        "subject_view_centers": np.asarray(
-            arrays["subject_view_centers"]
-        )[0].tolist(),
-        "reference_view_centers": np.asarray(
-            arrays["reference_view_centers"]
-        )[0].tolist(),
+        "subject_view_centers": np.asarray(arrays["subject_view_centers"])[0].tolist(),
+        "reference_view_centers": np.asarray(arrays["reference_view_centers"])[
+            0
+        ].tolist(),
         "grasp_anchors": np.asarray(arrays["grasp_anchor"])[0].tolist(),
         "goal_anchors": np.asarray(arrays["goal_anchor"])[0].tolist(),
         "interaction_anchors": np.asarray(arrays["interaction_anchor"])[0].tolist(),
@@ -811,9 +801,7 @@ def _predict_action_chunk(
                 pred["policy_guard_selected_counterfactual"]
             ),
             "base_score": float(pred["policy_guard_base_score"]),
-            "counterfactual_score": float(
-                pred["policy_guard_counterfactual_score"]
-            ),
+            "counterfactual_score": float(pred["policy_guard_counterfactual_score"]),
             "score_margin": float(pred["policy_guard_score_margin"]),
             "gate_mode": str(pred["policy_guard_gate_mode"]),
         }
@@ -852,18 +840,38 @@ def _predict_action_chunk(
         ):
             if source_key in pred:
                 policy_guard_diagnostics[output_key] = converter(pred[source_key])
-        if bool(cfg.EVALUATION.get("entity_relation_diagnostics", False)):
+        eraf_shadow_enabled = bool(
+            cfg.EVALUATION.get("entity_relation_shadow_audit", False)
+        )
+        if bool(cfg.EVALUATION.get("entity_relation_diagnostics", False)) or (
+            eraf_shadow_enabled
+        ):
             eraf = pred.get("policy_guard_eraf_diagnostics")
             if eraf is None:
                 raise RuntimeError(
                     "ERAF diagnostics were requested from a non-V9 checkpoint."
                 )
             policy_guard_diagnostics["_entity_relation_raw"] = {
-                name: value.detach().cpu().numpy()
-                if torch.is_tensor(value)
-                else np.asarray(value)
+                name: (
+                    value.detach().cpu().numpy()
+                    if torch.is_tensor(value)
+                    else np.asarray(value)
+                )
                 for name, value in eraf.items()
             }
+        if eraf_shadow_enabled:
+            if "policy_guard_base_action" not in pred:
+                raise RuntimeError(
+                    "ERAF shadow audit requires the explicit immutable Base "
+                    "action returned by PGC v4+."
+                )
+            policy_guard_diagnostics["shadow_action_integrity"] = (
+                verify_shadow_action_integrity(
+                    pred["action"],
+                    pred["policy_guard_base_action"],
+                    gate_mode=str(pred["policy_guard_gate_mode"]),
+                )
+            )
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
@@ -903,9 +911,7 @@ def _resolve_max_steps(cfg: DictConfig) -> int:
         else int(max_steps_cfg)
     )
     if max_steps <= 0:
-        raise ValueError(
-            f"EVALUATION.max_steps must be positive, got {max_steps}."
-        )
+        raise ValueError(f"EVALUATION.max_steps must be positive, got {max_steps}.")
     return max_steps
 
 
@@ -914,9 +920,7 @@ def _capture_libero_sim_state(env: Any) -> np.ndarray:
     inner = getattr(env, "env", None)
     sim = None if inner is None else getattr(inner, "sim", None)
     if sim is None or not hasattr(sim, "get_state"):
-        raise RuntimeError(
-            "PGC closed-loop capture requires env.env.sim.get_state()."
-        )
+        raise RuntimeError("PGC closed-loop capture requires env.env.sim.get_state().")
     state = sim.get_state()
     if hasattr(state, "flatten"):
         state = state.flatten()
@@ -942,9 +946,7 @@ def _write_closed_loop_capture_records(
     capture_root_value = cfg.EVALUATION.get("closed_loop_capture_dir")
     if capture_root_value in (None, "", "null") or not captured_states:
         return 0
-    target_objects = set(
-        counterfactual_diagnostics["counterfactual_target_objects"]
-    )
+    target_objects = set(counterfactual_diagnostics["counterfactual_target_objects"])
     lifted_objects = set(counterfactual_diagnostics["lifted_objects"])
     if target_objects & lifted_objects:
         # V8 first repairs target acquisition. States from episodes that already
@@ -1027,6 +1029,7 @@ def run_single_episode(
     input_h: int,
     model_device: str,
     counterfactual_metadata: Optional[dict[str, Any]] = None,
+    eraf_shadow_auditor: Optional[ERAFShadowAuditor] = None,
 ) -> tuple[
     bool,
     list,
@@ -1076,9 +1079,11 @@ def run_single_episode(
     current_replan_idx = -1
     inference_latencies_ms: list[float] = []
     policy_guard_decisions: list[dict[str, Any]] = []
-    closed_loop_capture_enabled = cfg.EVALUATION.get(
-        "closed_loop_capture_dir"
-    ) not in (None, "", "null")
+    closed_loop_capture_enabled = cfg.EVALUATION.get("closed_loop_capture_dir") not in (
+        None,
+        "",
+        "null",
+    )
     capture_stride_replans = int(
         cfg.EVALUATION.get("closed_loop_capture_stride_replans", 1)
     )
@@ -1086,13 +1091,9 @@ def run_single_episode(
         cfg.EVALUATION.get("closed_loop_capture_max_states_per_episode", 12)
     )
     if capture_stride_replans <= 0 or capture_max_states <= 0:
-        raise ValueError(
-            "PGC closed-loop capture stride/max states must be positive."
-        )
+        raise ValueError("PGC closed-loop capture stride/max states must be positive.")
     if closed_loop_capture_enabled and counterfactual_tracker is None:
-        raise ValueError(
-            "PGC closed-loop capture requires counterfactual diagnostics."
-        )
+        raise ValueError("PGC closed-loop capture requires counterfactual diagnostics.")
     captured_states: list[dict[str, Any]] = []
     inference_replan_index = -1
 
@@ -1152,19 +1153,28 @@ def run_single_episode(
             )
             inference_latencies_ms.append(inference_latency_ms)
             if policy_guard_diagnostics is not None:
-                eraf_raw = policy_guard_diagnostics.pop(
-                    "_entity_relation_raw", None
-                )
+                eraf_raw = policy_guard_diagnostics.pop("_entity_relation_raw", None)
                 if eraf_raw is not None:
-                    policy_guard_diagnostics["entity_relation"] = (
-                        _save_eraf_diagnostics(
-                            cfg=cfg,
-                            images=imgs,
-                            diagnostics=eraf_raw,
-                            episode_idx=episode_idx,
-                            replan_idx=inference_replan_index,
+                    if eraf_shadow_auditor is not None:
+                        policy_guard_diagnostics["entity_relation_shadow"] = (
+                            eraf_shadow_auditor.observe(
+                                obs=obs,
+                                diagnostics=eraf_raw,
+                                episode_idx=episode_idx,
+                                replan_idx=inference_replan_index,
+                                policy_step=policy_steps_executed,
+                            )
                         )
-                    )
+                    if bool(cfg.EVALUATION.get("entity_relation_diagnostics", False)):
+                        policy_guard_diagnostics["entity_relation"] = (
+                            _save_eraf_diagnostics(
+                                cfg=cfg,
+                                images=imgs,
+                                diagnostics=eraf_raw,
+                                episode_idx=episode_idx,
+                                replan_idx=inference_replan_index,
+                            )
+                        )
                 policy_guard_decisions.append(policy_guard_diagnostics)
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -1275,9 +1285,7 @@ def run_single_episode(
             counterfactual_diagnostics=counterfactual_diagnostics,
             captured_states=captured_states,
         )
-        counterfactual_diagnostics["closed_loop_capture_count"] = int(
-            capture_count
-        )
+        counterfactual_diagnostics["closed_loop_capture_count"] = int(capture_count)
     return (
         bool(done),
         replay_images,
@@ -1305,7 +1313,15 @@ def run_single_task(
     input_h: int,
     model_device: str,
 ) -> dict:
-    env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+    eraf_shadow_enabled = bool(
+        cfg.EVALUATION.get("entity_relation_shadow_audit", False)
+    )
+    env, task_description = get_libero_env(
+        task,
+        LIBERO_ENV_RESOLUTION,
+        cfg.get("seed"),
+        camera_segmentations="element" if eraf_shadow_enabled else None,
+    )
     (
         instruction_condition,
         policy_instruction,
@@ -1323,6 +1339,41 @@ def run_single_task(
             intervention_record,
             policy_instruction,
         )
+    eraf_shadow_auditor = None
+    if eraf_shadow_enabled:
+        if instruction_condition not in {"correct", "counterfactual"}:
+            raise ValueError(
+                "EVALUATION.entity_relation_shadow_audit supports only "
+                "correct or counterfactual instructions."
+            )
+        if (
+            not bool(getattr(model, "policy_guard_enabled", False))
+            or int(getattr(model, "policy_guard_version", -1)) != 9
+        ):
+            raise ValueError("ERAF shadow audit requires a PGC v9 checkpoint.")
+        if bool(model.training):
+            raise ValueError(
+                "ERAF shadow audit requires model.eval() so dropout cannot "
+                "perturb the Base rollout."
+            )
+        if str(getattr(model, "policy_guard_gate_mode", "")) != "base":
+            raise ValueError(
+                "ERAF shadow audit is passive and requires "
+                "model.policy_guard.gate_mode=base."
+            )
+        sidecar_value = cfg.EVALUATION.get("entity_relation_shadow_sidecar_dir")
+        if sidecar_value in (None, "", "null"):
+            raise ValueError(
+                "ERAF shadow audit requires "
+                "EVALUATION.entity_relation_shadow_sidecar_dir."
+            )
+        eraf_shadow_auditor = ERAFShadowAuditor(
+            env=env,
+            policy_instruction=policy_instruction,
+            instruction_condition=instruction_condition,
+            contract=ERAFShadowContract.load(str(sidecar_value)),
+            counterfactual_metadata=counterfactual_metadata,
+        )
     counterfactual_diagnostics_enabled = bool(
         cfg.EVALUATION.get("counterfactual_diagnostics", False)
     )
@@ -1331,9 +1382,11 @@ def run_single_task(
             "EVALUATION.counterfactual_diagnostics=true requires "
             "instruction_condition=counterfactual."
         )
-    closed_loop_capture_enabled = cfg.EVALUATION.get(
-        "closed_loop_capture_dir"
-    ) not in (None, "", "null")
+    closed_loop_capture_enabled = cfg.EVALUATION.get("closed_loop_capture_dir") not in (
+        None,
+        "",
+        "null",
+    )
     if closed_loop_capture_enabled and not counterfactual_diagnostics_enabled:
         raise ValueError(
             "EVALUATION.closed_loop_capture_dir requires "
@@ -1360,6 +1413,14 @@ def run_single_task(
         "policy_guard_episode_diagnostics": [],
         "closed_loop_capture_count": 0,
     }
+    if eraf_shadow_enabled:
+        results["eraf_shadow_audit"] = {
+            "enabled": True,
+            "observer_only": True,
+            "executed_policy": "immutable_base",
+            "privileged_labels": "evaluation_only",
+            "records": [],
+        }
     if intervention_record is not None:
         results["pair_id"] = intervention_record.get("pair_id")
     if counterfactual_metadata is not None:
@@ -1397,10 +1458,9 @@ def run_single_task(
             input_h=input_h,
             model_device=model_device,
             counterfactual_metadata=(
-                counterfactual_metadata
-                if counterfactual_diagnostics_enabled
-                else None
+                counterfactual_metadata if counterfactual_diagnostics_enabled else None
             ),
+            eraf_shadow_auditor=eraf_shadow_auditor,
         )
         results["inference_latencies_ms"].extend(inference_latencies_ms)
         results["episode_policy_steps"].append(policy_steps_executed)
@@ -1415,6 +1475,12 @@ def run_single_task(
                 "decisions": policy_guard_decisions,
             }
         )
+        if eraf_shadow_enabled:
+            results["eraf_shadow_audit"]["records"].extend(
+                item["entity_relation_shadow"]
+                for item in policy_guard_decisions
+                if "entity_relation_shadow" in item
+            )
         if horizon_timeout:
             results["horizon_timeout_episodes"].append(trial_idx)
         if success:
@@ -1428,19 +1494,13 @@ def run_single_task(
                     "Counterfactual diagnostics were enabled but no episode "
                     "diagnostics were returned."
                 )
-            counterfactual_diagnostics["policy_steps"] = int(
-                policy_steps_executed
-            )
-            counterfactual_diagnostics["horizon_timeout"] = bool(
-                horizon_timeout
-            )
+            counterfactual_diagnostics["policy_steps"] = int(policy_steps_executed)
+            counterfactual_diagnostics["horizon_timeout"] = bool(horizon_timeout)
             results["counterfactual_episode_diagnostics"].append(
                 counterfactual_diagnostics
             )
             results["closed_loop_capture_count"] += int(
-                counterfactual_diagnostics.get(
-                    "closed_loop_capture_count", 0
-                )
+                counterfactual_diagnostics.get("closed_loop_capture_count", 0)
             )
             category = str(counterfactual_diagnostics["category"])
             results["counterfactual_behavior_counts"][category] += 1
@@ -1506,24 +1566,17 @@ def run_single_task(
     ]
     results["policy_guard_decision_count"] = len(policy_guard_decisions)
     results["policy_guard_override_count"] = sum(
-        int(item["selected_counterfactual"])
-        for item in policy_guard_decisions
+        int(item["selected_counterfactual"]) for item in policy_guard_decisions
     )
-    results["policy_guard_override_rate"] = (
-        float(results["policy_guard_override_count"])
-        / max(1, results["policy_guard_decision_count"])
-    )
+    results["policy_guard_override_rate"] = float(
+        results["policy_guard_override_count"]
+    ) / max(1, results["policy_guard_decision_count"])
     if policy_guard_decisions:
         results["policy_guard_base_score_mean"] = float(
             np.mean([item["base_score"] for item in policy_guard_decisions])
         )
         results["policy_guard_counterfactual_score_mean"] = float(
-            np.mean(
-                [
-                    item["counterfactual_score"]
-                    for item in policy_guard_decisions
-                ]
-            )
+            np.mean([item["counterfactual_score"] for item in policy_guard_decisions])
         )
         results["policy_guard_score_margin_mean"] = float(
             np.mean([item["score_margin"] for item in policy_guard_decisions])
@@ -1544,33 +1597,27 @@ def run_single_task(
         ]
         if supported:
             results["policy_guard_candidate_supported_count"] = sum(supported)
-            results["policy_guard_candidate_supported_rate"] = float(
-                np.mean(supported)
-            )
+            results["policy_guard_candidate_supported_rate"] = float(np.mean(supported))
         delta_rms = [
             float(item["candidate_delta_rms"])
             for item in policy_guard_decisions
             if "candidate_delta_rms" in item
         ]
         if delta_rms:
-            results["policy_guard_candidate_delta_rms_mean"] = float(
-                np.mean(delta_rms)
-            )
-            results["policy_guard_candidate_delta_rms_max"] = float(
-                np.max(delta_rms)
-            )
+            results["policy_guard_candidate_delta_rms_mean"] = float(np.mean(delta_rms))
+            results["policy_guard_candidate_delta_rms_max"] = float(np.max(delta_rms))
         saturation = [
             float(item["candidate_saturation_fraction"])
             for item in policy_guard_decisions
             if "candidate_saturation_fraction" in item
         ]
         if saturation:
-            results[
-                "policy_guard_candidate_saturation_fraction_mean"
-            ] = float(np.mean(saturation))
-            results[
-                "policy_guard_candidate_saturation_fraction_max"
-            ] = float(np.max(saturation))
+            results["policy_guard_candidate_saturation_fraction_mean"] = float(
+                np.mean(saturation)
+            )
+            results["policy_guard_candidate_saturation_fraction_max"] = float(
+                np.max(saturation)
+            )
         for decision_key, result_key in (
             ("target_binding_top1_mass", "policy_guard_target_binding_top1_mass_mean"),
             ("target_binding_entropy", "policy_guard_target_binding_entropy_mean"),
@@ -1586,6 +1633,23 @@ def run_single_task(
             ]
             if values:
                 results[result_key] = float(np.mean(values))
+    if eraf_shadow_enabled:
+        shadow_records = results["eraf_shadow_audit"]["records"]
+        action_integrity = [
+            item["shadow_action_integrity"]
+            for item in policy_guard_decisions
+            if "shadow_action_integrity" in item
+        ]
+        if len(shadow_records) != len(policy_guard_decisions):
+            raise RuntimeError(
+                "ERAF shadow audit did not produce one privileged record per "
+                f"decision: records={len(shadow_records)} "
+                f"decisions={len(policy_guard_decisions)}."
+            )
+        results["eraf_shadow_audit"]["summary"] = summarize_eraf_shadow_records(
+            shadow_records,
+            action_integrity=action_integrity,
+        )
     if instruction_condition == "shuffled":
         # The simulator success predicate still represents the original task.
         results["default_task_successes"] = results["successes"]

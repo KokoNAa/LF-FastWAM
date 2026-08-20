@@ -21,7 +21,15 @@ CLOSED_LOOP_CAPTURE_DIR="${PGC_CLOSED_LOOP_CAPTURE_DIR:-}"
 CLOSED_LOOP_CAPTURE_STRIDE="${PGC_CLOSED_LOOP_CAPTURE_STRIDE_REPLANS:-1}"
 CLOSED_LOOP_CAPTURE_MAX_STATES="${PGC_CLOSED_LOOP_CAPTURE_MAX_STATES_PER_EPISODE:-12}"
 V9_ABLATION="${PGC_V9_ABLATION:-full}"
-ERAF_DIAGNOSTICS="${PGC_ERAF_DIAGNOSTICS:-true}"
+ERAF_SHADOW_AUDIT="${PGC_ERAF_SHADOW_AUDIT:-false}"
+ERAF_SHADOW_SIDECAR_DIR="${PGC_ERAF_SHADOW_SIDECAR_DIR:-}"
+ERAF_DIAGNOSTICS_DEFAULT=true
+if [[ "${ERAF_SHADOW_AUDIT}" == "true" ]]; then
+  # A shadow audit scores every replan directly in JSON. Avoid writing several
+  # thousand PNG/NPZ overlays unless the caller opts in explicitly.
+  ERAF_DIAGNOSTICS_DEFAULT=false
+fi
+ERAF_DIAGNOSTICS="${PGC_ERAF_DIAGNOSTICS:-${ERAF_DIAGNOSTICS_DEFAULT}}"
 ERAF_OVERLAY_DIR="${PGC_ERAF_OVERLAY_DIR:-${OUTPUT_ROOT}/eraf_overlays}"
 
 for value_name in NUM_GPUS NUM_TRIALS NUM_INFERENCE_STEPS; do
@@ -53,6 +61,13 @@ case "${ERAF_DIAGNOSTICS}" in
   true|false) ;;
   *)
     echo "PGC_ERAF_DIAGNOSTICS must be true or false." >&2
+    exit 1
+    ;;
+esac
+case "${ERAF_SHADOW_AUDIT}" in
+  true|false) ;;
+  *)
+    echo "PGC_ERAF_SHADOW_AUDIT must be true or false." >&2
     exit 1
     ;;
 esac
@@ -218,6 +233,10 @@ PGC_CHECKPOINT_REST="${PGC_CHECKPOINT_INFO#*:}"
 PGC_V9_GROUNDING_OBJECTIVE_VERSION="${PGC_CHECKPOINT_REST%%:*}"
 PGC_V9_TRAINING_STAGE="${PGC_CHECKPOINT_REST#*:}"
 echo "Validated PGC v${PGC_CHECKPOINT_VERSION} checkpoint: ${PGC_CHECKPOINT}"
+if [[ "${ERAF_SHADOW_AUDIT}" == "true" && "${PGC_CHECKPOINT_VERSION}" != "9" ]]; then
+  echo "PGC ERAF shadow audit requires a PGC v9 checkpoint." >&2
+  exit 1
+fi
 PGC_CLOSED_LOOP_ENABLED=false
 if [[ "${PGC_CHECKPOINT_VERSION}" == "8" ]]; then
   PGC_CLOSED_LOOP_ENABLED=true
@@ -282,6 +301,7 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
     "model.policy_guard.entity_relation_grounding.entity_only=${V9_ENTITY_ONLY}"
     "model.policy_guard.entity_relation_grounding.use_anchors=${V9_USE_ANCHORS}"
     "EVALUATION.entity_relation_diagnostics=${ERAF_DIAGNOSTICS}"
+    "EVALUATION.entity_relation_shadow_audit=${ERAF_SHADOW_AUDIT}"
   )
   if [[ "${ERAF_DIAGNOSTICS}" == "true" ]]; then
     EXTRA_OVERRIDES+=("EVALUATION.entity_relation_overlay_dir=${ERAF_OVERLAY_DIR}")
@@ -305,6 +325,27 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
       "model.policy_guard.entity_relation_grounding.clause_worst_slot_weight=2.0"
       "model.policy_guard.entity_relation_grounding.clause_multi_group_weight=1.0"
       "model.policy_guard.entity_relation_grounding.clause_adapter_energy_weight=0.01"
+    )
+  fi
+  if [[ "${ERAF_SHADOW_AUDIT}" == "true" ]]; then
+    if [[ "${GATE_MODE}" != "base" ]]; then
+      echo "PGC ERAF shadow audit requires PGC_GATE_MODE=base." >&2
+      exit 1
+    fi
+    if [[ "${CONDITION}" != "correct" && "${CONDITION}" != "counterfactual" ]]; then
+      echo "PGC ERAF shadow audit supports only correct or counterfactual." >&2
+      exit 1
+    fi
+    if [[ -z "${ERAF_SHADOW_SIDECAR_DIR}" ]]; then
+      echo "Set PGC_ERAF_SHADOW_SIDECAR_DIR for shadow workspace/mask metadata." >&2
+      exit 1
+    fi
+    if [[ ! -f "${ERAF_SHADOW_SIDECAR_DIR%/}/index.json" && ! -f "${ERAF_SHADOW_SIDECAR_DIR}" ]]; then
+      echo "ERAF shadow sidecar index not found: ${ERAF_SHADOW_SIDECAR_DIR}" >&2
+      exit 1
+    fi
+    EXTRA_OVERRIDES+=(
+      "EVALUATION.entity_relation_shadow_sidecar_dir=${ERAF_SHADOW_SIDECAR_DIR}"
     )
   fi
 fi
@@ -343,6 +384,8 @@ echo "  closed_loop_capture=${CLOSED_LOOP_CAPTURE_DIR:-disabled}"
 if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
   echo "  v9_ablation=${V9_ABLATION} eraf_diagnostics=${ERAF_DIAGNOSTICS}"
   echo "  eraf_overlay_dir=${ERAF_OVERLAY_DIR}"
+  echo "  eraf_shadow_audit=${ERAF_SHADOW_AUDIT}"
+  echo "  eraf_shadow_sidecar=${ERAF_SHADOW_SIDECAR_DIR:-disabled}"
 fi
 
 EXP_NAME="pgc-${CONDITION}" "${PYTHON_BIN}" \

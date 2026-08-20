@@ -55,6 +55,12 @@ EVALUATION:
   # writes ERAF heatmaps/anchors as a compressed NPZ plus a human-readable PNG.
   entity_relation_diagnostics: false
   entity_relation_overlay_dir: null
+  # Passive V9 online grounding audit. The policy must run with gate_mode=base;
+  # ERAF observes each replan but its outputs never enter the executed action.
+  # The sidecar is read only for its audited workspace/mask/predicate contract;
+  # online labels are generated from the current MuJoCo state.
+  entity_relation_shadow_audit: false
+  entity_relation_shadow_sidecar_dir: null
 
   # Optional external inputs
   dataset_stats_path: null
