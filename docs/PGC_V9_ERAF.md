@@ -73,8 +73,12 @@ V9 action 训练池由数据加载器确定性构造：
 
 - native : counterfactual = `1:1`；
 - counterfactual 内 historical : strict = `1:1`；
-- strict 内 conflict category 等频；
+- objective v2-v4 的 strict 池内 conflict category 等频；
 - 三个池必须非空且互不重叠。
+
+V9.4 grounding 改为在 native、historical CF、strict CF 三个池内部按
+`pair_id/task` 等频采样，同时保持上述两个 `1:1` 外层比例。这样 LIBERO-10
+的多 clause 和少数谓词不会被 native 的长轨迹数量淹没。
 
 ## 4. LIBERO-10 数据构建
 
@@ -284,12 +288,55 @@ V9.2 grounding checkpoint 的累计 step 为 2500。训练时必须同时监控
 原 `pgc_v9_role_swap_accuracy`、两个 top-1 hit 和 anchor loss。之后仍运行相同的
 500-sample grounding gate；objective v3 gate 只接受 step 2500。
 
+#### V9.4 cross-clause structured-role repair
+
+V9.3 的局部 role adapter 已把 subject/reference top-1 修复到较高水平，但最终
+500-sample gate 在 role-swap `77.75%`、multi-clause exact `63.61%` 附近平台。
+原因是每个 clause 只与自己的另一个 role 比较，仍可能绑定到其他 clause 的实体。
+
+V9.4 从已完成的 V9.3 objective-v4 step 2500 单向迁移：
+
+- 冻结完整 V9.3 ERAF，仅训练第二个零初始化 structured-role adapter；
+- 在最多八个 subject/reference slot 之间做跨 clause self-attention；
+- 每个 role 与同状态所有不同 entity ID 的 mask 对比；相同 entity ID（例如两个
+  clause 共用 basket）作为合法共享目标，不构造假负样本；
+- 对多 clause 样本额外优化最差 role，而非让容易 clause 抵消失败；
+- 三个数据池内部按 task/pair 等频，同时严格保持 native:CF 和 historical:strict
+  两级 `1:1`；
+- 新输出层为全零，迁移第 0 步与 V9.3 数值完全一致。
+
+正式训练新增 1000 steps，累计到 step 3500：
+
+```bash
+V9R3_CKPT=/absolute/path/to/v9r3/checkpoints/weights/step_002500.pt
+V94_TAG=v9r4-libero10-structured-role-1000-4gpu-seed42-v1
+V94_LOG=/root/gpufree-data/pgc_v9r4_libero10_structured_role_1000_4gpu.log
+
+nohup env \
+  CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  PGC_V9_GROUNDING_OBJECTIVE_VERSION=5 \
+  RUN_TAG="$V94_TAG" \
+  bash scripts/train_pgc_v9_libero_stage.sh \
+    libero_10 grounding-structured-role 4 \
+    "$BASE" "$V9R3_CKPT" \
+    "$HISTORICAL_CF" "$STRICT_DATASET" \
+    "$NATIVE_SIDECAR" "$HISTORICAL_SIDECAR" "$STRICT_SIDECAR" \
+    42 full \
+  > "$V94_LOG" 2>&1 &
+```
+
+训练中重点监控 `loss_pgc_v9_structured_assignment`、
+`loss_pgc_v9_multi_clause_consistency`、`pgc_v9_structured_assignment_accuracy`、
+`pgc_v9_structured_multi_clause_accuracy` 与两个 structured adapter delta norm。
+step 2750/3000/3250 可使用 `--allow-intermediate` 审计；只有 step 3500 的六项
+grounding gate 全部通过，才允许进入 action stage。
+
 ### 5.3 Stage 2：Grounding–Action，新增 4000 steps
 
-V9.1 Stage 2 从累计 step 1500 开始，最终 checkpoint 为 step 5500。若采用 V9.2
-objective v3，则从 step 2500 开始并最终保存为 step 6500。ERAF LR 为 `2e-5`，
-Proposal LR 为 `1e-4`，且启动命令必须显式设置
-`PGC_V9_GROUNDING_OBJECTIVE_VERSION=3`。
+V9.1 Stage 2 从累计 step 1500 开始，最终 checkpoint 为 step 5500；V9.2/V9.3
+从 step 2500 开始并最终保存为 step 6500；V9.4 从 step 3500 开始并最终保存为
+step 7500。ERAF LR 为 `2e-5`，Proposal LR 为 `1e-4`，启动命令必须显式设置与
+grounding checkpoint 一致的 `PGC_V9_GROUNDING_OBJECTIVE_VERSION`。
 
 ```bash
 ACTION_TAG=v9-libero10-eraf-action-4000-seed42-v1

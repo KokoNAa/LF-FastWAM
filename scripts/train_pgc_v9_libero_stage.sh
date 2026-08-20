@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
+SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|grounding-structured-role|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
 STAGE="${2:?Missing V9 training stage}"
 NPROC_PER_NODE="${3:?Missing GPU count}"
 BASE_CHECKPOINT="${4:?Missing released FastWAM checkpoint}"
@@ -50,8 +50,20 @@ case "${STAGE}" in
     DEFAULT_GROUNDING_OBJECTIVE_VERSION=4
     SAVE_EVERY=250
     ;;
+  grounding-structured-role)
+    START_STEP=2500
+    STAGE_START_STEP=2500
+    DEFAULT_STAGE_STEPS=1000
+    LEARNING_RATE="2.0e-5"
+    CONFIG_STAGE="grounding"
+    DEFAULT_GROUNDING_OBJECTIVE_VERSION=5
+    SAVE_EVERY=250
+    ;;
   action)
-    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "3" || "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "4" ]]; then
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "5" ]]; then
+      START_STEP=3500
+      STAGE_START_STEP=3500
+    elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "3" || "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "4" ]]; then
       START_STEP=2500
       STAGE_START_STEP=2500
     else
@@ -65,7 +77,10 @@ case "${STAGE}" in
     SAVE_EVERY=500
     ;;
   verifier)
-    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "3" || "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "4" ]]; then
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "5" ]]; then
+      START_STEP=7500
+      STAGE_START_STEP=7500
+    elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "3" || "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "4" ]]; then
       START_STEP=6500
       STAGE_START_STEP=6500
     else
@@ -79,7 +94,7 @@ case "${STAGE}" in
     SAVE_EVERY=500
     ;;
   *)
-    echo "Stage must be grounding, grounding-role, grounding-role-adapter, action, or verifier; got ${STAGE}." >&2
+    echo "Stage must be grounding, grounding-role, grounding-role-adapter, grounding-structured-role, action, or verifier; got ${STAGE}." >&2
     exit 1
     ;;
 esac
@@ -99,7 +114,7 @@ ROLE_SWAP_WEIGHT="${PGC_V9_ROLE_SWAP_WEIGHT:-2.0}"
 ROLE_OVERLAP_WEIGHT="${PGC_V9_ROLE_OVERLAP_WEIGHT:-1.0}"
 ROLE_SWAP_MARGIN="${PGC_V9_ROLE_SWAP_MARGIN:-0.20}"
 ROLE_ASSIGNMENT_TEMPERATURE="${PGC_V9_ROLE_ASSIGNMENT_TEMPERATURE:-0.10}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "4" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "4" || "${GROUNDING_OBJECTIVE_VERSION}" == "5" ]]; then
   DEFAULT_ROLE_ASSIGNMENT_WEIGHT=1.0
   DEFAULT_ROLE_ASSIGNMENT_HARD_WEIGHT=0.5
 elif [[ "${GROUNDING_OBJECTIVE_VERSION}" == "3" ]]; then
@@ -111,7 +126,7 @@ else
 fi
 ROLE_ASSIGNMENT_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_WEIGHT:-${DEFAULT_ROLE_ASSIGNMENT_WEIGHT}}"
 ROLE_ASSIGNMENT_HARD_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_HARD_WEIGHT:-${DEFAULT_ROLE_ASSIGNMENT_HARD_WEIGHT}}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "4" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "4" || "${GROUNDING_OBJECTIVE_VERSION}" == "5" ]]; then
   DEFAULT_ROLE_ATTENTION_PRESERVATION_WEIGHT=1.0
   DEFAULT_ROLE_POSITION_PRESERVATION_WEIGHT=0.5
   DEFAULT_ROLE_ANCHOR_PRESERVATION_WEIGHT=1.0
@@ -129,6 +144,21 @@ ROLE_POSITION_PRESERVATION_WEIGHT="${PGC_V9_ROLE_POSITION_PRESERVATION_WEIGHT:-$
 ROLE_ANCHOR_PRESERVATION_WEIGHT="${PGC_V9_ROLE_ANCHOR_PRESERVATION_WEIGHT:-${DEFAULT_ROLE_ANCHOR_PRESERVATION_WEIGHT}}"
 ROLE_RELATION_PRESERVATION_WEIGHT="${PGC_V9_ROLE_RELATION_PRESERVATION_WEIGHT:-${DEFAULT_ROLE_RELATION_PRESERVATION_WEIGHT}}"
 ROLE_ADAPTER_ENERGY_WEIGHT="${PGC_V9_ROLE_ADAPTER_ENERGY_WEIGHT:-${DEFAULT_ROLE_ADAPTER_ENERGY_WEIGHT}}"
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "5" ]]; then
+  DEFAULT_STRUCTURED_ASSIGNMENT_WEIGHT=2.0
+  DEFAULT_STRUCTURED_ASSIGNMENT_HARD_WEIGHT=2.0
+  DEFAULT_MULTI_CLAUSE_CONSISTENCY_WEIGHT=1.0
+  STRUCTURED_ROLE_SAMPLING=true
+else
+  DEFAULT_STRUCTURED_ASSIGNMENT_WEIGHT=0.0
+  DEFAULT_STRUCTURED_ASSIGNMENT_HARD_WEIGHT=0.0
+  DEFAULT_MULTI_CLAUSE_CONSISTENCY_WEIGHT=0.0
+  STRUCTURED_ROLE_SAMPLING=false
+fi
+STRUCTURED_ASSIGNMENT_WEIGHT="${PGC_V9_STRUCTURED_ASSIGNMENT_WEIGHT:-${DEFAULT_STRUCTURED_ASSIGNMENT_WEIGHT}}"
+STRUCTURED_ASSIGNMENT_TEMPERATURE="${PGC_V9_STRUCTURED_ASSIGNMENT_TEMPERATURE:-0.10}"
+STRUCTURED_ASSIGNMENT_HARD_WEIGHT="${PGC_V9_STRUCTURED_ASSIGNMENT_HARD_WEIGHT:-${DEFAULT_STRUCTURED_ASSIGNMENT_HARD_WEIGHT}}"
+MULTI_CLAUSE_CONSISTENCY_WEIGHT="${PGC_V9_MULTI_CLAUSE_CONSISTENCY_WEIGHT:-${DEFAULT_MULTI_CLAUSE_CONSISTENCY_WEIGHT}}"
 case "${STAGE}" in
   grounding)
     if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" ]]; then
@@ -148,9 +178,15 @@ case "${STAGE}" in
       exit 1
     fi
     ;;
+  grounding-structured-role)
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "5" ]]; then
+      echo "Formal V9.4 structured role repair requires objective version 5." >&2
+      exit 1
+    fi
+    ;;
   action|verifier)
-    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" && "${GROUNDING_OBJECTIVE_VERSION}" != "3" && "${GROUNDING_OBJECTIVE_VERSION}" != "4" ]]; then
-      echo "V9 action/verifier requires grounding objective version 2, 3, or 4." >&2
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" && "${GROUNDING_OBJECTIVE_VERSION}" != "3" && "${GROUNDING_OBJECTIVE_VERSION}" != "4" && "${GROUNDING_OBJECTIVE_VERSION}" != "5" ]]; then
+      echo "V9 action/verifier requires grounding objective version 2, 3, 4, or 5." >&2
       exit 1
     fi
     ;;
@@ -253,13 +289,24 @@ if stage == "grounding":
         raise SystemExit(
             "V9 grounding must warm-start from an exact suite-specific PGC V5 checkpoint."
         )
-elif stage in {"grounding-role", "grounding-role-adapter"}:
+elif stage in {
+    "grounding-role",
+    "grounding-role-adapter",
+    "grounding-structured-role",
+}:
     metadata = payload.get("architecture_metadata") or {}
     if fmt != "fastwam_policy_guard_v9" or version != 9:
         raise SystemExit("V9 role repair must resume from a V9 checkpoint.")
-    if int(metadata.get("eraf_grounding_objective_version", -1)) != 2:
+    expected_saved_objective = (
+        4 if stage == "grounding-structured-role" else 2
+    )
+    if (
+        int(metadata.get("eraf_grounding_objective_version", -1))
+        != expected_saved_objective
+    ):
         raise SystemExit(
-            "V9 role repair requires the completed V9.1 objective-v2 checkpoint."
+            "V9 role repair requires the completed objective-v"
+            f"{expected_saved_objective} grounding checkpoint."
         )
     if int(payload.get("step", -1)) != int(expected_step):
         raise SystemExit(
@@ -268,10 +315,22 @@ elif stage in {"grounding-role", "grounding-role-adapter"}:
         )
     if metadata.get("eraf_training_stage") != "grounding":
         raise SystemExit("V9 role repair requires a grounding-stage checkpoint.")
-    expected_objective = 3 if stage == "grounding-role" else 4
+    expected_objective = {
+        "grounding-role": 3,
+        "grounding-role-adapter": 4,
+        "grounding-structured-role": 5,
+    }[stage]
     if int(requested_objective) != expected_objective:
         raise SystemExit(
             f"{stage} must configure objective version {expected_objective}."
+        )
+    if stage == "grounding-structured-role" and (
+        metadata.get("eraf_role_adapter_trainable_scope")
+        != "role_assignment_adapter_only"
+    ):
+        raise SystemExit(
+            "V9.4 must warm-start from the completed V9.3 role-adapter-only "
+            "checkpoint."
         )
 else:
     if fmt != "fastwam_policy_guard_v9" or version != 9:
@@ -367,8 +426,9 @@ echo "  ablation=${ABLATION} entity_only=${ENTITY_ONLY} use_anchors=${USE_ANCHOR
 echo "  effective_batch=$((NPROC_PER_NODE * GRADIENT_ACCUMULATION_STEPS)) (${NPROC_PER_NODE} GPUs x batch1 x grad_accum${GRADIENT_ACCUMULATION_STEPS})"
 echo "  grounding_objective=v${GROUNDING_OBJECTIVE_VERSION} attention_mask=${ATTENTION_MASK_WEIGHT} role_swap=${ROLE_SWAP_WEIGHT} role_overlap=${ROLE_OVERLAP_WEIGHT} margin=${ROLE_SWAP_MARGIN}"
 echo "  role_assignment=${ROLE_ASSIGNMENT_WEIGHT} temperature=${ROLE_ASSIGNMENT_TEMPERATURE} hard_weight=${ROLE_ASSIGNMENT_HARD_WEIGHT}"
+echo "  structured_assignment=${STRUCTURED_ASSIGNMENT_WEIGHT} temperature=${STRUCTURED_ASSIGNMENT_TEMPERATURE} hard_weight=${STRUCTURED_ASSIGNMENT_HARD_WEIGHT} multi_clause=${MULTI_CLAUSE_CONSISTENCY_WEIGHT}"
 echo "  role_preservation=attention:${ROLE_ATTENTION_PRESERVATION_WEIGHT} position:${ROLE_POSITION_PRESERVATION_WEIGHT} anchor:${ROLE_ANCHOR_PRESERVATION_WEIGHT} relation:${ROLE_RELATION_PRESERVATION_WEIGHT} energy:${ROLE_ADAPTER_ENERGY_WEIGHT}"
-echo "  mixture=native:CF 1:1; CF=historical:strict 1:1; strict=relation-balanced"
+echo "  mixture=native:CF 1:1; CF=historical:strict 1:1; structured_task_balance=${STRUCTURED_ROLE_SAMPLING}"
 echo "  init=${INIT_CHECKPOINT}"
 echo "  native=${NATIVE_DATASET}"
 echo "  historical_cf=${ORIGINAL_CF_DATASET}"
@@ -386,6 +446,7 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   data.train.pgc_entity_relation_supervision_required=true \
   "data.train.pgc_entity_relation_sidecar_dirs=${SIDECAR_JSON}" \
   data.train.pgc_v9_balanced_sampling=true \
+  "data.train.pgc_v9_structured_role_sampling=${STRUCTURED_ROLE_SAMPLING}" \
   "++data.train.pretrained_norm_stats=${STATS_PATH}" \
   "data.train.text_embedding_cache_dir=${CACHE_DIR}" \
   "seed=${TRAIN_SEED}" \
@@ -421,6 +482,11 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.entity_relation_grounding.role_assignment_temperature=${ROLE_ASSIGNMENT_TEMPERATURE}" \
   "model.policy_guard.entity_relation_grounding.role_assignment_hard_weight=${ROLE_ASSIGNMENT_HARD_WEIGHT}" \
   model.policy_guard.entity_relation_grounding.role_adapter_hidden_dim=256 \
+  "model.policy_guard.entity_relation_grounding.structured_assignment_weight=${STRUCTURED_ASSIGNMENT_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.structured_assignment_temperature=${STRUCTURED_ASSIGNMENT_TEMPERATURE}" \
+  "model.policy_guard.entity_relation_grounding.structured_assignment_hard_weight=${STRUCTURED_ASSIGNMENT_HARD_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.multi_clause_consistency_weight=${MULTI_CLAUSE_CONSISTENCY_WEIGHT}" \
+  model.policy_guard.entity_relation_grounding.structured_role_adapter_hidden_dim=256 \
   "model.policy_guard.entity_relation_grounding.role_attention_preservation_weight=${ROLE_ATTENTION_PRESERVATION_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.role_position_preservation_weight=${ROLE_POSITION_PRESERVATION_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.role_anchor_preservation_weight=${ROLE_ANCHOR_PRESERVATION_WEIGHT}" \

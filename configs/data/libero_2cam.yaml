@@ -99,3 +99,4 @@ train:
   # V9: exact native:CF=1:1, original:strict=1:1, with strict conflict
   # categories balanced before the outer mixture is constructed.
   pgc_v9_balanced_sampling: false
+  pgc_v9_structured_role_sampling: false

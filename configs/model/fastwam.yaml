@@ -269,6 +269,9 @@ policy_guard:
     # bidirectional subject/reference assignment with online hard mining.
     # Version 4 (V9.3) freezes the complete V9.1 backbone and learns only a
     # zero-init role residual adapter with same-state teacher preservation.
+    # Version 5 (V9.4) freezes V9.3 and learns a second zero-init structured
+    # adapter across all clauses, using every different same-state entity as
+    # a role negative and emphasizing the worst clause in multi-clause tasks.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -293,6 +296,11 @@ policy_guard:
     role_assignment_temperature: 0.10
     role_assignment_hard_weight: 0.0
     role_adapter_hidden_dim: 256
+    structured_assignment_weight: 0.0
+    structured_assignment_temperature: 0.10
+    structured_assignment_hard_weight: 0.0
+    multi_clause_consistency_weight: 0.0
+    structured_role_adapter_hidden_dim: 256
     role_attention_preservation_weight: 0.0
     role_position_preservation_weight: 0.0
     role_anchor_preservation_weight: 0.0

@@ -68,12 +68,8 @@ def _role_group_summary(
     clauses: list[Mapping[str, Any]],
 ) -> dict[str, Any]:
     full = [bool(item["full_mask_correct"]) for item in clauses]
-    exclusive_items = [
-        item for item in clauses if bool(item["exclusive_mask_valid"])
-    ]
-    exclusive = [
-        bool(item["exclusive_mask_correct"]) for item in exclusive_items
-    ]
+    exclusive_items = [item for item in clauses if bool(item["exclusive_mask_valid"])]
+    exclusive = [bool(item["exclusive_mask_correct"]) for item in exclusive_items]
     full_failures = [item for item in clauses if not item["full_mask_correct"]]
     recovered = [
         item
@@ -85,9 +81,7 @@ def _role_group_summary(
         for item in full_failures
         if item["exclusive_mask_valid"] and not item["exclusive_mask_correct"]
     ]
-    ambiguous = [
-        item for item in full_failures if not item["exclusive_mask_valid"]
-    ]
+    ambiguous = [item for item in full_failures if not item["exclusive_mask_valid"]]
     return {
         "clauses": len(clauses),
         "full_mask": {
@@ -124,12 +118,10 @@ def _role_group_summary(
             float(item["full_reference_margin"]) for item in clauses
         ),
         "exclusive_subject_margin": _distribution(
-            float(item["exclusive_subject_margin"])
-            for item in exclusive_items
+            float(item["exclusive_subject_margin"]) for item in exclusive_items
         ),
         "exclusive_reference_margin": _distribution(
-            float(item["exclusive_reference_margin"])
-            for item in exclusive_items
+            float(item["exclusive_reference_margin"]) for item in exclusive_items
         ),
     }
 
@@ -153,8 +145,7 @@ def _role_residual_audit(records: list[Mapping[str, Any]]) -> dict[str, Any]:
         for clause in clauses:
             values[str(clause.get(field, "unknown"))].append(clause)
         grouped[f"by_{field}"] = {
-            key: _role_group_summary(items)
-            for key, items in sorted(values.items())
+            key: _role_group_summary(items) for key, items in sorted(values.items())
         }
 
     full_accuracy = overall["full_mask"]["accuracy"]
@@ -229,9 +220,7 @@ def compute_grounding_gate_report(
         "samples": len(records),
         "subject_top1_in_gt_mask": _safe_rate(subject_hits),
         "reference_top1_in_gt_mask": _safe_rate(reference_hits),
-        "relation_macro_f1": _macro_f1(
-            relation_targets, relation_predictions
-        ),
+        "relation_macro_f1": _macro_f1(relation_targets, relation_predictions),
         "role_swap_accuracy": _safe_rate(role_swap),
         "visible_goal_anchor_median_error_cm": anchor_median_cm,
         "clause_exact_match": _safe_rate(clause_exact),
@@ -239,20 +228,13 @@ def compute_grounding_gate_report(
         "multi_clause_samples": len(multi_clause_exact),
     }
     checks = {
-        "subject_top1_at_least_80pct": (
-            metrics["subject_top1_in_gt_mask"] >= 0.80
-        ),
-        "reference_top1_at_least_80pct": (
-            metrics["reference_top1_in_gt_mask"] >= 0.80
-        ),
-        "relation_macro_f1_at_least_90pct": (
-            metrics["relation_macro_f1"] >= 0.90
-        ),
+        "subject_top1_at_least_80pct": (metrics["subject_top1_in_gt_mask"] >= 0.80),
+        "reference_top1_at_least_80pct": (metrics["reference_top1_in_gt_mask"] >= 0.80),
+        "relation_macro_f1_at_least_90pct": (metrics["relation_macro_f1"] >= 0.90),
         "role_swap_at_least_90pct": metrics["role_swap_accuracy"] >= 0.90,
         "visible_goal_anchor_median_at_most_5cm": anchor_median_cm <= 5.0,
         "multi_clause_exact_at_least_80pct": (
-            bool(multi_clause_exact)
-            and metrics["multi_clause_exact_match"] >= 0.80
+            bool(multi_clause_exact) and metrics["multi_clause_exact_match"] >= 0.80
         ),
     }
     return {
@@ -352,9 +334,7 @@ def _sample_record(
     # same fixture. They have no meaningful role-swap negative and must not
     # make the grounding gate mathematically impossible.
     role_valid = (
-        subject_valid
-        & reference_valid
-        & (subject_entity_ids != reference_entity_ids)
+        subject_valid & reference_valid & (subject_entity_ids != reference_entity_ids)
     )
     role_swap_correct = []
     role_audit_clauses = []
@@ -366,9 +346,7 @@ def _sample_record(
     )
     task = prompt[len(prompt_prefix) :] if prompt.startswith(prompt_prefix) else prompt
     for index in np.flatnonzero(role_valid):
-        subject_own = float(
-            (subject_attention[index] * subject_target[index]).sum()
-        )
+        subject_own = float((subject_attention[index] * subject_target[index]).sum())
         subject_wrong = float(
             (subject_attention[index] * reference_target[index]).sum()
         )
@@ -378,9 +356,7 @@ def _sample_record(
         reference_wrong = float(
             (reference_attention[index] * subject_target[index]).sum()
         )
-        full_correct = (
-            subject_own > subject_wrong and reference_own > reference_wrong
-        )
+        full_correct = subject_own > subject_wrong and reference_own > reference_wrong
         role_swap_correct.append(full_correct)
 
         subject_mask = subject_target[index]
@@ -530,25 +506,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if payload.get("format") != "fastwam_policy_guard_v9":
         raise ValueError("Grounding gate requires a PGC v9 checkpoint.")
     metadata = payload.get("architecture_metadata") or {}
-    objective_version = int(
-        metadata.get("eraf_grounding_objective_version", 1)
-    )
-    expected_step = {2: 1500, 3: 2500, 4: 2500}.get(objective_version)
+    objective_version = int(metadata.get("eraf_grounding_objective_version", 1))
+    expected_step = {2: 1500, 3: 2500, 4: 2500, 5: 3500}.get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
-    intermediate_v93 = (
-        bool(args.allow_intermediate)
-        and objective_version == 4
-        and checkpoint_step in {1750, 2000, 2250}
+    intermediate_checkpoint = bool(args.allow_intermediate) and (
+        (objective_version == 4 and checkpoint_step in {1750, 2000, 2250})
+        or (objective_version == 5 and checkpoint_step in {2750, 3000, 3250})
     )
     if (
         expected_step is None
-        or (checkpoint_step != expected_step and not intermediate_v93)
+        or (checkpoint_step != expected_step and not intermediate_checkpoint)
         or metadata.get("eraf_training_stage") != "grounding"
     ):
         raise ValueError(
             "The pre-action grounding gate requires the completed V9 "
             "grounding-stage checkpoint: objective v2 at step 1500 or "
-            "objective v3/v4 at step 2500."
+            "objective v3/v4 at step 2500 or objective v5 at step 3500."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())
@@ -596,9 +569,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 rand_device="cpu",
                 tiled=False,
             )
-        dataset_index = int(
-            torch.as_tensor(sample["pgc_dataset_index"]).item()
-        )
+        dataset_index = int(torch.as_tensor(sample["pgc_dataset_index"]).item())
         sidecar = dataset.pgc_entity_relation_indices[dataset_index]
         records.append(
             _sample_record(
@@ -617,7 +588,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         {
             "checkpoint": str(checkpoint),
             "checkpoint_step": payload.get("step"),
-            "intermediate_checkpoint": intermediate_v93,
+            "intermediate_checkpoint": intermediate_checkpoint,
             "training_config": str(config_path),
             "seed": args.seed,
         }
@@ -640,7 +611,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-intermediate",
         action="store_true",
-        help="Audit V9.3 checkpoints at steps 1750/2000/2250 without treating them as final action-stage inputs.",
+        help=(
+            "Audit V9.3 steps 1750/2000/2250 or V9.4 steps "
+            "2750/3000/3250 without treating them as final action inputs."
+        ),
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(

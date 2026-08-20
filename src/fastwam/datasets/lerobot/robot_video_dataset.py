@@ -1,4 +1,5 @@
 import hashlib
+import math
 import os
 from pathlib import Path
 from typing import Optional
@@ -36,6 +37,7 @@ from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Norm
 from fastwam.utils.logging_config import get_logger
 from fastwam.utils import misc, pytorch_utils
 from accelerate import PartialState
+
 logger = get_logger(__name__)
 
 
@@ -52,9 +54,7 @@ def build_pgc_sample_indices(
     """Build deterministic native/CF indices with an optional exact 1:1 mix."""
     native_frame_count = int(native_frame_count)
     total_frame_count = int(total_frame_count)
-    counterfactual_oversample_factor = int(
-        counterfactual_oversample_factor
-    )
+    counterfactual_oversample_factor = int(counterfactual_oversample_factor)
     if not 0 <= native_frame_count <= total_frame_count:
         raise ValueError("PGC native/total frame counts are inconsistent.")
     if counterfactual_oversample_factor < 1:
@@ -103,25 +103,21 @@ def build_pgc_v8_sample_indices(
     to drown out the deployment-state corrections.
     """
     native_frame_count = int(native_frame_count)
-    offline_counterfactual_frame_count = int(
-        offline_counterfactual_frame_count
-    )
+    offline_counterfactual_frame_count = int(offline_counterfactual_frame_count)
     total_frame_count = int(total_frame_count)
     closed_loop_oversample_factor = int(closed_loop_oversample_factor)
     if not (
-        0 <= native_frame_count <= offline_counterfactual_frame_count
+        0
+        <= native_frame_count
+        <= offline_counterfactual_frame_count
         <= total_frame_count
     ):
         raise ValueError("PGC V8 frame boundaries are inconsistent.")
     if closed_loop_oversample_factor < 1:
         raise ValueError("PGC V8 closed-loop oversample factor must be >= 1.")
     native = list(range(native_frame_count))
-    offline = list(
-        range(native_frame_count, offline_counterfactual_frame_count)
-    )
-    corrective = list(
-        range(offline_counterfactual_frame_count, total_frame_count)
-    )
+    offline = list(range(native_frame_count, offline_counterfactual_frame_count))
+    corrective = list(range(offline_counterfactual_frame_count, total_frame_count))
     if not native or not offline or not corrective:
         raise ValueError(
             "PGC V8 requires non-empty native, offline CF, and closed-loop CF data."
@@ -135,9 +131,7 @@ def build_pgc_v8_sample_indices(
         return (values * repeats)[:count]
 
     target_count = max(len(native), len(counterfactual))
-    return _repeat_to(native, target_count) + _repeat_to(
-        counterfactual, target_count
-    )
+    return _repeat_to(native, target_count) + _repeat_to(counterfactual, target_count)
 
 
 def _repeat_indices(values: list[int], count: int) -> list[int]:
@@ -147,12 +141,44 @@ def _repeat_indices(values: list[int], count: int) -> list[int]:
     return (list(values) * repeats)[: int(count)]
 
 
+def _balance_indices_by_category(
+    indices: list[int], categories: list[str]
+) -> tuple[list[int], int]:
+    """Repeat and interleave a pool so every audited category is equiprobable."""
+    if len(indices) != len(categories):
+        raise ValueError("PGC v9 category labels must cover their sample pool.")
+    grouped: dict[str, list[int]] = {}
+    for index, category in zip(indices, categories, strict=True):
+        category = str(category).strip()
+        if not category:
+            raise ValueError("PGC v9 sample categories must be non-empty.")
+        grouped.setdefault(category, []).append(int(index))
+    if not grouped:
+        raise ValueError("Cannot balance an empty PGC v9 category pool.")
+    category_count = max(len(values) for values in grouped.values())
+    balanced_groups = {
+        category: _repeat_indices(values, category_count)
+        for category, values in sorted(grouped.items())
+    }
+    return (
+        [
+            balanced_groups[category][position]
+            for position in range(category_count)
+            for category in sorted(balanced_groups)
+        ],
+        len(balanced_groups),
+    )
+
+
 def build_pgc_v9_sample_indices(
     *,
     native_indices: list[int],
     original_counterfactual_indices: list[int],
     strict_counterfactual_indices: list[int],
     strict_relation_categories: list[str],
+    native_role_categories: Optional[list[str]] = None,
+    original_role_categories: Optional[list[str]] = None,
+    strict_role_categories: Optional[list[str]] = None,
 ) -> list[int]:
     """Build the exact V9 native/original/strict training mixture.
 
@@ -173,22 +199,52 @@ def build_pgc_v9_sample_indices(
         raise ValueError(
             "PGC v9 strict relation labels must cover every strict-CF sample."
         )
-    if len(set(native + original + strict)) != len(native) + len(original) + len(strict):
+    if len(set(native + original + strict)) != len(native) + len(original) + len(
+        strict
+    ):
         raise ValueError("PGC v9 sample pools must be disjoint.")
 
-    grouped: dict[str, list[int]] = {}
-    for index, category in zip(strict, categories, strict=True):
-        grouped.setdefault(category, []).append(index)
-    category_count = max(len(values) for values in grouped.values())
-    balanced_groups = {
-        category: _repeat_indices(values, category_count)
-        for category, values in sorted(grouped.items())
-    }
-    strict_balanced = [
-        balanced_groups[category][position]
-        for position in range(category_count)
-        for category in sorted(balanced_groups)
-    ]
+    structured_categories = (
+        native_role_categories,
+        original_role_categories,
+        strict_role_categories,
+    )
+    if any(value is not None for value in structured_categories) and not all(
+        value is not None for value in structured_categories
+    ):
+        raise ValueError(
+            "PGC v9.4 structured sampling requires role categories for all "
+            "three native/original/strict pools."
+        )
+
+    if all(value is not None for value in structured_categories):
+        native, native_category_total = _balance_indices_by_category(
+            native, list(native_role_categories or [])
+        )
+        original, original_category_total = _balance_indices_by_category(
+            original, list(original_role_categories or [])
+        )
+        strict_composite_categories = [
+            f"{role}::{relation}"
+            for role, relation in zip(
+                list(strict_role_categories or []), categories, strict=True
+            )
+        ]
+        strict_balanced, strict_category_total = _balance_indices_by_category(
+            strict, strict_composite_categories
+        )
+        # A complete interleaving cycle preserves every task/pair category.
+        # Native occupies twice the per-CF-subset size, hence its reduced unit.
+        exact_ratio_unit = math.lcm(
+            original_category_total,
+            strict_category_total,
+            native_category_total // math.gcd(native_category_total, 2),
+        )
+    else:
+        strict_balanced, strict_category_total = _balance_indices_by_category(
+            strict, categories
+        )
+        exact_ratio_unit = strict_category_total
 
     # Choose a common CF-subset size that is also a multiple of the number of
     # strict categories.  This preserves all three ratios exactly even when
@@ -199,10 +255,9 @@ def build_pgc_v9_sample_indices(
         len(strict_balanced),
         (len(native) + 1) // 2,
     )
-    category_total = len(balanced_groups)
     counterfactual_subset_count = (
-        (minimum_subset_count + category_total - 1) // category_total
-    ) * category_total
+        (minimum_subset_count + exact_ratio_unit - 1) // exact_ratio_unit
+    ) * exact_ratio_unit
     original_balanced = _repeat_indices(original, counterfactual_subset_count)
     strict_balanced = _repeat_indices(strict_balanced, counterfactual_subset_count)
     counterfactual = original_balanced + strict_balanced
@@ -227,8 +282,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
-        concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
-        override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        concat_multi_camera: str = "horizontal",  # "horizontal", "vertical", "robotwin", or None
+        override_instruction: Optional[
+            str
+        ] = None,  # whether to hardcode a specific instruction for all samples, for debugging
         counterfactual_manifest_path: Optional[str] = None,
         counterfactual_negative_probability: float = 0.0,
         pgc_counterfactual_dataset_dirs: Optional[list[str]] = None,
@@ -241,22 +298,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_entity_relation_supervision_required: bool = False,
         pgc_entity_relation_sidecar_dirs: Optional[list[str]] = None,
         pgc_v9_balanced_sampling: bool = False,
+        pgc_v9_structured_role_sampling: bool = False,
     ):
         native_dataset_dirs = [str(path) for path in dataset_dirs]
         pgc_counterfactual_dataset_dirs = [
             str(path) for path in (pgc_counterfactual_dataset_dirs or [])
         ]
         pgc_closed_loop_corrective_dataset_dirs = [
-            str(path)
-            for path in (pgc_closed_loop_corrective_dataset_dirs or [])
+            str(path) for path in (pgc_closed_loop_corrective_dataset_dirs or [])
         ]
         duplicate_dirs = set(native_dataset_dirs) & set(
-            pgc_counterfactual_dataset_dirs
-            + pgc_closed_loop_corrective_dataset_dirs
+            pgc_counterfactual_dataset_dirs + pgc_closed_loop_corrective_dataset_dirs
         )
-        duplicate_counterfactual_dirs = set(
-            pgc_counterfactual_dataset_dirs
-        ) & set(pgc_closed_loop_corrective_dataset_dirs)
+        duplicate_counterfactual_dirs = set(pgc_counterfactual_dataset_dirs) & set(
+            pgc_closed_loop_corrective_dataset_dirs
+        )
         if duplicate_dirs:
             raise ValueError(
                 "PGC direct-counterfactual datasets must be distinct from the "
@@ -284,9 +340,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             pgc_counterfactual_dataset_dirs
             + self.pgc_closed_loop_corrective_dataset_dirs
         )
-        self.pgc_has_counterfactual_data = bool(
-            self.pgc_counterfactual_dataset_dirs
-        )
+        self.pgc_has_counterfactual_data = bool(self.pgc_counterfactual_dataset_dirs)
         self.pgc_has_closed_loop_corrective_data = bool(
             self.pgc_closed_loop_corrective_dataset_dirs
         )
@@ -297,15 +351,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             raise ValueError(
                 "`pgc_closed_loop_corrective_oversample_factor` must be >= 1."
             )
-        self.pgc_episode_language_pairs: dict[
-            int, dict[int, dict[str, object]]
-        ] = {
-            self.pgc_native_dataset_count + offset: (
-                load_pgc_episode_language_pairs(dataset_dir)
-            )
-            for offset, dataset_dir in enumerate(
-                self.pgc_counterfactual_dataset_dirs
-            )
+        self.pgc_episode_language_pairs: dict[int, dict[int, dict[str, object]]] = {
+            self.pgc_native_dataset_count
+            + offset: (load_pgc_episode_language_pairs(dataset_dir))
+            for offset, dataset_dir in enumerate(self.pgc_counterfactual_dataset_dirs)
         }
         self.pgc_closed_loop_corrective_indices: dict[
             int, dict[int, dict[str, object]]
@@ -329,6 +378,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             pgc_entity_relation_supervision_required
         )
         self.pgc_v9_balanced_sampling = bool(pgc_v9_balanced_sampling)
+        self.pgc_v9_structured_role_sampling = bool(pgc_v9_structured_role_sampling)
+        if self.pgc_v9_structured_role_sampling and not self.pgc_v9_balanced_sampling:
+            raise ValueError(
+                "PGC v9.4 structured role sampling requires v9 balanced sampling."
+            )
         if self.pgc_completion_phase_supervision_required and not (
             self.pgc_counterfactual_dataset_dirs
         ):
@@ -336,14 +390,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 "PGC V5 completion supervision requires at least one direct "
                 "counterfactual dataset."
             )
-        self.pgc_completion_phase_indices: dict[
-            int, dict[int, dict[str, object]]
-        ] = {}
+        self.pgc_completion_phase_indices: dict[int, dict[int, dict[str, object]]] = {}
         if self.pgc_completion_phase_supervision_required:
             self.pgc_completion_phase_indices = {
-                self.pgc_native_dataset_count + offset: (
-                    load_pgc_completion_phase_index(dataset_dir)
-                )
+                self.pgc_native_dataset_count
+                + offset: (load_pgc_completion_phase_index(dataset_dir))
                 for offset, dataset_dir in enumerate(
                     self.pgc_counterfactual_dataset_dirs
                 )
@@ -358,9 +409,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.pgc_target_mask_indices: dict[int, dict[str, object]] = {}
         if self.pgc_target_mask_supervision_required:
             self.pgc_target_mask_indices = {
-                self.pgc_native_dataset_count + offset: (
-                    load_pgc_target_mask_index(dataset_dir)
-                )
+                self.pgc_native_dataset_count
+                + offset: (load_pgc_target_mask_index(dataset_dir))
                 for offset, dataset_dir in enumerate(
                     self.pgc_counterfactual_dataset_dirs
                 )
@@ -385,8 +435,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             native_dataset_dirs + self.pgc_counterfactual_dataset_dirs
         )
         pgc_entity_relation_sidecar_dirs = [
-            str(path)
-            for path in (pgc_entity_relation_sidecar_dirs or [])
+            str(path) for path in (pgc_entity_relation_sidecar_dirs or [])
         ]
         if self.pgc_entity_relation_supervision_required and len(
             pgc_entity_relation_sidecar_dirs
@@ -401,9 +450,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if self.pgc_entity_relation_supervision_required:
             self.pgc_entity_relation_indices = {
                 dataset_index: load_pgc_entity_relation_index(path)
-                for dataset_index, path in enumerate(
-                    pgc_entity_relation_sidecar_dirs
-                )
+                for dataset_index, path in enumerate(pgc_entity_relation_sidecar_dirs)
             }
             for dataset_index, dataset_dir in enumerate(combined_dataset_dirs):
                 audited_dataset = os.path.realpath(
@@ -424,18 +471,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     "PGC v9 sidecars disagree on mask size: "
                     f"{sorted(eraf_mask_shapes)}."
                 )
-            self.pgc_entity_relation_mask_shape = next(
-                iter(eraf_mask_shapes)
-            )
+            self.pgc_entity_relation_mask_shape = next(iter(eraf_mask_shapes))
         else:
             self.pgc_entity_relation_mask_shape = (56, 112)
         self._pgc_entity_relation_cache: OrderedDict[
             tuple[int, int], dict[str, np.ndarray]
         ] = OrderedDict()
         self._pgc_entity_relation_cache_size = 2
-        self.pgc_balance_native_counterfactual = bool(
-            pgc_balance_native_counterfactual
-        )
+        self.pgc_balance_native_counterfactual = bool(pgc_balance_native_counterfactual)
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=combined_dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
@@ -478,8 +521,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             + self.pgc_offline_counterfactual_dataset_count
         )
         self.pgc_offline_counterfactual_frame_end = sum(
-            int(dataset.num_frames)
-            for dataset in underlying[:offline_dataset_end]
+            int(dataset.num_frames) for dataset in underlying[:offline_dataset_end]
         )
         total_frame_count = sum(int(dataset.num_frames) for dataset in underlying)
         if self.pgc_v9_balanced_sampling:
@@ -545,12 +587,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 if (
                     pair_audit.get("strict_conflict") is not True
                     or pair_audit.get("strict_conflict_type") != category
-                    or not isinstance(
-                        pair_audit.get("strict_replay_audit"), dict
-                    )
-                    or pair_audit["strict_replay_audit"].get(
-                        "strict_conflict_passed"
-                    )
+                    or not isinstance(pair_audit.get("strict_replay_audit"), dict)
+                    or pair_audit["strict_replay_audit"].get("strict_conflict_passed")
                     is not True
                 ):
                     raise ValueError(
@@ -558,11 +596,61 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                         f"bidirectional audit for episode {episode_index}."
                     )
                 strict_categories.append(category)
+            native_role_categories: Optional[list[str]] = None
+            original_role_categories: Optional[list[str]] = None
+            strict_role_categories: Optional[list[str]] = None
+            if self.pgc_v9_structured_role_sampling:
+
+                def _dataset_pair_categories(dataset_index: int) -> list[str]:
+                    dataset = underlying[dataset_index]
+                    episode_records = self.pgc_entity_relation_indices[dataset_index][
+                        "episodes_by_index"
+                    ]
+                    result: list[str] = []
+                    for raw_episode_index in dataset.hf_dataset["episode_index"]:
+                        episode_index = int(
+                            torch.as_tensor(raw_episode_index).reshape(-1)[0].item()
+                        )
+                        try:
+                            record = episode_records[episode_index]
+                        except KeyError as exc:
+                            raise KeyError(
+                                "PGC v9.4 structured sampling sidecar does not "
+                                f"cover episode {episode_index} in dataset "
+                                f"{dataset_index}."
+                            ) from exc
+                        pair_id = str(record.get("pair_id", "")).strip()
+                        if not pair_id:
+                            raise ValueError(
+                                "PGC v9.4 structured sampling requires a pair_id "
+                                f"for dataset {dataset_index}, episode {episode_index}."
+                            )
+                        result.append(pair_id)
+                    if len(result) != int(dataset.num_frames):
+                        raise ValueError(
+                            "PGC v9.4 structured category/frame mismatch for "
+                            f"dataset {dataset_index}: categories={len(result)} "
+                            f"frames={dataset.num_frames}."
+                        )
+                    return result
+
+                native_role_categories = []
+                for dataset_index in range(self.pgc_native_dataset_count):
+                    native_role_categories.extend(
+                        _dataset_pair_categories(dataset_index)
+                    )
+                original_role_categories = _dataset_pair_categories(
+                    original_dataset_index
+                )
+                strict_role_categories = _dataset_pair_categories(strict_dataset_index)
             self._sample_indices = build_pgc_v9_sample_indices(
                 native_indices=list(range(self.pgc_native_frame_count)),
                 original_counterfactual_indices=original,
                 strict_counterfactual_indices=strict,
                 strict_relation_categories=strict_categories,
+                native_role_categories=native_role_categories,
+                original_role_categories=original_role_categories,
+                strict_role_categories=strict_role_categories,
             )
         elif self.pgc_has_closed_loop_corrective_data:
             if self.pgc_counterfactual_oversample_factor != 1:
@@ -579,9 +667,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 closed_loop_oversample_factor=(
                     self.pgc_closed_loop_corrective_oversample_factor
                 ),
-                balance_native_counterfactual=(
-                    self.pgc_balance_native_counterfactual
-                ),
+                balance_native_counterfactual=(self.pgc_balance_native_counterfactual),
             )
         else:
             self._sample_indices = build_pgc_sample_indices(
@@ -590,17 +676,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 counterfactual_oversample_factor=(
                     self.pgc_counterfactual_oversample_factor
                 ),
-                balance_native_counterfactual=(
-                    self.pgc_balance_native_counterfactual
-                ),
+                balance_native_counterfactual=(self.pgc_balance_native_counterfactual),
             )
         self.pgc_effective_native_sample_count = sum(
-            int(index < self.pgc_native_frame_count)
-            for index in self._sample_indices
+            int(index < self.pgc_native_frame_count) for index in self._sample_indices
         )
         self.pgc_effective_counterfactual_sample_count = (
-            len(self._sample_indices)
-            - self.pgc_effective_native_sample_count
+            len(self._sample_indices) - self.pgc_effective_native_sample_count
         )
         self.pgc_effective_closed_loop_corrective_sample_count = sum(
             int(index >= self.pgc_offline_counterfactual_frame_end)
@@ -614,15 +696,19 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 self.pgc_effective_closed_loop_corrective_sample_count,
                 self.pgc_balance_native_counterfactual,
             )
-    
+
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio
-        
-        assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
-            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
-        assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
-            f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+
+        assert (
+            num_frames - 1
+        ) % self.action_video_freq_ratio == 0, f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
+        assert (
+            (num_frames - 1) // self.action_video_freq_ratio
+        ) % 4 == 0, f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
+        self.video_sample_indices = list(
+            range(0, num_frames, self.action_video_freq_ratio)
+        )
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -649,9 +735,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             counterfactual_negative_probability
         )
         if not 0.0 <= self.counterfactual_negative_probability <= 1.0:
-            raise ValueError(
-                "`counterfactual_negative_probability` must be in [0,1]."
-            )
+            raise ValueError("`counterfactual_negative_probability` must be in [0,1].")
         if self.override_instruction is not None and counterfactual_manifest_path:
             raise ValueError(
                 "Counterfactual ranking cannot be combined with override_instruction."
@@ -682,15 +766,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 processor = instantiate(processor)
             if not pretrained_norm_stats:
                 if not is_training_set:
-                    raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
+                    raise ValueError(
+                        "pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them."
+                    )
                 if PartialState().is_main_process:
                     logger.info("Calculating dataset stats for normalization...")
                     dataset_stats = self.lerobot_dataset.get_dataset_stats(processor)
                     work_dir = misc.get_work_dir()
-                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
+                    save_dataset_stats_to_json(
+                        dataset_stats, os.path.join(work_dir, "dataset_stats.json")
+                    )
                 else:
                     dataset_stats = None
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                if (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
                     obj_list = [dataset_stats]
                     torch.distributed.broadcast_object_list(obj_list, src=0)
                     dataset_stats = obj_list[0]
@@ -699,11 +790,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
                 if PartialState().is_main_process:
                     work_dir = misc.get_work_dir()
-                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
+                    save_dataset_stats_to_json(
+                        dataset_stats, os.path.join(work_dir, "dataset_stats.json")
+                    )
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
-        
+
     def __len__(self):
         return len(self._sample_indices)
 
@@ -763,9 +856,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                         f"complete at dataset index {dataset_index}."
                     )
 
-            for local_episode_index, episode_index in enumerate(
-                selected_episode_ids
-            ):
+            for local_episode_index, episode_index in enumerate(selected_episode_ids):
                 episode_index = int(episode_index)
                 record = records[episode_index]
                 episode = dataset.get_episode_data(local_episode_index)
@@ -777,9 +868,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 action = episode["action"]
                 if hasattr(action, "detach"):
                     action = action.detach().cpu().numpy()
-                action = np.ascontiguousarray(
-                    np.asarray(action, dtype=np.float32)
-                )
+                action = np.ascontiguousarray(np.asarray(action, dtype=np.float32))
                 if action.ndim != 2 or action.shape[1] != 7:
                     raise ValueError(
                         "PGC v9 audited actions must be [T,7], got "
@@ -800,26 +889,18 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 if pgc_audits is None:
                     continue
                 audit = pgc_audits[episode_index]
-                if str(audit.get("pair_id", "")) != str(
-                    record.get("pair_id", "")
-                ):
+                if str(audit.get("pair_id", "")) != str(record.get("pair_id", "")):
                     raise ValueError(
                         "PGC v9 ERAF pair audit mismatch at dataset/episode "
                         f"{dataset_index}/{episode_index}."
                     )
-                expected_state_digest = str(
-                    record.get("initial_state_sha256", "")
-                )
-                if expected_state_digest != str(
-                    audit.get("initial_state_sha256", "")
-                ):
+                expected_state_digest = str(record.get("initial_state_sha256", ""))
+                if expected_state_digest != str(audit.get("initial_state_sha256", "")):
                     raise ValueError(
                         "PGC v9 ERAF initial-state provenance mismatch at "
                         f"dataset/episode {dataset_index}/{episode_index}."
                     )
-                state_relpath = Path(
-                    str(audit.get("source_initial_state_catalog", ""))
-                )
+                state_relpath = Path(str(audit.get("source_initial_state_catalog", "")))
                 if (
                     not str(state_relpath)
                     or state_relpath.is_absolute()
@@ -961,8 +1042,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if cached is None:
             with np.load(str(episode["path"]), allow_pickle=False) as payload:
                 cached = {
-                    name: np.asarray(payload[name]).copy()
-                    for name in payload.files
+                    name: np.asarray(payload[name]).copy() for name in payload.files
                 }
             required = {
                 f"{role}_{name}"
@@ -972,8 +1052,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             missing = sorted(required - set(cached))
             if missing:
                 raise ValueError(
-                    "PGC v9 episode is missing ERAF arrays: "
-                    f"{missing}."
+                    "PGC v9 episode is missing ERAF arrays: " f"{missing}."
                 )
             frame_count = int(episode["frame_count"])
             max_clauses = int(index["max_clauses"])
@@ -1004,9 +1083,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                             f"PGC v9 {role}_{entity_role}_masks has "
                             f"incompatible shape/dtype {mask.shape}/{mask.dtype}."
                         )
-                    view_visible = cached[
-                        f"{role}_{entity_role}_view_visible"
-                    ]
+                    view_visible = cached[f"{role}_{entity_role}_view_visible"]
                     if (
                         view_visible.shape != expected_view_visible_shape
                         or view_visible.dtype != np.bool_
@@ -1016,14 +1093,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                             f"bool {expected_view_visible_shape}, got "
                             f"{view_visible.shape}/{view_visible.dtype}."
                         )
-                    view_centers = cached[
-                        f"{role}_{entity_role}_view_centers"
-                    ]
+                    view_centers = cached[f"{role}_{entity_role}_view_centers"]
                     if (
                         view_centers.shape != expected_view_center_shape
-                        or not np.issubdtype(
-                            view_centers.dtype, np.floating
-                        )
+                        or not np.issubdtype(view_centers.dtype, np.floating)
                         or not np.isfinite(view_centers).all()
                         or bool((np.abs(view_centers) > 1.00001).any())
                     ):
@@ -1032,11 +1105,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                             f"be finite normalized {expected_view_center_shape}, "
                             f"got {view_centers.shape}/{view_centers.dtype}."
                         )
-                    if bool(
-                        (
-                            np.abs(view_centers[~view_visible]) > 1.0e-7
-                        ).any()
-                    ):
+                    if bool((np.abs(view_centers[~view_visible]) > 1.0e-7).any()):
                         raise ValueError(
                             f"PGC v9 {role}_{entity_role}_view_centers must be "
                             "zero for invisible camera views."
@@ -1086,12 +1155,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     predicate_ids.shape != expected_scalar_shape
                     or not np.issubdtype(predicate_ids.dtype, np.integer)
                     or bool((predicate_ids < 0).any())
-                    or bool(
-                        (
-                            predicate_ids
-                            >= len(index["predicate_vocabulary"])
-                        ).any()
-                    )
+                    or bool((predicate_ids >= len(index["predicate_vocabulary"])).any())
                     or bool((predicate_ids[clause_valid] == 0).any())
                     or bool((predicate_ids[~clause_valid] != 0).any())
                 ):
@@ -1190,21 +1254,27 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 break
 
             sample_idx = self._sample_indices[np.random.randint(len(self))]
-        
+
         image_is_pad = sample["image_is_pad"]
 
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
         num_cameras = 1
         if video.ndim == 5:
-            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+            video = video[
+                :, self.video_sample_indices, :, :, :
+            ]  # [num_cameras, T_video, C, H, W]
             num_cameras, T_video, C, H, W = video.shape
         else:
-            assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+            assert (
+                video.ndim == 4
+            ), f"Expected video to have shape [T, C, H, W], but got {video.shape}"
+            video = video[self.video_sample_indices, :, :, :]  # [T_video, C, H, W]
             T_video, C, H, W = video.shape
         image_is_pad = image_is_pad[self.video_sample_indices]
 
-        video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
+        video = video.view(
+            num_cameras, T_video, C, H, W
+        )  # [num_cameras, T_video, C, H, W]
         if self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
                 raise ValueError(
@@ -1232,9 +1302,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
         elif num_cameras > 1:
             if self.concat_multi_camera == "horizontal":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
+                video = torch.cat(
+                    [video[i] for i in range(num_cameras)], dim=-1
+                )  # [T_video, C, H, num_cameras*W]
             elif self.concat_multi_camera == "vertical":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)  # [T_video, C, num_cameras*H, W]
+                video = torch.cat(
+                    [video[i] for i in range(num_cameras)], dim=-2
+                )  # [T_video, C, num_cameras*H, W]
             else:
                 raise ValueError(
                     f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
@@ -1248,27 +1322,25 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video = self.crop_transform(video)
         video = self.normalize_transform(video)  # [T_video, C, H, W]
 
-        video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
+        video = video.permute(1, 0, 2, 3)  # [C, T_video, H, W], range [-1, 1]
 
-        # Proxy (from lerobot): 
+        # Proxy (from lerobot):
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
-        action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        action = sample["action"]  # [T-1, action_dim]
+        proprio = sample["proprio"][:-1, :]  # [T-1, state_dim]， to align with action
         if video.shape[1] <= 1:
-            raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
+            raise ValueError(
+                f"`video` must have at least 2 frames, got shape {tuple(video.shape)}"
+            )
         if action.shape[0] % (video.shape[1] - 1) != 0:
             raise ValueError(
                 f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
             )
 
         task = sample["instruction"]
-        dataset_index = int(
-            torch.as_tensor(sample.get("dataset_index", 0)).item()
-        )
-        pgc_is_counterfactual = (
-            dataset_index >= self.pgc_native_dataset_count
-        )
+        dataset_index = int(torch.as_tensor(sample.get("dataset_index", 0)).item())
+        pgc_is_counterfactual = dataset_index >= self.pgc_native_dataset_count
         pgc_is_closed_loop_corrective = dataset_index >= (
             self.pgc_native_dataset_count
             + self.pgc_offline_counterfactual_dataset_count
@@ -1294,28 +1366,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     "recover their paired source instruction."
                 )
             if (
-                (
-                    self.pgc_target_mask_supervision_required
-                    or pgc_is_closed_loop_corrective
-                )
-                and "frame_index" not in sample
-            ):
+                self.pgc_target_mask_supervision_required
+                or pgc_is_closed_loop_corrective
+            ) and "frame_index" not in sample:
                 raise KeyError(
                     "PGC counterfactual samples require `frame_index` for "
                     "V7 masks or V8 corrective audit boundaries."
                 )
             try:
-                pair = self.pgc_episode_language_pairs[dataset_index][
-                    episode_index
-                ]
+                pair = self.pgc_episode_language_pairs[dataset_index][episode_index]
             except KeyError as exc:
                 raise KeyError(
                     "No audited PGC language pair for dataset/episode "
                     f"{dataset_index}/{episode_index}."
                 ) from exc
-            recorded_counterfactual = str(
-                pair["counterfactual_instruction"]
-            ).strip()
+            recorded_counterfactual = str(pair["counterfactual_instruction"]).strip()
             if str(task).strip().casefold() != recorded_counterfactual.casefold():
                 raise ValueError(
                     "PGC recorded task text does not match its audited "
@@ -1334,9 +1399,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                         "No audited PGC V8 corrective record for "
                         f"dataset/episode {dataset_index}/{episode_index}."
                     ) from exc
-                if frame_index >= int(
-                    corrective_record["recorded_action_count"]
-                ):
+                if frame_index >= int(corrective_record["recorded_action_count"]):
                     raise ValueError(
                         "PGC V8 frame exceeds its verified correction range: "
                         f"frame={frame_index} actions="
@@ -1381,7 +1444,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 episode_index=episode_index,
                 frame_index=frame_index,
             )
-        
+
         # FIXME
         if self.override_instruction is not None:
             task = self.override_instruction
@@ -1394,13 +1457,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         if pgc_pair_valid:
             pgc_source_prompt = DEFAULT_PROMPT.format(task=pgc_source_task)
-            pgc_source_context, pgc_source_context_mask = (
-                self._get_cached_text_context(pgc_source_prompt)
+            pgc_source_context, pgc_source_context_mask = self._get_cached_text_context(
+                pgc_source_prompt
             )
             pgc_source_context[~pgc_source_context_mask] = 0.0
-            pgc_source_context_mask = torch.ones_like(
-                pgc_source_context_mask
-            )
+            pgc_source_context_mask = torch.ones_like(pgc_source_context_mask)
         else:
             # Keep the batch schema uniform. Native rows do not use this copy;
             # their ordinary zero-residual objective remains authoritative.
@@ -1432,11 +1493,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             pgc_target_mask_valid = bool(mask_sample["target_valid"])
             pgc_source_mask_valid = bool(mask_sample["source_valid"])
             pgc_aux_mask_valid = bool(mask_sample["aux_valid"])
-            pgc_aux_prompt = DEFAULT_PROMPT.format(
-                task=mask_sample["aux_instruction"]
-            )
-            pgc_aux_context, pgc_aux_context_mask = (
-                self._get_cached_text_context(pgc_aux_prompt)
+            pgc_aux_prompt = DEFAULT_PROMPT.format(task=mask_sample["aux_instruction"])
+            pgc_aux_context, pgc_aux_context_mask = self._get_cached_text_context(
+                pgc_aux_prompt
             )
             pgc_aux_context[~pgc_aux_context_mask] = 0.0
             pgc_aux_context_mask = torch.ones_like(pgc_aux_context_mask)
@@ -1464,10 +1523,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             negative_valid = bool(
                 has_realized_transition
                 and has_action
-                and np.random.random()
-                < self.counterfactual_negative_probability
+                and np.random.random() < self.counterfactual_negative_probability
             )
-        
+
         data = {
             "video": video,
             "action": action,
@@ -1491,18 +1549,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 ),
                 dtype=torch.bool,
             ),
-            "pgc_goal_id": torch.tensor(
-                stable_instruction_id(task), dtype=torch.long
-            ),
+            "pgc_goal_id": torch.tensor(stable_instruction_id(task), dtype=torch.long),
             "pgc_source_prompt": pgc_source_prompt,
             "pgc_source_context": pgc_source_context,
             "pgc_source_context_mask": pgc_source_context_mask,
             "pgc_source_goal_id": torch.tensor(
                 stable_instruction_id(pgc_source_task), dtype=torch.long
             ),
-            "pgc_paired_language_valid": torch.tensor(
-                pgc_pair_valid, dtype=torch.bool
-            ),
+            "pgc_paired_language_valid": torch.tensor(pgc_pair_valid, dtype=torch.bool),
             "pgc_completion_phase": torch.tensor(
                 pgc_completion_phase, dtype=torch.long
             ),
@@ -1518,9 +1572,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "pgc_source_mask_valid": torch.tensor(
                 pgc_source_mask_valid, dtype=torch.bool
             ),
-            "pgc_aux_mask_valid": torch.tensor(
-                pgc_aux_mask_valid, dtype=torch.bool
-            ),
+            "pgc_aux_mask_valid": torch.tensor(pgc_aux_mask_valid, dtype=torch.bool),
             "pgc_aux_prompt": pgc_aux_prompt,
             "pgc_aux_context": pgc_aux_context,
             "pgc_aux_context_mask": pgc_aux_context_mask,
@@ -1534,9 +1586,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     "negative_prompt": negative_prompt,
                     "negative_context": negative_context,
                     "negative_context_mask": negative_context_mask,
-                    "negative_valid": torch.tensor(
-                        negative_valid, dtype=torch.bool
-                    ),
+                    "negative_valid": torch.tensor(negative_valid, dtype=torch.bool),
                     "negative_type": "cross_task",
                     "transition_task_id": torch.tensor(
                         stable_instruction_id(task), dtype=torch.long
@@ -1554,7 +1604,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         cache_dir = self.text_embedding_cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt")
+        cache_path = os.path.join(
+            cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt"
+        )
         if not os.path.exists(cache_path):
             raise FileNotFoundError(
                 f"Missing text embedding cache: {cache_path}. "
@@ -1586,7 +1638,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         try:
             data = self._get(idx)
         except Exception as e:
-            print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
+            print(
+                f"Error processing sample idx {idx}: {e}. Returning a random sample instead."
+            )
             # trace back
             print(traceback.format_exc())
             random_idx = np.random.randint(len(self))

@@ -202,6 +202,17 @@ def tiny_pgc_fastwam(
                     else (2.0 if v9_grounding_objective_version >= 3 else 0.0)
                 ),
                 "role_adapter_hidden_dim": 8,
+                "structured_assignment_weight": (
+                    2.0 if v9_grounding_objective_version >= 5 else 0.0
+                ),
+                "structured_assignment_temperature": 0.10,
+                "structured_assignment_hard_weight": (
+                    2.0 if v9_grounding_objective_version >= 5 else 0.0
+                ),
+                "multi_clause_consistency_weight": (
+                    1.0 if v9_grounding_objective_version >= 5 else 0.0
+                ),
+                "structured_role_adapter_hidden_dim": 8,
                 "role_attention_preservation_weight": (
                     1.0 if v9_grounding_objective_version >= 4 else 0.0
                 ),
