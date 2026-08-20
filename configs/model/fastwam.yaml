@@ -267,6 +267,8 @@ policy_guard:
     # deployment and by eval_pgc_v9_grounding_gate.py. Version 1 remains
     # loadable only for reproducing historical V9 checkpoints. Version 3 adds
     # bidirectional subject/reference assignment with online hard mining.
+    # Version 4 (V9.3) freezes the complete V9.1 backbone and learns only a
+    # zero-init role residual adapter with same-state teacher preservation.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -290,6 +292,12 @@ policy_guard:
     role_assignment_weight: 0.0
     role_assignment_temperature: 0.10
     role_assignment_hard_weight: 0.0
+    role_adapter_hidden_dim: 256
+    role_attention_preservation_weight: 0.0
+    role_position_preservation_weight: 0.0
+    role_anchor_preservation_weight: 0.0
+    role_relation_preservation_weight: 0.0
+    role_adapter_energy_weight: 0.0
     phase_weight: 1.0
   # Stage A learns only language-to-visual binding. Stage B linearly enables
   # V5 action objectives; the verifier has its own later schedule below.

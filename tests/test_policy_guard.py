@@ -191,11 +191,31 @@ def tiny_pgc_fastwam(
                 "role_overlap_weight": 1.0,
                 "role_swap_margin": 0.20,
                 "role_assignment_weight": (
-                    4.0 if v9_grounding_objective_version >= 3 else 0.0
+                    1.0
+                    if v9_grounding_objective_version >= 4
+                    else (4.0 if v9_grounding_objective_version >= 3 else 0.0)
                 ),
                 "role_assignment_temperature": 0.10,
                 "role_assignment_hard_weight": (
-                    2.0 if v9_grounding_objective_version >= 3 else 0.0
+                    0.5
+                    if v9_grounding_objective_version >= 4
+                    else (2.0 if v9_grounding_objective_version >= 3 else 0.0)
+                ),
+                "role_adapter_hidden_dim": 8,
+                "role_attention_preservation_weight": (
+                    1.0 if v9_grounding_objective_version >= 4 else 0.0
+                ),
+                "role_position_preservation_weight": (
+                    0.5 if v9_grounding_objective_version >= 4 else 0.0
+                ),
+                "role_anchor_preservation_weight": (
+                    1.0 if v9_grounding_objective_version >= 4 else 0.0
+                ),
+                "role_relation_preservation_weight": (
+                    0.5 if v9_grounding_objective_version >= 4 else 0.0
+                ),
+                "role_adapter_energy_weight": (
+                    0.01 if v9_grounding_objective_version >= 4 else 0.0
                 ),
                 "phase_weight": 1.0,
                 "entity_only": v9_entity_only,

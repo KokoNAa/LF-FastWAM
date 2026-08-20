@@ -440,6 +440,66 @@ class RelationAffordanceReasoner(nn.Module):
         return self.decode_relation_hidden(relation)
 
 
+class RoleAssignmentResidualAdapter(nn.Module):
+    """A zero-init role-only repair on top of a frozen ERAF backbone.
+
+    V9.2 updated the complete ERAF module while trying to separate subject and
+    reference queries.  That also moved the already-good predicate, visual,
+    relation, and anchor representations.  V9.3 instead learns two small
+    residuals from the frozen V9.1 role/clause states.  Zero-initializing the
+    output projections makes a freshly migrated V9.3 checkpoint numerically
+    identical to V9.1 before the first optimizer step.
+    """
+
+    def __init__(self, *, hidden_dim: int, adapter_hidden_dim: int) -> None:
+        super().__init__()
+        if min(hidden_dim, adapter_hidden_dim) <= 0:
+            raise ValueError("ERAF role-adapter dimensions must be positive.")
+        self.hidden_dim = int(hidden_dim)
+        self.adapter_hidden_dim = int(adapter_hidden_dim)
+        self.input_norm = nn.LayerNorm(hidden_dim * 3)
+        self.shared = nn.Sequential(
+            nn.Linear(hidden_dim * 3, adapter_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(adapter_hidden_dim, adapter_hidden_dim),
+            nn.GELU(approximate="tanh"),
+        )
+        self.subject_output = nn.Linear(adapter_hidden_dim, hidden_dim)
+        self.reference_output = nn.Linear(adapter_hidden_dim, hidden_dim)
+        nn.init.zeros_(self.subject_output.weight)
+        nn.init.zeros_(self.subject_output.bias)
+        nn.init.zeros_(self.reference_output.weight)
+        nn.init.zeros_(self.reference_output.bias)
+
+    def forward(
+        self,
+        *,
+        clause_hidden: torch.Tensor,
+        subject_queries: torch.Tensor,
+        reference_queries: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if not (
+            clause_hidden.shape == subject_queries.shape == reference_queries.shape
+        ):
+            raise ValueError(
+                "ERAF role-adapter clause/subject/reference shapes must match."
+            )
+        features = self.input_norm(
+            torch.cat(
+                (clause_hidden, subject_queries, reference_queries), dim=-1
+            )
+        )
+        hidden = self.shared(features)
+        subject_delta = self.subject_output(hidden)
+        reference_delta = self.reference_output(hidden)
+        return {
+            "subject_queries": subject_queries + subject_delta,
+            "reference_queries": reference_queries + reference_delta,
+            "subject_delta": subject_delta,
+            "reference_delta": reference_delta,
+        }
+
+
 class EntityRelationAffordanceField(nn.Module):
     """Complete RGB+language ERAF deployment path used by PGC V9."""
 
@@ -458,6 +518,9 @@ class EntityRelationAffordanceField(nn.Module):
         temperature: float = 0.07,
         entity_only: bool = False,
         use_anchors: bool = True,
+        role_adapter_enabled: bool = False,
+        role_adapter_hidden_dim: int = 256,
+        role_adapter_teacher_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.text_dim = int(text_dim)
@@ -470,6 +533,9 @@ class EntityRelationAffordanceField(nn.Module):
         self.camera_count = int(camera_count)
         self.entity_only = bool(entity_only)
         self.use_anchors = bool(use_anchors)
+        self.role_adapter_enabled = bool(role_adapter_enabled)
+        self.role_adapter_hidden_dim = int(role_adapter_hidden_dim)
+        self.role_adapter_teacher_enabled = bool(role_adapter_teacher_enabled)
         self.role_decoder = PredicateRoleDecoder(
             text_dim=text_dim,
             hidden_dim=hidden_dim,
@@ -487,6 +553,14 @@ class EntityRelationAffordanceField(nn.Module):
             hidden_dim=hidden_dim,
             action_dim=action_dim,
             projection_dim=projection_dim,
+        )
+        self.role_assignment_adapter = (
+            RoleAssignmentResidualAdapter(
+                hidden_dim=hidden_dim,
+                adapter_hidden_dim=role_adapter_hidden_dim,
+            )
+            if self.role_adapter_enabled
+            else None
         )
         self.entity_only_projection = nn.Sequential(
             nn.LayerNorm(hidden_dim),
@@ -652,6 +726,62 @@ class EntityRelationAffordanceField(nn.Module):
         current_video_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         roles = self.role_decoder(language_hidden, language_mask)
+        teacher: dict[str, torch.Tensor] | None = None
+        base_subject_queries = roles["subject_queries"]
+        base_reference_queries = roles["reference_queries"]
+        if (
+            self.role_assignment_adapter is not None
+            and self.role_adapter_teacher_enabled
+            and torch.is_grad_enabled()
+        ):
+            # The backbone is frozen in V9.3, so this bypass is the exact V9.1
+            # teacher on the same RGB/language state.  Detaching it prevents a
+            # preservation loss from creating a second gradient path.
+            with torch.no_grad():
+                teacher_subject = self.entity_grounder.ground(
+                    base_subject_queries, current_video_hidden
+                )
+                teacher_reference = self.entity_grounder.ground(
+                    base_reference_queries, current_video_hidden
+                )
+                teacher_affordance = self._decode_affordance(
+                    clause_hidden=roles["clause_hidden"],
+                    subject_token=teacher_subject["token"],
+                    reference_token=teacher_reference["token"],
+                    subject_position=teacher_subject["position"],
+                    reference_position=teacher_reference["position"],
+                    active_logits=roles["active_logits"],
+                )
+            teacher = {
+                "subject_attention": teacher_subject["attention"].detach(),
+                "reference_attention": teacher_reference["attention"].detach(),
+                "subject_position": teacher_subject["position"].detach(),
+                "reference_position": teacher_reference["position"].detach(),
+                "relation_hidden": teacher_affordance["relation_hidden"].detach(),
+                "grasp_anchor": teacher_affordance["grasp_anchor"].detach(),
+                "goal_anchor": teacher_affordance["goal_anchor"].detach(),
+                "interaction_anchor": teacher_affordance[
+                    "interaction_anchor"
+                ].detach(),
+                "active_logits": roles["active_logits"].detach(),
+                "predicate_logits": roles["predicate_logits"].detach(),
+            }
+        if self.role_assignment_adapter is not None:
+            adapted_roles = self.role_assignment_adapter(
+                clause_hidden=roles["clause_hidden"],
+                subject_queries=base_subject_queries,
+                reference_queries=base_reference_queries,
+            )
+            roles = {
+                **roles,
+                "subject_queries": adapted_roles["subject_queries"],
+                "reference_queries": adapted_roles["reference_queries"],
+            }
+            subject_role_delta = adapted_roles["subject_delta"]
+            reference_role_delta = adapted_roles["reference_delta"]
+        else:
+            subject_role_delta = torch.zeros_like(base_subject_queries)
+            reference_role_delta = torch.zeros_like(base_reference_queries)
         subject = self.entity_grounder.ground(
             roles["subject_queries"], current_video_hidden
         )
@@ -699,6 +829,14 @@ class EntityRelationAffordanceField(nn.Module):
             .float()
             .norm(dim=-1)
             .mean(),
+            "pgc_v9_role_adapter_subject_delta_norm": subject_role_delta
+            .float()
+            .norm(dim=-1)
+            .mean(),
+            "pgc_v9_role_adapter_reference_delta_norm": reference_role_delta
+            .float()
+            .norm(dim=-1)
+            .mean(),
         }
         outputs = {
             **roles,
@@ -725,8 +863,14 @@ class EntityRelationAffordanceField(nn.Module):
             "reference_view_attention_mass": reference["view_attention_mass"],
             "spatial_coordinates": subject["coordinates"],
             "camera_ids": subject["camera_ids"],
+            "subject_role_delta": subject_role_delta,
+            "reference_role_delta": reference_role_delta,
             **affordance,
         }
+        if teacher is not None:
+            outputs.update(
+                {f"teacher_{name}": value for name, value in teacher.items()}
+            )
         return routed_queries, routed_embedding, outputs, metrics
 
 
@@ -745,6 +889,11 @@ class ERAFLossWeights:
     role_assignment: float = 0.0
     role_assignment_temperature: float = 0.10
     role_assignment_hard_weight: float = 0.0
+    role_attention_preservation: float = 0.0
+    role_position_preservation: float = 0.0
+    role_anchor_preservation: float = 0.0
+    role_relation_preservation: float = 0.0
+    role_adapter_energy: float = 0.0
     phase: float = 0.25
 
 
@@ -1086,6 +1235,146 @@ def entity_relation_affordance_loss(
     role_overlap_loss = _masked_mean(
         0.5 * (subject_overlap + reference_overlap), role_swap_valid
     )
+    zero = outputs["active_logits"].sum() * 0.0
+    role_attention_preservation_loss = zero
+    role_position_preservation_loss = zero
+    role_anchor_preservation_loss = zero
+    role_relation_preservation_loss = zero
+    role_adapter_energy_loss = zero
+    teacher_preservation_fraction = zero.detach()
+    teacher_predicate_max_abs_error = zero.detach()
+    teacher_active_max_abs_error = zero.detach()
+    if int(weights.objective_version) >= 4:
+        required_teacher = {
+            "teacher_subject_attention",
+            "teacher_reference_attention",
+            "teacher_subject_position",
+            "teacher_reference_position",
+            "teacher_relation_hidden",
+            "teacher_grasp_anchor",
+            "teacher_goal_anchor",
+            "teacher_interaction_anchor",
+            "teacher_active_logits",
+            "teacher_predicate_logits",
+            "subject_role_delta",
+            "reference_role_delta",
+        }
+        missing_teacher = sorted(required_teacher.difference(outputs))
+        if missing_teacher:
+            raise ValueError(
+                "V9.3 role-adapter training requires the frozen V9.1 teacher "
+                f"bypass outputs; missing={missing_teacher}."
+            )
+        teacher_subject_attention = outputs[
+            "teacher_subject_attention"
+        ].float()
+        teacher_reference_attention = outputs[
+            "teacher_reference_attention"
+        ].float()
+        teacher_subject_own = (
+            teacher_subject_attention * role_targets["subject"]
+        ).sum(dim=-1)
+        teacher_subject_wrong = (
+            teacher_subject_attention * role_targets["reference"]
+        ).sum(dim=-1)
+        teacher_reference_own = (
+            teacher_reference_attention * role_targets["reference"]
+        ).sum(dim=-1)
+        teacher_reference_wrong = (
+            teacher_reference_attention * role_targets["subject"]
+        ).sum(dim=-1)
+        # Preserve only clauses V9.1 already bound correctly.  Incorrect
+        # clauses remain free to move under the supervised assignment loss.
+        role_pair_valid = (
+            role_mask_valid["subject"] & role_mask_valid["reference"]
+        )
+        unary_role = (
+            labels["subject_entity_ids"].long()
+            == labels["reference_entity_ids"].long()
+        )
+        teacher_preservation_valid = role_pair_valid & (
+            unary_role
+            | (
+                (teacher_subject_own > teacher_subject_wrong)
+                & (teacher_reference_own > teacher_reference_wrong)
+            )
+        )
+        teacher_preservation_fraction = _masked_mean(
+            teacher_preservation_valid.float(), role_pair_valid
+        ).detach()
+
+        attention_preservation_terms = []
+        for role, teacher_attention in (
+            ("subject", teacher_subject_attention),
+            ("reference", teacher_reference_attention),
+        ):
+            student_attention = role_attentions[role].float().clamp_min(1.0e-8)
+            teacher_probability = teacher_attention.clamp_min(1.0e-8)
+            teacher_probability = teacher_probability / teacher_probability.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0e-8)
+            kl = (
+                teacher_probability
+                * (teacher_probability.log() - student_attention.log())
+            ).sum(dim=-1)
+            attention_preservation_terms.append(
+                _masked_mean(kl, teacher_preservation_valid)
+            )
+        role_attention_preservation_loss = torch.stack(
+            attention_preservation_terms
+        ).mean()
+
+        position_preservation_terms = []
+        for role in ("subject", "reference"):
+            value = F.smooth_l1_loss(
+                outputs[f"{role}_position"].float(),
+                outputs[f"teacher_{role}_position"].float(),
+                reduction="none",
+            ).mean(dim=-1)
+            position_preservation_terms.append(
+                _masked_mean(value, teacher_preservation_valid)
+            )
+        role_position_preservation_loss = torch.stack(
+            position_preservation_terms
+        ).mean()
+
+        anchor_preservation_terms = []
+        for name in ("grasp", "goal", "interaction"):
+            value = F.smooth_l1_loss(
+                outputs[f"{name}_anchor"].float(),
+                outputs[f"teacher_{name}_anchor"].float(),
+                reduction="none",
+            ).mean(dim=-1)
+            anchor_preservation_terms.append(
+                _masked_mean(value, teacher_preservation_valid)
+            )
+        role_anchor_preservation_loss = torch.stack(
+            anchor_preservation_terms
+        ).mean()
+        role_relation_preservation_loss = _masked_mean(
+            F.mse_loss(
+                outputs["relation_hidden"].float(),
+                outputs["teacher_relation_hidden"].float(),
+                reduction="none",
+            ).mean(dim=-1),
+            teacher_preservation_valid,
+        )
+        role_adapter_energy_loss = _masked_mean(
+            0.5
+            * (
+                outputs["subject_role_delta"].float().pow(2).mean(dim=-1)
+                + outputs["reference_role_delta"].float().pow(2).mean(dim=-1)
+            ),
+            clause_valid,
+        )
+        teacher_predicate_max_abs_error = (
+            outputs["predicate_logits"].float()
+            - outputs["teacher_predicate_logits"].float()
+        ).abs().max().detach()
+        teacher_active_max_abs_error = (
+            outputs["active_logits"].float()
+            - outputs["teacher_active_logits"].float()
+        ).abs().max().detach()
     entity_loss = active_loss + role_entity_loss
     relation_loss = predicate_loss + truth_loss
     total = (
@@ -1098,6 +1387,14 @@ def entity_relation_affordance_loss(
         + weights.role_swap * role_swap_loss
         + weights.role_overlap * role_overlap_loss
         + weights.role_assignment * role_assignment_loss
+        + weights.role_attention_preservation
+        * role_attention_preservation_loss
+        + weights.role_position_preservation
+        * role_position_preservation_loss
+        + weights.role_anchor_preservation * role_anchor_preservation_loss
+        + weights.role_relation_preservation
+        * role_relation_preservation_loss
+        + weights.role_adapter_energy * role_adapter_energy_loss
         + weights.phase * phase_loss
     )
     predicate_prediction = outputs["predicate_logits"].argmax(dim=-1)
@@ -1121,6 +1418,19 @@ def entity_relation_affordance_loss(
         "loss_pgc_v9_role_swap": role_swap_loss.detach(),
         "loss_pgc_v9_role_overlap": role_overlap_loss.detach(),
         "loss_pgc_v9_role_assignment": role_assignment_loss.detach(),
+        "loss_pgc_v9_role_attention_preservation": (
+            role_attention_preservation_loss.detach()
+        ),
+        "loss_pgc_v9_role_position_preservation": (
+            role_position_preservation_loss.detach()
+        ),
+        "loss_pgc_v9_role_anchor_preservation": (
+            role_anchor_preservation_loss.detach()
+        ),
+        "loss_pgc_v9_role_relation_preservation": (
+            role_relation_preservation_loss.detach()
+        ),
+        "loss_pgc_v9_role_adapter_energy": role_adapter_energy_loss.detach(),
         "loss_pgc_v9_phase": phase_loss.detach(),
         "loss_pgc_v9_predicate": predicate_loss.detach(),
         "loss_pgc_v9_role_entity_contrastive": role_entity_loss.detach(),
@@ -1167,6 +1477,11 @@ def entity_relation_affordance_loss(
         "pgc_v9_role_assignment_hard_fraction": _masked_mean(
             hard_assignment, role_swap_valid
         ).detach(),
+        "pgc_v9_teacher_preservation_fraction": teacher_preservation_fraction,
+        "pgc_v9_teacher_predicate_max_abs_error": (
+            teacher_predicate_max_abs_error
+        ),
+        "pgc_v9_teacher_active_max_abs_error": teacher_active_max_abs_error,
         "pgc_v9_subject_entity_retrieval_acc": entity_accuracies[0].detach(),
         "pgc_v9_reference_entity_retrieval_acc": entity_accuracies[1].detach(),
         "pgc_v9_relation_accuracy": _masked_mean(

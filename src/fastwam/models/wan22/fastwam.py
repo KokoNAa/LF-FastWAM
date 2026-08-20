@@ -648,6 +648,12 @@ class FastWAM(torch.nn.Module):
         assignment_grounding = (
             self.policy_guard_eraf_grounding_objective_version >= 3
         )
+        role_adapter_grounding = (
+            self.policy_guard_eraf_grounding_objective_version >= 4
+        )
+        self.policy_guard_eraf_role_adapter_hidden_dim = int(
+            eraf_config.get("role_adapter_hidden_dim", 256)
+        )
         self.policy_guard_eraf_loss_weights = ERAFLossWeights(
             objective_version=(
                 self.policy_guard_eraf_grounding_objective_version
@@ -680,7 +686,11 @@ class FastWAM(torch.nn.Module):
             role_assignment=float(
                 eraf_config.get(
                     "role_assignment_weight",
-                    4.0 if assignment_grounding else 0.0,
+                    (
+                        1.0
+                        if role_adapter_grounding
+                        else (4.0 if assignment_grounding else 0.0)
+                    ),
                 )
             ),
             role_assignment_temperature=float(
@@ -689,7 +699,41 @@ class FastWAM(torch.nn.Module):
             role_assignment_hard_weight=float(
                 eraf_config.get(
                     "role_assignment_hard_weight",
-                    2.0 if assignment_grounding else 0.0,
+                    (
+                        0.5
+                        if role_adapter_grounding
+                        else (2.0 if assignment_grounding else 0.0)
+                    ),
+                )
+            ),
+            role_attention_preservation=float(
+                eraf_config.get(
+                    "role_attention_preservation_weight",
+                    1.0 if role_adapter_grounding else 0.0,
+                )
+            ),
+            role_position_preservation=float(
+                eraf_config.get(
+                    "role_position_preservation_weight",
+                    0.5 if role_adapter_grounding else 0.0,
+                )
+            ),
+            role_anchor_preservation=float(
+                eraf_config.get(
+                    "role_anchor_preservation_weight",
+                    1.0 if role_adapter_grounding else 0.0,
+                )
+            ),
+            role_relation_preservation=float(
+                eraf_config.get(
+                    "role_relation_preservation_weight",
+                    0.5 if role_adapter_grounding else 0.0,
+                )
+            ),
+            role_adapter_energy=float(
+                eraf_config.get(
+                    "role_adapter_energy_weight",
+                    0.01 if role_adapter_grounding else 0.0,
                 )
             ),
             phase=float(eraf_config.get("phase_weight", 1.0)),
@@ -1013,9 +1057,10 @@ class FastWAM(torch.nn.Module):
                     1,
                     2,
                     3,
+                    4,
                 }:
                     raise ValueError(
-                        "PGC v9 ERAF grounding_objective_version must be 1, 2, or 3."
+                        "PGC v9 ERAF grounding_objective_version must be 1, 2, 3, or 4."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1045,6 +1090,7 @@ class FastWAM(torch.nn.Module):
                     self.policy_guard_eraf_num_heads,
                     self.policy_guard_eraf_max_clauses,
                     self.policy_guard_eraf_camera_count,
+                    self.policy_guard_eraf_role_adapter_hidden_dim,
                 ) <= 0:
                     raise ValueError("PGC v9 ERAF dimensions must be positive.")
                 if (
@@ -1335,6 +1381,17 @@ class FastWAM(torch.nn.Module):
                             temperature=self.policy_guard_eraf_temperature,
                             entity_only=self.policy_guard_eraf_entity_only,
                             use_anchors=self.policy_guard_eraf_use_anchors,
+                            role_adapter_enabled=(
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 4
+                            ),
+                            role_adapter_hidden_dim=(
+                                self.policy_guard_eraf_role_adapter_hidden_dim
+                            ),
+                            role_adapter_teacher_enabled=(
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 4
+                            ),
                         )
                     if self.policy_guard_version in {6, 7}:
                         binder_kwargs = {
@@ -1684,21 +1741,51 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_modules.train()
                 self.policy_guard_modules.requires_grad_(True)
                 if self.policy_guard_version == 9:
-                    trainable_modules = {
-                        "grounding": {"entity_relation_affordance"},
-                        "action": {
-                            "entity_relation_affordance",
-                            "action_chunk_proposal",
-                        },
-                        "verifier": {"verifier"},
-                    }[self.policy_guard_eraf_training_stage]
-                    for name, module in self.policy_guard_modules.items():
-                        if name in trainable_modules:
-                            module.train()
-                            module.requires_grad_(True)
-                        else:
+                    if self.policy_guard_eraf_grounding_objective_version >= 4:
+                        # V9.3 preserves the complete validated V9.1 ERAF
+                        # backbone.  Grounding repair learns only the zero-init
+                        # role adapter; after it passes the gate, action and
+                        # verifier stages freeze that adapter as well.
+                        for module in self.policy_guard_modules.values():
                             module.eval()
                             module.requires_grad_(False)
+                        if self.policy_guard_eraf_training_stage == "grounding":
+                            eraf = self.policy_guard_modules[
+                                "entity_relation_affordance"
+                            ]
+                            role_adapter = eraf.role_assignment_adapter
+                            if role_adapter is None:
+                                raise RuntimeError(
+                                    "V9.3 grounding requires its role adapter."
+                                )
+                            role_adapter.train()
+                            role_adapter.requires_grad_(True)
+                        elif self.policy_guard_eraf_training_stage == "action":
+                            proposal = self.policy_guard_modules[
+                                "action_chunk_proposal"
+                            ]
+                            proposal.train()
+                            proposal.requires_grad_(True)
+                        else:
+                            verifier = self.policy_guard_modules["verifier"]
+                            verifier.train()
+                            verifier.requires_grad_(True)
+                    else:
+                        trainable_modules = {
+                            "grounding": {"entity_relation_affordance"},
+                            "action": {
+                                "entity_relation_affordance",
+                                "action_chunk_proposal",
+                            },
+                            "verifier": {"verifier"},
+                        }[self.policy_guard_eraf_training_stage]
+                        for name, module in self.policy_guard_modules.items():
+                            if name in trainable_modules:
+                                module.train()
+                                module.requires_grad_(True)
+                            else:
+                                module.eval()
+                                module.requires_grad_(False)
                 if (
                     self.policy_guard_version == 5
                     and self.policy_guard_completion_phase_enabled
@@ -9311,9 +9398,17 @@ class FastWAM(torch.nn.Module):
             "representation_supervision": (
                 (
                     (
-                        "bidirectional_role_assignment_hard_mining_"
-                        "gate_aligned_attention_multiview_masks_3d_anchors_"
-                        "state_and_phase"
+                        (
+                            "frozen_v9_1_role_residual_assignment_with_"
+                            "teacher_preserved_attention_relation_and_anchors"
+                        )
+                        if self.policy_guard_eraf_grounding_objective_version
+                        >= 4
+                        else (
+                            "bidirectional_role_assignment_hard_mining_"
+                            "gate_aligned_attention_multiview_masks_3d_anchors_"
+                            "state_and_phase"
+                        )
                     )
                     if self.policy_guard_eraf_grounding_objective_version >= 3
                     else (
@@ -9687,6 +9782,43 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_role_assignment_hard_weight": (
                 self.policy_guard_eraf_loss_weights.role_assignment_hard_weight
+                if is_v9
+                else None
+            ),
+            "eraf_role_adapter_hidden_dim": (
+                self.policy_guard_eraf_role_adapter_hidden_dim
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 4
+                else None
+            ),
+            "eraf_role_adapter_trainable_scope": (
+                "role_assignment_adapter_only"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 4
+                else None
+            ),
+            "eraf_role_attention_preservation_weight": (
+                self.policy_guard_eraf_loss_weights.role_attention_preservation
+                if is_v9
+                else None
+            ),
+            "eraf_role_position_preservation_weight": (
+                self.policy_guard_eraf_loss_weights.role_position_preservation
+                if is_v9
+                else None
+            ),
+            "eraf_role_anchor_preservation_weight": (
+                self.policy_guard_eraf_loss_weights.role_anchor_preservation
+                if is_v9
+                else None
+            ),
+            "eraf_role_relation_preservation_weight": (
+                self.policy_guard_eraf_loss_weights.role_relation_preservation
+                if is_v9
+                else None
+            ),
+            "eraf_role_adapter_energy_weight": (
+                self.policy_guard_eraf_loss_weights.role_adapter_energy
                 if is_v9
                 else None
             ),
@@ -10131,6 +10263,11 @@ class FastWAM(torch.nn.Module):
         saved_policy_guard_version = int(
             metadata.get("policy_guard_version", -1)
         )
+        saved_eraf_grounding_objective = (
+            int(metadata.get("eraf_grounding_objective_version", 1))
+            if saved_policy_guard_version == 9
+            else None
+        )
         migrate_v5_to_target_binder = (
             saved_policy_guard_version == 5
             and int(self.policy_guard_version) in {6, 7}
@@ -10142,6 +10279,14 @@ class FastWAM(torch.nn.Module):
         migrate_v5_to_v9 = (
             saved_policy_guard_version == 5
             and int(self.policy_guard_version) == 9
+        )
+        migrate_v9_to_role_adapter = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 2
+            and self.policy_guard_eraf_grounding_objective_version == 4
+            and self.policy_guard_eraf_training_stage == "grounding"
+            and metadata.get("eraf_training_stage") == "grounding"
         )
         if (
             saved_policy_guard_version != int(self.policy_guard_version)
@@ -10296,6 +10441,10 @@ class FastWAM(torch.nn.Module):
                             "eraf_camera_count": int(eraf.camera_count),
                         }
                     )
+                    if int(saved_eraf_grounding_objective or 1) >= 4:
+                        architecture_fields["eraf_role_adapter_hidden_dim"] = int(
+                            eraf.role_adapter_hidden_dim
+                        )
                 for metadata_name, expected_value in architecture_fields.items():
                     try:
                         saved_value = int(metadata[metadata_name])
@@ -10802,7 +10951,7 @@ class FastWAM(torch.nn.Module):
                         objective_upgrade = (
                             saved_grounding_objective == 2
                             and self.policy_guard_eraf_grounding_objective_version
-                            == 3
+                            in {3, 4}
                             and self.policy_guard_eraf_training_stage == "grounding"
                             and metadata.get("eraf_training_stage") == "grounding"
                         )
@@ -10880,6 +11029,50 @@ class FastWAM(torch.nn.Module):
                                         f"checkpoint={saved_value}, "
                                         f"model={expected_value}."
                                     )
+                        if saved_grounding_objective >= 4:
+                            if (
+                                metadata.get("eraf_role_adapter_trainable_scope")
+                                != "role_assignment_adapter_only"
+                            ):
+                                raise ValueError(
+                                    "PGC v9.3 checkpoint does not declare its "
+                                    "role-adapter-only trainable scope."
+                                )
+                            for metadata_name, expected_value in {
+                                "eraf_role_attention_preservation_weight": (
+                                    self.policy_guard_eraf_loss_weights.role_attention_preservation
+                                ),
+                                "eraf_role_position_preservation_weight": (
+                                    self.policy_guard_eraf_loss_weights.role_position_preservation
+                                ),
+                                "eraf_role_anchor_preservation_weight": (
+                                    self.policy_guard_eraf_loss_weights.role_anchor_preservation
+                                ),
+                                "eraf_role_relation_preservation_weight": (
+                                    self.policy_guard_eraf_loss_weights.role_relation_preservation
+                                ),
+                                "eraf_role_adapter_energy_weight": (
+                                    self.policy_guard_eraf_loss_weights.role_adapter_energy
+                                ),
+                            }.items():
+                                try:
+                                    saved_value = float(metadata[metadata_name])
+                                except (KeyError, TypeError, ValueError) as exc:
+                                    raise ValueError(
+                                        "PGC v9.3 checkpoint is missing valid "
+                                        f"preservation value {metadata_name!r}."
+                                    ) from exc
+                                if not math.isclose(
+                                    saved_value,
+                                    float(expected_value),
+                                    rel_tol=0.0,
+                                    abs_tol=1.0e-9,
+                                ):
+                                    raise ValueError(
+                                        f"PGC v9.3 {metadata_name} mismatch: "
+                                        f"checkpoint={saved_value}, "
+                                        f"model={expected_value}."
+                                    )
                         if (
                             bool(metadata.get("eraf_entity_only", False))
                             != self.policy_guard_eraf_entity_only
@@ -10941,7 +11134,9 @@ class FastWAM(torch.nn.Module):
                     "Nested PGC checkpoints are not supported as bases."
                 )
             migrate_with_new_modules = (
-                migrate_v5_to_target_binder or migrate_v5_to_v9
+                migrate_v5_to_target_binder
+                or migrate_v5_to_v9
+                or migrate_v9_to_role_adapter
             )
             incompatible = self.policy_guard_modules.load_state_dict(
                 guard_state, strict=not migrate_with_new_modules
@@ -10972,6 +11167,22 @@ class FastWAM(torch.nn.Module):
                         "PGC v5 -> v9 warm start has incompatible sidecars: "
                         f"missing={missing}, unexpected={unexpected}."
                     )
+            elif migrate_v9_to_role_adapter:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                disallowed_missing = [
+                    key
+                    for key in missing
+                    if not key.startswith(
+                        "entity_relation_affordance.role_assignment_adapter."
+                    )
+                ]
+                if disallowed_missing or unexpected or not missing:
+                    raise ValueError(
+                        "PGC v9.1 -> v9.3 role-adapter warm start has "
+                        f"incompatible sidecars: missing={missing}, "
+                        f"unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -10984,6 +11195,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v5_to_target_binder
                 and not migrate_v5_to_v8
                 and not migrate_v5_to_v9
+                and not migrate_v9_to_role_adapter
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -11008,6 +11220,15 @@ class FastWAM(torch.nn.Module):
                 logger.info(
                     "Warm-started PGC v9 from exact validated PGC v5 "
                     "sidecars at %s (base=%s restored=%d new_eraf=%d).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
+                    len(incompatible.missing_keys),
+                )
+            elif migrate_v9_to_role_adapter:
+                logger.info(
+                    "Warm-started PGC v9.3 from frozen V9.1 ERAF at %s "
+                    "(base=%s restored=%d new_role_adapter=%d).",
                     path,
                     resolved_base,
                     len(guard_state),

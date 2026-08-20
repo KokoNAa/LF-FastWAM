@@ -533,16 +533,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     objective_version = int(
         metadata.get("eraf_grounding_objective_version", 1)
     )
-    expected_step = {2: 1500, 3: 2500}.get(objective_version)
+    expected_step = {2: 1500, 3: 2500, 4: 2500}.get(objective_version)
+    checkpoint_step = int(payload.get("step", -1))
+    intermediate_v93 = (
+        bool(args.allow_intermediate)
+        and objective_version == 4
+        and checkpoint_step in {1750, 2000, 2250}
+    )
     if (
         expected_step is None
-        or int(payload.get("step", -1)) != expected_step
+        or (checkpoint_step != expected_step and not intermediate_v93)
         or metadata.get("eraf_training_stage") != "grounding"
     ):
         raise ValueError(
             "The pre-action grounding gate requires the completed V9 "
             "grounding-stage checkpoint: objective v2 at step 1500 or "
-            "objective v3 at step 2500."
+            "objective v3/v4 at step 2500."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())
@@ -611,6 +617,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         {
             "checkpoint": str(checkpoint),
             "checkpoint_step": payload.get("step"),
+            "intermediate_checkpoint": intermediate_v93,
             "training_config": str(config_path),
             "seed": args.seed,
         }
@@ -630,6 +637,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=500)
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--allow-intermediate",
+        action="store_true",
+        help="Audit V9.3 checkpoints at steps 1750/2000/2250 without treating them as final action-stage inputs.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16"
