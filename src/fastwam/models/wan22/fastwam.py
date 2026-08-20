@@ -1110,10 +1110,11 @@ class FastWAM(torch.nn.Module):
                     5,
                     6,
                     7,
+                    8,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "1, 2, 3, 4, 5, 6, or 7."
+                        "1, 2, 3, 4, 5, 6, 7, or 8."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1838,7 +1839,7 @@ class FastWAM(torch.nn.Module):
                                 role_adapter = eraf.balanced_role_binding_adapter
                                 if role_adapter is None:
                                     raise RuntimeError(
-                                        "V9.5/V9.6 grounding requires its balanced "
+                                        "V9.5/V9.6/V9.7 grounding requires its balanced "
                                         "visual role-binding adapter."
                                     )
                             elif (
@@ -9502,9 +9503,17 @@ class FastWAM(torch.nn.Module):
                         (
                             (
                                 (
-                                    "frozen_v9_3_native_hard_curriculum_global_"
-                                    "ddp_bipartite_binding_with_all_clause_"
-                                    "geometry_preservation"
+                                    (
+                                        "exclusive_evidence_subject_reference_"
+                                        "assignment_with_full_mask_localization"
+                                        if self.policy_guard_eraf_grounding_objective_version
+                                        >= 8
+                                        else (
+                                            "frozen_v9_3_native_hard_curriculum_global_"
+                                            "ddp_bipartite_binding_with_all_clause_"
+                                            "geometry_preservation"
+                                        )
+                                    )
                                 )
                                 if self.policy_guard_eraf_grounding_objective_version
                                 >= 7
@@ -9893,6 +9902,24 @@ class FastWAM(torch.nn.Module):
                 and self.policy_guard_eraf_grounding_objective_version >= 7
                 else None
             ),
+            "eraf_role_evidence": (
+                "exclusive_subject_reference_support"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 8
+                else None
+            ),
+            "eraf_role_gate": (
+                "exclusive_accuracy_with_full_mask_localization"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 8
+                else None
+            ),
+            "eraf_exclusive_role_coverage_min": (
+                0.5
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 8
+                else None
+            ),
             "eraf_attention_mask_weight": (
                 self.policy_guard_eraf_loss_weights.attention_mask
                 if is_v9
@@ -9957,7 +9984,15 @@ class FastWAM(torch.nn.Module):
             "eraf_role_adapter_trainable_scope": (
                 (
                     (
-                        "global_hard_curriculum_balanced_visual_role_binding_adapter_only"
+                        (
+                            "exclusive_evidence_global_hard_curriculum_"
+                            "balanced_visual_role_binding_adapter_only"
+                            if self.policy_guard_eraf_grounding_objective_version >= 8
+                            else (
+                                "global_hard_curriculum_balanced_visual_"
+                                "role_binding_adapter_only"
+                            )
+                        )
                         if self.policy_guard_eraf_grounding_objective_version >= 7
                         else "balanced_visual_role_binding_adapter_only"
                     )
@@ -11162,6 +11197,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 in {5, 6, 7}
                             )
+                            or (
+                                saved_grounding_objective == 7
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 8
+                            )
                         )
                         objective_upgrade = (
                             objective_upgrade
@@ -11245,7 +11285,15 @@ class FastWAM(torch.nn.Module):
                         if saved_grounding_objective >= 4 and not objective_upgrade:
                             expected_scope = (
                                 (
-                                    "global_hard_curriculum_balanced_visual_role_binding_adapter_only"
+                                    (
+                                        "exclusive_evidence_global_hard_curriculum_"
+                                        "balanced_visual_role_binding_adapter_only"
+                                        if saved_grounding_objective >= 8
+                                        else (
+                                            "global_hard_curriculum_balanced_visual_"
+                                            "role_binding_adapter_only"
+                                        )
+                                    )
                                     if saved_grounding_objective >= 7
                                     else "balanced_visual_role_binding_adapter_only"
                                 )
@@ -11388,6 +11436,23 @@ class FastWAM(torch.nn.Module):
                                 if metadata.get(name) != expected:
                                     raise ValueError(
                                         "PGC V9.6 checkpoint contract mismatch: "
+                                        f"{name}={metadata.get(name)!r}, "
+                                        f"expected={expected!r}."
+                                    )
+                        if saved_grounding_objective >= 8 and not objective_upgrade:
+                            expected_v97_contract = {
+                                "eraf_role_evidence": (
+                                    "exclusive_subject_reference_support"
+                                ),
+                                "eraf_role_gate": (
+                                    "exclusive_accuracy_with_full_mask_localization"
+                                ),
+                                "eraf_exclusive_role_coverage_min": 0.5,
+                            }
+                            for name, expected in expected_v97_contract.items():
+                                if metadata.get(name) != expected:
+                                    raise ValueError(
+                                        "PGC V9.7 checkpoint contract mismatch: "
                                         f"{name}={metadata.get(name)!r}, "
                                         f"expected={expected!r}."
                                     )

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|grounding-structured-role|grounding-balanced-role|grounding-hard-role|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
+SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|grounding-structured-role|grounding-balanced-role|grounding-hard-role|grounding-exclusive-role|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
 STAGE="${2:?Missing V9 training stage}"
 NPROC_PER_NODE="${3:?Missing GPU count}"
 BASE_CHECKPOINT="${4:?Missing released FastWAM checkpoint}"
@@ -77,8 +77,20 @@ case "${STAGE}" in
     DEFAULT_GROUNDING_OBJECTIVE_VERSION=7
     SAVE_EVERY=250
     ;;
+  grounding-exclusive-role)
+    START_STEP=3000
+    STAGE_START_STEP=3000
+    DEFAULT_STAGE_STEPS=250
+    LEARNING_RATE="1.0e-5"
+    CONFIG_STAGE="grounding"
+    DEFAULT_GROUNDING_OBJECTIVE_VERSION=8
+    SAVE_EVERY=250
+    ;;
   action)
-    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "7" ]]; then
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "8" ]]; then
+      START_STEP=3250
+      STAGE_START_STEP=3250
+    elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "7" ]]; then
       START_STEP=3000
       STAGE_START_STEP=3000
     elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "5" || "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "6" ]]; then
@@ -98,7 +110,10 @@ case "${STAGE}" in
     SAVE_EVERY=500
     ;;
   verifier)
-    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "7" ]]; then
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "8" ]]; then
+      START_STEP=7250
+      STAGE_START_STEP=7250
+    elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "7" ]]; then
       START_STEP=7000
       STAGE_START_STEP=7000
     elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "5" || "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "6" ]]; then
@@ -118,7 +133,7 @@ case "${STAGE}" in
     SAVE_EVERY=500
     ;;
   *)
-    echo "Stage must be grounding, grounding-role, grounding-role-adapter, grounding-structured-role, grounding-balanced-role, grounding-hard-role, action, or verifier; got ${STAGE}." >&2
+    echo "Stage must be grounding, grounding-role, grounding-role-adapter, grounding-structured-role, grounding-balanced-role, grounding-hard-role, grounding-exclusive-role, action, or verifier; got ${STAGE}." >&2
     exit 1
     ;;
 esac
@@ -138,7 +153,7 @@ ROLE_SWAP_WEIGHT="${PGC_V9_ROLE_SWAP_WEIGHT:-2.0}"
 ROLE_OVERLAP_WEIGHT="${PGC_V9_ROLE_OVERLAP_WEIGHT:-1.0}"
 ROLE_SWAP_MARGIN="${PGC_V9_ROLE_SWAP_MARGIN:-0.20}"
 ROLE_ASSIGNMENT_TEMPERATURE="${PGC_V9_ROLE_ASSIGNMENT_TEMPERATURE:-0.10}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "4" || "${GROUNDING_OBJECTIVE_VERSION}" == "5" || "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "4" || "${GROUNDING_OBJECTIVE_VERSION}" == "5" || "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" || "${GROUNDING_OBJECTIVE_VERSION}" == "8" ]]; then
   DEFAULT_ROLE_ASSIGNMENT_WEIGHT=1.0
   DEFAULT_ROLE_ASSIGNMENT_HARD_WEIGHT=0.5
 elif [[ "${GROUNDING_OBJECTIVE_VERSION}" == "3" ]]; then
@@ -150,7 +165,7 @@ else
 fi
 ROLE_ASSIGNMENT_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_WEIGHT:-${DEFAULT_ROLE_ASSIGNMENT_WEIGHT}}"
 ROLE_ASSIGNMENT_HARD_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_HARD_WEIGHT:-${DEFAULT_ROLE_ASSIGNMENT_HARD_WEIGHT}}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" || "${GROUNDING_OBJECTIVE_VERSION}" == "8" ]]; then
   DEFAULT_ROLE_ATTENTION_PRESERVATION_WEIGHT=5.0
   DEFAULT_ROLE_POSITION_PRESERVATION_WEIGHT=2.0
   DEFAULT_ROLE_ANCHOR_PRESERVATION_WEIGHT=10.0
@@ -174,7 +189,7 @@ ROLE_POSITION_PRESERVATION_WEIGHT="${PGC_V9_ROLE_POSITION_PRESERVATION_WEIGHT:-$
 ROLE_ANCHOR_PRESERVATION_WEIGHT="${PGC_V9_ROLE_ANCHOR_PRESERVATION_WEIGHT:-${DEFAULT_ROLE_ANCHOR_PRESERVATION_WEIGHT}}"
 ROLE_RELATION_PRESERVATION_WEIGHT="${PGC_V9_ROLE_RELATION_PRESERVATION_WEIGHT:-${DEFAULT_ROLE_RELATION_PRESERVATION_WEIGHT}}"
 ROLE_ADAPTER_ENERGY_WEIGHT="${PGC_V9_ROLE_ADAPTER_ENERGY_WEIGHT:-${DEFAULT_ROLE_ADAPTER_ENERGY_WEIGHT}}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" || "${GROUNDING_OBJECTIVE_VERSION}" == "8" ]]; then
   DEFAULT_STRUCTURED_ASSIGNMENT_WEIGHT=2.0
   # V9.5 interprets this as hard-group:easy-group mass.  1.0 is exact 1:1.
   DEFAULT_STRUCTURED_ASSIGNMENT_HARD_WEIGHT=1.0
@@ -232,19 +247,25 @@ case "${STAGE}" in
       exit 1
     fi
     ;;
+  grounding-exclusive-role)
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "8" ]]; then
+      echo "Formal V9.7 exclusive-role calibration requires objective version 8." >&2
+      exit 1
+    fi
+    ;;
   action|verifier)
-    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" && "${GROUNDING_OBJECTIVE_VERSION}" != "3" && "${GROUNDING_OBJECTIVE_VERSION}" != "4" && "${GROUNDING_OBJECTIVE_VERSION}" != "5" && "${GROUNDING_OBJECTIVE_VERSION}" != "6" && "${GROUNDING_OBJECTIVE_VERSION}" != "7" ]]; then
-      echo "V9 action/verifier requires grounding objective version 2, 3, 4, 5, 6, or 7." >&2
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" && "${GROUNDING_OBJECTIVE_VERSION}" != "3" && "${GROUNDING_OBJECTIVE_VERSION}" != "4" && "${GROUNDING_OBJECTIVE_VERSION}" != "5" && "${GROUNDING_OBJECTIVE_VERSION}" != "6" && "${GROUNDING_OBJECTIVE_VERSION}" != "7" && "${GROUNDING_OBJECTIVE_VERSION}" != "8" ]]; then
+      echo "V9 action/verifier requires grounding objective version 2, 3, 4, 5, 6, 7, or 8." >&2
       exit 1
     fi
     ;;
 esac
 HARD_ROLE_CURRICULUM=false
 HARD_ROLE_INDEX_PATH="${PGC_V9_HARD_ROLE_INDEX_PATH:-}"
-if [[ "${STAGE}" == "grounding-hard-role" ]]; then
+if [[ "${STAGE}" == "grounding-hard-role" || "${STAGE}" == "grounding-exclusive-role" ]]; then
   HARD_ROLE_CURRICULUM=true
   if [[ -z "${HARD_ROLE_INDEX_PATH}" || ! -f "${HARD_ROLE_INDEX_PATH}" ]]; then
-    echo "V9.6 requires PGC_V9_HARD_ROLE_INDEX_PATH from the clean V9.3 audit." >&2
+    echo "V9.6/V9.7 requires PGC_V9_HARD_ROLE_INDEX_PATH from the clean V9.3 audit." >&2
     exit 1
   fi
   HARD_ROLE_INDEX_PATH="$(cd -- "$(dirname -- "${HARD_ROLE_INDEX_PATH}")" && pwd -P)/$(basename -- "${HARD_ROLE_INDEX_PATH}")"
@@ -353,15 +374,19 @@ elif stage in {
     "grounding-structured-role",
     "grounding-balanced-role",
     "grounding-hard-role",
+    "grounding-exclusive-role",
 }:
     metadata = payload.get("architecture_metadata") or {}
     if fmt != "fastwam_policy_guard_v9" or version != 9:
         raise SystemExit("V9 role repair must resume from a V9 checkpoint.")
-    expected_saved_objective = (
-        4
-        if stage in {"grounding-structured-role", "grounding-balanced-role", "grounding-hard-role"}
-        else 2
-    )
+    expected_saved_objective = {
+        "grounding-role": 2,
+        "grounding-role-adapter": 2,
+        "grounding-structured-role": 4,
+        "grounding-balanced-role": 4,
+        "grounding-hard-role": 4,
+        "grounding-exclusive-role": 7,
+    }[stage]
     if (
         int(metadata.get("eraf_grounding_objective_version", -1))
         != expected_saved_objective
@@ -383,6 +408,7 @@ elif stage in {
         "grounding-structured-role": 5,
         "grounding-balanced-role": 6,
         "grounding-hard-role": 7,
+        "grounding-exclusive-role": 8,
     }[stage]
     if int(requested_objective) != expected_objective:
         raise SystemExit(
@@ -411,6 +437,14 @@ elif stage in {
         raise SystemExit(
             "V9.6 must warm-start from the completed clean V9.3 "
             "role-adapter-only checkpoint, not V9.4/V9.5."
+        )
+    if stage == "grounding-exclusive-role" and (
+        metadata.get("eraf_role_adapter_trainable_scope")
+        != "global_hard_curriculum_balanced_visual_role_binding_adapter_only"
+    ):
+        raise SystemExit(
+            "V9.7 must warm-start from the completed V9.6 hard-role "
+            "checkpoint at step 3000."
         )
 else:
     if fmt != "fastwam_policy_guard_v9" or version != 9:

@@ -1396,6 +1396,7 @@ def _structured_all_entity_assignment_loss(
         "hard_gradient_fraction": zero.detach(),
         "global_easy_count": zero.detach(),
         "global_hard_count": zero.detach(),
+        "exclusive_coverage": zero.detach(),
     }
     return assignment_loss, multi_clause_loss, metrics
 
@@ -1601,6 +1602,155 @@ def _balanced_bipartite_assignment_loss(
         "hard_gradient_fraction": hard_gradient_fraction.detach(),
         "global_easy_count": global_easy_count.detach(),
         "global_hard_count": global_hard_count.detach(),
+        "exclusive_coverage": zero.detach(),
+    }
+    return assignment_loss, multi_clause_loss, metrics
+
+
+def _balanced_exclusive_role_assignment_loss(
+    *,
+    role_attentions: Mapping[str, torch.Tensor],
+    role_targets: Mapping[str, torch.Tensor],
+    role_entity_ids: Mapping[str, torch.Tensor],
+    role_valid: Mapping[str, torch.Tensor],
+    clause_valid: torch.Tensor,
+    temperature: float,
+    hard_group_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Assign subject/reference roles using only unambiguous visual evidence.
+
+    Projected masks can overlap when an object is inside or on a reference
+    fixture.  Shared patches cannot identify which semantic role an attention
+    query selected, so V9.7 removes them from both the positive and negative
+    role evidence.  Full masks remain supervised by the localization losses;
+    this objective only changes the subject/reference competition used by the
+    role gate.
+    """
+    if temperature <= 0:
+        raise ValueError("ERAF exclusive-assignment temperature must be positive.")
+    if hard_group_weight <= 0:
+        raise ValueError(
+            "ERAF exclusive-assignment hard-group weight must be positive."
+        )
+
+    subject_target = role_targets["subject"].float()
+    reference_target = role_targets["reference"].float()
+    shared = torch.minimum(subject_target, reference_target)
+    subject_exclusive = (subject_target - shared).clamp_min(0.0)
+    reference_exclusive = (reference_target - shared).clamp_min(0.0)
+    distinct_entities = (
+        role_entity_ids["subject"].long()
+        != role_entity_ids["reference"].long()
+    )
+    pair_valid = (
+        clause_valid.bool()
+        & role_valid["subject"].bool()
+        & role_valid["reference"].bool()
+        & distinct_entities
+        & (subject_exclusive.sum(dim=-1) > 1.0e-8)
+        & (reference_exclusive.sum(dim=-1) > 1.0e-8)
+    )
+
+    subject_attention = role_attentions["subject"].float()
+    reference_attention = role_attentions["reference"].float()
+    subject_own = (subject_attention * subject_exclusive).sum(dim=-1)
+    subject_wrong = (subject_attention * reference_exclusive).sum(dim=-1)
+    reference_own = (reference_attention * reference_exclusive).sum(dim=-1)
+    reference_wrong = (reference_attention * subject_exclusive).sum(dim=-1)
+
+    def binary_nll(own: torch.Tensor, wrong: torch.Tensor) -> torch.Tensor:
+        own_logit = own / float(temperature)
+        wrong_logit = wrong / float(temperature)
+        return torch.logaddexp(own_logit, wrong_logit) - own_logit
+
+    row_losses = torch.stack(
+        (
+            binary_nll(subject_own, subject_wrong),
+            binary_nll(reference_own, reference_wrong),
+        ),
+        dim=-1,
+    )
+    row_correct = torch.stack(
+        (
+            subject_own > subject_wrong,
+            reference_own > reference_wrong,
+        ),
+        dim=-1,
+    )
+    row_margins = torch.stack(
+        (
+            subject_own - subject_wrong,
+            reference_own - reference_wrong,
+        ),
+        dim=-1,
+    )
+    # Each exclusive entity should also prefer its corresponding semantic
+    # query, preventing both queries from collapsing onto the same role.
+    column_losses = torch.stack(
+        (
+            binary_nll(subject_own, reference_wrong),
+            binary_nll(reference_own, subject_wrong),
+        ),
+        dim=-1,
+    )
+    column_correct = torch.stack(
+        (
+            subject_own > reference_wrong,
+            reference_own > subject_wrong,
+        ),
+        dim=-1,
+    )
+    decision_valid = pair_valid.unsqueeze(-1).expand_as(row_correct)
+    (
+        assignment_loss,
+        hard_gradient_fraction,
+        global_easy_count,
+        global_hard_count,
+    ) = _balanced_group_mean(
+        torch.cat((row_losses, column_losses), dim=1),
+        torch.cat((decision_valid, decision_valid), dim=1),
+        torch.cat((row_correct, column_correct), dim=1),
+        hard_group_weight=hard_group_weight,
+    )
+
+    multi_sample = (clause_valid.bool().sum(dim=-1) > 1) & pair_valid.any(dim=-1)
+    worst_row = torch.where(
+        decision_valid, row_losses, torch.zeros_like(row_losses)
+    ).flatten(1).amax(dim=-1)
+    worst_column = torch.where(
+        decision_valid, column_losses, torch.zeros_like(column_losses)
+    ).flatten(1).amax(dim=-1)
+    multi_clause_loss = _masked_mean(
+        0.5 * (worst_row + worst_column), multi_sample
+    )
+    sample_correct = (row_correct | ~decision_valid).flatten(1).all(dim=-1)
+    zero = row_losses.sum() * 0.0
+    metrics = {
+        "accuracy": _masked_mean(
+            row_correct.float(), decision_valid
+        ).detach(),
+        "column_accuracy": _masked_mean(
+            column_correct.float(), decision_valid
+        ).detach(),
+        "hard_fraction": _masked_mean(
+            (~row_correct).float(), decision_valid
+        ).detach(),
+        "margin": _masked_mean(row_margins, decision_valid).detach(),
+        "negative_count": _masked_mean(
+            torch.ones_like(row_losses), decision_valid
+        ).detach(),
+        "multi_clause_accuracy": (
+            _masked_mean(sample_correct.float(), multi_sample).detach()
+            if bool(multi_sample.any())
+            else zero.detach()
+        ),
+        "multi_clause_fraction": multi_sample.float().mean().detach(),
+        "hard_gradient_fraction": hard_gradient_fraction.detach(),
+        "global_easy_count": global_easy_count.detach(),
+        "global_hard_count": global_hard_count.detach(),
+        "exclusive_coverage": _masked_mean(
+            pair_valid.float(), clause_valid.bool()
+        ).detach(),
     }
     return assignment_loss, multi_clause_loss, metrics
 
@@ -1782,11 +1932,46 @@ def entity_relation_affordance_loss(
     reference_attention_wrong = (
         role_attentions["reference"] * role_targets["subject"]
     ).sum(dim=-1)
-    if int(weights.objective_version) >= 2:
+    shared_role_target = torch.minimum(
+        role_targets["subject"], role_targets["reference"]
+    )
+    subject_exclusive_target = (
+        role_targets["subject"] - shared_role_target
+    ).clamp_min(0.0)
+    reference_exclusive_target = (
+        role_targets["reference"] - shared_role_target
+    ).clamp_min(0.0)
+    exclusive_role_valid = (
+        role_swap_valid
+        & (subject_exclusive_target.sum(dim=-1) > 1.0e-8)
+        & (reference_exclusive_target.sum(dim=-1) > 1.0e-8)
+    )
+    subject_exclusive_own = (
+        role_attentions["subject"] * subject_exclusive_target
+    ).sum(dim=-1)
+    subject_exclusive_wrong = (
+        role_attentions["subject"] * reference_exclusive_target
+    ).sum(dim=-1)
+    reference_exclusive_own = (
+        role_attentions["reference"] * reference_exclusive_target
+    ).sum(dim=-1)
+    reference_exclusive_wrong = (
+        role_attentions["reference"] * subject_exclusive_target
+    ).sum(dim=-1)
+    if int(weights.objective_version) >= 8:
+        # V9.7 aligns role competition with the exclusive-evidence gate.
+        # Full-mask localization remains optimized above and is still audited.
+        subject_own = subject_exclusive_own
+        subject_wrong = subject_exclusive_wrong
+        reference_own = reference_exclusive_own
+        reference_wrong = reference_exclusive_wrong
+        role_supervision_valid = exclusive_role_valid
+    elif int(weights.objective_version) >= 2:
         subject_own = subject_attention_own
         subject_wrong = subject_attention_wrong
         reference_own = reference_attention_own
         reference_wrong = reference_attention_wrong
+        role_supervision_valid = role_swap_valid
     else:
         # Preserve the historical V9 objective for explicit reproduction.
         # Formal V9.1 runs set objective_version=2 and never take this branch.
@@ -1802,6 +1987,7 @@ def entity_relation_affordance_loss(
         reference_wrong = (
             role_heatmap_predictions["reference"] * role_targets["subject"]
         ).sum(dim=-1) / role_targets["subject"].sum(dim=-1).clamp_min(1.0)
+        role_supervision_valid = role_swap_valid
     role_swap_margin = float(weights.role_swap_margin)
     role_swap_loss = _masked_mean(
         0.5
@@ -1809,7 +1995,7 @@ def entity_relation_affordance_loss(
             torch.relu(role_swap_margin + subject_wrong - subject_own)
             + torch.relu(role_swap_margin + reference_wrong - reference_own)
         ),
-        role_swap_valid,
+        role_supervision_valid,
     )
     # V9.2 adds an explicit two-query/two-entity assignment objective.  The
     # row terms require each semantic query to prefer its own entity; the
@@ -1845,7 +2031,7 @@ def entity_relation_affordance_loss(
     assignment_sample_weights = 1.0 + hard_weight * hard_assignment
     role_assignment_loss = _masked_weighted_mean(
         assignment_per_clause,
-        role_swap_valid,
+        role_supervision_valid,
         assignment_sample_weights,
     )
     zero = outputs["active_logits"].sum() * 0.0
@@ -1862,8 +2048,26 @@ def entity_relation_affordance_loss(
         "hard_gradient_fraction": zero.detach(),
         "global_easy_count": zero.detach(),
         "global_hard_count": zero.detach(),
+        "exclusive_coverage": zero.detach(),
     }
-    if int(weights.objective_version) >= 6:
+    if int(weights.objective_version) >= 8:
+        (
+            structured_assignment_loss,
+            multi_clause_consistency_loss,
+            structured_metrics,
+        ) = _balanced_exclusive_role_assignment_loss(
+            role_attentions=role_attentions,
+            role_targets=role_targets,
+            role_entity_ids={
+                role: labels[f"{role}_entity_ids"]
+                for role in ("subject", "reference")
+            },
+            role_valid=role_mask_valid,
+            clause_valid=clause_valid,
+            temperature=float(weights.structured_assignment_temperature),
+            hard_group_weight=float(weights.structured_assignment_hard_weight),
+        )
+    elif int(weights.objective_version) >= 6:
         (
             structured_assignment_loss,
             multi_clause_consistency_loss,
@@ -1898,16 +2102,18 @@ def entity_relation_affordance_loss(
     # Penalize attention assigned exclusively to the other semantic role.
     # Pixels shared by overlapping objects/containers are excluded so an
     # object entering a basket is not trained as a false negative.
-    subject_exclusive_wrong = role_targets["reference"] * (
+    subject_exclusive_negative = role_targets["reference"] * (
         role_targets["subject"] <= 0
     ).to(role_targets["reference"].dtype)
-    reference_exclusive_wrong = role_targets["subject"] * (
+    reference_exclusive_negative = role_targets["subject"] * (
         role_targets["reference"] <= 0
     ).to(role_targets["subject"].dtype)
-    subject_overlap = (role_attentions["subject"] * subject_exclusive_wrong).sum(dim=-1)
-    reference_overlap = (role_attentions["reference"] * reference_exclusive_wrong).sum(
-        dim=-1
-    )
+    subject_overlap = (
+        role_attentions["subject"] * subject_exclusive_negative
+    ).sum(dim=-1)
+    reference_overlap = (
+        role_attentions["reference"] * reference_exclusive_negative
+    ).sum(dim=-1)
     role_overlap_loss = _masked_mean(
         0.5 * (subject_overlap + reference_overlap), role_swap_valid
     )
@@ -2183,17 +2389,35 @@ def entity_relation_affordance_loss(
         "pgc_v9_role_swap_valid_fraction": _masked_mean(
             role_swap_valid.float(), clause_valid
         ).detach(),
+        "pgc_v9_exclusive_role_swap_accuracy": _masked_mean(
+            (
+                (subject_exclusive_own > subject_exclusive_wrong)
+                & (reference_exclusive_own > reference_exclusive_wrong)
+            ).float(),
+            exclusive_role_valid,
+        ).detach(),
+        "pgc_v9_exclusive_role_coverage": _masked_mean(
+            exclusive_role_valid.float(), role_swap_valid
+        ).detach(),
+        "pgc_v9_exclusive_subject_role_attention_margin": _masked_mean(
+            subject_exclusive_own - subject_exclusive_wrong,
+            exclusive_role_valid,
+        ).detach(),
+        "pgc_v9_exclusive_reference_role_attention_margin": _masked_mean(
+            reference_exclusive_own - reference_exclusive_wrong,
+            exclusive_role_valid,
+        ).detach(),
         "pgc_v9_role_assignment_accuracy": _masked_mean(
-            assignment_correct.float(), role_swap_valid
+            assignment_correct.float(), role_supervision_valid
         ).detach(),
         "pgc_v9_role_assignment_row_accuracy": _masked_mean(
-            row_correct.float(), role_swap_valid
+            row_correct.float(), role_supervision_valid
         ).detach(),
         "pgc_v9_role_assignment_column_accuracy": _masked_mean(
-            column_correct.float(), role_swap_valid
+            column_correct.float(), role_supervision_valid
         ).detach(),
         "pgc_v9_role_assignment_hard_fraction": _masked_mean(
-            hard_assignment, role_swap_valid
+            hard_assignment, role_supervision_valid
         ).detach(),
         "pgc_v9_structured_assignment_accuracy": structured_metrics["accuracy"],
         "pgc_v9_structured_assignment_column_accuracy": structured_metrics[
@@ -2220,6 +2444,9 @@ def entity_relation_affordance_loss(
         ],
         "pgc_v9_structured_global_hard_count": structured_metrics[
             "global_hard_count"
+        ],
+        "pgc_v9_structured_exclusive_coverage": structured_metrics[
+            "exclusive_coverage"
         ],
         "pgc_v9_teacher_preservation_fraction": teacher_preservation_fraction,
         "pgc_v9_teacher_predicate_max_abs_error": (teacher_predicate_max_abs_error),

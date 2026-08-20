@@ -151,21 +151,22 @@ def _role_residual_audit(records: list[Mapping[str, Any]]) -> dict[str, Any]:
     full_accuracy = overall["full_mask"]["accuracy"]
     exclusive_accuracy = overall["exclusive_mask"]["accuracy"]
     exclusive_coverage = overall["exclusive_mask"]["coverage"]
-    if full_accuracy is not None and full_accuracy >= 0.90:
-        diagnosis = "role_gate_pass"
-        recommendation = "Proceed only if every other grounding gate passes."
-    elif exclusive_coverage is None or exclusive_coverage < 0.50:
+    if exclusive_coverage is None or exclusive_coverage < 0.50:
         diagnosis = "insufficient_exclusive_role_support"
         recommendation = (
             "Inspect mask construction or add higher-resolution role labels before "
             "changing the role objective."
         )
     elif exclusive_accuracy is not None and exclusive_accuracy >= 0.90:
-        diagnosis = "overlap_sensitive_full_mask_gate"
-        recommendation = (
-            "Align the role objective and gate to exclusive evidence while retaining "
-            "full-mask top-1 localization checks."
-        )
+        if full_accuracy is not None and full_accuracy >= 0.90:
+            diagnosis = "role_gate_pass"
+            recommendation = "Proceed only if every other grounding gate passes."
+        else:
+            diagnosis = "exclusive_role_gate_pass_full_mask_overlap_diagnostic"
+            recommendation = (
+                "Use exclusive evidence for semantic role acceptance and retain "
+                "full-mask top-1 checks for localization."
+            )
     else:
         diagnosis = "role_binding_generalization_failure"
         recommendation = (
@@ -216,12 +217,23 @@ def compute_grounding_gate_report(
         if goal_anchor_errors_m
         else float("inf")
     )
+    role_residual_audit = _role_residual_audit(records)
+    role_overall = role_residual_audit.get("overall", {})
+    exclusive_summary = role_overall.get("exclusive_mask", {})
+    exclusive_role_accuracy = exclusive_summary.get("accuracy")
+    exclusive_role_coverage = exclusive_summary.get("coverage")
     metrics = {
         "samples": len(records),
         "subject_top1_in_gt_mask": _safe_rate(subject_hits),
         "reference_top1_in_gt_mask": _safe_rate(reference_hits),
         "relation_macro_f1": _macro_f1(relation_targets, relation_predictions),
+        # Retained for historical comparison only. V9.7 gates semantic roles
+        # with exclusive evidence because full subject/reference masks may
+        # overlap in valid in/on states.
         "role_swap_accuracy": _safe_rate(role_swap),
+        "full_mask_role_swap_accuracy": _safe_rate(role_swap),
+        "exclusive_role_accuracy": exclusive_role_accuracy,
+        "exclusive_role_coverage": exclusive_role_coverage,
         "visible_goal_anchor_median_error_cm": anchor_median_cm,
         "clause_exact_match": _safe_rate(clause_exact),
         "multi_clause_exact_match": _safe_rate(multi_clause_exact),
@@ -231,18 +243,28 @@ def compute_grounding_gate_report(
         "subject_top1_at_least_80pct": (metrics["subject_top1_in_gt_mask"] >= 0.80),
         "reference_top1_at_least_80pct": (metrics["reference_top1_in_gt_mask"] >= 0.80),
         "relation_macro_f1_at_least_90pct": (metrics["relation_macro_f1"] >= 0.90),
-        "role_swap_at_least_90pct": metrics["role_swap_accuracy"] >= 0.90,
+        "exclusive_role_coverage_at_least_50pct": (
+            exclusive_role_coverage is not None and exclusive_role_coverage >= 0.50
+        ),
+        "exclusive_role_accuracy_at_least_90pct": (
+            exclusive_role_accuracy is not None and exclusive_role_accuracy >= 0.90
+        ),
         "visible_goal_anchor_median_at_most_5cm": anchor_median_cm <= 5.0,
         "multi_clause_exact_at_least_80pct": (
             bool(multi_clause_exact) and metrics["multi_clause_exact_match"] >= 0.80
         ),
     }
     return {
-        "format": "pgc_v9_eraf_grounding_gate_v1",
+        "format": "pgc_v9_eraf_grounding_gate_v2",
         "metrics": metrics,
         "checks": checks,
         "passed": all(checks.values()),
-        "role_residual_audit": _role_residual_audit(records),
+        "diagnostics": {
+            "full_mask_role_swap_at_least_90pct": (
+                metrics["full_mask_role_swap_accuracy"] >= 0.90
+            )
+        },
+        "role_residual_audit": role_residual_audit,
     }
 
 
@@ -514,6 +536,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         5: 3500,
         6: 3500,
         7: 3000,
+        8: 3250,
     }.get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
     intermediate_checkpoint = bool(args.allow_intermediate) and (
@@ -530,7 +553,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "The pre-action grounding gate requires the completed V9 "
             "grounding-stage checkpoint: objective v2 at step 1500 or "
             "objective v3/v4 at step 2500, objective v5/v6 at step 3500, "
-            "or objective v7 at step 3000."
+            "objective v7 at step 3000, or objective v8 at step 3250."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())

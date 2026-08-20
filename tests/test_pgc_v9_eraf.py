@@ -36,6 +36,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
     ERAFLossWeights,
     EntityRelationAffordanceField,
     _balanced_bipartite_assignment_loss,
+    _balanced_exclusive_role_assignment_loss,
     _structured_all_entity_assignment_loss,
     entity_relation_affordance_loss,
 )
@@ -1111,6 +1112,69 @@ class PGCERAFModuleTest(unittest.TestCase):
         (loss + multi_loss).backward()
         self.assertIsNotNone(subject_attention.grad)
 
+    def test_v97_exclusive_assignment_ignores_shared_role_support(self):
+        subject_target = torch.tensor([[[1.0, 1.0, 0.0, 0.0]]])
+        reference_target = torch.tensor([[[0.0, 1.0, 1.0, 0.0]]])
+        common = {
+            "role_targets": {
+                "subject": subject_target,
+                "reference": reference_target,
+            },
+            "role_entity_ids": {
+                "subject": torch.tensor([[1]]),
+                "reference": torch.tensor([[2]]),
+            },
+            "role_valid": {
+                "subject": torch.ones(1, 1, dtype=torch.bool),
+                "reference": torch.ones(1, 1, dtype=torch.bool),
+            },
+            "clause_valid": torch.ones(1, 1, dtype=torch.bool),
+            "temperature": 0.10,
+            "hard_group_weight": 1.0,
+        }
+        good_loss, _, good_metrics = _balanced_exclusive_role_assignment_loss(
+            role_attentions={
+                "subject": torch.tensor([[[0.40, 0.50, 0.10, 0.0]]]),
+                "reference": torch.tensor([[[0.10, 0.50, 0.40, 0.0]]]),
+            },
+            **common,
+        )
+        bad_loss, _, bad_metrics = _balanced_exclusive_role_assignment_loss(
+            role_attentions={
+                "subject": torch.tensor([[[0.10, 0.50, 0.40, 0.0]]]),
+                "reference": torch.tensor([[[0.40, 0.50, 0.10, 0.0]]]),
+            },
+            **common,
+        )
+        self.assertLess(good_loss.item(), bad_loss.item())
+        self.assertEqual(good_metrics["accuracy"].item(), 1.0)
+        self.assertEqual(bad_metrics["accuracy"].item(), 0.0)
+        self.assertEqual(good_metrics["exclusive_coverage"].item(), 1.0)
+
+        ambiguous_loss, _, ambiguous_metrics = (
+            _balanced_exclusive_role_assignment_loss(
+                role_attentions={
+                    "subject": torch.tensor([[[0.5, 0.5]]], requires_grad=True),
+                    "reference": torch.tensor([[[0.5, 0.5]]], requires_grad=True),
+                },
+                role_targets={
+                    "subject": torch.tensor([[[1.0, 1.0]]]),
+                    "reference": torch.tensor([[[1.0, 1.0]]]),
+                },
+                role_entity_ids={
+                    "subject": torch.tensor([[1]]),
+                    "reference": torch.tensor([[2]]),
+                },
+                role_valid=common["role_valid"],
+                clause_valid=common["clause_valid"],
+                temperature=0.10,
+                hard_group_weight=1.0,
+            )
+        )
+        self.assertTrue(torch.isfinite(ambiguous_loss))
+        self.assertEqual(ambiguous_loss.item(), 0.0)
+        self.assertEqual(ambiguous_metrics["exclusive_coverage"].item(), 0.0)
+
     def test_v95_zero_init_visual_binding_adapter_matches_v93_teacher(self):
         torch.manual_seed(95)
         module = EntityRelationAffordanceField(
@@ -1919,6 +1983,86 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             )
             restored.load_checkpoint(v9r6_path)
 
+    def test_v96_can_upgrade_to_v97_exclusive_role_evidence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v5_path = root / "v5.pt"
+            v9r1_path = root / "v9r1.pt"
+            v9r3_path = root / "v9r3.pt"
+            v9r6_path = root / "v9r6.pt"
+            v9r7_path = root / "v9r7.pt"
+            base = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": base.mot.state_dict()},
+                base_path,
+            )
+            base.load_checkpoint(base_path)
+            base.save_checkpoint(v5_path, step=4000)
+            v9r1 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=2,
+            )
+            v9r1.load_checkpoint(v5_path)
+            v9r1.save_checkpoint(v9r1_path, step=1500)
+            v9r3 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=4,
+            )
+            v9r3.load_checkpoint(v9r1_path)
+            v9r3.save_checkpoint(v9r3_path, step=2500)
+            v9r6 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=7,
+            )
+            v9r6.load_checkpoint(v9r3_path)
+            v9r6.save_checkpoint(v9r6_path, step=3000)
+
+            v9r7 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=8,
+            )
+            v9r7.load_checkpoint(v9r6_path)
+            v9r7.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v9r7.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all("balanced_role_binding_adapter" in name for name in trainable)
+            )
+            v9r7.save_checkpoint(v9r7_path, step=3250)
+            metadata = torch.load(
+                v9r7_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 8)
+            self.assertEqual(
+                metadata["eraf_role_evidence"],
+                "exclusive_subject_reference_support",
+            )
+            self.assertEqual(
+                metadata["eraf_role_gate"],
+                "exclusive_accuracy_with_full_mask_localization",
+            )
+            self.assertEqual(metadata["eraf_exclusive_role_coverage_min"], 0.5)
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "exclusive_evidence_global_hard_curriculum_"
+                "balanced_visual_role_binding_adapter_only",
+            )
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=8,
+            )
+            restored.load_checkpoint(v9r7_path)
+
     def test_stage_trainability_optimizer_contract_and_deployment_inputs(self):
         expected_modules = {
             "grounding": {"entity_relation_affordance"},
@@ -1984,6 +2128,23 @@ class PGCERAFIntegrationTest(unittest.TestCase):
 
 class PGCERAFGroundingGateTest(unittest.TestCase):
     def test_gate_requires_every_declared_threshold(self):
+        def role_clause(correct: bool):
+            return {
+                "full_mask_correct": correct,
+                "exclusive_mask_valid": True,
+                "exclusive_mask_correct": correct,
+                "mask_overlap_iou": 0.1,
+                "subject_overlap_fraction": 0.1,
+                "reference_overlap_fraction": 0.1,
+                "full_subject_margin": 0.2 if correct else -0.2,
+                "full_reference_margin": 0.2 if correct else -0.2,
+                "exclusive_subject_margin": 0.2 if correct else -0.2,
+                "exclusive_reference_margin": 0.2 if correct else -0.2,
+                "dataset_kind": "native",
+                "predicate": "in",
+                "task": "task-a",
+            }
+
         good = {
             "subject_top1_hits": [True] * 9 + [False],
             "reference_top1_hits": [True] * 9 + [False],
@@ -1993,6 +2154,10 @@ class PGCERAFGroundingGateTest(unittest.TestCase):
             "goal_anchor_errors_m": [0.01, 0.03, 0.05],
             "clause_exact": True,
             "clause_count": 2,
+            "role_audit_clauses": [
+                *[role_clause(True) for _ in range(9)],
+                role_clause(False),
+            ],
         }
         report = compute_grounding_gate_report([good] * 5)
         self.assertTrue(report["passed"])
@@ -2009,7 +2174,7 @@ class PGCERAFGroundingGateTest(unittest.TestCase):
             "relation_targets": [1],
             "relation_predictions": [1],
             "goal_anchor_errors_m": [0.01],
-            "clause_exact": False,
+            "clause_exact": True,
             "clause_count": 2,
         }
 
@@ -2037,7 +2202,15 @@ class PGCERAFGroundingGateTest(unittest.TestCase):
         audit = compute_grounding_gate_report(overlap_records)[
             "role_residual_audit"
         ]
-        self.assertEqual(audit["diagnosis"], "overlap_sensitive_full_mask_gate")
+        overlap_report = compute_grounding_gate_report(overlap_records)
+        self.assertTrue(overlap_report["passed"])
+        self.assertFalse(
+            overlap_report["diagnostics"]["full_mask_role_swap_at_least_90pct"]
+        )
+        self.assertEqual(
+            audit["diagnosis"],
+            "exclusive_role_gate_pass_full_mask_overlap_diagnostic",
+        )
         self.assertEqual(
             audit["overall"]["full_mask_failure_partition"][
                 "exclusive_recovers"
@@ -2055,6 +2228,7 @@ class PGCERAFGroundingGateTest(unittest.TestCase):
         audit = compute_grounding_gate_report(binding_records)[
             "role_residual_audit"
         ]
+        self.assertFalse(compute_grounding_gate_report(binding_records)["passed"])
         self.assertEqual(
             audit["diagnosis"], "role_binding_generalization_failure"
         )

@@ -278,6 +278,8 @@ policy_guard:
     # Version 7 (V9.6) fixes that balance globally across DDP ranks, samples
     # audited native hard/easy rows in every optimizer window, and protects
     # V9.3 position/relation/anchor geometry on every active clause.
+    # Version 8 (V9.7) removes subject/reference mask intersections from role
+    # competition while preserving full-mask localization supervision.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8

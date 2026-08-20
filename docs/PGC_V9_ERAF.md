@@ -227,7 +227,10 @@ CUDA_VISIBLE_DEVICES=0 /opt/conda/bin/python \
 echo "GROUNDING_GATE_EXIT=$?"
 ```
 
-Gate 同时要求 subject/reference top-1 ≥80%、relation macro-F1 ≥90%、role-swap ≥90%、可见 goal anchor 中位误差 ≤5 cm、多 clause exact match ≥80%。失败返回码为 2。
+V9.7 gate 同时要求 subject/reference full-mask top-1 ≥80%、relation macro-F1
+≥90%、exclusive role accuracy ≥90%、exclusive evidence coverage ≥50%、可见 goal
+anchor 中位误差 ≤5 cm、多 clause exact match ≥80%。失败返回码为 2。完整 mask
+role-swap accuracy 继续输出作重叠诊断，但不再作为语义角色的硬准入项。
 
 Gate 报告还包含 `role_residual_audit`，但该审计不会放宽上述准入标准。它使用
 subject/reference mask 的逐 patch 交集构造 exclusive evidence，并分别报告：
@@ -237,11 +240,28 @@ subject/reference mask 的逐 patch 交集构造 exclusive evidence，并分别�
 - mask IoU、subject/reference overlap fraction 和两种判据下的 margin 分布；
 - 按 native/counterfactual、predicate 和任务指令拆分的同类指标。
 
-`diagnosis=overlap_sensitive_full_mask_gate` 表示实体定位正确，但完整 mask 判据受到
-物体/容器重叠影响；此时应对齐训练目标和 gate，而不是继续堆训练步数。
+`diagnosis=exclusive_role_gate_pass_full_mask_overlap_diagnostic` 表示 exclusive
+角色准入已通过，但完整 mask 判据受到物体/容器重叠影响；它不会单独阻止进入
+下一阶段。
 `diagnosis=role_binding_generalization_failure` 表示 exclusive evidence 下仍会交换角色；
 此时应增加显式 subject/reference assignment loss 和均衡 hard role-swap 采样，且不得
 进入 Stage 2。
+
+#### V9.7 exclusive-evidence calibration
+
+V9.7 从 V9.6 objective-v7 step 3000 继续 250 个 grounding steps，仍只训练
+`balanced_role_binding_adapter`。同一 clause 的 subject/reference mask 先删除逐 patch
+交集，再计算 row/column assignment、hard/easy 全局梯度平衡和 multi-clause worst-role
+loss。完整 mask 仍用于 BCE/Dice、attention mass 与 top-1 定位监督，因此不会通过
+缩小 mask 来规避实体定位。
+
+训练 stage 为 `grounding-exclusive-role`，objective version 为 8，默认学习率
+`1e-5`，结束 step 为 3250。它继续使用 V9.3 审计得到的 hard-role index 和
+V9.6 四池 curriculum。V9.7 checkpoint 额外声明：
+
+- `eraf_role_evidence=exclusive_subject_reference_support`；
+- `eraf_role_gate=exclusive_accuracy_with_full_mask_localization`；
+- `eraf_exclusive_role_coverage_min=0.5`。
 
 #### V9.2-B role-assignment repair
 
