@@ -609,6 +609,129 @@ class StructuredRoleAssignmentAdapter(nn.Module):
         }
 
 
+class BalancedRoleBindingAdapter(nn.Module):
+    """Visual-candidate-aware V9.5 repair on top of the frozen V9.3 path.
+
+    V9.4 only exchanged language-side clause slots.  That leaves the adapter
+    unable to distinguish two clauses whose linguistic structure is similar
+    but whose same-state visual candidates differ.  V9.5 injects the frozen
+    V9.3 subject/reference visual tokens into the cross-clause slots before a
+    new zero-initialized residual is predicted.  The frozen tokens are
+    detached by the caller, so assignment gradients cannot update the V9.3
+    grounder, position head, relation reasoner, or anchor heads.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        adapter_hidden_dim: int,
+        num_heads: int,
+        max_clauses: int,
+    ) -> None:
+        super().__init__()
+        if min(hidden_dim, adapter_hidden_dim, num_heads, max_clauses) <= 0:
+            raise ValueError("ERAF balanced-role dimensions must be positive.")
+        if adapter_hidden_dim % num_heads:
+            raise ValueError(
+                "ERAF balanced-role hidden dimension must be divisible by heads."
+            )
+        self.hidden_dim = int(hidden_dim)
+        self.adapter_hidden_dim = int(adapter_hidden_dim)
+        self.max_clauses = int(max_clauses)
+        self.input_norm = nn.LayerNorm(hidden_dim * 4)
+        self.input_projection = nn.Linear(hidden_dim * 4, adapter_hidden_dim)
+        self.clause_embedding = nn.Parameter(
+            torch.zeros(max_clauses, adapter_hidden_dim)
+        )
+        self.role_embedding = nn.Parameter(torch.zeros(2, adapter_hidden_dim))
+        nn.init.normal_(self.clause_embedding, std=0.02)
+        nn.init.normal_(self.role_embedding, std=0.02)
+        self.encoder = nn.TransformerEncoderLayer(
+            d_model=adapter_hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=adapter_hidden_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.output_norm = nn.LayerNorm(adapter_hidden_dim)
+        self.subject_output = nn.Linear(adapter_hidden_dim, hidden_dim)
+        self.reference_output = nn.Linear(adapter_hidden_dim, hidden_dim)
+        nn.init.zeros_(self.subject_output.weight)
+        nn.init.zeros_(self.subject_output.bias)
+        nn.init.zeros_(self.reference_output.weight)
+        nn.init.zeros_(self.reference_output.bias)
+
+    def forward(
+        self,
+        *,
+        clause_hidden: torch.Tensor,
+        subject_queries: torch.Tensor,
+        reference_queries: torch.Tensor,
+        subject_candidates: torch.Tensor,
+        reference_candidates: torch.Tensor,
+        active_logits: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        expected = clause_hidden.shape
+        if not all(
+            value.shape == expected
+            for value in (
+                subject_queries,
+                reference_queries,
+                subject_candidates,
+                reference_candidates,
+            )
+        ):
+            raise ValueError(
+                "ERAF balanced-role clause/query/candidate shapes must match."
+            )
+        if clause_hidden.shape[1] != self.max_clauses:
+            raise ValueError(
+                "ERAF balanced-role input does not match configured clauses."
+            )
+        if active_logits.shape != clause_hidden.shape[:2]:
+            raise ValueError("ERAF balanced-role active logits must match [B,clauses].")
+
+        def slot(
+            query: torch.Tensor, candidate: torch.Tensor, role_index: int
+        ) -> torch.Tensor:
+            projected = self.input_projection(
+                self.input_norm(
+                    torch.cat(
+                        (
+                            clause_hidden,
+                            query,
+                            candidate.detach(),
+                            query - candidate.detach(),
+                        ),
+                        dim=-1,
+                    )
+                )
+            )
+            return (
+                projected
+                + self.clause_embedding.unsqueeze(0)
+                + self.role_embedding[role_index]
+            )
+
+        subject_slot = slot(subject_queries, subject_candidates, 0)
+        reference_slot = slot(reference_queries, reference_candidates, 1)
+        slots = torch.cat((subject_slot, reference_slot), dim=1)
+        encoded = self.output_norm(self.encoder(slots))
+        subject_hidden, reference_hidden = encoded.split(self.max_clauses, dim=1)
+        active = torch.sigmoid(active_logits.float()).to(encoded.dtype).unsqueeze(-1)
+        subject_delta = self.subject_output(subject_hidden) * active
+        reference_delta = self.reference_output(reference_hidden) * active
+        return {
+            "subject_queries": subject_queries + subject_delta,
+            "reference_queries": reference_queries + reference_delta,
+            "subject_delta": subject_delta,
+            "reference_delta": reference_delta,
+        }
+
+
 class EntityRelationAffordanceField(nn.Module):
     """Complete RGB+language ERAF deployment path used by PGC V9."""
 
@@ -632,6 +755,8 @@ class EntityRelationAffordanceField(nn.Module):
         role_adapter_teacher_enabled: bool = False,
         structured_role_adapter_enabled: bool = False,
         structured_role_adapter_hidden_dim: int = 256,
+        balanced_role_adapter_enabled: bool = False,
+        balanced_role_adapter_hidden_dim: int = 256,
     ) -> None:
         super().__init__()
         self.text_dim = int(text_dim)
@@ -651,6 +776,8 @@ class EntityRelationAffordanceField(nn.Module):
         self.structured_role_adapter_hidden_dim = int(
             structured_role_adapter_hidden_dim
         )
+        self.balanced_role_adapter_enabled = bool(balanced_role_adapter_enabled)
+        self.balanced_role_adapter_hidden_dim = int(balanced_role_adapter_hidden_dim)
         self.role_decoder = PredicateRoleDecoder(
             text_dim=text_dim,
             hidden_dim=hidden_dim,
@@ -685,6 +812,16 @@ class EntityRelationAffordanceField(nn.Module):
                 max_clauses=max_clauses,
             )
             if self.structured_role_adapter_enabled
+            else None
+        )
+        self.balanced_role_binding_adapter = (
+            BalancedRoleBindingAdapter(
+                hidden_dim=hidden_dim,
+                adapter_hidden_dim=balanced_role_adapter_hidden_dim,
+                num_heads=num_heads,
+                max_clauses=max_clauses,
+            )
+            if self.balanced_role_adapter_enabled
             else None
         )
         self.entity_only_projection = nn.Sequential(
@@ -869,11 +1006,19 @@ class EntityRelationAffordanceField(nn.Module):
         else:
             subject_role_delta = torch.zeros_like(base_subject_queries)
             reference_role_delta = torch.zeros_like(base_reference_queries)
-        if self.role_adapter_teacher_enabled and torch.is_grad_enabled():
+        teacher_subject: dict[str, torch.Tensor] | None = None
+        teacher_reference: dict[str, torch.Tensor] | None = None
+        needs_visual_candidates = self.balanced_role_binding_adapter is not None
+        if self.role_adapter_teacher_enabled and (
+            torch.is_grad_enabled() or needs_visual_candidates
+        ):
             # V9.3 preserves the exact V9.1 path before its local adapter.
             # V9.4 layers a second adapter on top and instead freezes the
             # complete validated V9.3 role path as its same-state teacher.
-            if self.structured_role_assignment_adapter is not None:
+            if (
+                self.structured_role_assignment_adapter is not None
+                or self.balanced_role_binding_adapter is not None
+            ):
                 teacher_subject_queries = roles["subject_queries"]
                 teacher_reference_queries = roles["reference_queries"]
             else:
@@ -886,26 +1031,33 @@ class EntityRelationAffordanceField(nn.Module):
                 teacher_reference = self.entity_grounder.ground(
                     teacher_reference_queries, current_video_hidden
                 )
-                teacher_affordance = self._decode_affordance(
-                    clause_hidden=roles["clause_hidden"],
-                    subject_token=teacher_subject["token"],
-                    reference_token=teacher_reference["token"],
-                    subject_position=teacher_subject["position"],
-                    reference_position=teacher_reference["position"],
-                    active_logits=roles["active_logits"],
+                teacher_affordance = (
+                    self._decode_affordance(
+                        clause_hidden=roles["clause_hidden"],
+                        subject_token=teacher_subject["token"],
+                        reference_token=teacher_reference["token"],
+                        subject_position=teacher_subject["position"],
+                        reference_position=teacher_reference["position"],
+                        active_logits=roles["active_logits"],
+                    )
+                    if torch.is_grad_enabled()
+                    else None
                 )
-            teacher = {
-                "subject_attention": teacher_subject["attention"].detach(),
-                "reference_attention": teacher_reference["attention"].detach(),
-                "subject_position": teacher_subject["position"].detach(),
-                "reference_position": teacher_reference["position"].detach(),
-                "relation_hidden": teacher_affordance["relation_hidden"].detach(),
-                "grasp_anchor": teacher_affordance["grasp_anchor"].detach(),
-                "goal_anchor": teacher_affordance["goal_anchor"].detach(),
-                "interaction_anchor": teacher_affordance["interaction_anchor"].detach(),
-                "active_logits": roles["active_logits"].detach(),
-                "predicate_logits": roles["predicate_logits"].detach(),
-            }
+            if teacher_affordance is not None:
+                teacher = {
+                    "subject_attention": teacher_subject["attention"].detach(),
+                    "reference_attention": teacher_reference["attention"].detach(),
+                    "subject_position": teacher_subject["position"].detach(),
+                    "reference_position": teacher_reference["position"].detach(),
+                    "relation_hidden": teacher_affordance["relation_hidden"].detach(),
+                    "grasp_anchor": teacher_affordance["grasp_anchor"].detach(),
+                    "goal_anchor": teacher_affordance["goal_anchor"].detach(),
+                    "interaction_anchor": teacher_affordance[
+                        "interaction_anchor"
+                    ].detach(),
+                    "active_logits": roles["active_logits"].detach(),
+                    "predicate_logits": roles["predicate_logits"].detach(),
+                }
         if self.structured_role_assignment_adapter is not None:
             structured_roles = self.structured_role_assignment_adapter(
                 clause_hidden=roles["clause_hidden"],
@@ -923,6 +1075,29 @@ class EntityRelationAffordanceField(nn.Module):
         else:
             structured_subject_role_delta = torch.zeros_like(base_subject_queries)
             structured_reference_role_delta = torch.zeros_like(base_reference_queries)
+        if self.balanced_role_binding_adapter is not None:
+            if teacher_subject is None or teacher_reference is None:
+                raise RuntimeError(
+                    "V9.5 balanced binding requires frozen V9.3 visual candidates."
+                )
+            balanced_roles = self.balanced_role_binding_adapter(
+                clause_hidden=roles["clause_hidden"],
+                subject_queries=roles["subject_queries"],
+                reference_queries=roles["reference_queries"],
+                subject_candidates=teacher_subject["token"],
+                reference_candidates=teacher_reference["token"],
+                active_logits=roles["active_logits"],
+            )
+            roles = {
+                **roles,
+                "subject_queries": balanced_roles["subject_queries"],
+                "reference_queries": balanced_roles["reference_queries"],
+            }
+            balanced_subject_role_delta = balanced_roles["subject_delta"]
+            balanced_reference_role_delta = balanced_roles["reference_delta"]
+        else:
+            balanced_subject_role_delta = torch.zeros_like(base_subject_queries)
+            balanced_reference_role_delta = torch.zeros_like(base_reference_queries)
         subject = self.entity_grounder.ground(
             roles["subject_queries"], current_video_hidden
         )
@@ -982,6 +1157,12 @@ class EntityRelationAffordanceField(nn.Module):
             "pgc_v9_structured_role_adapter_reference_delta_norm": (
                 structured_reference_role_delta.float().norm(dim=-1).mean()
             ),
+            "pgc_v9_balanced_role_adapter_subject_delta_norm": (
+                balanced_subject_role_delta.float().norm(dim=-1).mean()
+            ),
+            "pgc_v9_balanced_role_adapter_reference_delta_norm": (
+                balanced_reference_role_delta.float().norm(dim=-1).mean()
+            ),
         }
         outputs = {
             **roles,
@@ -1008,6 +1189,8 @@ class EntityRelationAffordanceField(nn.Module):
             "reference_role_delta": reference_role_delta,
             "structured_subject_role_delta": structured_subject_role_delta,
             "structured_reference_role_delta": structured_reference_role_delta,
+            "balanced_subject_role_delta": balanced_subject_role_delta,
+            "balanced_reference_role_delta": balanced_reference_role_delta,
             **affordance,
         }
         if teacher is not None:
@@ -1195,6 +1378,7 @@ def _structured_all_entity_assignment_loss(
     zero = losses.sum() * 0.0
     metrics = {
         "accuracy": _masked_mean(correct.float(), valid).detach(),
+        "column_accuracy": zero.detach(),
         "hard_fraction": _masked_mean(hard, valid).detach(),
         "margin": _masked_mean(margins, valid).detach(),
         "negative_count": _masked_mean(negative_counts, valid).detach(),
@@ -1204,6 +1388,149 @@ def _structured_all_entity_assignment_loss(
             else zero.detach()
         ),
         "multi_clause_fraction": multi_sample.float().mean().detach(),
+        "hard_gradient_fraction": zero.detach(),
+    }
+    return assignment_loss, multi_clause_loss, metrics
+
+
+def _balanced_group_mean(
+    values: torch.Tensor,
+    valid: torch.Tensor,
+    correct: torch.Tensor,
+    *,
+    hard_group_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Give correct and incorrect groups explicit, count-independent mass."""
+    if hard_group_weight <= 0:
+        raise ValueError("ERAF balanced hard-group weight must be positive.")
+    easy_valid = valid.bool() & correct.bool()
+    hard_valid = valid.bool() & ~correct.bool()
+    easy_present = bool(easy_valid.any())
+    hard_present = bool(hard_valid.any())
+    if easy_present and hard_present:
+        denominator = 1.0 + float(hard_group_weight)
+        value = (
+            _masked_mean(values, easy_valid)
+            + float(hard_group_weight) * _masked_mean(values, hard_valid)
+        ) / denominator
+        hard_gradient_fraction = values.new_tensor(
+            float(hard_group_weight) / denominator
+        )
+        return value, hard_gradient_fraction
+    if hard_present:
+        return _masked_mean(values, hard_valid), values.new_tensor(1.0)
+    if easy_present:
+        return _masked_mean(values, easy_valid), values.new_tensor(0.0)
+    zero = values.sum() * 0.0
+    return zero, zero.detach()
+
+
+def _balanced_bipartite_assignment_loss(
+    *,
+    role_attentions: Mapping[str, torch.Tensor],
+    role_targets: Mapping[str, torch.Tensor],
+    role_entity_ids: Mapping[str, torch.Tensor],
+    role_valid: Mapping[str, torch.Tensor],
+    clause_valid: torch.Tensor,
+    temperature: float,
+    hard_group_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """V9.5 row/column assignment with balanced online hard mining.
+
+    Rows are semantic role queries and columns are all visible same-state role
+    entities.  Multi-positive IDs allow shared containers while the column
+    term prevents unrelated queries from collapsing onto one entity.  Hard
+    and easy rows/columns receive fixed group-level mass, so a 10% failure
+    rate still supplies 50% of the gradient when ``hard_group_weight=1``.
+    """
+    if temperature <= 0:
+        raise ValueError("ERAF bipartite-assignment temperature must be positive.")
+    if hard_group_weight <= 0:
+        raise ValueError(
+            "ERAF bipartite-assignment hard-group weight must be positive."
+        )
+    queries = torch.cat(
+        (role_attentions["subject"], role_attentions["reference"]), dim=1
+    ).float()
+    candidates = torch.cat(
+        (role_targets["subject"], role_targets["reference"]), dim=1
+    ).float()
+    query_ids = torch.cat(
+        (role_entity_ids["subject"], role_entity_ids["reference"]), dim=1
+    ).long()
+    candidate_ids = query_ids
+    query_valid = torch.cat(
+        (role_valid["subject"], role_valid["reference"]), dim=1
+    ).bool() & (query_ids >= 0)
+    candidate_valid = query_valid
+    mass = torch.einsum("brt,bkt->brk", queries, candidates)
+    pair_valid = query_valid.unsqueeze(-1) & candidate_valid.unsqueeze(1)
+    positive = pair_valid & (query_ids.unsqueeze(-1) == candidate_ids.unsqueeze(1))
+    negative = pair_valid & ~positive
+
+    def directional(
+        scores: torch.Tensor,
+        valid_pairs: torch.Tensor,
+        positive_pairs: torch.Tensor,
+        negative_pairs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid = positive_pairs.any(dim=-1) & negative_pairs.any(dim=-1)
+        logits = (scores / float(temperature)).masked_fill(~valid_pairs, -torch.inf)
+        positive_logits = logits.masked_fill(~positive_pairs, -torch.inf)
+        nll = torch.logsumexp(logits, dim=-1) - torch.logsumexp(positive_logits, dim=-1)
+        selected = logits.argmax(dim=-1, keepdim=True)
+        correct = positive_pairs.gather(-1, selected).squeeze(-1) & valid
+        negative_count = negative_pairs.float().sum(dim=-1)
+        return nll, valid, correct, negative_count
+
+    row_loss, row_valid, row_correct, row_negative_count = directional(
+        mass, pair_valid, positive, negative
+    )
+    column_loss, column_valid, column_correct, column_negative_count = directional(
+        mass.transpose(1, 2),
+        pair_valid.transpose(1, 2),
+        positive.transpose(1, 2),
+        negative.transpose(1, 2),
+    )
+    # Balance all row and column decisions together.  Balancing each direction
+    # separately would silently reduce the hard mass when one direction has no
+    # mistakes, which is exactly the long-tail failure V9.5 is meant to repair.
+    assignment_loss, hard_gradient_fraction = _balanced_group_mean(
+        torch.cat((row_loss, column_loss), dim=1),
+        torch.cat((row_valid, column_valid), dim=1),
+        torch.cat((row_correct, column_correct), dim=1),
+        hard_group_weight=hard_group_weight,
+    )
+
+    # The gate requires every active role in a conjunction to be right.  Use
+    # the worst row and worst column rather than an average over easy clauses.
+    multi_sample = (clause_valid.bool().sum(dim=-1) > 1) & row_valid.any(dim=-1)
+    worst_row = row_loss.masked_fill(~row_valid, -torch.inf).amax(dim=-1)
+    worst_column = column_loss.masked_fill(~column_valid, -torch.inf).amax(dim=-1)
+    worst_row = torch.where(
+        row_valid.any(dim=-1), worst_row, torch.zeros_like(worst_row)
+    )
+    worst_column = torch.where(
+        column_valid.any(dim=-1), worst_column, torch.zeros_like(worst_column)
+    )
+    multi_clause_loss = _masked_mean(0.5 * (worst_row + worst_column), multi_sample)
+    sample_correct = (row_correct | ~row_valid).all(dim=-1)
+    zero = mass.sum() * 0.0
+    metrics = {
+        "accuracy": _masked_mean(row_correct.float(), row_valid).detach(),
+        "column_accuracy": _masked_mean(column_correct.float(), column_valid).detach(),
+        "hard_fraction": _masked_mean((~row_correct).float(), row_valid).detach(),
+        "margin": zero.detach(),
+        "negative_count": _masked_mean(
+            0.5 * (row_negative_count + column_negative_count), row_valid
+        ).detach(),
+        "multi_clause_accuracy": (
+            _masked_mean(sample_correct.float(), multi_sample).detach()
+            if bool(multi_sample.any())
+            else zero.detach()
+        ),
+        "multi_clause_fraction": multi_sample.float().mean().detach(),
+        "hard_gradient_fraction": hard_gradient_fraction.detach(),
     }
     return assignment_loss, multi_clause_loss, metrics
 
@@ -1456,13 +1783,31 @@ def entity_relation_affordance_loss(
     multi_clause_consistency_loss = zero
     structured_metrics = {
         "accuracy": zero.detach(),
+        "column_accuracy": zero.detach(),
         "hard_fraction": zero.detach(),
         "margin": zero.detach(),
         "negative_count": zero.detach(),
         "multi_clause_accuracy": zero.detach(),
         "multi_clause_fraction": zero.detach(),
+        "hard_gradient_fraction": zero.detach(),
     }
-    if int(weights.objective_version) >= 5:
+    if int(weights.objective_version) >= 6:
+        (
+            structured_assignment_loss,
+            multi_clause_consistency_loss,
+            structured_metrics,
+        ) = _balanced_bipartite_assignment_loss(
+            role_attentions=role_attentions,
+            role_targets=role_targets,
+            role_entity_ids={
+                role: labels[f"{role}_entity_ids"] for role in ("subject", "reference")
+            },
+            role_valid=role_mask_valid,
+            clause_valid=clause_valid,
+            temperature=float(weights.structured_assignment_temperature),
+            hard_group_weight=float(weights.structured_assignment_hard_weight),
+        )
+    elif int(weights.objective_version) >= 5:
         (
             structured_assignment_loss,
             multi_clause_consistency_loss,
@@ -1608,7 +1953,20 @@ def entity_relation_affordance_loss(
             ).mean(dim=-1),
             teacher_preservation_valid,
         )
-        if int(weights.objective_version) >= 5:
+        if int(weights.objective_version) >= 6:
+            required_balanced = {
+                "balanced_subject_role_delta",
+                "balanced_reference_role_delta",
+            }
+            missing_balanced = sorted(required_balanced.difference(outputs))
+            if missing_balanced:
+                raise ValueError(
+                    "V9.5 balanced-role training requires its zero-init "
+                    f"adapter outputs; missing={missing_balanced}."
+                )
+            energy_subject_delta = outputs["balanced_subject_role_delta"]
+            energy_reference_delta = outputs["balanced_reference_role_delta"]
+        elif int(weights.objective_version) >= 5:
             required_structured = {
                 "structured_subject_role_delta",
                 "structured_reference_role_delta",
@@ -1756,6 +2114,9 @@ def entity_relation_affordance_loss(
             hard_assignment, role_swap_valid
         ).detach(),
         "pgc_v9_structured_assignment_accuracy": structured_metrics["accuracy"],
+        "pgc_v9_structured_assignment_column_accuracy": structured_metrics[
+            "column_accuracy"
+        ],
         "pgc_v9_structured_assignment_hard_fraction": structured_metrics[
             "hard_fraction"
         ],
@@ -1768,6 +2129,9 @@ def entity_relation_affordance_loss(
         ],
         "pgc_v9_structured_multi_clause_fraction": structured_metrics[
             "multi_clause_fraction"
+        ],
+        "pgc_v9_structured_hard_gradient_fraction": structured_metrics[
+            "hard_gradient_fraction"
         ],
         "pgc_v9_teacher_preservation_fraction": teacher_preservation_fraction,
         "pgc_v9_teacher_predicate_max_abs_error": (teacher_predicate_max_abs_error),

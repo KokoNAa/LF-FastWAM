@@ -507,11 +507,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Grounding gate requires a PGC v9 checkpoint.")
     metadata = payload.get("architecture_metadata") or {}
     objective_version = int(metadata.get("eraf_grounding_objective_version", 1))
-    expected_step = {2: 1500, 3: 2500, 4: 2500, 5: 3500}.get(objective_version)
+    expected_step = {2: 1500, 3: 2500, 4: 2500, 5: 3500, 6: 3500}.get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
     intermediate_checkpoint = bool(args.allow_intermediate) and (
         (objective_version == 4 and checkpoint_step in {1750, 2000, 2250})
-        or (objective_version == 5 and checkpoint_step in {2750, 3000, 3250})
+        or (objective_version in {5, 6} and checkpoint_step in {2750, 3000, 3250})
     )
     if (
         expected_step is None
@@ -521,7 +521,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(
             "The pre-action grounding gate requires the completed V9 "
             "grounding-stage checkpoint: objective v2 at step 1500 or "
-            "objective v3/v4 at step 2500 or objective v5 at step 3500."
+            "objective v3/v4 at step 2500 or objective v5/v6 at step 3500."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())
@@ -612,7 +612,7 @@ def parse_args() -> argparse.Namespace:
         "--allow-intermediate",
         action="store_true",
         help=(
-            "Audit V9.3 steps 1750/2000/2250 or V9.4 steps "
+            "Audit V9.3 steps 1750/2000/2250 or V9.4/V9.5 steps "
             "2750/3000/3250 without treating them as final action inputs."
         ),
     )

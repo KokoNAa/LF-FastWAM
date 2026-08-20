@@ -34,6 +34,7 @@ from fastwam.datasets.pgc_libero import (
 from fastwam.models.wan22.entity_relation_affordance import (
     ERAFLossWeights,
     EntityRelationAffordanceField,
+    _balanced_bipartite_assignment_loss,
     _structured_all_entity_assignment_loss,
     entity_relation_affordance_loss,
 )
@@ -973,6 +974,111 @@ class PGCERAFModuleTest(unittest.TestCase):
         (loss + multi_loss).backward()
         self.assertIsNotNone(subject_attention.grad)
 
+    def test_v95_bipartite_assignment_balances_rare_hard_rows(self):
+        subject_attention = torch.tensor(
+            [[[0.40, 0.50, 0.10, 0.00], [0.02, 0.90, 0.08, 0.00]]],
+            requires_grad=True,
+        )
+        reference_attention = torch.tensor(
+            [[[0.05, 0.05, 0.90, 0.00], [0.05, 0.05, 0.90, 0.00]]],
+            requires_grad=True,
+        )
+        subject_targets = torch.tensor(
+            [[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]]
+        )
+        reference_targets = torch.tensor(
+            [[[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0]]]
+        )
+        loss, multi_loss, metrics = _balanced_bipartite_assignment_loss(
+            role_attentions={
+                "subject": subject_attention,
+                "reference": reference_attention,
+            },
+            role_targets={
+                "subject": subject_targets,
+                "reference": reference_targets,
+            },
+            role_entity_ids={
+                "subject": torch.tensor([[1, 2]]),
+                "reference": torch.tensor([[3, 3]]),
+            },
+            role_valid={
+                "subject": torch.ones(1, 2, dtype=torch.bool),
+                "reference": torch.ones(1, 2, dtype=torch.bool),
+            },
+            clause_valid=torch.ones(1, 2, dtype=torch.bool),
+            temperature=0.10,
+            hard_group_weight=1.0,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(multi_loss))
+        self.assertAlmostEqual(metrics["accuracy"].item(), 0.75)
+        self.assertAlmostEqual(metrics["hard_gradient_fraction"].item(), 0.5)
+        self.assertEqual(metrics["multi_clause_accuracy"].item(), 0.0)
+        (loss + multi_loss).backward()
+        self.assertIsNotNone(subject_attention.grad)
+        self.assertIsNotNone(reference_attention.grad)
+
+    def test_v95_zero_init_visual_binding_adapter_matches_v93_teacher(self):
+        torch.manual_seed(95)
+        module = EntityRelationAffordanceField(
+            text_dim=10,
+            video_dim=16,
+            action_dim=12,
+            projection_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            max_clauses=4,
+            camera_count=2,
+            visual_aspect_ratio=2.0,
+            role_adapter_enabled=True,
+            role_adapter_hidden_dim=8,
+            role_adapter_teacher_enabled=True,
+            balanced_role_adapter_enabled=True,
+            balanced_role_adapter_hidden_dim=8,
+        )
+        module.eval()
+        module.requires_grad_(False)
+        adapter = module.balanced_role_binding_adapter
+        self.assertIsNotNone(adapter)
+        adapter.train()
+        adapter.requires_grad_(True)
+        _, _, outputs, metrics = module(
+            base_goal_queries=torch.randn(2, 3, 12),
+            base_goal_embedding=torch.randn(2, 8),
+            language_hidden=torch.randn(2, 6, 10),
+            language_mask=torch.ones(2, 6, dtype=torch.bool),
+            current_video_hidden=torch.randn(2, 8, 16),
+        )
+        for role in ("subject", "reference"):
+            self.assertTrue(
+                torch.equal(
+                    outputs[f"{role}_attention"],
+                    outputs[f"teacher_{role}_attention"],
+                )
+            )
+        for name in ("grasp", "goal", "interaction"):
+            self.assertTrue(
+                torch.equal(
+                    outputs[f"{name}_anchor"],
+                    outputs[f"teacher_{name}_anchor"],
+                )
+            )
+        self.assertEqual(
+            metrics["pgc_v9_balanced_role_adapter_subject_delta_norm"].item(),
+            0.0,
+        )
+        repair_loss = outputs["subject_attention"][..., 0].pow(2).mean()
+        repair_loss.backward()
+        self.assertIsNotNone(adapter.subject_output.weight.grad)
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for name, parameter in module.named_parameters()
+                if not name.startswith("balanced_role_binding_adapter.")
+            )
+        )
+
     def test_gate_aligned_attention_loss_rejects_role_swaps(self):
         def outputs(subject_logits, reference_logits):
             subject_logits = subject_logits.reshape(1, 1, 4).requires_grad_()
@@ -1569,6 +1675,87 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 for name in action_trainable
             )
         )
+
+    def test_v93_can_upgrade_to_v95_balanced_visual_binding(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v5_path = root / "v5.pt"
+            v9r1_path = root / "v9r1.pt"
+            v9r3_path = root / "v9r3.pt"
+            v9r5_path = root / "v9r5.pt"
+            base = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": base.mot.state_dict()},
+                base_path,
+            )
+            base.load_checkpoint(base_path)
+            base.save_checkpoint(v5_path, step=4000)
+            v9r1 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=2,
+            )
+            v9r1.load_checkpoint(v5_path)
+            v9r1.save_checkpoint(v9r1_path, step=1500)
+            v9r3 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=4,
+            )
+            v9r3.load_checkpoint(v9r1_path)
+            v9r3.save_checkpoint(v9r3_path, step=2500)
+
+            v9r5 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=6,
+            )
+            v9r5.load_checkpoint(v9r3_path)
+            old_state = v9r3.policy_guard_modules.state_dict()
+            new_state = v9r5.policy_guard_modules.state_dict()
+            for key, value in old_state.items():
+                self.assertTrue(torch.equal(value, new_state[key]), key)
+            adapter = v9r5.policy_guard_modules[
+                "entity_relation_affordance"
+            ].balanced_role_binding_adapter
+            self.assertIsNotNone(adapter)
+            self.assertEqual(
+                int(adapter.subject_output.weight.count_nonzero().item()), 0
+            )
+            self.assertEqual(
+                int(adapter.reference_output.weight.count_nonzero().item()), 0
+            )
+            v9r5.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v9r5.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules.entity_relation_affordance."
+                        "balanced_role_binding_adapter."
+                    )
+                    for name in trainable
+                )
+            )
+            v9r5.save_checkpoint(v9r5_path, step=3500)
+            payload = torch.load(v9r5_path, map_location="cpu", weights_only=False)
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 6)
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "balanced_visual_role_binding_adapter_only",
+            )
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=6,
+            )
+            restored.load_checkpoint(v9r5_path)
 
     def test_stage_trainability_optimizer_contract_and_deployment_inputs(self):
         expected_modules = {

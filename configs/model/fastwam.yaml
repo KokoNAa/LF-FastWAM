@@ -272,6 +272,9 @@ policy_guard:
     # Version 5 (V9.4) freezes V9.3 and learns a second zero-init structured
     # adapter across all clauses, using every different same-state entity as
     # a role negative and emphasizing the worst clause in multi-clause tasks.
+    # Version 6 (V9.5) returns to the clean V9.3 checkpoint and trains a
+    # visual-candidate-aware bipartite binding adapter. Hard/easy assignment
+    # groups receive fixed 1:1 gradient mass and geometry is teacher protected.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -301,6 +304,7 @@ policy_guard:
     structured_assignment_hard_weight: 0.0
     multi_clause_consistency_weight: 0.0
     structured_role_adapter_hidden_dim: 256
+    balanced_role_adapter_hidden_dim: 256
     role_attention_preservation_weight: 0.0
     role_position_preservation_weight: 0.0
     role_anchor_preservation_weight: 0.0

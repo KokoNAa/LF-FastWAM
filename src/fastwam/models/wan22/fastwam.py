@@ -654,11 +654,17 @@ class FastWAM(torch.nn.Module):
         structured_role_grounding = (
             self.policy_guard_eraf_grounding_objective_version >= 5
         )
+        balanced_role_grounding = (
+            self.policy_guard_eraf_grounding_objective_version >= 6
+        )
         self.policy_guard_eraf_role_adapter_hidden_dim = int(
             eraf_config.get("role_adapter_hidden_dim", 256)
         )
         self.policy_guard_eraf_structured_role_adapter_hidden_dim = int(
             eraf_config.get("structured_role_adapter_hidden_dim", 256)
+        )
+        self.policy_guard_eraf_balanced_role_adapter_hidden_dim = int(
+            eraf_config.get("balanced_role_adapter_hidden_dim", 256)
         )
         self.policy_guard_eraf_loss_weights = ERAFLossWeights(
             objective_version=(
@@ -715,25 +721,41 @@ class FastWAM(torch.nn.Module):
             role_attention_preservation=float(
                 eraf_config.get(
                     "role_attention_preservation_weight",
-                    1.0 if role_adapter_grounding else 0.0,
+                    (
+                        5.0
+                        if balanced_role_grounding
+                        else (1.0 if role_adapter_grounding else 0.0)
+                    ),
                 )
             ),
             role_position_preservation=float(
                 eraf_config.get(
                     "role_position_preservation_weight",
-                    0.5 if role_adapter_grounding else 0.0,
+                    (
+                        2.0
+                        if balanced_role_grounding
+                        else (0.5 if role_adapter_grounding else 0.0)
+                    ),
                 )
             ),
             role_anchor_preservation=float(
                 eraf_config.get(
                     "role_anchor_preservation_weight",
-                    1.0 if role_adapter_grounding else 0.0,
+                    (
+                        10.0
+                        if balanced_role_grounding
+                        else (1.0 if role_adapter_grounding else 0.0)
+                    ),
                 )
             ),
             role_relation_preservation=float(
                 eraf_config.get(
                     "role_relation_preservation_weight",
-                    0.5 if role_adapter_grounding else 0.0,
+                    (
+                        2.0
+                        if balanced_role_grounding
+                        else (0.5 if role_adapter_grounding else 0.0)
+                    ),
                 )
             ),
             role_adapter_energy=float(
@@ -1086,10 +1108,11 @@ class FastWAM(torch.nn.Module):
                     3,
                     4,
                     5,
+                    6,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "1, 2, 3, 4, or 5."
+                        "1, 2, 3, 4, 5, or 6."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1131,6 +1154,7 @@ class FastWAM(torch.nn.Module):
                     self.policy_guard_eraf_camera_count,
                     self.policy_guard_eraf_role_adapter_hidden_dim,
                     self.policy_guard_eraf_structured_role_adapter_hidden_dim,
+                    self.policy_guard_eraf_balanced_role_adapter_hidden_dim,
                 ) <= 0:
                     raise ValueError("PGC v9 ERAF dimensions must be positive.")
                 if (
@@ -1434,10 +1458,17 @@ class FastWAM(torch.nn.Module):
                             ),
                             structured_role_adapter_enabled=(
                                 self.policy_guard_eraf_grounding_objective_version
-                                >= 5
+                                == 5
                             ),
                             structured_role_adapter_hidden_dim=(
                                 self.policy_guard_eraf_structured_role_adapter_hidden_dim
+                            ),
+                            balanced_role_adapter_enabled=(
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 6
+                            ),
+                            balanced_role_adapter_hidden_dim=(
+                                self.policy_guard_eraf_balanced_role_adapter_hidden_dim
                             ),
                         )
                     if self.policy_guard_version in {6, 7}:
@@ -1800,6 +1831,16 @@ class FastWAM(torch.nn.Module):
                                 "entity_relation_affordance"
                             ]
                             if (
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 6
+                            ):
+                                role_adapter = eraf.balanced_role_binding_adapter
+                                if role_adapter is None:
+                                    raise RuntimeError(
+                                        "V9.5 grounding requires its balanced "
+                                        "visual role-binding adapter."
+                                    )
+                            elif (
                                 self.policy_guard_eraf_grounding_objective_version
                                 >= 5
                             ):
@@ -9458,8 +9499,16 @@ class FastWAM(torch.nn.Module):
                 (
                     (
                         (
-                            "frozen_v9_3_cross_clause_structured_role_"
-                            "assignment_with_same_state_entity_negatives"
+                            (
+                                "frozen_v9_3_visual_candidate_bipartite_role_"
+                                "binding_with_balanced_hard_easy_gradients"
+                            )
+                            if self.policy_guard_eraf_grounding_objective_version
+                            >= 6
+                            else (
+                                "frozen_v9_3_cross_clause_structured_role_"
+                                "assignment_with_same_state_entity_negatives"
+                            )
                         )
                         if self.policy_guard_eraf_grounding_objective_version
                         >= 5
@@ -9880,9 +9929,13 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_role_adapter_trainable_scope": (
                 (
-                    "structured_role_assignment_adapter_only"
-                    if self.policy_guard_eraf_grounding_objective_version >= 5
-                    else "role_assignment_adapter_only"
+                    "balanced_visual_role_binding_adapter_only"
+                    if self.policy_guard_eraf_grounding_objective_version >= 6
+                    else (
+                        "structured_role_assignment_adapter_only"
+                        if self.policy_guard_eraf_grounding_objective_version >= 5
+                        else "role_assignment_adapter_only"
+                    )
                 )
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 4
@@ -9892,6 +9945,12 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_eraf_structured_role_adapter_hidden_dim
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 5
+                else None
+            ),
+            "eraf_balanced_role_adapter_hidden_dim": (
+                self.policy_guard_eraf_balanced_role_adapter_hidden_dim
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 6
                 else None
             ),
             "eraf_role_attention_preservation_weight": (
@@ -10390,6 +10449,14 @@ class FastWAM(torch.nn.Module):
             and int(self.policy_guard_version) == 9
             and saved_eraf_grounding_objective == 4
             and self.policy_guard_eraf_grounding_objective_version == 5
+            and self.policy_guard_eraf_training_stage == "grounding"
+            and metadata.get("eraf_training_stage") == "grounding"
+        )
+        migrate_v9_to_balanced_role_adapter = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 4
+            and self.policy_guard_eraf_grounding_objective_version == 6
             and self.policy_guard_eraf_training_stage == "grounding"
             and metadata.get("eraf_training_stage") == "grounding"
         )
@@ -11062,7 +11129,7 @@ class FastWAM(torch.nn.Module):
                             or (
                                 saved_grounding_objective == 4
                                 and self.policy_guard_eraf_grounding_objective_version
-                                == 5
+                                in {5, 6}
                             )
                         )
                         objective_upgrade = (
@@ -11144,11 +11211,15 @@ class FastWAM(torch.nn.Module):
                                         f"checkpoint={saved_value}, "
                                         f"model={expected_value}."
                                     )
-                        if saved_grounding_objective >= 4:
+                        if saved_grounding_objective >= 4 and not objective_upgrade:
                             expected_scope = (
-                                "structured_role_assignment_adapter_only"
-                                if saved_grounding_objective >= 5
-                                else "role_assignment_adapter_only"
+                                "balanced_visual_role_binding_adapter_only"
+                                if saved_grounding_objective >= 6
+                                else (
+                                    "structured_role_assignment_adapter_only"
+                                    if saved_grounding_objective >= 5
+                                    else "role_assignment_adapter_only"
+                                )
                             )
                             if (
                                 metadata.get("eraf_role_adapter_trainable_scope")
@@ -11194,7 +11265,7 @@ class FastWAM(torch.nn.Module):
                                         f"checkpoint={saved_value}, "
                                         f"model={expected_value}."
                                     )
-                        if saved_grounding_objective >= 5:
+                        if saved_grounding_objective >= 5 and not objective_upgrade:
                             for metadata_name, expected_value in {
                                 "eraf_structured_assignment_weight": (
                                     self.policy_guard_eraf_loss_weights.structured_assignment
@@ -11247,6 +11318,26 @@ class FastWAM(torch.nn.Module):
                                     "dimension mismatch: checkpoint="
                                     f"{saved_structured_hidden_dim}, model="
                                     f"{self.policy_guard_eraf_structured_role_adapter_hidden_dim}."
+                                )
+                        if saved_grounding_objective >= 6 and not objective_upgrade:
+                            try:
+                                saved_balanced_hidden_dim = int(
+                                    metadata["eraf_balanced_role_adapter_hidden_dim"]
+                                )
+                            except (KeyError, TypeError, ValueError) as exc:
+                                raise ValueError(
+                                    "PGC v9.5 checkpoint is missing its balanced "
+                                    "role-adapter hidden dimension."
+                                ) from exc
+                            if (
+                                saved_balanced_hidden_dim
+                                != self.policy_guard_eraf_balanced_role_adapter_hidden_dim
+                            ):
+                                raise ValueError(
+                                    "PGC v9.5 balanced role-adapter hidden "
+                                    "dimension mismatch: checkpoint="
+                                    f"{saved_balanced_hidden_dim}, model="
+                                    f"{self.policy_guard_eraf_balanced_role_adapter_hidden_dim}."
                                 )
                         if (
                             bool(metadata.get("eraf_entity_only", False))
@@ -11313,6 +11404,7 @@ class FastWAM(torch.nn.Module):
                 or migrate_v5_to_v9
                 or migrate_v9_to_role_adapter
                 or migrate_v9_to_structured_role_adapter
+                or migrate_v9_to_balanced_role_adapter
             )
             incompatible = self.policy_guard_modules.load_state_dict(
                 guard_state, strict=not migrate_with_new_modules
@@ -11376,6 +11468,23 @@ class FastWAM(torch.nn.Module):
                         f"has incompatible sidecars: missing={missing}, "
                         f"unexpected={unexpected}."
                     )
+            elif migrate_v9_to_balanced_role_adapter:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                disallowed_missing = [
+                    key
+                    for key in missing
+                    if not key.startswith(
+                        "entity_relation_affordance."
+                        "balanced_role_binding_adapter."
+                    )
+                ]
+                if disallowed_missing or unexpected or not missing:
+                    raise ValueError(
+                        "PGC v9.3 -> v9.5 balanced role-binding warm start "
+                        f"has incompatible sidecars: missing={missing}, "
+                        f"unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -11390,6 +11499,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v5_to_v9
                 and not migrate_v9_to_role_adapter
                 and not migrate_v9_to_structured_role_adapter
+                and not migrate_v9_to_balanced_role_adapter
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -11432,6 +11542,15 @@ class FastWAM(torch.nn.Module):
                 logger.info(
                     "Warm-started PGC v9.4 from frozen V9.3 ERAF at %s "
                     "(base=%s restored=%d new_structured_role_adapter=%d).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
+                    len(incompatible.missing_keys),
+                )
+            elif migrate_v9_to_balanced_role_adapter:
+                logger.info(
+                    "Warm-started PGC v9.5 from frozen V9.3 ERAF at %s "
+                    "(base=%s restored=%d new_balanced_role_adapter=%d).",
                     path,
                     resolved_base,
                     len(guard_state),
