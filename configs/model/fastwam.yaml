@@ -285,6 +285,9 @@ policy_guard:
     # Version 10 (V9.9) repairs closed-loop entity binding with independently
     # normalized per-camera heatmaps, visibility-gated view fusion, and an
     # unfinished-predicate clause scheduler. Both new routes are zero-init.
+    # Version 11 (V9.10) freezes the validated V9.9 view/scheduler routes and
+    # trains only the balanced role adapter against exclusive evidence from
+    # every same-state entity, including hard negatives owned by other clauses.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8

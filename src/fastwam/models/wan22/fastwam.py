@@ -1188,10 +1188,11 @@ class FastWAM(torch.nn.Module):
                     8,
                     9,
                     10,
+                    11,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "1, 2, 3, 4, 5, 6, 7, 8, 9, or 10."
+                        "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, or 11."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1969,6 +1970,16 @@ class FastWAM(torch.nn.Module):
                                 "entity_relation_affordance"
                             ]
                             if (
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 11
+                            ):
+                                role_adapter = eraf.balanced_role_binding_adapter
+                                if role_adapter is None:
+                                    raise RuntimeError(
+                                        "V9.10 grounding requires its balanced "
+                                        "visual role-binding adapter."
+                                    )
+                            elif (
                                 self.policy_guard_eraf_grounding_objective_version
                                 >= 10
                             ):
@@ -9688,8 +9699,17 @@ class FastWAM(torch.nn.Module):
                             (
                                 (
                                     (
-                                        "exclusive_evidence_subject_reference_"
-                                        "assignment_with_full_mask_localization"
+                                        (
+                                            "exclusive_same_state_all_entity_"
+                                            "bipartite_role_assignment_with_"
+                                            "cross_clause_hard_negatives"
+                                            if self.policy_guard_eraf_grounding_objective_version
+                                            >= 11
+                                            else (
+                                                "exclusive_evidence_subject_reference_"
+                                                "assignment_with_full_mask_localization"
+                                            )
+                                        )
                                         if self.policy_guard_eraf_grounding_objective_version
                                         >= 8
                                         else (
@@ -10134,6 +10154,18 @@ class FastWAM(torch.nn.Module):
                 and self.policy_guard_eraf_grounding_objective_version >= 10
                 else None
             ),
+            "eraf_all_entity_role_contract": (
+                "exclusive_evidence_same_state_all_entity_bipartite_assignment"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 11
+                else None
+            ),
+            "eraf_multi_clause_gate_contract": (
+                "semantic_exact_with_exclusive_role_evidence"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 11
+                else None
+            ),
             "eraf_attention_mask_weight": (
                 self.policy_guard_eraf_loss_weights.attention_mask
                 if is_v9
@@ -10243,9 +10275,17 @@ class FastWAM(torch.nn.Module):
             "eraf_role_adapter_trainable_scope": (
                 (
                     (
-                        "clause_activation_plus_balanced_role_plus_"
-                        "visibility_gated_view_fusion_plus_unfinished_"
-                        "clause_scheduler"
+                        (
+                            "exclusive_all_entity_balanced_visual_role_"
+                            "binding_adapter_only"
+                            if self.policy_guard_eraf_grounding_objective_version
+                            >= 11
+                            else (
+                                "clause_activation_plus_balanced_role_plus_"
+                                "visibility_gated_view_fusion_plus_unfinished_"
+                                "clause_scheduler"
+                            )
+                        )
                         if self.policy_guard_eraf_grounding_objective_version >= 10
                         else "clause_activation_calibration_adapter_only"
                     )
@@ -10845,6 +10885,34 @@ class FastWAM(torch.nn.Module):
             and self.policy_guard_eraf_training_stage == "grounding"
             and metadata.get("eraf_training_stage") == "grounding"
         )
+        migrate_v9_to_exclusive_all_entity = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 10
+            and self.policy_guard_eraf_grounding_objective_version == 11
+            and self.policy_guard_eraf_training_stage == "grounding"
+            and metadata.get("eraf_training_stage") == "grounding"
+        )
+        if migrate_v9_to_exclusive_all_entity:
+            expected_v99_warm_start = {
+                "eraf_view_fusion_contract": (
+                    "per_view_local_attention_visibility_gated_zero_init_residual"
+                ),
+                "eraf_clause_scheduler_contract": (
+                    "first_active_unfinished_predicate_zero_init_residual_route"
+                ),
+                "eraf_role_adapter_trainable_scope": (
+                    "clause_activation_plus_balanced_role_plus_visibility_gated_"
+                    "view_fusion_plus_unfinished_clause_scheduler"
+                ),
+            }
+            for name, expected in expected_v99_warm_start.items():
+                if metadata.get(name) != expected:
+                    raise ValueError(
+                        "PGC V9.10 requires the completed V9.9 checkpoint "
+                        f"contract: {name}={metadata.get(name)!r}, "
+                        f"expected={expected!r}."
+                    )
         if (
             saved_policy_guard_version != int(self.policy_guard_version)
             and not migrate_v5_to_target_binder
@@ -11531,6 +11599,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 10
                             )
+                            or (
+                                saved_grounding_objective == 10
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 11
+                            )
                         )
                         objective_upgrade = (
                             objective_upgrade
@@ -11614,9 +11687,16 @@ class FastWAM(torch.nn.Module):
                         if saved_grounding_objective >= 4 and not objective_upgrade:
                             expected_scope = (
                                 (
-                                    "clause_activation_plus_balanced_role_plus_"
-                                    "visibility_gated_view_fusion_plus_unfinished_"
-                                    "clause_scheduler"
+                                    (
+                                        "exclusive_all_entity_balanced_visual_role_"
+                                        "binding_adapter_only"
+                                        if saved_grounding_objective >= 11
+                                        else (
+                                            "clause_activation_plus_balanced_role_plus_"
+                                            "visibility_gated_view_fusion_plus_unfinished_"
+                                            "clause_scheduler"
+                                        )
+                                    )
                                     if saved_grounding_objective >= 10
                                     else "clause_activation_calibration_adapter_only"
                                 )
@@ -11949,6 +12029,23 @@ class FastWAM(torch.nn.Module):
                                         f"checkpoint={saved_value}, "
                                         f"model={expected_value}."
                                     )
+                        if saved_grounding_objective >= 11 and not objective_upgrade:
+                            expected_v910_contract = {
+                                "eraf_all_entity_role_contract": (
+                                    "exclusive_evidence_same_state_all_entity_"
+                                    "bipartite_assignment"
+                                ),
+                                "eraf_multi_clause_gate_contract": (
+                                    "semantic_exact_with_exclusive_role_evidence"
+                                ),
+                            }
+                            for name, expected in expected_v910_contract.items():
+                                if metadata.get(name) != expected:
+                                    raise ValueError(
+                                        "PGC V9.10 checkpoint contract mismatch: "
+                                        f"{name}={metadata.get(name)!r}, "
+                                        f"expected={expected!r}."
+                                    )
                         if (
                             bool(metadata.get("eraf_entity_only", False))
                             != self.policy_guard_eraf_entity_only
@@ -12150,6 +12247,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v9_to_balanced_role_adapter
                 and not migrate_v9_to_clause_activation_adapter
                 and not migrate_v9_to_view_scheduler
+                and not migrate_v9_to_exclusive_all_entity
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -12223,6 +12321,14 @@ class FastWAM(torch.nn.Module):
                     resolved_base,
                     len(guard_state),
                     len(incompatible.missing_keys),
+                )
+            elif migrate_v9_to_exclusive_all_entity:
+                logger.info(
+                    "Warm-started PGC v9.10 from frozen V9.9 ERAF at %s "
+                    "(base=%s restored=%d new_tensors=0).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
                 )
             else:
                 logger.info(

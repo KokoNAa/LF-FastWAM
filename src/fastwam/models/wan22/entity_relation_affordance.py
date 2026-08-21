@@ -2380,6 +2380,201 @@ def _balanced_exclusive_role_assignment_loss(
     return assignment_loss, multi_clause_loss, metrics
 
 
+def _balanced_exclusive_all_entity_assignment_loss(
+    *,
+    role_attentions: Mapping[str, torch.Tensor],
+    role_targets: Mapping[str, torch.Tensor],
+    role_entity_ids: Mapping[str, torch.Tensor],
+    role_valid: Mapping[str, torch.Tensor],
+    clause_valid: torch.Tensor,
+    temperature: float,
+    hard_group_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """V9.10 exclusive assignment across every same-state role entity.
+
+    V9.7 removed ambiguous subject/reference overlap, but its binary objective
+    only compared the two roles inside one clause.  In compound instructions a
+    query could therefore move to a different clause's visually similar entity
+    without being penalized.  This objective keeps the overlap-safe evidence
+    contract while restoring a global row/column assignment across all active
+    subject and reference slots in the same state.
+
+    Repeated entity IDs are multi-positive (for example, two clauses sharing a
+    basket).  Exclusive support is computed against *different* entity IDs, so
+    duplicate mentions never erase one another.  Rows without both positive
+    and negative exclusive evidence are excluded and reported through coverage
+    instead of becoming noisy pseudo-negatives.
+    """
+    if temperature <= 0:
+        raise ValueError(
+            "ERAF exclusive all-entity temperature must be positive."
+        )
+    if hard_group_weight <= 0:
+        raise ValueError(
+            "ERAF exclusive all-entity hard-group weight must be positive."
+        )
+
+    queries = torch.cat(
+        (role_attentions["subject"], role_attentions["reference"]), dim=1
+    ).float()
+    candidates = torch.cat(
+        (role_targets["subject"], role_targets["reference"]), dim=1
+    ).float()
+    entity_ids = torch.cat(
+        (role_entity_ids["subject"], role_entity_ids["reference"]), dim=1
+    ).long()
+    candidate_valid = torch.cat(
+        (role_valid["subject"], role_valid["reference"]), dim=1
+    ).bool() & (entity_ids >= 0)
+    distinct_clause = (
+        role_entity_ids["subject"].long()
+        != role_entity_ids["reference"].long()
+    ) & clause_valid.bool()
+    query_valid = torch.cat(
+        (
+            role_valid["subject"].bool() & distinct_clause,
+            role_valid["reference"].bool() & distinct_clause,
+        ),
+        dim=1,
+    ) & (entity_ids >= 0)
+
+    # For candidate i, remove evidence claimed by every candidate j carrying a
+    # different entity ID.  Same-ID mentions remain legal multi-positives.
+    different_entity = (
+        candidate_valid.unsqueeze(-1)
+        & candidate_valid.unsqueeze(1)
+        & (entity_ids.unsqueeze(-1) != entity_ids.unsqueeze(1))
+    )
+    competing_support = torch.where(
+        different_entity.unsqueeze(-1),
+        candidates.unsqueeze(1),
+        torch.zeros_like(candidates).unsqueeze(1),
+    ).amax(dim=2)
+    exclusive_candidates = (candidates - competing_support).clamp_min(0.0)
+    exclusive_valid = candidate_valid & (
+        exclusive_candidates.sum(dim=-1) > 1.0e-8
+    )
+
+    mass = torch.einsum("brt,bkt->brk", queries, exclusive_candidates)
+    pair_valid = query_valid.unsqueeze(-1) & exclusive_valid.unsqueeze(1)
+    positive = pair_valid & (
+        entity_ids.unsqueeze(-1) == entity_ids.unsqueeze(1)
+    )
+    negative = pair_valid & ~positive
+
+    def directional(
+        scores: torch.Tensor,
+        valid_pairs: torch.Tensor,
+        positive_pairs: torch.Tensor,
+        negative_pairs: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        valid = positive_pairs.any(dim=-1) & negative_pairs.any(dim=-1)
+        logits = (scores / float(temperature)).masked_fill(
+            ~valid_pairs, -torch.inf
+        )
+        positive_logits = logits.masked_fill(~positive_pairs, -torch.inf)
+        nll = (
+            torch.logsumexp(logits, dim=-1)
+            - torch.logsumexp(positive_logits, dim=-1)
+        )
+        selected = logits.argmax(dim=-1, keepdim=True)
+        correct = (
+            positive_pairs.gather(-1, selected).squeeze(-1) & valid
+        )
+        positive_mass = scores.masked_fill(
+            ~positive_pairs, -torch.inf
+        ).amax(dim=-1)
+        negative_mass = scores.masked_fill(
+            ~negative_pairs, -torch.inf
+        ).amax(dim=-1)
+        margin = torch.where(
+            valid,
+            positive_mass - negative_mass,
+            torch.zeros_like(positive_mass),
+        )
+        negative_count = negative_pairs.float().sum(dim=-1)
+        return nll, valid, correct, margin, negative_count
+
+    (
+        row_loss,
+        row_valid,
+        row_correct,
+        row_margin,
+        row_negative_count,
+    ) = directional(mass, pair_valid, positive, negative)
+    (
+        column_loss,
+        column_valid,
+        column_correct,
+        _column_margin,
+        column_negative_count,
+    ) = directional(
+        mass.transpose(1, 2),
+        pair_valid.transpose(1, 2),
+        positive.transpose(1, 2),
+        negative.transpose(1, 2),
+    )
+    (
+        assignment_loss,
+        hard_gradient_fraction,
+        global_easy_count,
+        global_hard_count,
+    ) = _balanced_group_mean(
+        torch.cat((row_loss, column_loss), dim=1),
+        torch.cat((row_valid, column_valid), dim=1),
+        torch.cat((row_correct, column_correct), dim=1),
+        hard_group_weight=hard_group_weight,
+    )
+
+    multi_sample = (
+        (clause_valid.bool().sum(dim=-1) > 1) & row_valid.any(dim=-1)
+    )
+    worst_row = torch.where(
+        row_valid, row_loss, torch.zeros_like(row_loss)
+    ).amax(dim=-1)
+    worst_column = torch.where(
+        column_valid, column_loss, torch.zeros_like(column_loss)
+    ).amax(dim=-1)
+    multi_clause_loss = _masked_mean(
+        0.5 * (worst_row + worst_column), multi_sample
+    )
+    sample_correct = (row_correct | ~row_valid).all(dim=-1)
+    zero = mass.sum() * 0.0
+    role_slot_count = query_valid.float().sum().clamp_min(1.0)
+    metrics = {
+        "accuracy": _masked_mean(row_correct.float(), row_valid).detach(),
+        "column_accuracy": _masked_mean(
+            column_correct.float(), column_valid
+        ).detach(),
+        "hard_fraction": _masked_mean(
+            (~row_correct).float(), row_valid
+        ).detach(),
+        "margin": _masked_mean(row_margin, row_valid).detach(),
+        "negative_count": _masked_mean(
+            0.5 * (row_negative_count + column_negative_count), row_valid
+        ).detach(),
+        "multi_clause_accuracy": (
+            _masked_mean(sample_correct.float(), multi_sample).detach()
+            if bool(multi_sample.any())
+            else zero.detach()
+        ),
+        "multi_clause_fraction": multi_sample.float().mean().detach(),
+        "hard_gradient_fraction": hard_gradient_fraction.detach(),
+        "global_easy_count": global_easy_count.detach(),
+        "global_hard_count": global_hard_count.detach(),
+        "exclusive_coverage": (
+            row_valid.float().sum() / role_slot_count
+        ).detach(),
+    }
+    return assignment_loss, multi_clause_loss, metrics
+
+
 def entity_relation_affordance_loss(
     outputs: Mapping[str, torch.Tensor],
     labels: Mapping[str, torch.Tensor],
@@ -2722,7 +2917,24 @@ def entity_relation_affordance_loss(
         "global_hard_count": zero.detach(),
         "exclusive_coverage": zero.detach(),
     }
-    if int(weights.objective_version) >= 8:
+    if int(weights.objective_version) >= 11:
+        (
+            structured_assignment_loss,
+            multi_clause_consistency_loss,
+            structured_metrics,
+        ) = _balanced_exclusive_all_entity_assignment_loss(
+            role_attentions=role_attentions,
+            role_targets=role_targets,
+            role_entity_ids={
+                role: labels[f"{role}_entity_ids"]
+                for role in ("subject", "reference")
+            },
+            role_valid=role_mask_valid,
+            clause_valid=clause_valid,
+            temperature=float(weights.structured_assignment_temperature),
+            hard_group_weight=float(weights.structured_assignment_hard_weight),
+        )
+    elif int(weights.objective_version) >= 8:
         (
             structured_assignment_loss,
             multi_clause_consistency_loss,
@@ -3146,6 +3358,11 @@ def entity_relation_affordance_loss(
         ),
         "loss_pgc_v9_role_adapter_energy": role_adapter_energy_loss.detach(),
         "loss_pgc_v9_structured_assignment": (structured_assignment_loss.detach()),
+        "loss_pgc_v9_all_entity_assignment": (
+            structured_assignment_loss.detach()
+            if int(weights.objective_version) >= 11
+            else zero.detach()
+        ),
         "loss_pgc_v9_multi_clause_consistency": (
             multi_clause_consistency_loss.detach()
         ),
@@ -3254,6 +3471,26 @@ def entity_relation_affordance_loss(
         "pgc_v9_structured_exclusive_coverage": structured_metrics[
             "exclusive_coverage"
         ],
+        "pgc_v9_all_entity_assignment_accuracy": (
+            structured_metrics["accuracy"]
+            if int(weights.objective_version) >= 11
+            else zero.detach()
+        ),
+        "pgc_v9_all_entity_assignment_column_accuracy": (
+            structured_metrics["column_accuracy"]
+            if int(weights.objective_version) >= 11
+            else zero.detach()
+        ),
+        "pgc_v9_all_entity_multi_clause_accuracy": (
+            structured_metrics["multi_clause_accuracy"]
+            if int(weights.objective_version) >= 11
+            else zero.detach()
+        ),
+        "pgc_v9_all_entity_exclusive_coverage": (
+            structured_metrics["exclusive_coverage"]
+            if int(weights.objective_version) >= 11
+            else zero.detach()
+        ),
         "pgc_v9_clause_activation_exact": clause_metrics["exact"],
         "pgc_v9_clause_activation_multi_exact": clause_metrics["multi_exact"],
         "pgc_v9_clause_cardinality_accuracy": clause_metrics[

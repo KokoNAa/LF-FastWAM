@@ -206,7 +206,7 @@ if version == 9:
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
     objective = int(metadata.get("eraf_grounding_objective_version", -1))
-    if objective not in set(range(1, 11)):
+    if objective not in set(range(1, 12)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -229,6 +229,13 @@ if version == 9:
         != "first_active_unfinished_predicate_zero_init_residual_route"
     ):
         raise SystemExit("PGC v9.9 checkpoint lacks view/scheduler contract")
+    if objective >= 11 and (
+        metadata.get("eraf_all_entity_role_contract")
+        != "exclusive_evidence_same_state_all_entity_bipartite_assignment"
+        or metadata.get("eraf_multi_clause_gate_contract")
+        != "semantic_exact_with_exclusive_role_evidence"
+    ):
+        raise SystemExit("PGC v9.10 checkpoint lacks all-entity role contract")
 else:
     objective = 0
     training_stage = "grounding"

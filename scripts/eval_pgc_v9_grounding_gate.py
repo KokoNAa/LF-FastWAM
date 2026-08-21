@@ -82,6 +82,18 @@ def _role_group_summary(
         if item["exclusive_mask_valid"] and not item["exclusive_mask_correct"]
     ]
     ambiguous = [item for item in full_failures if not item["exclusive_mask_valid"]]
+    all_entity_available = any(
+        "all_entity_exclusive_valid" in item for item in clauses
+    )
+    all_entity_items = [
+        item
+        for item in clauses
+        if bool(item.get("all_entity_exclusive_valid", False))
+    ]
+    all_entity = [
+        bool(item["all_entity_exclusive_correct"])
+        for item in all_entity_items
+    ]
     return {
         "clauses": len(clauses),
         "full_mask": {
@@ -95,6 +107,17 @@ def _role_group_summary(
             ),
             "correct": int(sum(exclusive)),
             "accuracy": _optional_rate(exclusive),
+        },
+        "all_entity_exclusive_mask": {
+            "available": all_entity_available,
+            "eligible": len(all_entity_items),
+            "coverage": (
+                float(len(all_entity_items) / len(clauses))
+                if clauses and all_entity_available
+                else None
+            ),
+            "correct": int(sum(all_entity)),
+            "accuracy": _optional_rate(all_entity),
         },
         "full_mask_failure_partition": {
             "total": len(full_failures),
@@ -149,8 +172,13 @@ def _role_residual_audit(records: list[Mapping[str, Any]]) -> dict[str, Any]:
         }
 
     full_accuracy = overall["full_mask"]["accuracy"]
-    exclusive_accuracy = overall["exclusive_mask"]["accuracy"]
-    exclusive_coverage = overall["exclusive_mask"]["coverage"]
+    all_entity_summary = overall["all_entity_exclusive_mask"]
+    use_all_entity = bool(all_entity_summary["available"])
+    semantic_summary = (
+        all_entity_summary if use_all_entity else overall["exclusive_mask"]
+    )
+    exclusive_accuracy = semantic_summary["accuracy"]
+    exclusive_coverage = semantic_summary["coverage"]
     if exclusive_coverage is None or exclusive_coverage < 0.50:
         diagnosis = "insufficient_exclusive_role_support"
         recommendation = (
@@ -168,14 +196,24 @@ def _role_residual_audit(records: list[Mapping[str, Any]]) -> dict[str, Any]:
                 "full-mask top-1 checks for localization."
             )
     else:
-        diagnosis = "role_binding_generalization_failure"
+        diagnosis = (
+            "all_entity_role_binding_generalization_failure"
+            if use_all_entity
+            else "role_binding_generalization_failure"
+        )
         recommendation = (
-            "Train an explicit subject/reference assignment objective with balanced "
-            "hard role-swap examples; do not enter action training yet."
+            "Train the same-state exclusive all-entity assignment objective with "
+            "balanced cross-clause hard negatives; do not enter action training yet."
+            if use_all_entity
+            else "Train an explicit subject/reference assignment objective with "
+            "balanced hard role-swap examples; do not enter action training yet."
         )
     return {
         "format": "pgc_v9_eraf_role_residual_audit_v1",
         "available": True,
+        "semantic_role_scope": (
+            "exclusive_all_entity" if use_all_entity else "exclusive_pairwise"
+        ),
         "overall": overall,
         **grouped,
         "diagnosis": diagnosis,
@@ -202,6 +240,7 @@ def compute_grounding_gate_report(
     single_visible_view_selection: list[bool] = []
     clause_scheduler_correct: list[bool] = []
     clause_scheduler_confidence: list[float] = []
+    multi_clause_failure_partition: dict[str, int] = defaultdict(int)
     for record in records:
         subject_hits.extend(bool(value) for value in record["subject_top1_hits"])
         reference_hits.extend(bool(value) for value in record["reference_top1_hits"])
@@ -217,6 +256,16 @@ def compute_grounding_gate_report(
         clause_exact.append(exact)
         if int(record["clause_count"]) > 1:
             multi_clause_exact.append(exact)
+            components = record.get("clause_exact_components", {})
+            for name in (
+                "active",
+                "predicate",
+                "subject_localization",
+                "reference_localization",
+                "semantic_role",
+            ):
+                if not bool(components.get(name, True)):
+                    multi_clause_failure_partition[name] += 1
         single_visible_view_selection.extend(
             bool(value)
             for value in record.get("single_visible_view_selection_correct", ())
@@ -236,7 +285,12 @@ def compute_grounding_gate_report(
     )
     role_residual_audit = _role_residual_audit(records)
     role_overall = role_residual_audit.get("overall", {})
-    exclusive_summary = role_overall.get("exclusive_mask", {})
+    all_entity_summary = role_overall.get("all_entity_exclusive_mask", {})
+    pairwise_exclusive_summary = role_overall.get("exclusive_mask", {})
+    use_all_entity = bool(all_entity_summary.get("available", False))
+    exclusive_summary = (
+        all_entity_summary if use_all_entity else pairwise_exclusive_summary
+    )
     exclusive_role_accuracy = exclusive_summary.get("accuracy")
     exclusive_role_coverage = exclusive_summary.get("coverage")
     metrics = {
@@ -251,6 +305,18 @@ def compute_grounding_gate_report(
         "full_mask_role_swap_accuracy": _safe_rate(role_swap),
         "exclusive_role_accuracy": exclusive_role_accuracy,
         "exclusive_role_coverage": exclusive_role_coverage,
+        "pairwise_exclusive_role_accuracy": pairwise_exclusive_summary.get(
+            "accuracy"
+        ),
+        "all_entity_exclusive_role_accuracy": all_entity_summary.get(
+            "accuracy"
+        ),
+        "all_entity_exclusive_role_coverage": all_entity_summary.get(
+            "coverage"
+        ),
+        "semantic_role_gate_scope": (
+            "exclusive_all_entity" if use_all_entity else "exclusive_pairwise"
+        ),
         "visible_goal_anchor_median_error_cm": anchor_median_cm,
         "clause_exact_match": _safe_rate(clause_exact),
         "multi_clause_exact_match": _safe_rate(multi_clause_exact),
@@ -325,6 +391,9 @@ def compute_grounding_gate_report(
             )
         },
         "role_residual_audit": role_residual_audit,
+        "multi_clause_failure_partition": dict(
+            sorted(multi_clause_failure_partition.items())
+        ),
     }
 
 
@@ -369,6 +438,7 @@ def _sample_record(
     dataset_kind: str = "unknown",
     dataset_label: str = "unknown",
     predicate_vocabulary: Iterable[str] = (),
+    all_entity_role_gate: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -478,7 +548,76 @@ def _sample_record(
         subject_valid & reference_valid & (subject_entity_ids != reference_entity_ids)
     )
     role_swap_correct = []
+    all_entity_role_correct: list[bool] = []
     role_audit_clauses = []
+    all_entity_clause_audit: dict[int, tuple[bool, bool]] = {}
+    if all_entity_role_gate:
+        candidate_targets = np.concatenate(
+            (subject_target, reference_target), axis=0
+        )
+        candidate_ids = np.concatenate(
+            (subject_entity_ids, reference_entity_ids), axis=0
+        )
+        candidate_valid = np.concatenate(
+            (subject_valid, reference_valid), axis=0
+        ) & (candidate_ids >= 0)
+        exclusive_candidates = np.zeros_like(candidate_targets)
+        for candidate_index in np.flatnonzero(candidate_valid):
+            competitors = np.flatnonzero(
+                candidate_valid
+                & (candidate_ids != candidate_ids[candidate_index])
+            )
+            competing_support = (
+                candidate_targets[competitors].max(axis=0)
+                if len(competitors)
+                else np.zeros_like(candidate_targets[candidate_index])
+            )
+            exclusive_candidates[candidate_index] = np.clip(
+                candidate_targets[candidate_index] - competing_support,
+                0.0,
+                None,
+            )
+        exclusive_candidate_valid = candidate_valid & (
+            exclusive_candidates.sum(axis=-1) > 1e-8
+        )
+        query_attentions = np.concatenate(
+            (subject_attention, reference_attention), axis=0
+        )
+        query_ids = candidate_ids
+        query_valid = np.concatenate((role_valid, role_valid), axis=0)
+        all_entity_scores = query_attentions @ exclusive_candidates.T
+        query_correct = np.zeros_like(query_valid, dtype=bool)
+        query_auditable = np.zeros_like(query_valid, dtype=bool)
+        for query_index in np.flatnonzero(query_valid):
+            positives = exclusive_candidate_valid & (
+                candidate_ids == query_ids[query_index]
+            )
+            negatives = exclusive_candidate_valid & (
+                candidate_ids != query_ids[query_index]
+            )
+            if not bool(positives.any() and negatives.any()):
+                continue
+            query_auditable[query_index] = True
+            query_correct[query_index] = bool(
+                all_entity_scores[query_index, positives].max()
+                > all_entity_scores[query_index, negatives].max()
+            )
+        clause_slots = len(clause_valid)
+        for clause_index in np.flatnonzero(role_valid):
+            subject_index = int(clause_index)
+            reference_index = clause_slots + int(clause_index)
+            auditable = bool(
+                query_auditable[subject_index]
+                and query_auditable[reference_index]
+            )
+            correct = bool(
+                auditable
+                and query_correct[subject_index]
+                and query_correct[reference_index]
+            )
+            all_entity_clause_audit[int(clause_index)] = (auditable, correct)
+            if auditable:
+                all_entity_role_correct.append(correct)
     predicate_names = tuple(str(value) for value in predicate_vocabulary)
     prompt = str(sample.get("prompt", "unknown"))
     prompt_prefix = (
@@ -570,6 +709,18 @@ def _sample_record(
                 "exclusive_reference_margin": (
                     reference_exclusive_own - reference_exclusive_wrong
                 ),
+                **(
+                    {
+                        "all_entity_exclusive_valid": all_entity_clause_audit[
+                            int(index)
+                        ][0],
+                        "all_entity_exclusive_correct": all_entity_clause_audit[
+                            int(index)
+                        ][1],
+                    }
+                    if all_entity_role_gate
+                    else {}
+                ),
             }
         )
 
@@ -582,11 +733,17 @@ def _sample_record(
     target = np.asarray(sample["pgc_eraf_goal_anchors"], dtype=np.float32)
     scale = (workspace_max - workspace_min) / 2.0
     anchor_errors = np.linalg.norm((prediction - target) * scale, axis=-1)
-    semantic_exact = bool(
-        np.array_equal(active, clause_valid)
-        and np.array_equal(
+    active_exact = bool(np.array_equal(active, clause_valid))
+    predicate_exact = bool(
+        np.array_equal(
             predicate_prediction[clause_valid], predicate_ids[clause_valid]
         )
+    )
+    semantic_exact = active_exact and predicate_exact
+    semantic_role_correct = (
+        all_entity_role_correct
+        if all_entity_role_gate
+        else role_swap_correct
     )
     # Clause exact match is intentionally stricter than predicate decoding:
     # every visible semantic role must also land in its own mask and beat its
@@ -595,17 +752,26 @@ def _sample_record(
         semantic_exact
         and all(subject_hits)
         and all(reference_hits)
-        and all(role_swap_correct)
+        and all(semantic_role_correct)
     )
     return {
         "subject_top1_hits": subject_hits,
         "reference_top1_hits": reference_hits,
         "role_swap_correct": role_swap_correct,
+        "all_entity_role_correct": all_entity_role_correct,
+        "all_entity_role_gate": bool(all_entity_role_gate),
         "role_audit_clauses": role_audit_clauses,
         "relation_targets": predicate_ids[clause_valid].tolist(),
         "relation_predictions": predicate_prediction[clause_valid].tolist(),
         "goal_anchor_errors_m": anchor_errors[goal_valid].tolist(),
         "clause_exact": exact,
+        "clause_exact_components": {
+            "active": active_exact,
+            "predicate": predicate_exact,
+            "subject_localization": all(subject_hits),
+            "reference_localization": all(reference_hits),
+            "semantic_role": all(semantic_role_correct),
+        },
         "clause_count": int(clause_valid.sum()),
         "single_visible_view_selection_correct": (
             single_visible_view_selection_correct
@@ -672,6 +838,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         8: 3250,
         9: 3750,
         10: 4750,
+        11: 5750,
     }.get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
     intermediate_checkpoint = bool(args.allow_intermediate) and (
@@ -680,6 +847,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         or (objective_version == 7 and checkpoint_step == 2750)
         or (objective_version == 9 and checkpoint_step == 3500)
         or (objective_version == 10 and checkpoint_step in {4000, 4250, 4500})
+        or (objective_version == 11 and checkpoint_step in {5000, 5250, 5500})
     )
     if (
         expected_step is None
@@ -691,7 +859,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "grounding-stage checkpoint: objective v2 at step 1500 or "
             "objective v3/v4 at step 2500, objective v5/v6 at step 3500, "
             "objective v7 at step 3000, objective v8 at step 3250, "
-            "objective v9 at step 3750, or objective v10 at step 4750."
+            "objective v9 at step 3750, objective v10 at step 4750, or "
+            "objective v11 at step 5750."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())
@@ -750,6 +919,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 dataset_kind=str(sidecar["dataset_kind"]),
                 dataset_label=Path(str(sidecar["dataset"])).name,
                 predicate_vocabulary=sidecar["predicate_vocabulary"],
+                all_entity_role_gate=objective_version >= 11,
             )
         )
         records[-1]["_raw_index"] = int(dataset._sample_indices[position])
@@ -850,8 +1020,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Audit V9.3 steps 1750/2000/2250, V9.4/V9.5 steps "
-            "2750/3000/3250, V9.6 step 2750, V9.8 step 3500, or V9.9 "
-            "steps 4000/4250/4500 without treating them as final action inputs."
+            "2750/3000/3250, V9.6 step 2750, V9.8 step 3500, V9.9 "
+            "steps 4000/4250/4500, or V9.10 steps 5000/5250/5500 without "
+            "treating them as final action inputs."
         ),
     )
     parser.add_argument("--device", default="cuda:0")
