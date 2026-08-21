@@ -2657,12 +2657,12 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 "entity_relation_affordance"
             ]
             with torch.no_grad():
-                eraf99.balanced_role_binding_adapter.output.weight.normal_(
-                    std=0.02
-                )
-                eraf99.balanced_role_binding_adapter.output.bias.normal_(
-                    std=0.02
-                )
+                for output in (
+                    eraf99.balanced_role_binding_adapter.subject_output,
+                    eraf99.balanced_role_binding_adapter.reference_output,
+                ):
+                    output.weight.normal_(std=0.02)
+                    output.bias.normal_(std=0.02)
             v99.save_checkpoint(v99_path, step=4750)
 
             v910 = tiny_pgc_fastwam(

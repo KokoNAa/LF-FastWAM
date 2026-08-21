@@ -1967,8 +1967,10 @@ def _balanced_group_mean(
     straight-through detached all-reduce keeps the forward loss identical on
     every rank while preserving that local autograd path.
     """
-    if hard_group_weight <= 0:
-        raise ValueError("ERAF balanced hard-group weight must be positive.")
+    if hard_group_weight < 0:
+        raise ValueError(
+            "ERAF balanced hard-group weight must be non-negative."
+        )
     easy_valid = valid.bool() & correct.bool()
     hard_valid = valid.bool() & ~correct.bool()
     graph_zero = torch.nan_to_num(
@@ -2130,9 +2132,9 @@ def _balanced_bipartite_assignment_loss(
     """
     if temperature <= 0:
         raise ValueError("ERAF bipartite-assignment temperature must be positive.")
-    if hard_group_weight <= 0:
+    if hard_group_weight < 0:
         raise ValueError(
-            "ERAF bipartite-assignment hard-group weight must be positive."
+            "ERAF bipartite-assignment hard-group weight must be non-negative."
         )
     queries = torch.cat(
         (role_attentions["subject"], role_attentions["reference"]), dim=1
@@ -2253,9 +2255,9 @@ def _balanced_exclusive_role_assignment_loss(
     """
     if temperature <= 0:
         raise ValueError("ERAF exclusive-assignment temperature must be positive.")
-    if hard_group_weight <= 0:
+    if hard_group_weight < 0:
         raise ValueError(
-            "ERAF exclusive-assignment hard-group weight must be positive."
+            "ERAF exclusive-assignment hard-group weight must be non-negative."
         )
 
     subject_target = role_targets["subject"].float()
@@ -2409,9 +2411,9 @@ def _balanced_exclusive_all_entity_assignment_loss(
         raise ValueError(
             "ERAF exclusive all-entity temperature must be positive."
         )
-    if hard_group_weight <= 0:
+    if hard_group_weight < 0:
         raise ValueError(
-            "ERAF exclusive all-entity hard-group weight must be positive."
+            "ERAF exclusive all-entity hard-group weight must be non-negative."
         )
 
     queries = torch.cat(
