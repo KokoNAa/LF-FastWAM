@@ -37,6 +37,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
     ERAFLossWeights,
     EntityRelationAffordanceField,
     _balanced_bipartite_assignment_loss,
+    _balanced_clause_tuple_assignment_loss,
     _balanced_exclusive_all_entity_assignment_loss,
     _balanced_exclusive_role_assignment_loss,
     _clause_activation_calibration_loss,
@@ -50,7 +51,10 @@ from scripts.build_pgc_libero_entity_relations import (
     _match_native_demo,
     _region_anchor,
 )
-from scripts.eval_pgc_v9_grounding_gate import compute_grounding_gate_report
+from scripts.eval_pgc_v9_grounding_gate import (
+    compute_grounding_gate_report,
+    mine_hard_native_rows,
+)
 from tests.test_policy_guard import tiny_pgc_fastwam
 from fastwam.utils.samplers import ResumableEpochSampler
 
@@ -401,6 +405,67 @@ class PGCERAFSamplingTest(unittest.TestCase):
                 self.assertIn(index, {8, 9})
             else:
                 self.assertIn(index, {10, 11})
+
+    def test_v911_mines_only_multiclause_v910_native_failures(self):
+        def record(
+            raw_index: int,
+            *,
+            kind: str,
+            clauses: int,
+            role_correct: bool,
+            localized: bool,
+        ) -> dict[str, object]:
+            return {
+                "_raw_index": raw_index,
+                "_dataset_kind": kind,
+                "clause_count": clauses,
+                "subject_top1_hits": [localized] * clauses,
+                "reference_top1_hits": [True] * clauses,
+                "role_audit_clauses": [
+                    {
+                        "all_entity_exclusive_valid": True,
+                        "all_entity_exclusive_correct": role_correct,
+                    }
+                    for _ in range(clauses)
+                ],
+            }
+
+        mined = mine_hard_native_rows(
+            [
+                record(
+                    0,
+                    kind="native",
+                    clauses=2,
+                    role_correct=True,
+                    localized=True,
+                ),
+                record(
+                    1,
+                    kind="native",
+                    clauses=2,
+                    role_correct=False,
+                    localized=True,
+                ),
+                record(
+                    2,
+                    kind="native",
+                    clauses=1,
+                    role_correct=False,
+                    localized=False,
+                ),
+                record(
+                    99,
+                    kind="counterfactual",
+                    clauses=2,
+                    role_correct=False,
+                    localized=False,
+                ),
+            ],
+            objective_version=11,
+        )
+        self.assertEqual(mined["audited_native_raw_indices"], [0, 1, 2])
+        self.assertEqual(mined["hard_native_raw_indices"], [1])
+        self.assertEqual(mined["format"], "pgc_v9_hard_role_index_v2")
 
     def test_v96_sampler_balances_every_global_optimizer_window(self):
         class CurriculumDataset:
@@ -1417,6 +1482,99 @@ class PGCERAFModuleTest(unittest.TestCase):
         for attention in differentiable.values():
             self.assertIsNotNone(attention.grad)
             self.assertTrue(torch.isfinite(attention.grad).all())
+
+    def test_v911_clause_tuple_rejects_shared_reference_subject_swap(self):
+        clause_valid = torch.ones(1, 3, dtype=torch.bool)
+        role_targets = {
+            "subject": torch.tensor(
+                [
+                    [
+                        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    ]
+                ]
+            ),
+            "reference": torch.tensor(
+                [
+                    [
+                        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                    ]
+                ]
+            ),
+        }
+        common = {
+            "role_targets": role_targets,
+            "role_entity_ids": {
+                "subject": torch.tensor([[1, 3, 4]]),
+                "reference": torch.tensor([[2, 2, 5]]),
+            },
+            "role_valid": {
+                "subject": clause_valid.clone(),
+                "reference": clause_valid.clone(),
+            },
+            "predicate_logits": torch.tensor(
+                [[[0.0, 8.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 8.0]]]
+            ),
+            "predicate_ids": torch.tensor([[1, 1, 2]]),
+            "clause_valid": clause_valid,
+            "temperature": 0.10,
+            "hard_group_weight": 1.0,
+        }
+        corrected = {
+            "subject": torch.tensor(
+                [
+                    [
+                        [0.90, 0.02, 0.03, 0.03, 0.01, 0.01],
+                        [0.03, 0.02, 0.90, 0.03, 0.01, 0.01],
+                        [0.03, 0.02, 0.03, 0.90, 0.01, 0.01],
+                    ]
+                ]
+            ),
+            "reference": torch.tensor(
+                [
+                    [
+                        [0.02, 0.90, 0.02, 0.02, 0.02, 0.02],
+                        [0.02, 0.90, 0.02, 0.02, 0.02, 0.02],
+                        [0.02, 0.02, 0.02, 0.02, 0.90, 0.02],
+                    ]
+                ]
+            ),
+        }
+        swapped = {
+            "subject": corrected["subject"].clone(),
+            "reference": corrected["reference"],
+        }
+        swapped["subject"][:, [0, 1]] = swapped["subject"][:, [1, 0]]
+        good_loss, _, good_metrics = _balanced_clause_tuple_assignment_loss(
+            role_attentions=corrected,
+            **common,
+        )
+        bad_loss, _, bad_metrics = _balanced_clause_tuple_assignment_loss(
+            role_attentions=swapped,
+            **common,
+        )
+        self.assertEqual(good_metrics["accuracy"].item(), 1.0)
+        self.assertLess(bad_metrics["accuracy"].item(), 1.0)
+        self.assertLess(good_loss.item(), bad_loss.item())
+
+        differentiable = {
+            role: value.clone().requires_grad_(True)
+            for role, value in corrected.items()
+        }
+        predicate_logits = common["predicate_logits"].clone().requires_grad_(True)
+        gradient_loss, gradient_multi_loss, _ = (
+            _balanced_clause_tuple_assignment_loss(
+                role_attentions=differentiable,
+                **{**common, "predicate_logits": predicate_logits},
+            )
+        )
+        (gradient_loss + gradient_multi_loss).backward()
+        for value in (*differentiable.values(), predicate_logits):
+            self.assertIsNotNone(value.grad)
+            self.assertTrue(torch.isfinite(value.grad).all())
 
     def test_v98_zero_init_clause_adapter_preserves_active_logits(self):
         torch.manual_seed(98)
@@ -2738,6 +2896,73 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 v9_grounding_objective_version=11,
             )
             restored.load_checkpoint(v910_path)
+
+    def test_v910_to_v911_clause_tuple_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v910_path = root / "v910.pt"
+            v911_path = root / "v911.pt"
+            v910 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=11,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v910.mot.state_dict()},
+                base_path,
+            )
+            v910.load_checkpoint(base_path)
+            v910.save_checkpoint(v910_path, step=5750)
+
+            v911 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=12,
+            )
+            v911.load_checkpoint(v910_path)
+            state910 = v910.policy_guard_modules.state_dict()
+            state911 = v911.policy_guard_modules.state_dict()
+            self.assertEqual(state910.keys(), state911.keys())
+            for key, value in state910.items():
+                self.assertTrue(torch.equal(value, state911[key]), key)
+
+            v911.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v911.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all("balanced_role_binding_adapter" in name for name in trainable)
+            )
+            v911.save_checkpoint(v911_path, step=6250)
+            payload = torch.load(
+                v911_path, map_location="cpu", weights_only=False
+            )
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 12)
+            self.assertEqual(
+                metadata["eraf_clause_tuple_contract"],
+                "exclusive_same_state_subject_predicate_reference_assignment",
+            )
+            self.assertEqual(
+                metadata["eraf_clause_tuple_curriculum_contract"],
+                "v9_10_audit_native_hard_easy_plus_historical_strict_1_1_1_1",
+            )
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "audited_hard_clause_tuple_balanced_visual_"
+                "role_binding_adapter_only",
+            )
+            self.assertEqual(metadata["eraf_clause_tuple_assignment_weight"], 4.0)
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=12,
+            )
+            restored.load_checkpoint(v911_path)
 
     def test_stage_trainability_optimizer_contract_and_deployment_inputs(self):
         expected_modules = {

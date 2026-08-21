@@ -203,21 +203,21 @@ class Wan22Trainer:
                     )
                 )
                 if (
-                    objective_version in {7, 8}
+                    objective_version in {7, 8, 12}
                     and training_stage == "grounding"
                     and not hard_curriculum
                 ):
                     raise ValueError(
-                        "PGC V9.6/V9.7 grounding requires its audited native hard/easy "
+                        "PGC V9.6/V9.7/V9.11 grounding requires its audited native hard/easy "
                         "curriculum."
                     )
                 if hard_curriculum and not (
-                    objective_version in {7, 8}
+                    objective_version in {7, 8, 12}
                     and training_stage == "grounding"
                 ):
                     raise ValueError(
                         "PGC hard-role curriculum is valid only for "
-                        "objective-v7/v8 grounding repair."
+                        "objective-v7/v8/v12 grounding repair."
                     )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.

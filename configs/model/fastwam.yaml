@@ -288,6 +288,9 @@ policy_guard:
     # Version 11 (V9.10) freezes the validated V9.9 view/scheduler routes and
     # trains only the balanced role adapter against exclusive evidence from
     # every same-state entity, including hard negatives owned by other clauses.
+    # Version 12 (V9.11) adds an audited hard curriculum and binds each clause
+    # to its complete (subject, predicate, reference) tuple, preventing subject
+    # identity swaps when clauses share a plate, basket, or fixture.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -316,6 +319,10 @@ policy_guard:
     structured_assignment_temperature: 0.10
     structured_assignment_hard_weight: 0.0
     multi_clause_consistency_weight: 0.0
+    clause_tuple_assignment_weight: 0.0
+    clause_tuple_temperature: 0.10
+    clause_tuple_hard_weight: 0.0
+    clause_tuple_multi_consistency_weight: 0.0
     structured_role_adapter_hidden_dim: 256
     balanced_role_adapter_hidden_dim: 256
     clause_activation_adapter_hidden_dim: 256

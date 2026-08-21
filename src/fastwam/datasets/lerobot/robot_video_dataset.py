@@ -461,12 +461,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             self.pgc_v9_balanced_sampling and self.pgc_v9_structured_role_sampling
         ):
             raise ValueError(
-                "PGC V9.6 hard-role curriculum requires balanced and structured "
+                "PGC hard-role curriculum requires balanced and structured "
                 "V9 sampling."
             )
         if self.pgc_v9_hard_role_curriculum and not self.pgc_v9_hard_role_index_path:
             raise ValueError(
-                "PGC V9.6 hard-role curriculum requires a V9.3 hard index."
+                "PGC hard-role curriculum requires an audited teacher index."
             )
         if self.pgc_completion_phase_supervision_required and not (
             self.pgc_counterfactual_dataset_dirs
@@ -754,17 +754,30 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 ).expanduser().resolve()
                 if not hard_index_path.is_file():
                     raise FileNotFoundError(
-                        f"PGC V9.6 hard-role index not found: {hard_index_path}."
+                        f"PGC hard-role index not found: {hard_index_path}."
                     )
                 hard_index = json.loads(hard_index_path.read_text(encoding="utf-8"))
-                if hard_index.get("format") != "pgc_v9_hard_role_index_v1":
+                hard_index_contracts = {
+                    "pgc_v9_hard_role_index_v1": (4, 2500, "V9.3"),
+                    "pgc_v9_hard_role_index_v2": (11, 5750, "V9.10"),
+                }
+                hard_index_format = str(hard_index.get("format", ""))
+                if hard_index_format not in hard_index_contracts:
                     raise ValueError(
-                        f"Unsupported PGC V9.6 hard-role index: {hard_index_path}."
+                        f"Unsupported PGC hard-role index: {hard_index_path}."
                     )
-                if int(hard_index.get("teacher_objective_version", -1)) != 4:
+                teacher_objective, teacher_step, teacher_label = (
+                    hard_index_contracts[hard_index_format]
+                )
+                if (
+                    int(hard_index.get("teacher_objective_version", -1))
+                    != teacher_objective
+                    or int(hard_index.get("teacher_step", -1)) != teacher_step
+                ):
                     raise ValueError(
-                        "PGC V9.6 curriculum must be mined from the clean V9.3 "
-                        "objective-v4 teacher."
+                        "PGC hard-role curriculum teacher mismatch: expected "
+                        f"{teacher_label} objective-v{teacher_objective} "
+                        f"step-{teacher_step}."
                     )
                 expected_native_datasets = sorted(
                     str(Path(path).expanduser().resolve())
@@ -776,7 +789,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 )
                 if actual_native_datasets != expected_native_datasets:
                     raise ValueError(
-                        "PGC V9.6 hard-role index was mined from different native "
+                        "PGC hard-role index was mined from different native "
                         f"datasets: expected={expected_native_datasets} "
                         f"got={actual_native_datasets}."
                     )
@@ -784,7 +797,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     self.pgc_native_frame_count
                 ):
                     raise ValueError(
-                        "PGC V9.6 hard-role index native frame count mismatch."
+                        "PGC hard-role index native frame count mismatch."
                     )
                 hard_native_indices = [
                     int(index) for index in hard_index.get("hard_native_raw_indices", [])
@@ -796,11 +809,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 all_native_indices = list(range(self.pgc_native_frame_count))
                 if not set(hard_native_indices).issubset(set(audited_native_indices)):
                     raise ValueError(
-                        "PGC V9.6 hard rows must be a subset of audited native rows."
+                        "PGC hard rows must be a subset of audited native rows."
                     )
                 if not set(audited_native_indices).issubset(set(all_native_indices)):
                     raise ValueError(
-                        "PGC V9.6 audited native rows are outside the loaded dataset."
+                        "PGC audited native rows are outside the loaded dataset."
                     )
                 native_category_by_index = dict(
                     zip(
@@ -826,8 +839,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     strict_role_categories=list(strict_role_categories or []),
                 )
                 logger.info(
-                    "PGC V9.6 curriculum: native_hard=%d native_easy=%d "
+                    "PGC %s curriculum: native_hard=%d native_easy=%d "
                     "historical_cf=%d strict_cf=%d source=%s",
+                    teacher_label,
                     *(self.pgc_v9_hard_curriculum_group_ids.count(group) for group in range(4)),
                     hard_index_path,
                 )

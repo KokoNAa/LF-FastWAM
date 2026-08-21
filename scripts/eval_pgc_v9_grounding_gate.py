@@ -397,6 +397,69 @@ def compute_grounding_gate_report(
     }
 
 
+def mine_hard_native_rows(
+    records: list[Mapping[str, Any]],
+    *,
+    objective_version: int,
+) -> dict[str, Any]:
+    """Mine audited native failures for a later hard/easy curriculum."""
+    native_records = [
+        record for record in records if record.get("_dataset_kind") == "native"
+    ]
+    audited = sorted({int(record["_raw_index"]) for record in native_records})
+    if objective_version == 4:
+        hard = sorted(
+            {
+                int(record["_raw_index"])
+                for record in native_records
+                if record.get("role_swap_correct")
+                and not all(
+                    bool(value) for value in record["role_swap_correct"]
+                )
+            }
+        )
+        index_format = "pgc_v9_hard_role_index_v1"
+        criterion = "any_valid_full_mask_role_swap_failure"
+    elif objective_version == 11:
+        hard_rows: set[int] = set()
+        for record in native_records:
+            if int(record.get("clause_count", 0)) <= 1:
+                continue
+            role_failure = any(
+                bool(clause.get("all_entity_exclusive_valid", False))
+                and not bool(
+                    clause.get("all_entity_exclusive_correct", False)
+                )
+                for clause in record.get("role_audit_clauses", ())
+            )
+            localization_failure = not all(
+                bool(value)
+                for value in (
+                    *record.get("subject_top1_hits", ()),
+                    *record.get("reference_top1_hits", ()),
+                )
+            )
+            if role_failure or localization_failure:
+                hard_rows.add(int(record["_raw_index"]))
+        hard = sorted(hard_rows)
+        index_format = "pgc_v9_hard_role_index_v2"
+        criterion = (
+            "multi_clause_any_all_entity_role_or_subject_reference_"
+            "localization_failure"
+        )
+    else:
+        raise ValueError(
+            "Hard-row mining supports objective-v4 (V9.3) or "
+            "objective-v11 (V9.10)."
+        )
+    return {
+        "audited_native_raw_indices": audited,
+        "hard_native_raw_indices": hard,
+        "format": index_format,
+        "criterion": criterion,
+    }
+
+
 def _find_training_config(checkpoint: Path) -> Path:
     for parent in checkpoint.parents:
         candidate = parent / "config.yaml"
@@ -839,6 +902,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         9: 3750,
         10: 4750,
         11: 5750,
+        12: 6250,
     }.get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
     intermediate_checkpoint = bool(args.allow_intermediate) and (
@@ -848,6 +912,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         or (objective_version == 9 and checkpoint_step == 3500)
         or (objective_version == 10 and checkpoint_step in {4000, 4250, 4500})
         or (objective_version == 11 and checkpoint_step in {5000, 5250, 5500})
+        or (objective_version == 12 and checkpoint_step == 6000)
     )
     if (
         expected_step is None
@@ -860,7 +925,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "objective v3/v4 at step 2500, objective v5/v6 at step 3500, "
             "objective v7 at step 3000, objective v8 at step 3250, "
             "objective v9 at step 3750, objective v10 at step 4750, or "
-            "objective v11 at step 5750."
+            "objective v11 at step 5750, or objective v12 at step 6250."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())
@@ -941,34 +1006,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     if args.hard_index_output is not None:
-        if objective_version != 4 or checkpoint_step != 2500:
+        valid_teacher = (
+            (objective_version == 4 and checkpoint_step == 2500)
+            or (objective_version == 11 and checkpoint_step == 5750)
+        )
+        if not valid_teacher:
             raise ValueError(
-                "PGC V9.6 hard-role mining requires the completed clean V9.3 "
-                "objective-v4 step-2500 checkpoint."
+                "PGC hard-role mining requires the completed clean V9.3 "
+                "objective-v4 step-2500 checkpoint or the completed V9.10 "
+                "objective-v11 step-5750 checkpoint."
             )
-        audited_native = sorted(
-            {
-                int(record["_raw_index"])
-                for record in records
-                if record["_dataset_kind"] == "native"
-            }
+        mined = mine_hard_native_rows(
+            records,
+            objective_version=objective_version,
         )
-        hard_native = sorted(
-            {
-                int(record["_raw_index"])
-                for record in records
-                if record["_dataset_kind"] == "native"
-                and record["role_swap_correct"]
-                and not all(bool(value) for value in record["role_swap_correct"])
-            }
-        )
+        audited_native = mined["audited_native_raw_indices"]
+        hard_native = mined["hard_native_raw_indices"]
+        if not audited_native:
+            raise ValueError("Hard-role mining found no audited native rows.")
         if not hard_native:
             raise ValueError(
-                "V9.3 hard-role mining found no native role-swap failures; "
+                "Hard-role mining found no native failures; "
                 "increase --num-samples or inspect the audit inputs."
             )
         hard_payload = {
-            "format": "pgc_v9_hard_role_index_v1",
+            "format": mined["format"],
             "teacher_checkpoint": str(checkpoint),
             "teacher_objective_version": objective_version,
             "teacher_step": checkpoint_step,
@@ -978,7 +1040,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "audited_native_count": len(audited_native),
             "hard_native_count": len(hard_native),
             "hard_native_fraction": float(len(hard_native) / len(audited_native)),
-            "criterion": "any_valid_full_mask_role_swap_failure",
+            "criterion": mined["criterion"],
             "native_datasets": sorted(
                 str(Path(str(index["dataset"])).expanduser().resolve())
                 for index in sidecars
@@ -1008,8 +1070,8 @@ def parse_args() -> argparse.Namespace:
         "--hard-index-output",
         type=Path,
         help=(
-            "Write audited native V9.3 role-swap failures for the V9.6 "
-            "four-way curriculum."
+            "Write audited native V9.3 role-swap failures for V9.6 or V9.10 "
+            "clause-tuple failures for the V9.11 four-way curriculum."
         ),
     )
     parser.add_argument("--num-samples", type=int, default=500)
@@ -1021,7 +1083,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Audit V9.3 steps 1750/2000/2250, V9.4/V9.5 steps "
             "2750/3000/3250, V9.6 step 2750, V9.8 step 3500, V9.9 "
-            "steps 4000/4250/4500, or V9.10 steps 5000/5250/5500 without "
+            "steps 4000/4250/4500, V9.10 steps 5000/5250/5500, or V9.11 "
+            "step 6000 without "
             "treating them as final action inputs."
         ),
     )

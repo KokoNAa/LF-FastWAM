@@ -1767,6 +1767,10 @@ class ERAFLossWeights:
     structured_assignment_temperature: float = 0.10
     structured_assignment_hard_weight: float = 0.0
     multi_clause_consistency: float = 0.0
+    clause_tuple_assignment: float = 0.0
+    clause_tuple_temperature: float = 0.10
+    clause_tuple_hard_weight: float = 0.0
+    clause_tuple_multi_consistency: float = 0.0
     clause_activation_balance: float = 0.0
     clause_cardinality: float = 0.0
     clause_worst_slot: float = 0.0
@@ -2577,6 +2581,219 @@ def _balanced_exclusive_all_entity_assignment_loss(
     return assignment_loss, multi_clause_loss, metrics
 
 
+def _balanced_clause_tuple_assignment_loss(
+    *,
+    role_attentions: Mapping[str, torch.Tensor],
+    role_targets: Mapping[str, torch.Tensor],
+    role_entity_ids: Mapping[str, torch.Tensor],
+    role_valid: Mapping[str, torch.Tensor],
+    predicate_logits: torch.Tensor,
+    predicate_ids: torch.Tensor,
+    clause_valid: torch.Tensor,
+    temperature: float,
+    hard_group_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """V9.11 same-state assignment of complete semantic clause tuples.
+
+    V9.10 assigns subject and reference roles independently.  That is still
+    ambiguous when two active clauses share the same plate, basket, or fixture:
+    a subject can move to the other clause while the reference remains right.
+    V9.11 scores each candidate as the complete
+    ``(subject, predicate, reference)`` tuple.  Every other active same-state
+    tuple is a negative, while exact duplicate tuples remain legal
+    multi-positives.
+    """
+    if temperature <= 0:
+        raise ValueError("ERAF clause-tuple temperature must be positive.")
+    if hard_group_weight < 0:
+        raise ValueError(
+            "ERAF clause-tuple hard-group weight must be non-negative."
+        )
+
+    subject_ids = role_entity_ids["subject"].long()
+    reference_ids = role_entity_ids["reference"].long()
+    predicate_ids = predicate_ids.long()
+    clause_valid = clause_valid.bool()
+    clause_count = clause_valid.shape[1]
+    all_targets = torch.cat(
+        (role_targets["subject"], role_targets["reference"]), dim=1
+    ).float()
+    all_entity_ids = torch.cat((subject_ids, reference_ids), dim=1)
+    all_valid = torch.cat(
+        (role_valid["subject"], role_valid["reference"]), dim=1
+    ).bool() & (all_entity_ids >= 0)
+
+    # Subtract only support claimed by a *different* entity.  Repeated entity
+    # IDs (for example a shared basket) are deliberately preserved.
+    different_entity = (
+        all_valid.unsqueeze(-1)
+        & all_valid.unsqueeze(1)
+        & (all_entity_ids.unsqueeze(-1) != all_entity_ids.unsqueeze(1))
+    )
+    competing_support = torch.where(
+        different_entity.unsqueeze(-1),
+        all_targets.unsqueeze(1),
+        torch.zeros_like(all_targets).unsqueeze(1),
+    ).amax(dim=2)
+    exclusive_targets = (all_targets - competing_support).clamp_min(0.0)
+    subject_targets = exclusive_targets[:, :clause_count]
+    reference_targets = exclusive_targets[:, clause_count:]
+    subject_valid = (
+        clause_valid
+        & role_valid["subject"].bool()
+        & (subject_ids >= 0)
+        & (subject_targets.sum(dim=-1) > 1.0e-8)
+    )
+    reference_valid = (
+        clause_valid
+        & role_valid["reference"].bool()
+        & (reference_ids >= 0)
+        & (reference_targets.sum(dim=-1) > 1.0e-8)
+    )
+    predicate_valid = (predicate_ids >= 0) & (
+        predicate_ids < predicate_logits.shape[-1]
+    )
+    tuple_valid = (
+        clause_valid & subject_valid & reference_valid & predicate_valid
+    )
+
+    subject_mass = torch.einsum(
+        "bqt,bkt->bqk",
+        role_attentions["subject"].float(),
+        subject_targets,
+    )
+    reference_mass = torch.einsum(
+        "bqt,bkt->bqk",
+        role_attentions["reference"].float(),
+        reference_targets,
+    )
+    predicate_probability = predicate_logits.float().softmax(dim=-1)
+    safe_predicate_ids = predicate_ids.clamp(
+        min=0, max=predicate_logits.shape[-1] - 1
+    )
+    predicate_score = predicate_probability.gather(
+        -1,
+        safe_predicate_ids.unsqueeze(1).expand(
+            -1, clause_count, -1
+        ),
+    )
+    score = (subject_mass + reference_mass + predicate_score) / 3.0
+    pair_valid = tuple_valid.unsqueeze(-1) & tuple_valid.unsqueeze(1)
+    positive = (
+        pair_valid
+        & (subject_ids.unsqueeze(-1) == subject_ids.unsqueeze(1))
+        & (reference_ids.unsqueeze(-1) == reference_ids.unsqueeze(1))
+        & (predicate_ids.unsqueeze(-1) == predicate_ids.unsqueeze(1))
+    )
+    negative = pair_valid & ~positive
+
+    def directional(
+        scores: torch.Tensor,
+        valid_pairs: torch.Tensor,
+        positive_pairs: torch.Tensor,
+        negative_pairs: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        valid = positive_pairs.any(dim=-1) & negative_pairs.any(dim=-1)
+        logits = (scores / float(temperature)).masked_fill(
+            ~valid_pairs, -torch.inf
+        )
+        positive_logits = logits.masked_fill(~positive_pairs, -torch.inf)
+        nll = torch.logsumexp(logits, dim=-1) - torch.logsumexp(
+            positive_logits, dim=-1
+        )
+        selected = logits.argmax(dim=-1, keepdim=True)
+        correct = positive_pairs.gather(-1, selected).squeeze(-1) & valid
+        positive_score = scores.masked_fill(
+            ~positive_pairs, -torch.inf
+        ).amax(dim=-1)
+        negative_score = scores.masked_fill(
+            ~negative_pairs, -torch.inf
+        ).amax(dim=-1)
+        margin = torch.where(
+            valid,
+            positive_score - negative_score,
+            torch.zeros_like(positive_score),
+        )
+        return (
+            nll,
+            valid,
+            correct,
+            margin,
+            negative_pairs.float().sum(dim=-1),
+        )
+
+    row_loss, row_valid, row_correct, row_margin, row_negative_count = (
+        directional(score, pair_valid, positive, negative)
+    )
+    (
+        column_loss,
+        column_valid,
+        column_correct,
+        _column_margin,
+        column_negative_count,
+    ) = directional(
+        score.transpose(1, 2),
+        pair_valid.transpose(1, 2),
+        positive.transpose(1, 2),
+        negative.transpose(1, 2),
+    )
+    (
+        assignment_loss,
+        hard_gradient_fraction,
+        global_easy_count,
+        global_hard_count,
+    ) = _balanced_group_mean(
+        torch.cat((row_loss, column_loss), dim=1),
+        torch.cat((row_valid, column_valid), dim=1),
+        torch.cat((row_correct, column_correct), dim=1),
+        hard_group_weight=hard_group_weight,
+    )
+
+    multi_sample = (clause_valid.sum(dim=-1) > 1) & row_valid.any(dim=-1)
+    worst_row = torch.where(
+        row_valid, row_loss, torch.zeros_like(row_loss)
+    ).amax(dim=-1)
+    worst_column = torch.where(
+        column_valid, column_loss, torch.zeros_like(column_loss)
+    ).amax(dim=-1)
+    multi_clause_loss = _masked_mean(
+        0.5 * (worst_row + worst_column), multi_sample
+    )
+    sample_correct = (row_correct | ~row_valid).all(dim=-1)
+    zero = score.sum() * 0.0
+    valid_clause_count = clause_valid.float().sum().clamp_min(1.0)
+    metrics = {
+        "accuracy": _masked_mean(row_correct.float(), row_valid).detach(),
+        "column_accuracy": _masked_mean(
+            column_correct.float(), column_valid
+        ).detach(),
+        "hard_fraction": _masked_mean(
+            (~row_correct).float(), row_valid
+        ).detach(),
+        "margin": _masked_mean(row_margin, row_valid).detach(),
+        "negative_count": _masked_mean(
+            0.5 * (row_negative_count + column_negative_count), row_valid
+        ).detach(),
+        "multi_clause_accuracy": (
+            _masked_mean(sample_correct.float(), multi_sample).detach()
+            if bool(multi_sample.any())
+            else zero.detach()
+        ),
+        "multi_clause_fraction": multi_sample.float().mean().detach(),
+        "hard_gradient_fraction": hard_gradient_fraction.detach(),
+        "global_easy_count": global_easy_count.detach(),
+        "global_hard_count": global_hard_count.detach(),
+        "coverage": (row_valid.float().sum() / valid_clause_count).detach(),
+    }
+    return assignment_loss, multi_clause_loss, metrics
+
+
 def entity_relation_affordance_loss(
     outputs: Mapping[str, torch.Tensor],
     labels: Mapping[str, torch.Tensor],
@@ -2985,6 +3202,40 @@ def entity_relation_affordance_loss(
             temperature=float(weights.structured_assignment_temperature),
             hard_weight=float(weights.structured_assignment_hard_weight),
         )
+    clause_tuple_assignment_loss = zero
+    clause_tuple_multi_consistency_loss = zero
+    clause_tuple_metrics = {
+        "accuracy": zero.detach(),
+        "column_accuracy": zero.detach(),
+        "hard_fraction": zero.detach(),
+        "margin": zero.detach(),
+        "negative_count": zero.detach(),
+        "multi_clause_accuracy": zero.detach(),
+        "multi_clause_fraction": zero.detach(),
+        "hard_gradient_fraction": zero.detach(),
+        "global_easy_count": zero.detach(),
+        "global_hard_count": zero.detach(),
+        "coverage": zero.detach(),
+    }
+    if int(weights.objective_version) >= 12:
+        (
+            clause_tuple_assignment_loss,
+            clause_tuple_multi_consistency_loss,
+            clause_tuple_metrics,
+        ) = _balanced_clause_tuple_assignment_loss(
+            role_attentions=role_attentions,
+            role_targets=role_targets,
+            role_entity_ids={
+                role: labels[f"{role}_entity_ids"]
+                for role in ("subject", "reference")
+            },
+            role_valid=role_mask_valid,
+            predicate_logits=outputs["predicate_logits"],
+            predicate_ids=predicate_ids,
+            clause_valid=clause_valid,
+            temperature=float(weights.clause_tuple_temperature),
+            hard_group_weight=float(weights.clause_tuple_hard_weight),
+        )
     clause_activation_balance_loss = zero
     clause_cardinality_loss = zero
     clause_worst_slot_loss = zero
@@ -3315,6 +3566,9 @@ def entity_relation_affordance_loss(
         + weights.role_adapter_energy * role_adapter_energy_loss
         + weights.structured_assignment * structured_assignment_loss
         + weights.multi_clause_consistency * multi_clause_consistency_loss
+        + weights.clause_tuple_assignment * clause_tuple_assignment_loss
+        + weights.clause_tuple_multi_consistency
+        * clause_tuple_multi_consistency_loss
         + weights.clause_activation_balance * clause_activation_balance_loss
         + weights.clause_cardinality * clause_cardinality_loss
         + weights.clause_worst_slot * clause_worst_slot_loss
@@ -3367,6 +3621,12 @@ def entity_relation_affordance_loss(
         ),
         "loss_pgc_v9_multi_clause_consistency": (
             multi_clause_consistency_loss.detach()
+        ),
+        "loss_pgc_v9_clause_tuple_assignment": (
+            clause_tuple_assignment_loss.detach()
+        ),
+        "loss_pgc_v9_clause_tuple_multi_consistency": (
+            clause_tuple_multi_consistency_loss.detach()
         ),
         "loss_pgc_v9_clause_activation_balance": (
             clause_activation_balance_loss.detach()
@@ -3493,6 +3753,33 @@ def entity_relation_affordance_loss(
             if int(weights.objective_version) >= 11
             else zero.detach()
         ),
+        "pgc_v9_clause_tuple_accuracy": clause_tuple_metrics["accuracy"],
+        "pgc_v9_clause_tuple_column_accuracy": clause_tuple_metrics[
+            "column_accuracy"
+        ],
+        "pgc_v9_clause_tuple_hard_fraction": clause_tuple_metrics[
+            "hard_fraction"
+        ],
+        "pgc_v9_clause_tuple_margin": clause_tuple_metrics["margin"],
+        "pgc_v9_clause_tuple_negative_count": clause_tuple_metrics[
+            "negative_count"
+        ],
+        "pgc_v9_clause_tuple_multi_accuracy": clause_tuple_metrics[
+            "multi_clause_accuracy"
+        ],
+        "pgc_v9_clause_tuple_multi_fraction": clause_tuple_metrics[
+            "multi_clause_fraction"
+        ],
+        "pgc_v9_clause_tuple_hard_gradient_fraction": clause_tuple_metrics[
+            "hard_gradient_fraction"
+        ],
+        "pgc_v9_clause_tuple_global_easy_count": clause_tuple_metrics[
+            "global_easy_count"
+        ],
+        "pgc_v9_clause_tuple_global_hard_count": clause_tuple_metrics[
+            "global_hard_count"
+        ],
+        "pgc_v9_clause_tuple_coverage": clause_tuple_metrics["coverage"],
         "pgc_v9_clause_activation_exact": clause_metrics["exact"],
         "pgc_v9_clause_activation_multi_exact": clause_metrics["multi_exact"],
         "pgc_v9_clause_cardinality_accuracy": clause_metrics[

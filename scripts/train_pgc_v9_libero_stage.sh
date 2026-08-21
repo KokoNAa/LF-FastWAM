@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|grounding-structured-role|grounding-balanced-role|grounding-hard-role|grounding-exclusive-role|grounding-clause-calibration|grounding-view-scheduler|grounding-all-entity-role|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
+SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|grounding-structured-role|grounding-balanced-role|grounding-hard-role|grounding-exclusive-role|grounding-clause-calibration|grounding-view-scheduler|grounding-all-entity-role|grounding-clause-tuple|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
 STAGE="${2:?Missing V9 training stage}"
 NPROC_PER_NODE="${3:?Missing GPU count}"
 BASE_CHECKPOINT="${4:?Missing released FastWAM checkpoint}"
@@ -113,8 +113,20 @@ case "${STAGE}" in
     DEFAULT_GROUNDING_OBJECTIVE_VERSION=11
     SAVE_EVERY=250
     ;;
+  grounding-clause-tuple)
+    START_STEP=5750
+    STAGE_START_STEP=5750
+    DEFAULT_STAGE_STEPS=500
+    LEARNING_RATE="5.0e-6"
+    CONFIG_STAGE="grounding"
+    DEFAULT_GROUNDING_OBJECTIVE_VERSION=12
+    SAVE_EVERY=250
+    ;;
   action)
-    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
+      START_STEP=6250
+      STAGE_START_STEP=6250
+    elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
       START_STEP=5750
       STAGE_START_STEP=5750
     elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "10" ]]; then
@@ -146,7 +158,10 @@ case "${STAGE}" in
     SAVE_EVERY=500
     ;;
   verifier)
-    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
+      START_STEP=10250
+      STAGE_START_STEP=10250
+    elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
       START_STEP=9750
       STAGE_START_STEP=9750
     elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "10" ]]; then
@@ -178,7 +193,7 @@ case "${STAGE}" in
     SAVE_EVERY=500
     ;;
   *)
-    echo "Stage must be grounding, grounding-role, grounding-role-adapter, grounding-structured-role, grounding-balanced-role, grounding-hard-role, grounding-exclusive-role, grounding-clause-calibration, grounding-view-scheduler, grounding-all-entity-role, action, or verifier; got ${STAGE}." >&2
+    echo "Stage must be grounding, grounding-role, grounding-role-adapter, grounding-structured-role, grounding-balanced-role, grounding-hard-role, grounding-exclusive-role, grounding-clause-calibration, grounding-view-scheduler, grounding-all-entity-role, grounding-clause-tuple, action, or verifier; got ${STAGE}." >&2
     exit 1
     ;;
 esac
@@ -198,7 +213,7 @@ ROLE_SWAP_WEIGHT="${PGC_V9_ROLE_SWAP_WEIGHT:-2.0}"
 ROLE_OVERLAP_WEIGHT="${PGC_V9_ROLE_OVERLAP_WEIGHT:-1.0}"
 ROLE_SWAP_MARGIN="${PGC_V9_ROLE_SWAP_MARGIN:-0.20}"
 ROLE_ASSIGNMENT_TEMPERATURE="${PGC_V9_ROLE_ASSIGNMENT_TEMPERATURE:-0.10}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "4" || "${GROUNDING_OBJECTIVE_VERSION}" == "5" || "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" || "${GROUNDING_OBJECTIVE_VERSION}" == "8" || "${GROUNDING_OBJECTIVE_VERSION}" == "9" || "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "4" || "${GROUNDING_OBJECTIVE_VERSION}" == "5" || "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" || "${GROUNDING_OBJECTIVE_VERSION}" == "8" || "${GROUNDING_OBJECTIVE_VERSION}" == "9" || "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" || "${GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
   DEFAULT_ROLE_ASSIGNMENT_WEIGHT=1.0
   DEFAULT_ROLE_ASSIGNMENT_HARD_WEIGHT=0.5
 elif [[ "${GROUNDING_OBJECTIVE_VERSION}" == "3" ]]; then
@@ -210,7 +225,7 @@ else
 fi
 ROLE_ASSIGNMENT_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_WEIGHT:-${DEFAULT_ROLE_ASSIGNMENT_WEIGHT}}"
 ROLE_ASSIGNMENT_HARD_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_HARD_WEIGHT:-${DEFAULT_ROLE_ASSIGNMENT_HARD_WEIGHT}}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" || "${GROUNDING_OBJECTIVE_VERSION}" == "8" || "${GROUNDING_OBJECTIVE_VERSION}" == "9" || "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" || "${GROUNDING_OBJECTIVE_VERSION}" == "8" || "${GROUNDING_OBJECTIVE_VERSION}" == "9" || "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" || "${GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
   DEFAULT_ROLE_ATTENTION_PRESERVATION_WEIGHT=5.0
   DEFAULT_ROLE_POSITION_PRESERVATION_WEIGHT=2.0
   DEFAULT_ROLE_ANCHOR_PRESERVATION_WEIGHT=10.0
@@ -234,7 +249,7 @@ ROLE_POSITION_PRESERVATION_WEIGHT="${PGC_V9_ROLE_POSITION_PRESERVATION_WEIGHT:-$
 ROLE_ANCHOR_PRESERVATION_WEIGHT="${PGC_V9_ROLE_ANCHOR_PRESERVATION_WEIGHT:-${DEFAULT_ROLE_ANCHOR_PRESERVATION_WEIGHT}}"
 ROLE_RELATION_PRESERVATION_WEIGHT="${PGC_V9_ROLE_RELATION_PRESERVATION_WEIGHT:-${DEFAULT_ROLE_RELATION_PRESERVATION_WEIGHT}}"
 ROLE_ADAPTER_ENERGY_WEIGHT="${PGC_V9_ROLE_ADAPTER_ENERGY_WEIGHT:-${DEFAULT_ROLE_ADAPTER_ENERGY_WEIGHT}}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" || "${GROUNDING_OBJECTIVE_VERSION}" == "8" || "${GROUNDING_OBJECTIVE_VERSION}" == "9" || "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "6" || "${GROUNDING_OBJECTIVE_VERSION}" == "7" || "${GROUNDING_OBJECTIVE_VERSION}" == "8" || "${GROUNDING_OBJECTIVE_VERSION}" == "9" || "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" || "${GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
   DEFAULT_STRUCTURED_ASSIGNMENT_WEIGHT=2.0
   # V9.5 interprets this as hard-group:easy-group mass.  1.0 is exact 1:1.
   DEFAULT_STRUCTURED_ASSIGNMENT_HARD_WEIGHT=1.0
@@ -255,7 +270,20 @@ STRUCTURED_ASSIGNMENT_WEIGHT="${PGC_V9_STRUCTURED_ASSIGNMENT_WEIGHT:-${DEFAULT_S
 STRUCTURED_ASSIGNMENT_TEMPERATURE="${PGC_V9_STRUCTURED_ASSIGNMENT_TEMPERATURE:-0.10}"
 STRUCTURED_ASSIGNMENT_HARD_WEIGHT="${PGC_V9_STRUCTURED_ASSIGNMENT_HARD_WEIGHT:-${DEFAULT_STRUCTURED_ASSIGNMENT_HARD_WEIGHT}}"
 MULTI_CLAUSE_CONSISTENCY_WEIGHT="${PGC_V9_MULTI_CLAUSE_CONSISTENCY_WEIGHT:-${DEFAULT_MULTI_CLAUSE_CONSISTENCY_WEIGHT}}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "9" || "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
+  DEFAULT_CLAUSE_TUPLE_ASSIGNMENT_WEIGHT=4.0
+  DEFAULT_CLAUSE_TUPLE_HARD_WEIGHT=1.0
+  DEFAULT_CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT=2.0
+else
+  DEFAULT_CLAUSE_TUPLE_ASSIGNMENT_WEIGHT=0.0
+  DEFAULT_CLAUSE_TUPLE_HARD_WEIGHT=0.0
+  DEFAULT_CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT=0.0
+fi
+CLAUSE_TUPLE_ASSIGNMENT_WEIGHT="${PGC_V9_CLAUSE_TUPLE_ASSIGNMENT_WEIGHT:-${DEFAULT_CLAUSE_TUPLE_ASSIGNMENT_WEIGHT}}"
+CLAUSE_TUPLE_TEMPERATURE="${PGC_V9_CLAUSE_TUPLE_TEMPERATURE:-0.10}"
+CLAUSE_TUPLE_HARD_WEIGHT="${PGC_V9_CLAUSE_TUPLE_HARD_WEIGHT:-${DEFAULT_CLAUSE_TUPLE_HARD_WEIGHT}}"
+CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT="${PGC_V9_CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT:-${DEFAULT_CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT}}"
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "9" || "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" || "${GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
   DEFAULT_CLAUSE_ACTIVATION_BALANCE_WEIGHT=1.0
   DEFAULT_CLAUSE_CARDINALITY_WEIGHT=1.0
   DEFAULT_CLAUSE_WORST_SLOT_WEIGHT=2.0
@@ -272,7 +300,7 @@ CLAUSE_WORST_SLOT_WEIGHT="${PGC_V9_CLAUSE_WORST_SLOT_WEIGHT:-${DEFAULT_CLAUSE_WO
 CLAUSE_MULTI_GROUP_WEIGHT="${PGC_V9_CLAUSE_MULTI_GROUP_WEIGHT:-1.0}"
 CLAUSE_ADAPTER_ENERGY_WEIGHT="${PGC_V9_CLAUSE_ADAPTER_ENERGY_WEIGHT:-${DEFAULT_CLAUSE_ADAPTER_ENERGY_WEIGHT}}"
 CLAUSE_ACTIVATION_RESIDUAL_MAX_ABS="${PGC_V9_CLAUSE_ACTIVATION_RESIDUAL_MAX_ABS:-4.0}"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "10" || "${GROUNDING_OBJECTIVE_VERSION}" == "11" || "${GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
   DEFAULT_VIEW_FUSION_WEIGHT=2.0
   DEFAULT_VIEW_FUSION_ENERGY_WEIGHT=0.01
   DEFAULT_CLAUSE_SCHEDULER_WEIGHT=1.0
@@ -350,19 +378,25 @@ case "${STAGE}" in
       exit 1
     fi
     ;;
+  grounding-clause-tuple)
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "12" ]]; then
+      echo "Formal V9.11 clause-tuple binding requires objective version 12." >&2
+      exit 1
+    fi
+    ;;
   action|verifier)
-    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" && "${GROUNDING_OBJECTIVE_VERSION}" != "3" && "${GROUNDING_OBJECTIVE_VERSION}" != "4" && "${GROUNDING_OBJECTIVE_VERSION}" != "5" && "${GROUNDING_OBJECTIVE_VERSION}" != "6" && "${GROUNDING_OBJECTIVE_VERSION}" != "7" && "${GROUNDING_OBJECTIVE_VERSION}" != "8" && "${GROUNDING_OBJECTIVE_VERSION}" != "9" && "${GROUNDING_OBJECTIVE_VERSION}" != "10" && "${GROUNDING_OBJECTIVE_VERSION}" != "11" ]]; then
-      echo "V9 action/verifier requires grounding objective version 2 through 11." >&2
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" && "${GROUNDING_OBJECTIVE_VERSION}" != "3" && "${GROUNDING_OBJECTIVE_VERSION}" != "4" && "${GROUNDING_OBJECTIVE_VERSION}" != "5" && "${GROUNDING_OBJECTIVE_VERSION}" != "6" && "${GROUNDING_OBJECTIVE_VERSION}" != "7" && "${GROUNDING_OBJECTIVE_VERSION}" != "8" && "${GROUNDING_OBJECTIVE_VERSION}" != "9" && "${GROUNDING_OBJECTIVE_VERSION}" != "10" && "${GROUNDING_OBJECTIVE_VERSION}" != "11" && "${GROUNDING_OBJECTIVE_VERSION}" != "12" ]]; then
+      echo "V9 action/verifier requires grounding objective version 2 through 12." >&2
       exit 1
     fi
     ;;
 esac
 HARD_ROLE_CURRICULUM=false
 HARD_ROLE_INDEX_PATH="${PGC_V9_HARD_ROLE_INDEX_PATH:-}"
-if [[ "${STAGE}" == "grounding-hard-role" || "${STAGE}" == "grounding-exclusive-role" ]]; then
+if [[ "${STAGE}" == "grounding-hard-role" || "${STAGE}" == "grounding-exclusive-role" || "${STAGE}" == "grounding-clause-tuple" ]]; then
   HARD_ROLE_CURRICULUM=true
   if [[ -z "${HARD_ROLE_INDEX_PATH}" || ! -f "${HARD_ROLE_INDEX_PATH}" ]]; then
-    echo "V9.6/V9.7 requires PGC_V9_HARD_ROLE_INDEX_PATH from the clean V9.3 audit." >&2
+    echo "V9.6/V9.7/V9.11 requires PGC_V9_HARD_ROLE_INDEX_PATH from its audited teacher." >&2
     exit 1
   fi
   HARD_ROLE_INDEX_PATH="$(cd -- "$(dirname -- "${HARD_ROLE_INDEX_PATH}")" && pwd -P)/$(basename -- "${HARD_ROLE_INDEX_PATH}")"
@@ -475,6 +509,7 @@ elif stage in {
     "grounding-clause-calibration",
     "grounding-view-scheduler",
     "grounding-all-entity-role",
+    "grounding-clause-tuple",
 }:
     metadata = payload.get("architecture_metadata") or {}
     if fmt != "fastwam_policy_guard_v9" or version != 9:
@@ -489,6 +524,7 @@ elif stage in {
         "grounding-clause-calibration": 8,
         "grounding-view-scheduler": 9,
         "grounding-all-entity-role": 10,
+        "grounding-clause-tuple": 11,
     }[stage]
     if (
         int(metadata.get("eraf_grounding_objective_version", -1))
@@ -515,6 +551,7 @@ elif stage in {
         "grounding-clause-calibration": 9,
         "grounding-view-scheduler": 10,
         "grounding-all-entity-role": 11,
+        "grounding-clause-tuple": 12,
     }[stage]
     if int(requested_objective) != expected_objective:
         raise SystemExit(
@@ -577,6 +614,14 @@ elif stage in {
         raise SystemExit(
             "V9.10 must warm-start from the completed V9.9 view/scheduler "
             "checkpoint at step 4750."
+        )
+    if stage == "grounding-clause-tuple" and (
+        metadata.get("eraf_role_adapter_trainable_scope")
+        != "exclusive_all_entity_balanced_visual_role_binding_adapter_only"
+    ):
+        raise SystemExit(
+            "V9.11 must warm-start from the completed V9.10 all-entity "
+            "checkpoint at step 5750."
         )
 else:
     if fmt != "fastwam_policy_guard_v9" or version != 9:
@@ -673,6 +718,7 @@ echo "  effective_batch=$((NPROC_PER_NODE * GRADIENT_ACCUMULATION_STEPS)) (${NPR
 echo "  grounding_objective=v${GROUNDING_OBJECTIVE_VERSION} attention_mask=${ATTENTION_MASK_WEIGHT} role_swap=${ROLE_SWAP_WEIGHT} role_overlap=${ROLE_OVERLAP_WEIGHT} margin=${ROLE_SWAP_MARGIN}"
 echo "  role_assignment=${ROLE_ASSIGNMENT_WEIGHT} temperature=${ROLE_ASSIGNMENT_TEMPERATURE} hard_weight=${ROLE_ASSIGNMENT_HARD_WEIGHT}"
 echo "  structured_assignment=${STRUCTURED_ASSIGNMENT_WEIGHT} temperature=${STRUCTURED_ASSIGNMENT_TEMPERATURE} hard_weight=${STRUCTURED_ASSIGNMENT_HARD_WEIGHT} multi_clause=${MULTI_CLAUSE_CONSISTENCY_WEIGHT}"
+echo "  clause_tuple=assignment:${CLAUSE_TUPLE_ASSIGNMENT_WEIGHT} temperature:${CLAUSE_TUPLE_TEMPERATURE} hard_weight:${CLAUSE_TUPLE_HARD_WEIGHT} multi_consistency:${CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT}"
 echo "  clause_calibration=active:${CLAUSE_ACTIVATION_BALANCE_WEIGHT} cardinality:${CLAUSE_CARDINALITY_WEIGHT} worst_slot:${CLAUSE_WORST_SLOT_WEIGHT} multi_group:${CLAUSE_MULTI_GROUP_WEIGHT} energy:${CLAUSE_ADAPTER_ENERGY_WEIGHT} max_abs:${CLAUSE_ACTIVATION_RESIDUAL_MAX_ABS}"
 echo "  view_fusion=weight:${VIEW_FUSION_WEIGHT} energy:${VIEW_FUSION_ENERGY_WEIGHT} max_abs:${VIEW_FUSION_RESIDUAL_MAX_ABS}"
 echo "  clause_scheduler=weight:${CLAUSE_SCHEDULER_WEIGHT} energy:${CLAUSE_SCHEDULER_ENERGY_WEIGHT} max_abs:${CLAUSE_SCHEDULER_RESIDUAL_MAX_ABS}"
@@ -738,6 +784,10 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.entity_relation_grounding.structured_assignment_temperature=${STRUCTURED_ASSIGNMENT_TEMPERATURE}" \
   "model.policy_guard.entity_relation_grounding.structured_assignment_hard_weight=${STRUCTURED_ASSIGNMENT_HARD_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.multi_clause_consistency_weight=${MULTI_CLAUSE_CONSISTENCY_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.clause_tuple_assignment_weight=${CLAUSE_TUPLE_ASSIGNMENT_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.clause_tuple_temperature=${CLAUSE_TUPLE_TEMPERATURE}" \
+  "model.policy_guard.entity_relation_grounding.clause_tuple_hard_weight=${CLAUSE_TUPLE_HARD_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.clause_tuple_multi_consistency_weight=${CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT}" \
   model.policy_guard.entity_relation_grounding.structured_role_adapter_hidden_dim=256 \
   model.policy_guard.entity_relation_grounding.balanced_role_adapter_hidden_dim=256 \
   model.policy_guard.entity_relation_grounding.clause_activation_adapter_hidden_dim=256 \

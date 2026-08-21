@@ -206,7 +206,7 @@ if version == 9:
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
     objective = int(metadata.get("eraf_grounding_objective_version", -1))
-    if objective not in set(range(1, 12)):
+    if objective not in set(range(1, 13)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -236,6 +236,13 @@ if version == 9:
         != "semantic_exact_with_exclusive_role_evidence"
     ):
         raise SystemExit("PGC v9.10 checkpoint lacks all-entity role contract")
+    if objective >= 12 and (
+        metadata.get("eraf_clause_tuple_contract")
+        != "exclusive_same_state_subject_predicate_reference_assignment"
+        or metadata.get("eraf_clause_tuple_curriculum_contract")
+        != "v9_10_audit_native_hard_easy_plus_historical_strict_1_1_1_1"
+    ):
+        raise SystemExit("PGC v9.11 checkpoint lacks clause-tuple contract")
 else:
     objective = 0
     training_stage = "grounding"
@@ -351,6 +358,14 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
       "model.policy_guard.entity_relation_grounding.clause_scheduler_residual_max_abs=1.0"
       "model.policy_guard.entity_relation_grounding.clause_scheduler_weight=1.0"
       "model.policy_guard.entity_relation_grounding.clause_scheduler_energy_weight=0.01"
+    )
+  fi
+  if (( PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 12 )); then
+    EXTRA_OVERRIDES+=(
+      "model.policy_guard.entity_relation_grounding.clause_tuple_assignment_weight=4.0"
+      "model.policy_guard.entity_relation_grounding.clause_tuple_temperature=0.10"
+      "model.policy_guard.entity_relation_grounding.clause_tuple_hard_weight=1.0"
+      "model.policy_guard.entity_relation_grounding.clause_tuple_multi_consistency_weight=2.0"
     )
   fi
   if [[ "${ERAF_SHADOW_AUDIT}" == "true" ]]; then
