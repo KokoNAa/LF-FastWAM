@@ -31,6 +31,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exit 2 unless the canonical grounding gate and Base integrity pass.",
     )
+    parser.add_argument(
+        "--require-extended",
+        action="store_true",
+        help="Exit 2 unless every record contains the expanded V2 diagnostics.",
+    )
     return parser.parse_args()
 
 
@@ -158,6 +163,12 @@ def main() -> None:
     print(json.dumps(summary, indent=2))
     print(f"ERAF_SHADOW_SUMMARY={output}")
     if args.require_pass and not summary["passed"]:
+        raise SystemExit(2)
+    extended = summary.get("extended_diagnostics", {})
+    if args.require_extended and (
+        not extended.get("available")
+        or float(extended.get("record_coverage", 0.0)) != 1.0
+    ):
         raise SystemExit(2)
 
 

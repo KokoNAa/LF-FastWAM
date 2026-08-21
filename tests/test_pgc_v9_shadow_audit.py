@@ -10,6 +10,7 @@ import torch
 from experiments.libero.eraf_shadow_audit import (
     ERAFShadowAuditor,
     ERAFShadowContract,
+    _clause_statuses,
     summarize_eraf_shadow_records,
     verify_shadow_action_integrity,
 )
@@ -46,6 +47,40 @@ def _good_record():
         "clause_exact": True,
         "clause_count": 2,
         "online_stage": "pregrasp",
+    }
+
+
+def _extended_clause(status="initial_search", oracle_partition="role_pass"):
+    view = {
+        "gt_visible": True,
+        "predicted_visible": True,
+        "visibility_correct": True,
+        "top1_hit": True,
+        "attention_mass": 0.5,
+        "center_error_px": 1.0,
+    }
+    return {
+        "predicate": "on",
+        "status": status,
+        "active_correct": True,
+        "predicate_correct": True,
+        "predicate_truth_correct": True,
+        "phase_target": 0,
+        "phase_prediction": 0,
+        "phase_correct": True,
+        "subject_top1_hit": True,
+        "reference_top1_hit": True,
+        "full_role_correct": True,
+        "exclusive_role_valid": True,
+        "exclusive_role_correct": True,
+        "oracle_partition": oracle_partition,
+        "subject_position_error_m": 0.01,
+        "reference_position_error_m": 0.02,
+        "goal_anchor_error_m": 0.03,
+        "views": {
+            camera: {"subject": dict(view), "reference": dict(view)}
+            for camera in ("agentview", "robot0_eye_in_hand")
+        },
     }
 
 
@@ -156,12 +191,40 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
             / (contract.workspace_max - contract.workspace_min)
             - 1.0
         )
+        subject_position = np.zeros((1, 4, 3), dtype=np.float32)
+        subject_position[0, 0] = (
+            2.0
+            * (np.asarray([0.0, 0.0, 0.2], dtype=np.float32) - contract.workspace_min)
+            / (contract.workspace_max - contract.workspace_min)
+            - 1.0
+        )
+        reference_position = np.zeros((1, 4, 3), dtype=np.float32)
+        reference_position[0, 0] = goal_anchor[0, 0]
+        phase_logits = np.zeros((1, 4, 3), dtype=np.float32)
+        phase_logits[0, 0, 0] = 5.0
         diagnostics = {
             "active_logits": np.asarray([[5.0, -5.0, -5.0, -5.0]]),
             "predicate_logits": predicate_logits,
             "subject_attention": subject_attention,
             "reference_attention": reference_attention,
+            "subject_position": subject_position,
+            "reference_position": reference_position,
             "goal_anchor": goal_anchor,
+            "predicate_truth_logits": np.asarray(
+                [[-5.0, -5.0, -5.0, -5.0]], dtype=np.float32
+            ),
+            "phase_logits": phase_logits,
+            "camera_ids": np.asarray([0, 0, 1, 1, 0, 0, 1, 1]),
+            "subject_view_visibility_logits": np.asarray(
+                [[[5.0, 5.0], [-5.0, -5.0], [-5.0, -5.0], [-5.0, -5.0]]]
+            ),
+            "reference_view_visibility_logits": np.asarray(
+                [[[5.0, 5.0], [-5.0, -5.0], [-5.0, -5.0], [-5.0, -5.0]]]
+            ),
+            "subject_view_centers": np.zeros((1, 4, 2, 2), dtype=np.float32),
+            "reference_view_centers": np.zeros((1, 4, 2, 2), dtype=np.float32),
+            "subject_view_attention_mass": np.full((1, 4, 2), 0.5, dtype=np.float32),
+            "reference_view_attention_mass": np.full((1, 4, 2), 0.5, dtype=np.float32),
         }
         record = auditor.observe(
             obs=obs,
@@ -172,12 +235,26 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
         )
         self.assertEqual(record["clause_count"], 1)
         self.assertEqual(record["online_stage"], "pregrasp")
+        self.assertEqual(record["online_stage_v2"], "initial_search")
+        self.assertEqual(record["clause_statuses"], ["initial_search"])
+        self.assertTrue(record["extended_diagnostics"]["available"])
+        self.assertTrue(record["extended_diagnostics"]["clauses"][0]["phase_correct"])
+        self.assertTrue(
+            record["extended_diagnostics"]["clauses"][0]["predicate_truth_correct"]
+        )
         self.assertEqual(record["relation_predictions"], [2])
         self.assertEqual(len(record["goal_anchor_errors_m"]), 1)
         self.assertAlmostEqual(record["goal_anchor_errors_m"][0], 0.0, places=6)
 
     def test_summary_requires_grounding_and_action_integrity(self):
         records = [_good_record() for _ in range(5)]
+        for record in records:
+            record["online_stage_v2"] = "initial_search"
+            record["extended_diagnostics"] = {
+                "available": True,
+                "missing_diagnostics": [],
+                "clauses": [_extended_clause(), _extended_clause()],
+            }
         integrity = [
             {
                 "exact": True,
@@ -194,6 +271,38 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
         self.assertTrue(summary["passed"])
         self.assertEqual(summary["action_integrity"]["exact_rate"], 1.0)
         self.assertEqual(summary["by_online_stage"]["pregrasp"]["decisions"], 5)
+        self.assertTrue(summary["extended_diagnostics"]["available"])
+        self.assertEqual(summary["extended_diagnostics"]["overall"]["clauses"], 10)
+        self.assertEqual(
+            summary["extended_diagnostics"]["overall"][
+                "privileged_gt_mask_oracle_partition"
+            ]["counts"]["role_pass"],
+            10,
+        )
+        self.assertEqual(
+            summary["by_online_stage_v2"]["initial_search"]["decisions"], 5
+        )
+
+    def test_non_sticky_clause_statuses_separate_second_search_and_release(self):
+        statuses, phases, stage = _clause_statuses(
+            clause_valid=np.asarray([True, True, False, False]),
+            predicate_truth=np.asarray([True, False, False, False]),
+            subject_grasped=np.asarray([False, False, False, False]),
+            subject_ever_grasped=np.asarray([True, False, False, False]),
+        )
+        self.assertEqual(statuses, ["completed", "next_clause_search"])
+        self.assertEqual(phases.tolist(), [2, 0, 0, 0])
+        self.assertEqual(stage, "next_clause_search")
+
+        statuses, phases, stage = _clause_statuses(
+            clause_valid=np.asarray([True, False, False, False]),
+            predicate_truth=np.asarray([False, False, False, False]),
+            subject_grasped=np.asarray([False, False, False, False]),
+            subject_ever_grasped=np.asarray([True, False, False, False]),
+        )
+        self.assertEqual(statuses, ["released_unfinished"])
+        self.assertEqual(phases.tolist(), [1, 0, 0, 0])
+        self.assertEqual(stage, "released_unfinished")
 
 
 if __name__ == "__main__":

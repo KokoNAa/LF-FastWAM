@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -27,6 +28,366 @@ from fastwam.datasets.pgc_libero import (
 
 
 CAMERA_NAMES = ("agentview", "robot0_eye_in_hand")
+
+
+def _diagnostic_array(diagnostics: Mapping[str, Any], name: str) -> np.ndarray:
+    """Return one-example ERAF diagnostics without assuming torch at import time."""
+    value = diagnostics[name]
+    try:
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+    except ImportError:
+        pass
+    array = np.asarray(value)
+    return array[0] if array.ndim > 0 and array.shape[0] == 1 else array
+
+
+def _sigmoid(value: np.ndarray | float) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float64)
+    return 1.0 / (1.0 + np.exp(-np.clip(array, -60.0, 60.0)))
+
+
+def _mask_center_pixels(mask: np.ndarray) -> tuple[np.ndarray, bool]:
+    ys, xs = np.nonzero(mask)
+    if not len(xs):
+        return np.zeros(2, dtype=np.float32), False
+    return np.asarray([xs.mean(), ys.mean()], dtype=np.float32), True
+
+
+def _predicted_center_pixels(
+    normalized_xy: np.ndarray, *, height: int, width: int
+) -> np.ndarray:
+    value = np.asarray(normalized_xy, dtype=np.float32)
+    return np.asarray(
+        [
+            (float(value[0]) + 1.0) * max(0, width - 1) / 2.0,
+            (float(value[1]) + 1.0) * max(0, height - 1) / 2.0,
+        ],
+        dtype=np.float32,
+    )
+
+
+def _clause_statuses(
+    *,
+    clause_valid: np.ndarray,
+    predicate_truth: np.ndarray,
+    subject_grasped: np.ndarray,
+    subject_ever_grasped: np.ndarray,
+) -> tuple[list[str], np.ndarray, str]:
+    """Build non-sticky per-clause phases for compound-task diagnosis.
+
+    The legacy `postgrasp` label remains in the output for comparison, but it
+    becomes sticky after the first grasp.  These labels distinguish holding,
+    an unsuccessful release, and the search for a later conjunction member.
+    """
+    valid_indices = list(np.flatnonzero(clause_valid))
+    any_prior_progress = bool(
+        predicate_truth[clause_valid].any() or subject_ever_grasped[clause_valid].any()
+    )
+    statuses: list[str] = []
+    phase_targets = np.zeros_like(predicate_truth, dtype=np.int64)
+    for index in valid_indices:
+        if bool(predicate_truth[index]):
+            status = "completed"
+            phase_targets[index] = 2
+        elif bool(subject_grasped[index]):
+            status = "holding"
+            phase_targets[index] = 1
+        elif bool(subject_ever_grasped[index]):
+            status = "released_unfinished"
+            phase_targets[index] = 1
+        elif any_prior_progress:
+            status = "next_clause_search"
+            phase_targets[index] = 0
+        else:
+            status = "initial_search"
+            phase_targets[index] = 0
+        statuses.append(status)
+    status_set = set(statuses)
+    if statuses and status_set == {"completed"}:
+        online_stage = "complete"
+    elif "holding" in status_set:
+        online_stage = "holding"
+    elif "released_unfinished" in status_set:
+        online_stage = "released_unfinished"
+    elif "next_clause_search" in status_set:
+        online_stage = "next_clause_search"
+    else:
+        online_stage = "initial_search"
+    return statuses, phase_targets, online_stage
+
+
+def _extended_clause_diagnostics(
+    *,
+    diagnostics: Mapping[str, Any],
+    sample: Mapping[str, Any],
+    clauses: Sequence[Mapping[str, Any]],
+    clause_statuses: Sequence[str],
+    phase_targets: np.ndarray,
+    predicate_truth: np.ndarray,
+    subject_grasped: np.ndarray,
+    subject_ever_grasped: np.ndarray,
+    subject_positions: np.ndarray,
+    reference_positions: np.ndarray,
+    subject_position_valid: np.ndarray,
+    reference_position_valid: np.ndarray,
+    workspace_min: np.ndarray,
+    workspace_max: np.ndarray,
+) -> dict[str, Any]:
+    """Decompose online failures with privileged labels, never policy inputs."""
+    required = {
+        "active_logits",
+        "predicate_logits",
+        "subject_attention",
+        "reference_attention",
+        "subject_position",
+        "reference_position",
+        "goal_anchor",
+        "predicate_truth_logits",
+        "phase_logits",
+        "camera_ids",
+        "subject_view_visibility_logits",
+        "reference_view_visibility_logits",
+        "subject_view_centers",
+        "reference_view_centers",
+        "subject_view_attention_mass",
+        "reference_view_attention_mass",
+    }
+    missing = sorted(required.difference(diagnostics))
+    if missing:
+        return {"available": False, "missing_diagnostics": missing, "clauses": []}
+
+    from scripts.eval_pgc_v9_grounding_gate import _patch_targets
+
+    clause_valid = np.asarray(sample["pgc_eraf_clause_valid"], dtype=bool)
+    predicate_ids = np.asarray(sample["pgc_eraf_predicate_ids"], dtype=np.int64)
+    subject_ids = np.asarray(sample["pgc_eraf_subject_entity_ids"], dtype=np.int64)
+    reference_ids = np.asarray(sample["pgc_eraf_reference_entity_ids"], dtype=np.int64)
+    subject_masks = np.asarray(sample["pgc_eraf_subject_masks"], dtype=bool)
+    reference_masks = np.asarray(sample["pgc_eraf_reference_masks"], dtype=bool)
+    subject_valid = clause_valid & np.asarray(
+        sample["pgc_eraf_subject_mask_valid"], dtype=bool
+    )
+    reference_valid = clause_valid & np.asarray(
+        sample["pgc_eraf_reference_mask_valid"], dtype=bool
+    )
+    subject_attention = _diagnostic_array(diagnostics, "subject_attention")
+    reference_attention = _diagnostic_array(diagnostics, "reference_attention")
+    token_count = int(subject_attention.shape[-1])
+    subject_targets = _patch_targets(subject_masks, token_count)
+    reference_targets = _patch_targets(reference_masks, token_count)
+    camera_ids = _diagnostic_array(diagnostics, "camera_ids").astype(np.int64)
+    active_prediction = _diagnostic_array(diagnostics, "active_logits") > 0
+    predicate_prediction = _diagnostic_array(diagnostics, "predicate_logits").argmax(
+        axis=-1
+    )
+    truth_probability = _sigmoid(
+        _diagnostic_array(diagnostics, "predicate_truth_logits")
+    )
+    truth_prediction = truth_probability >= 0.5
+    phase_prediction = _diagnostic_array(diagnostics, "phase_logits").argmax(axis=-1)
+    predicted_subject_positions = _diagnostic_array(diagnostics, "subject_position")
+    predicted_reference_positions = _diagnostic_array(diagnostics, "reference_position")
+    predicted_goal_anchor = _diagnostic_array(diagnostics, "goal_anchor")
+    scale = (workspace_max - workspace_min) / 2.0
+    half_width = int(subject_masks.shape[-1] // len(CAMERA_NAMES))
+    mask_height = int(subject_masks.shape[-2])
+    status_by_index = {
+        int(index): str(status)
+        for index, status in zip(np.flatnonzero(clause_valid), clause_statuses)
+    }
+    prompt = str(sample.get("prompt", "unknown"))
+    prompt_prefix = DEFAULT_PROMPT.split("{task}", 1)[0]
+    task = prompt[len(prompt_prefix) :] if prompt.startswith(prompt_prefix) else prompt
+
+    rows: list[dict[str, Any]] = []
+    for index in np.flatnonzero(clause_valid):
+        subject_target = subject_targets[index]
+        reference_target = reference_targets[index]
+        subject_hit = (
+            bool(subject_target[subject_attention[index].argmax()] > 0)
+            if subject_valid[index]
+            else None
+        )
+        reference_hit = (
+            bool(reference_target[reference_attention[index].argmax()] > 0)
+            if reference_valid[index]
+            else None
+        )
+        role_applicable = bool(
+            subject_valid[index]
+            and reference_valid[index]
+            and subject_ids[index] != reference_ids[index]
+        )
+        full_role_correct = None
+        exclusive_role_valid = False
+        exclusive_role_correct = None
+        overlap_iou = None
+        if role_applicable:
+            subject_own = float((subject_attention[index] * subject_target).sum())
+            subject_wrong = float((subject_attention[index] * reference_target).sum())
+            reference_own = float((reference_attention[index] * reference_target).sum())
+            reference_wrong = float((reference_attention[index] * subject_target).sum())
+            full_role_correct = bool(
+                subject_own > subject_wrong and reference_own > reference_wrong
+            )
+            shared = np.minimum(subject_target, reference_target)
+            union = np.maximum(subject_target, reference_target)
+            subject_exclusive = np.clip(subject_target - shared, 0.0, None)
+            reference_exclusive = np.clip(reference_target - shared, 0.0, None)
+            exclusive_role_valid = bool(
+                float(subject_exclusive.sum()) > 1.0e-8
+                and float(reference_exclusive.sum()) > 1.0e-8
+            )
+            if exclusive_role_valid:
+                exclusive_role_correct = bool(
+                    float((subject_attention[index] * subject_exclusive).sum())
+                    > float((subject_attention[index] * reference_exclusive).sum())
+                    and float((reference_attention[index] * reference_exclusive).sum())
+                    > float((reference_attention[index] * subject_exclusive).sum())
+                )
+            overlap_iou = (
+                float(shared.sum() / union.sum()) if float(union.sum()) > 0 else 0.0
+            )
+
+        if subject_ids[index] == reference_ids[index]:
+            oracle_partition = "unary_role_not_applicable"
+        elif not subject_valid[index] or not reference_valid[index]:
+            oracle_partition = "gt_not_jointly_visible"
+        elif not exclusive_role_valid:
+            oracle_partition = "mask_overlap_ambiguous"
+        elif not bool(exclusive_role_correct):
+            oracle_partition = "visible_binding_error"
+        else:
+            oracle_partition = "role_pass"
+
+        views: dict[str, Any] = {}
+        for camera_index, camera_name in enumerate(CAMERA_NAMES):
+            token_indices = np.flatnonzero(camera_ids == camera_index)
+            if not len(token_indices):
+                raise ValueError(
+                    f"ERAF diagnostics expose no patches for camera {camera_name}."
+                )
+            left = camera_index * half_width
+            right = left + half_width
+            role_views: dict[str, Any] = {}
+            for role, mask, attention in (
+                ("subject", subject_masks[index, :, left:right], subject_attention),
+                (
+                    "reference",
+                    reference_masks[index, :, left:right],
+                    reference_attention,
+                ),
+            ):
+                gt_center, gt_visible = _mask_center_pixels(mask)
+                local_index = int(
+                    token_indices[np.argmax(attention[index, token_indices])]
+                )
+                target = subject_target if role == "subject" else reference_target
+                predicted_visibility = bool(
+                    _diagnostic_array(diagnostics, f"{role}_view_visibility_logits")[
+                        index, camera_index
+                    ]
+                    > 0
+                )
+                predicted_center = _predicted_center_pixels(
+                    _diagnostic_array(diagnostics, f"{role}_view_centers")[
+                        index, camera_index
+                    ],
+                    height=mask_height,
+                    width=half_width,
+                )
+                role_views[role] = {
+                    "gt_visible": bool(gt_visible),
+                    "predicted_visible": predicted_visibility,
+                    "visibility_correct": bool(predicted_visibility == gt_visible),
+                    "top1_hit": (bool(target[local_index] > 0) if gt_visible else None),
+                    "attention_mass": float(
+                        _diagnostic_array(diagnostics, f"{role}_view_attention_mass")[
+                            index, camera_index
+                        ]
+                    ),
+                    "center_error_px": (
+                        float(np.linalg.norm(predicted_center - gt_center))
+                        if gt_visible
+                        else None
+                    ),
+                }
+            views[camera_name] = role_views
+
+        goal_anchor_valid = bool(sample["pgc_eraf_goal_anchor_valid"][index])
+        goal_anchor_error_m = (
+            float(
+                np.linalg.norm(
+                    (
+                        predicted_goal_anchor[index]
+                        - np.asarray(sample["pgc_eraf_goal_anchors"])[index]
+                    )
+                    * scale
+                )
+            )
+            if goal_anchor_valid
+            else None
+        )
+        subject_position_error_m = (
+            float(
+                np.linalg.norm(
+                    (predicted_subject_positions[index] - subject_positions[index])
+                    * scale
+                )
+            )
+            if subject_position_valid[index]
+            else None
+        )
+        reference_position_error_m = (
+            float(
+                np.linalg.norm(
+                    (predicted_reference_positions[index] - reference_positions[index])
+                    * scale
+                )
+            )
+            if reference_position_valid[index]
+            else None
+        )
+        rows.append(
+            {
+                "clause_index": int(index),
+                "task": task,
+                "predicate": str(clauses[index]["predicate"]),
+                "status": status_by_index[int(index)],
+                "active_correct": bool(active_prediction[index]),
+                "predicate_correct": bool(
+                    predicate_prediction[index] == predicate_ids[index]
+                ),
+                "predicate_truth": bool(predicate_truth[index]),
+                "predicate_truth_probability": float(truth_probability[index]),
+                "predicate_truth_correct": bool(
+                    truth_prediction[index] == predicate_truth[index]
+                ),
+                "phase_target": int(phase_targets[index]),
+                "phase_target_kind": "online_state_proxy",
+                "phase_prediction": int(phase_prediction[index]),
+                "phase_correct": bool(phase_prediction[index] == phase_targets[index]),
+                "subject_grasped": bool(subject_grasped[index]),
+                "subject_ever_grasped": bool(subject_ever_grasped[index]),
+                "subject_visible": bool(subject_valid[index]),
+                "reference_visible": bool(reference_valid[index]),
+                "subject_top1_hit": subject_hit,
+                "reference_top1_hit": reference_hit,
+                "full_role_correct": full_role_correct,
+                "exclusive_role_valid": exclusive_role_valid,
+                "exclusive_role_correct": exclusive_role_correct,
+                "mask_overlap_iou": overlap_iou,
+                "oracle_partition": oracle_partition,
+                "subject_position_error_m": subject_position_error_m,
+                "reference_position_error_m": reference_position_error_m,
+                "goal_anchor_error_m": goal_anchor_error_m,
+                "views": views,
+            }
+        )
+    return {"available": True, "missing_diagnostics": [], "clauses": rows}
 
 
 @dataclass(frozen=True)
@@ -419,6 +780,10 @@ class ERAFShadowAuditor:
         goal_anchor_valid = np.zeros(count, dtype=np.bool_)
         predicate_truth = np.zeros(count, dtype=np.bool_)
         subject_grasped = np.zeros(count, dtype=np.bool_)
+        subject_positions = np.zeros((count, 3), dtype=np.float32)
+        reference_positions = np.zeros((count, 3), dtype=np.float32)
+        subject_position_valid = np.zeros(count, dtype=np.bool_)
+        reference_position_valid = np.zeros(count, dtype=np.bool_)
         if self._episode_idx != int(episode_idx):
             self._episode_idx = int(episode_idx)
             self._ever_grasped.fill(False)
@@ -443,7 +808,29 @@ class ERAFShadowAuditor:
                 )
             predicate_truth[index] = _clause_truth(self.env, clause["raw"])
             subject_grasped[index] = _is_grasped(self.env, subject)
+            position, valid = _body_position(self.env, subject)
+            subject_position_valid[index] = bool(valid)
+            if valid:
+                subject_positions[index] = _normalize_position(
+                    position,
+                    self.contract.workspace_min,
+                    self.contract.workspace_max,
+                )
+            position, valid = _body_position(self.env, reference)
+            reference_position_valid[index] = bool(valid)
+            if valid:
+                reference_positions[index] = _normalize_position(
+                    position,
+                    self.contract.workspace_min,
+                    self.contract.workspace_max,
+                )
         self._ever_grasped |= subject_grasped
+        clause_statuses, phase_targets, stage_v2 = _clause_statuses(
+            clause_valid=clause_valid,
+            predicate_truth=predicate_truth,
+            subject_grasped=subject_grasped,
+            subject_ever_grasped=self._ever_grasped,
+        )
         if bool(predicate_truth[clause_valid].all()):
             stage = "complete"
         elif bool(self._ever_grasped[clause_valid].any()):
@@ -472,20 +859,277 @@ class ERAFShadowAuditor:
             dataset_label=self.instruction_condition,
             predicate_vocabulary=self.contract.predicate_vocabulary,
         )
+        extended = _extended_clause_diagnostics(
+            diagnostics=diagnostics,
+            sample=sample,
+            clauses=self.clauses,
+            clause_statuses=clause_statuses,
+            phase_targets=phase_targets,
+            predicate_truth=predicate_truth,
+            subject_grasped=subject_grasped,
+            subject_ever_grasped=self._ever_grasped,
+            subject_positions=subject_positions,
+            reference_positions=reference_positions,
+            subject_position_valid=subject_position_valid,
+            reference_position_valid=reference_position_valid,
+            workspace_min=self.contract.workspace_min,
+            workspace_max=self.contract.workspace_max,
+        )
         record.update(
             {
                 "episode": int(episode_idx),
                 "replan_index": int(replan_idx),
                 "policy_step": int(policy_step),
                 "online_stage": stage,
+                "online_stage_v2": stage_v2,
+                "clause_statuses": clause_statuses,
+                "phase_targets": phase_targets[clause_valid].tolist(),
                 "instruction_condition": self.instruction_condition,
                 "policy_instruction": self.policy_instruction,
                 "predicate_truth": predicate_truth[clause_valid].tolist(),
                 "subject_grasped": subject_grasped[clause_valid].tolist(),
                 "subject_ever_grasped": self._ever_grasped[clause_valid].tolist(),
+                "extended_diagnostics": extended,
             }
         )
         return record
+
+
+def _optional_rate(values: Sequence[Any]) -> float | None:
+    valid = [bool(value) for value in values if value is not None]
+    return float(np.mean(valid)) if valid else None
+
+
+def _optional_mean(values: Sequence[Any]) -> float | None:
+    valid = [float(value) for value in values if value is not None]
+    return float(np.mean(valid)) if valid else None
+
+
+def _optional_median(values: Sequence[Any]) -> float | None:
+    valid = [float(value) for value in values if value is not None]
+    return float(np.median(valid)) if valid else None
+
+
+def _summarize_camera_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for camera_name in CAMERA_NAMES:
+        camera: dict[str, Any] = {}
+        for role in ("subject", "reference"):
+            role_rows = [
+                row["views"][camera_name][role]
+                for row in rows
+                if camera_name in row.get("views", {})
+                and role in row["views"][camera_name]
+            ]
+            visible_rows = [row for row in role_rows if row.get("gt_visible")]
+            hidden_rows = [row for row in role_rows if not row.get("gt_visible")]
+            camera[role] = {
+                "samples": len(role_rows),
+                "gt_visible_samples": len(visible_rows),
+                "gt_visibility_rate": _optional_rate(
+                    [row.get("gt_visible") for row in role_rows]
+                ),
+                "visibility_accuracy": _optional_rate(
+                    [row.get("visibility_correct") for row in role_rows]
+                ),
+                "visible_top1_in_gt_mask": _optional_rate(
+                    [row.get("top1_hit") for row in visible_rows]
+                ),
+                "visible_center_median_error_px": _optional_median(
+                    [row.get("center_error_px") for row in visible_rows]
+                ),
+                "attention_mass_when_visible_mean": _optional_mean(
+                    [row.get("attention_mass") for row in visible_rows]
+                ),
+                "attention_mass_when_hidden_mean": _optional_mean(
+                    [row.get("attention_mass") for row in hidden_rows]
+                ),
+            }
+        result[camera_name] = camera
+    return result
+
+
+def _summarize_clause_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    rows = [dict(row) for row in rows]
+    if not rows:
+        return {"clauses": 0, "metrics": {}, "status_counts": {}}
+    exclusive_rows = [row for row in rows if row.get("exclusive_role_valid")]
+    applicable_rows = [row for row in rows if row.get("full_role_correct") is not None]
+    phase_confusion: dict[str, Counter[str]] = defaultdict(Counter)
+    for row in rows:
+        phase_confusion[str(row.get("phase_target"))][
+            str(row.get("phase_prediction"))
+        ] += 1
+    oracle_counts = Counter(str(row.get("oracle_partition")) for row in rows)
+    oracle_total = sum(
+        value
+        for key, value in oracle_counts.items()
+        if key != "unary_role_not_applicable"
+    )
+    metrics = {
+        "active_accuracy": _optional_rate([row.get("active_correct") for row in rows]),
+        "predicate_accuracy": _optional_rate(
+            [row.get("predicate_correct") for row in rows]
+        ),
+        "predicate_truth_accuracy": _optional_rate(
+            [row.get("predicate_truth_correct") for row in rows]
+        ),
+        "phase_proxy_accuracy": _optional_rate(
+            [row.get("phase_correct") for row in rows]
+        ),
+        "subject_top1_in_gt_mask": _optional_rate(
+            [row.get("subject_top1_hit") for row in rows]
+        ),
+        "reference_top1_in_gt_mask": _optional_rate(
+            [row.get("reference_top1_hit") for row in rows]
+        ),
+        "full_role_accuracy": _optional_rate(
+            [row.get("full_role_correct") for row in applicable_rows]
+        ),
+        "exclusive_role_coverage": (
+            float(len(exclusive_rows) / len(applicable_rows))
+            if applicable_rows
+            else None
+        ),
+        "exclusive_role_accuracy": _optional_rate(
+            [row.get("exclusive_role_correct") for row in exclusive_rows]
+        ),
+        "subject_position_median_error_cm": (
+            100.0
+            * _optional_median([row.get("subject_position_error_m") for row in rows])
+            if any(row.get("subject_position_error_m") is not None for row in rows)
+            else None
+        ),
+        "reference_position_median_error_cm": (
+            100.0
+            * _optional_median([row.get("reference_position_error_m") for row in rows])
+            if any(row.get("reference_position_error_m") is not None for row in rows)
+            else None
+        ),
+        "goal_anchor_median_error_cm": (
+            100.0 * _optional_median([row.get("goal_anchor_error_m") for row in rows])
+            if any(row.get("goal_anchor_error_m") is not None for row in rows)
+            else None
+        ),
+    }
+    return {
+        "clauses": len(rows),
+        "metrics": metrics,
+        "status_counts": dict(Counter(str(row.get("status")) for row in rows)),
+        "phase_confusion": {
+            target: dict(predictions)
+            for target, predictions in sorted(phase_confusion.items())
+        },
+        "phase_target_kind": "online_state_proxy",
+        "privileged_gt_mask_oracle_partition": {
+            "counts": dict(oracle_counts),
+            "rates_excluding_unary": {
+                key: (float(value / oracle_total) if oracle_total else None)
+                for key, value in oracle_counts.items()
+                if key != "unary_role_not_applicable"
+            },
+            "audited_non_unary_clauses": oracle_total,
+        },
+        "per_camera": _summarize_camera_rows(rows),
+    }
+
+
+def _extended_shadow_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    available_records = [
+        record
+        for record in records
+        if record.get("extended_diagnostics", {}).get("available")
+    ]
+    missing = Counter(
+        name
+        for record in records
+        for name in record.get("extended_diagnostics", {}).get(
+            "missing_diagnostics", []
+        )
+    )
+    clause_rows = [
+        dict(clause)
+        for record in available_records
+        for clause in record["extended_diagnostics"].get("clauses", [])
+    ]
+    if not clause_rows:
+        return {
+            "format": "pgc_v9_eraf_shadow_diagnostic_v2",
+            "available": False,
+            "records": 0,
+            "missing_diagnostics": dict(missing),
+        }
+    by_status = {
+        status: _summarize_clause_rows(
+            [row for row in clause_rows if row.get("status") == status]
+        )
+        for status in sorted({str(row.get("status")) for row in clause_rows})
+    }
+    by_predicate = {
+        predicate: _summarize_clause_rows(
+            [row for row in clause_rows if row.get("predicate") == predicate]
+        )
+        for predicate in sorted({str(row.get("predicate")) for row in clause_rows})
+    }
+    by_task = {
+        task: _summarize_clause_rows(
+            [row for row in clause_rows if row.get("task") == task]
+        )
+        for task in sorted({str(row.get("task")) for row in clause_rows})
+    }
+    unfinished = [row for row in clause_rows if row.get("status") != "completed"]
+    overall = _summarize_clause_rows(clause_rows)
+    oracle_rates = overall["privileged_gt_mask_oracle_partition"][
+        "rates_excluding_unary"
+    ]
+    occlusion_or_missing_rate = float(oracle_rates.get("gt_not_jointly_visible") or 0.0)
+    overlap_ambiguity_rate = float(oracle_rates.get("mask_overlap_ambiguous") or 0.0)
+    visible_binding_error_rate = float(oracle_rates.get("visible_binding_error") or 0.0)
+    phase_proxy_accuracy = overall["metrics"].get("phase_proxy_accuracy")
+    truth_accuracy = overall["metrics"].get("predicate_truth_accuracy")
+    evidence = {
+        "gt_not_jointly_visible_rate": occlusion_or_missing_rate,
+        "mask_overlap_ambiguous_rate": overlap_ambiguity_rate,
+        "visible_binding_error_rate": visible_binding_error_rate,
+        "phase_proxy_error_rate": (
+            None if phase_proxy_accuracy is None else 1.0 - float(phase_proxy_accuracy)
+        ),
+        "predicate_truth_error_rate": (
+            None if truth_accuracy is None else 1.0 - float(truth_accuracy)
+        ),
+    }
+    ranked = sorted(
+        ((name, value) for name, value in evidence.items() if value is not None),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return {
+        "format": "pgc_v9_eraf_shadow_diagnostic_v2",
+        "available": True,
+        "records": len(available_records),
+        "record_coverage": float(len(available_records) / len(records)),
+        "missing_diagnostics": dict(missing),
+        "phase_target_note": (
+            "Online phase targets are state-derived proxies: search=0, holding or "
+            "released-unfinished=1, predicate-complete=2. They are not replay "
+            "interaction-step labels."
+        ),
+        "overall": overall,
+        "unfinished_clauses": _summarize_clause_rows(unfinished),
+        "by_clause_status": by_status,
+        "by_predicate": by_predicate,
+        "by_task": by_task,
+        "diagnosis": {
+            "dominant_observed_error": ranked[0][0] if ranked else None,
+            "evidence_rates": evidence,
+            "interpretation": (
+                "This is a passive information and prediction decomposition, "
+                "not a causal intervention. GT masks determine whether the error "
+                "is compatible with camera visibility, mask overlap, or visible "
+                "role binding; phase uses the documented online-state proxy."
+            ),
+        },
+    }
 
 
 def summarize_eraf_shadow_records(
@@ -527,6 +1171,22 @@ def summarize_eraf_shadow_records(
                 "decisions": len(subset),
                 "metrics": report["metrics"],
             }
+    by_stage_v2: dict[str, Any] = {}
+    for stage in (
+        "initial_search",
+        "holding",
+        "released_unfinished",
+        "next_clause_search",
+        "complete",
+    ):
+        subset = [row for row in rows if row.get("online_stage_v2") == stage]
+        if subset:
+            report = compute_grounding_gate_report(subset)
+            by_stage_v2[stage] = {
+                "decisions": len(subset),
+                "metrics": report["metrics"],
+                "extended": _extended_shadow_summary(subset),
+            }
     replan_windows = {
         "initial_0": lambda value: value == 0,
         "early_1_4": lambda value: 1 <= value <= 4,
@@ -542,13 +1202,16 @@ def summarize_eraf_shadow_records(
                 "decisions": len(subset),
                 "metrics": report["metrics"],
             }
+    extended = _extended_shadow_summary(rows)
     return {
-        "format": "pgc_v9_eraf_shadow_audit_v1",
+        "format": "pgc_v9_eraf_shadow_audit_v2",
         "decisions": len(rows),
         "action_integrity": action_summary,
         "grounding_gate": gate,
         "by_online_stage": by_stage,
+        "by_online_stage_v2": by_stage_v2,
         "by_replan_window": by_replan_window,
+        "extended_diagnostics": extended,
         "passed": bool(
             gate["passed"]
             and action_summary["chunks"] == len(rows)

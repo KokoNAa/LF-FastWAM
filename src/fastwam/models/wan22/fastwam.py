@@ -2602,6 +2602,7 @@ class FastWAM(torch.nn.Module):
                 "grasp_anchor",
                 "goal_anchor",
                 "interaction_anchor",
+                "predicate_truth_logits",
                 "phase_logits",
                 "spatial_coordinates",
                 "camera_ids",
