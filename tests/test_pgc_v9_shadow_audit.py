@@ -225,6 +225,24 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
             "reference_view_centers": np.zeros((1, 4, 2, 2), dtype=np.float32),
             "subject_view_attention_mass": np.full((1, 4, 2), 0.5, dtype=np.float32),
             "reference_view_attention_mass": np.full((1, 4, 2), 0.5, dtype=np.float32),
+            "subject_base_view_attention_mass": np.full(
+                (1, 4, 2), 0.5, dtype=np.float32
+            ),
+            "reference_base_view_attention_mass": np.full(
+                (1, 4, 2), 0.5, dtype=np.float32
+            ),
+            "subject_view_gate_residual_logits": np.zeros(
+                (1, 4, 2), dtype=np.float32
+            ),
+            "reference_view_gate_residual_logits": np.zeros(
+                (1, 4, 2), dtype=np.float32
+            ),
+            "clause_execution_probability": np.asarray(
+                [[1.0, 0.0, 0.0, 0.0]], dtype=np.float32
+            ),
+            "clause_routing_residual": np.zeros((1, 4), dtype=np.float32),
+            "clause_routing_multiplier": np.ones((1, 4), dtype=np.float32),
+            "view_scheduler_enabled": np.asarray([True]),
         }
         record = auditor.observe(
             obs=obs,
@@ -238,7 +256,18 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
         self.assertEqual(record["online_stage_v2"], "initial_search")
         self.assertEqual(record["clause_statuses"], ["initial_search"])
         self.assertTrue(record["extended_diagnostics"]["available"])
+        self.assertTrue(
+            record["extended_diagnostics"]["v99_view_fusion_available"]
+        )
+        self.assertTrue(
+            record["extended_diagnostics"]["v99_clause_scheduler_available"]
+        )
         self.assertTrue(record["extended_diagnostics"]["clauses"][0]["phase_correct"])
+        self.assertTrue(
+            record["extended_diagnostics"]["clauses"][0][
+                "execution_selection_correct"
+            ]
+        )
         self.assertTrue(
             record["extended_diagnostics"]["clauses"][0]["predicate_truth_correct"]
         )

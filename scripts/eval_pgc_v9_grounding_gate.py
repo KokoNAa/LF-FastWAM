@@ -185,6 +185,8 @@ def _role_residual_audit(records: list[Mapping[str, Any]]) -> dict[str, Any]:
 
 def compute_grounding_gate_report(
     records: list[Mapping[str, Any]],
+    *,
+    require_view_scheduler: bool = False,
 ) -> dict[str, Any]:
     """Aggregate serializable per-sample ERAF observations into gate metrics."""
     if not records:
@@ -197,6 +199,9 @@ def compute_grounding_gate_report(
     goal_anchor_errors_m: list[float] = []
     clause_exact: list[bool] = []
     multi_clause_exact: list[bool] = []
+    single_visible_view_selection: list[bool] = []
+    clause_scheduler_correct: list[bool] = []
+    clause_scheduler_confidence: list[float] = []
     for record in records:
         subject_hits.extend(bool(value) for value in record["subject_top1_hits"])
         reference_hits.extend(bool(value) for value in record["reference_top1_hits"])
@@ -212,6 +217,18 @@ def compute_grounding_gate_report(
         clause_exact.append(exact)
         if int(record["clause_count"]) > 1:
             multi_clause_exact.append(exact)
+        single_visible_view_selection.extend(
+            bool(value)
+            for value in record.get("single_visible_view_selection_correct", ())
+        )
+        clause_scheduler_correct.extend(
+            bool(value)
+            for value in record.get("clause_scheduler_correct", ())
+        )
+        clause_scheduler_confidence.extend(
+            float(value)
+            for value in record.get("clause_scheduler_confidence", ())
+        )
     anchor_median_cm = (
         float(np.median(goal_anchor_errors_m) * 100.0)
         if goal_anchor_errors_m
@@ -238,6 +255,19 @@ def compute_grounding_gate_report(
         "clause_exact_match": _safe_rate(clause_exact),
         "multi_clause_exact_match": _safe_rate(multi_clause_exact),
         "multi_clause_samples": len(multi_clause_exact),
+        "single_visible_view_selection_accuracy": _optional_rate(
+            single_visible_view_selection
+        ),
+        "single_visible_view_selection_samples": len(
+            single_visible_view_selection
+        ),
+        "clause_scheduler_accuracy": _optional_rate(clause_scheduler_correct),
+        "clause_scheduler_samples": len(clause_scheduler_correct),
+        "clause_scheduler_confidence_mean": (
+            float(np.mean(clause_scheduler_confidence))
+            if clause_scheduler_confidence
+            else None
+        ),
     }
     checks = {
         "subject_top1_at_least_80pct": (metrics["subject_top1_in_gt_mask"] >= 0.80),
@@ -254,6 +284,19 @@ def compute_grounding_gate_report(
             bool(multi_clause_exact) and metrics["multi_clause_exact_match"] >= 0.80
         ),
     }
+    if require_view_scheduler:
+        checks.update(
+            {
+                "single_visible_view_selection_at_least_80pct": (
+                    bool(single_visible_view_selection)
+                    and metrics["single_visible_view_selection_accuracy"] >= 0.80
+                ),
+                "unfinished_clause_scheduler_at_least_90pct": (
+                    bool(clause_scheduler_correct)
+                    and metrics["clause_scheduler_accuracy"] >= 0.90
+                ),
+            }
+        )
     failed_checks = [name for name, passed in checks.items() if not passed]
     if failed_checks == ["multi_clause_exact_at_least_80pct"]:
         diagnosis = "multi_clause_activation_failure"
@@ -363,6 +406,65 @@ def _sample_record(
         bool(reference_target[index, reference_attention[index].argmax()] > 0)
         for index in np.flatnonzero(reference_valid)
     ]
+    single_visible_view_selection_correct: list[bool] = []
+    view_diagnostic_names = {
+        "camera_ids",
+        "subject_view_attention_mass",
+        "reference_view_attention_mass",
+    }
+    v99_enabled = (
+        "view_scheduler_enabled" in diagnostics
+        and bool(array("view_scheduler_enabled").reshape(-1)[0])
+    )
+    if v99_enabled and not view_diagnostic_names.difference(diagnostics):
+        camera_ids = array("camera_ids").astype(np.int64)
+        for role, valid in (
+            ("subject", subject_valid),
+            ("reference", reference_valid),
+        ):
+            view_visible_key = f"pgc_eraf_{role}_view_visible"
+            if view_visible_key not in sample:
+                continue
+            view_visible = np.asarray(sample[view_visible_key], dtype=bool)
+            predicted_view_mass = array(f"{role}_view_attention_mass")
+            for index in np.flatnonzero(valid):
+                visible_indices = np.flatnonzero(view_visible[index])
+                if len(visible_indices) != 1:
+                    continue
+                target_camera = int(visible_indices[0])
+                if not bool((camera_ids == target_camera).any()):
+                    continue
+                single_visible_view_selection_correct.append(
+                    int(predicted_view_mass[index].argmax()) == target_camera
+                )
+
+    clause_scheduler_correct: list[bool] = []
+    clause_scheduler_confidence: list[float] = []
+    scheduler_names = {
+        "clause_execution_probability",
+        "clause_routing_residual",
+    }
+    if v99_enabled and not scheduler_names.difference(diagnostics):
+        truth_key = "pgc_eraf_predicate_truth"
+        truth_valid_key = "pgc_eraf_predicate_truth_valid"
+        if truth_key in sample and truth_valid_key in sample:
+            predicate_truth = np.asarray(sample[truth_key], dtype=np.float32)
+            predicate_truth_valid = np.asarray(sample[truth_valid_key], dtype=bool)
+            unfinished = (
+                clause_valid
+                & predicate_truth_valid
+                & (predicate_truth < 0.5)
+            )
+            if bool(unfinished.any()):
+                target_index = int(np.flatnonzero(unfinished)[0])
+                execution_probability = array("clause_execution_probability")
+                selected_index = int(
+                    np.where(clause_valid, execution_probability, -np.inf).argmax()
+                )
+                clause_scheduler_correct.append(selected_index == target_index)
+                clause_scheduler_confidence.append(
+                    float(execution_probability[selected_index])
+                )
     subject_entity_ids = np.asarray(
         sample["pgc_eraf_subject_entity_ids"], dtype=np.int64
     )
@@ -505,6 +607,20 @@ def _sample_record(
         "goal_anchor_errors_m": anchor_errors[goal_valid].tolist(),
         "clause_exact": exact,
         "clause_count": int(clause_valid.sum()),
+        "single_visible_view_selection_correct": (
+            single_visible_view_selection_correct
+        ),
+        "clause_scheduler_correct": clause_scheduler_correct,
+        "clause_scheduler_confidence": clause_scheduler_confidence,
+        "v99_view_scheduler_available": bool(
+            v99_enabled
+            and not view_diagnostic_names.difference(diagnostics)
+            and not scheduler_names.difference(diagnostics)
+            and "pgc_eraf_subject_view_visible" in sample
+            and "pgc_eraf_reference_view_visible" in sample
+            and "pgc_eraf_predicate_truth" in sample
+            and "pgc_eraf_predicate_truth_valid" in sample
+        ),
     }
 
 
@@ -555,6 +671,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         7: 3000,
         8: 3250,
         9: 3750,
+        10: 4750,
     }.get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
     intermediate_checkpoint = bool(args.allow_intermediate) and (
@@ -562,6 +679,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         or (objective_version in {5, 6} and checkpoint_step in {2750, 3000, 3250})
         or (objective_version == 7 and checkpoint_step == 2750)
         or (objective_version == 9 and checkpoint_step == 3500)
+        or (objective_version == 10 and checkpoint_step in {4000, 4250, 4500})
     )
     if (
         expected_step is None
@@ -572,7 +690,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "The pre-action grounding gate requires the completed V9 "
             "grounding-stage checkpoint: objective v2 at step 1500 or "
             "objective v3/v4 at step 2500, objective v5/v6 at step 3500, "
-            "objective v7 at step 3000, or objective v8 at step 3250."
+            "objective v7 at step 3000, objective v8 at step 3250, "
+            "objective v9 at step 3750, or objective v10 at step 4750."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())
@@ -637,7 +756,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         records[-1]["_dataset_index"] = dataset_index
         records[-1]["_dataset_kind"] = str(sidecar["dataset_kind"])
         print(f"ERAF_GATE {ordinal + 1}/{len(selected)}", flush=True)
-    report = compute_grounding_gate_report(records)
+    report = compute_grounding_gate_report(
+        records,
+        require_view_scheduler=objective_version >= 10,
+    )
     report.update(
         {
             "checkpoint": str(checkpoint),
@@ -728,8 +850,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Audit V9.3 steps 1750/2000/2250, V9.4/V9.5 steps "
-            "2750/3000/3250, or V9.6 step 2750 without treating them as "
-            "final action inputs."
+            "2750/3000/3250, V9.6 step 2750, V9.8 step 3500, or V9.9 "
+            "steps 4000/4250/4500 without treating them as final action inputs."
         ),
     )
     parser.add_argument("--device", default="cuda:0")

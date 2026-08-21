@@ -191,6 +191,62 @@ def _extended_clause_diagnostics(
     predicted_subject_positions = _diagnostic_array(diagnostics, "subject_position")
     predicted_reference_positions = _diagnostic_array(diagnostics, "reference_position")
     predicted_goal_anchor = _diagnostic_array(diagnostics, "goal_anchor")
+    v99_view_names = {
+        f"{role}_{name}"
+        for role in ("subject", "reference")
+        for name in (
+            "base_view_attention_mass",
+            "view_gate_residual_logits",
+        )
+    }
+    v99_scheduler_names = {
+        "clause_execution_probability",
+        "clause_routing_residual",
+        "clause_routing_multiplier",
+    }
+    v99_enabled = (
+        "view_scheduler_enabled" in diagnostics
+        and bool(
+            _diagnostic_array(
+                diagnostics, "view_scheduler_enabled"
+            ).reshape(-1)[0]
+        )
+    )
+    v99_view_available = v99_enabled and not v99_view_names.difference(
+        diagnostics
+    )
+    v99_scheduler_available = v99_enabled and not v99_scheduler_names.difference(
+        diagnostics
+    )
+    if v99_scheduler_available:
+        execution_probability = _diagnostic_array(
+            diagnostics, "clause_execution_probability"
+        )
+        routing_residual = _diagnostic_array(
+            diagnostics, "clause_routing_residual"
+        )
+        routing_multiplier = _diagnostic_array(
+            diagnostics, "clause_routing_multiplier"
+        )
+        execution_selected_index = int(
+            np.where(clause_valid, execution_probability, -np.inf).argmax()
+        )
+        unfinished_indices = np.flatnonzero(clause_valid & ~predicate_truth)
+        execution_target_index = (
+            int(unfinished_indices[0]) if len(unfinished_indices) else None
+        )
+        execution_selection_correct = (
+            execution_selected_index == execution_target_index
+            if execution_target_index is not None
+            else None
+        )
+    else:
+        execution_probability = None
+        routing_residual = None
+        routing_multiplier = None
+        execution_selected_index = None
+        execution_target_index = None
+        execution_selection_correct = None
     scale = (workspace_max - workspace_min) / 2.0
     half_width = int(subject_masks.shape[-1] // len(CAMERA_NAMES))
     mask_height = int(subject_masks.shape[-2])
@@ -292,6 +348,13 @@ def _extended_clause_diagnostics(
                     ]
                     > 0
                 )
+                visibility_probability = float(
+                    _sigmoid(
+                        _diagnostic_array(
+                            diagnostics, f"{role}_view_visibility_logits"
+                        )[index, camera_index]
+                    )
+                )
                 predicted_center = _predicted_center_pixels(
                     _diagnostic_array(diagnostics, f"{role}_view_centers")[
                         index, camera_index
@@ -299,22 +362,44 @@ def _extended_clause_diagnostics(
                     height=mask_height,
                     width=half_width,
                 )
+                final_attention_mass = float(
+                    _diagnostic_array(
+                        diagnostics, f"{role}_view_attention_mass"
+                    )[index, camera_index]
+                )
                 role_views[role] = {
                     "gt_visible": bool(gt_visible),
                     "predicted_visible": predicted_visibility,
+                    "visibility_probability": visibility_probability,
                     "visibility_correct": bool(predicted_visibility == gt_visible),
                     "top1_hit": (bool(target[local_index] > 0) if gt_visible else None),
-                    "attention_mass": float(
-                        _diagnostic_array(diagnostics, f"{role}_view_attention_mass")[
-                            index, camera_index
-                        ]
-                    ),
+                    "attention_mass": final_attention_mass,
                     "center_error_px": (
                         float(np.linalg.norm(predicted_center - gt_center))
                         if gt_visible
                         else None
                     ),
                 }
+                if v99_view_available:
+                    base_attention_mass = float(
+                        _diagnostic_array(
+                            diagnostics, f"{role}_base_view_attention_mass"
+                        )[index, camera_index]
+                    )
+                    role_views[role].update(
+                        {
+                            "base_attention_mass": base_attention_mass,
+                            "attention_mass_delta": (
+                                final_attention_mass - base_attention_mass
+                            ),
+                            "view_gate_residual_logit": float(
+                                _diagnostic_array(
+                                    diagnostics,
+                                    f"{role}_view_gate_residual_logits",
+                                )[index, camera_index]
+                            ),
+                        }
+                    )
             views[camera_name] = role_views
 
         goal_anchor_valid = bool(sample["pgc_eraf_goal_anchor_valid"][index])
@@ -370,6 +455,32 @@ def _extended_clause_diagnostics(
                 "phase_target_kind": "online_state_proxy",
                 "phase_prediction": int(phase_prediction[index]),
                 "phase_correct": bool(phase_prediction[index] == phase_targets[index]),
+                "execution_probability": (
+                    float(execution_probability[index])
+                    if execution_probability is not None
+                    else None
+                ),
+                "execution_selected": (
+                    bool(index == execution_selected_index)
+                    if execution_selected_index is not None
+                    else None
+                ),
+                "execution_target": (
+                    bool(index == execution_target_index)
+                    if execution_target_index is not None
+                    else None
+                ),
+                "execution_selection_correct": execution_selection_correct,
+                "routing_residual": (
+                    float(routing_residual[index])
+                    if routing_residual is not None
+                    else None
+                ),
+                "routing_multiplier": (
+                    float(routing_multiplier[index])
+                    if routing_multiplier is not None
+                    else None
+                ),
                 "subject_grasped": bool(subject_grasped[index]),
                 "subject_ever_grasped": bool(subject_ever_grasped[index]),
                 "subject_visible": bool(subject_valid[index]),
@@ -387,7 +498,13 @@ def _extended_clause_diagnostics(
                 "views": views,
             }
         )
-    return {"available": True, "missing_diagnostics": [], "clauses": rows}
+    return {
+        "available": True,
+        "missing_diagnostics": [],
+        "v99_view_fusion_available": v99_view_available,
+        "v99_clause_scheduler_available": v99_scheduler_available,
+        "clauses": rows,
+    }
 
 
 @dataclass(frozen=True)
@@ -847,8 +964,32 @@ class ERAFShadowAuditor:
             "pgc_eraf_reference_masks": reference_masks,
             "pgc_eraf_subject_mask_valid": subject_mask_valid,
             "pgc_eraf_reference_mask_valid": reference_mask_valid,
+            "pgc_eraf_subject_view_visible": np.stack(
+                (
+                    subject_masks[:, :, : self.contract.mask_width // 2].any(
+                        axis=(1, 2)
+                    ),
+                    subject_masks[:, :, self.contract.mask_width // 2 :].any(
+                        axis=(1, 2)
+                    ),
+                ),
+                axis=-1,
+            ),
+            "pgc_eraf_reference_view_visible": np.stack(
+                (
+                    reference_masks[:, :, : self.contract.mask_width // 2].any(
+                        axis=(1, 2)
+                    ),
+                    reference_masks[:, :, self.contract.mask_width // 2 :].any(
+                        axis=(1, 2)
+                    ),
+                ),
+                axis=-1,
+            ),
             "pgc_eraf_goal_anchors": goal_anchors,
             "pgc_eraf_goal_anchor_valid": goal_anchor_valid,
+            "pgc_eraf_predicate_truth": predicate_truth.astype(np.float32),
+            "pgc_eraf_predicate_truth_valid": clause_valid.copy(),
         }
         record = _sample_record(
             diagnostics,
@@ -944,6 +1085,25 @@ def _summarize_camera_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 "attention_mass_when_hidden_mean": _optional_mean(
                     [row.get("attention_mass") for row in hidden_rows]
                 ),
+                "base_attention_mass_when_visible_mean": _optional_mean(
+                    [row.get("base_attention_mass") for row in visible_rows]
+                ),
+                "base_attention_mass_when_hidden_mean": _optional_mean(
+                    [row.get("base_attention_mass") for row in hidden_rows]
+                ),
+                "attention_mass_delta_when_visible_mean": _optional_mean(
+                    [row.get("attention_mass_delta") for row in visible_rows]
+                ),
+                "attention_mass_delta_when_hidden_mean": _optional_mean(
+                    [row.get("attention_mass_delta") for row in hidden_rows]
+                ),
+                "view_gate_residual_abs_mean": _optional_mean(
+                    [
+                        abs(row["view_gate_residual_logit"])
+                        for row in role_rows
+                        if row.get("view_gate_residual_logit") is not None
+                    ]
+                ),
             }
         result[camera_name] = camera
     return result
@@ -976,6 +1136,23 @@ def _summarize_clause_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ),
         "phase_proxy_accuracy": _optional_rate(
             [row.get("phase_correct") for row in rows]
+        ),
+        "clause_scheduler_accuracy": _optional_rate(
+            [row.get("execution_selection_correct") for row in rows]
+        ),
+        "clause_scheduler_top1_probability": _optional_mean(
+            [
+                row.get("execution_probability")
+                for row in rows
+                if row.get("execution_selected")
+            ]
+        ),
+        "clause_routing_residual_abs_mean": _optional_mean(
+            [
+                abs(row["routing_residual"])
+                for row in rows
+                if row.get("routing_residual") is not None
+            ]
         ),
         "subject_top1_in_gt_mask": _optional_rate(
             [row.get("subject_top1_hit") for row in rows]
@@ -1143,7 +1320,20 @@ def summarize_eraf_shadow_records(
     rows = [dict(record) for record in records]
     if not rows:
         raise ValueError("ERAF shadow summary received no online records.")
-    gate = compute_grounding_gate_report(rows)
+
+    def gate_report(items: list[dict[str, Any]]) -> dict[str, Any]:
+        require_view_scheduler = bool(items) and all(
+            bool(item.get("v99_view_scheduler_available")) for item in items
+        )
+        return compute_grounding_gate_report(
+            items,
+            require_view_scheduler=require_view_scheduler,
+        )
+
+    gate = gate_report(rows)
+    require_view_scheduler = bool(rows) and all(
+        bool(row.get("v99_view_scheduler_available")) for row in rows
+    )
     integrity = [dict(item) for item in action_integrity]
     action_summary = {
         "chunks": len(integrity),
@@ -1166,7 +1356,7 @@ def summarize_eraf_shadow_records(
     for stage in ("pregrasp", "postgrasp", "complete"):
         subset = [row for row in rows if row.get("online_stage") == stage]
         if subset:
-            report = compute_grounding_gate_report(subset)
+            report = gate_report(subset)
             by_stage[stage] = {
                 "decisions": len(subset),
                 "metrics": report["metrics"],
@@ -1181,7 +1371,7 @@ def summarize_eraf_shadow_records(
     ):
         subset = [row for row in rows if row.get("online_stage_v2") == stage]
         if subset:
-            report = compute_grounding_gate_report(subset)
+            report = gate_report(subset)
             by_stage_v2[stage] = {
                 "decisions": len(subset),
                 "metrics": report["metrics"],
@@ -1197,7 +1387,7 @@ def summarize_eraf_shadow_records(
     for name, predicate in replan_windows.items():
         subset = [row for row in rows if predicate(int(row.get("replan_index", -1)))]
         if subset:
-            report = compute_grounding_gate_report(subset)
+            report = gate_report(subset)
             by_replan_window[name] = {
                 "decisions": len(subset),
                 "metrics": report["metrics"],
@@ -1208,6 +1398,7 @@ def summarize_eraf_shadow_records(
         "decisions": len(rows),
         "action_integrity": action_summary,
         "grounding_gate": gate,
+        "v99_view_scheduler_gate_required": require_view_scheduler,
         "by_online_stage": by_stage,
         "by_online_stage_v2": by_stage_v2,
         "by_replan_window": by_replan_window,

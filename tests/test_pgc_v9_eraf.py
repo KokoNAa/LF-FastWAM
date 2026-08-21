@@ -854,6 +854,166 @@ class PGCERAFModuleTest(unittest.TestCase):
         self.assertEqual(unary_metrics["loss_pgc_v9_role_swap"].item(), 0.0)
         self.assertEqual(unary_metrics["loss_pgc_v9_role_overlap"].item(), 0.0)
 
+    def test_v99_view_fusion_and_scheduler_are_zero_init_and_trainable(self):
+        torch.manual_seed(919)
+        module = EntityRelationAffordanceField(
+            text_dim=10,
+            video_dim=16,
+            action_dim=12,
+            projection_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            max_clauses=4,
+            camera_count=2,
+            visual_aspect_ratio=2.0,
+            role_adapter_enabled=True,
+            role_adapter_hidden_dim=8,
+            role_adapter_teacher_enabled=True,
+            balanced_role_adapter_enabled=True,
+            balanced_role_adapter_hidden_dim=8,
+            clause_activation_adapter_enabled=True,
+            clause_activation_adapter_hidden_dim=8,
+            view_fusion_enabled=True,
+            view_fusion_adapter_hidden_dim=8,
+            clause_scheduler_enabled=True,
+            clause_scheduler_hidden_dim=8,
+        )
+        base_queries = torch.randn(2, 3, 12)
+        base_embedding = torch.randn(2, 8)
+        queries, embedding, outputs, _ = module(
+            base_goal_queries=base_queries,
+            base_goal_embedding=base_embedding,
+            language_hidden=torch.randn(2, 6, 10),
+            language_mask=torch.ones(2, 6, dtype=torch.bool),
+            current_video_hidden=torch.randn(2, 8, 16),
+        )
+        self.assertTrue(torch.equal(queries, base_queries))
+        self.assertTrue(torch.equal(embedding, base_embedding))
+        self.assertTrue(
+            torch.equal(
+                outputs["subject_attention"], outputs["subject_base_attention"]
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                outputs["reference_attention"],
+                outputs["reference_base_attention"],
+            )
+        )
+        self.assertEqual(
+            int(outputs["subject_view_gate_residual_logits"].count_nonzero()), 0
+        )
+        self.assertEqual(int(outputs["clause_execution_logits"].count_nonzero()), 0)
+        self.assertTrue(
+            torch.equal(
+                outputs["clause_routing_multiplier"],
+                torch.ones_like(outputs["clause_routing_multiplier"]),
+            )
+        )
+        self.assertTrue(bool(outputs["view_scheduler_enabled"].all()))
+        repair_loss = (
+            outputs["subject_view_gate_residual_logits"].sum()
+            + outputs["reference_view_gate_residual_logits"].sum()
+            + outputs["clause_execution_logits"].sum()
+        )
+        repair_loss.backward()
+        self.assertIsNotNone(
+            module.entity_grounder.view_fusion_adapter.output.weight.grad
+        )
+        self.assertIsNotNone(module.clause_execution_scheduler.output.weight.grad)
+
+    def test_v99_loss_supervises_camera_fusion_and_first_unfinished_clause(self):
+        torch.manual_seed(920)
+        module = EntityRelationAffordanceField(
+            text_dim=10,
+            video_dim=16,
+            action_dim=12,
+            projection_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            max_clauses=4,
+            camera_count=2,
+            visual_aspect_ratio=2.0,
+            role_adapter_enabled=True,
+            role_adapter_hidden_dim=8,
+            role_adapter_teacher_enabled=True,
+            balanced_role_adapter_enabled=True,
+            balanced_role_adapter_hidden_dim=8,
+            clause_activation_adapter_enabled=True,
+            clause_activation_adapter_hidden_dim=8,
+            view_fusion_enabled=True,
+            view_fusion_adapter_hidden_dim=8,
+            clause_scheduler_enabled=True,
+            clause_scheduler_hidden_dim=8,
+        )
+        _, _, outputs, _ = module(
+            base_goal_queries=torch.randn(2, 3, 12),
+            base_goal_embedding=torch.randn(2, 8),
+            language_hidden=torch.randn(2, 6, 10),
+            language_mask=torch.ones(2, 6, dtype=torch.bool),
+            current_video_hidden=torch.randn(2, 8, 16),
+        )
+        clause_valid = torch.tensor(
+            [[True, True, False, False], [True, True, False, False]]
+        )
+        labels = {
+            "predicate_ids": torch.tensor([[1, 2, 0, 0], [1, 2, 0, 0]]),
+            "clause_valid": clause_valid,
+            "predicate_truth": torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
+            ),
+            "predicate_truth_valid": clause_valid.clone(),
+            "phase_ids": torch.zeros(2, 4, dtype=torch.long),
+            "phase_valid": clause_valid.clone(),
+        }
+        for role, ids in (
+            ("subject", (11, 12)),
+            ("reference", (21, 22)),
+        ):
+            masks = torch.zeros(2, 4, 8, 16)
+            masks[:, 0, 1:7, 1:7] = 1
+            masks[:, 1, 1:7, 9:15] = 1
+            labels[f"{role}_masks"] = masks
+            labels[f"{role}_mask_valid"] = clause_valid.clone()
+            view_visible = torch.zeros(2, 4, 2, dtype=torch.bool)
+            view_visible[:, 0, 0] = True
+            view_visible[:, 1, 1] = True
+            labels[f"{role}_view_visible"] = view_visible
+            labels[f"{role}_view_centers"] = torch.zeros(2, 4, 2, 2)
+            labels[f"{role}_positions"] = torch.zeros(2, 4, 3)
+            labels[f"{role}_position_valid"] = clause_valid.clone()
+            labels[f"{role}_entity_ids"] = torch.tensor(
+                [[ids[0], ids[1], -1, -1], [ids[0], ids[1], -1, -1]]
+            )
+        for name in ("grasp", "goal", "interaction"):
+            labels[f"{name}_anchors"] = torch.zeros(2, 4, 3)
+            labels[f"{name}_anchor_valid"] = clause_valid.clone()
+        loss, metrics = entity_relation_affordance_loss(
+            outputs,
+            labels,
+            weights=ERAFLossWeights(
+                objective_version=10,
+                mask=0.0,
+                entity=0.0,
+                relation=0.0,
+                anchor=0.0,
+                position=0.0,
+                role_swap=0.0,
+                view_fusion=1.0,
+                clause_scheduler=1.0,
+                phase=0.0,
+            ),
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(metrics["loss_pgc_v9_view_fusion"]))
+        self.assertTrue(torch.isfinite(metrics["loss_pgc_v9_clause_scheduler"]))
+        self.assertEqual(metrics["pgc_v9_unfinished_clause_fraction"].item(), 1.0)
+        loss.backward()
+        self.assertIsNotNone(
+            module.entity_grounder.view_fusion_adapter.output.weight.grad
+        )
+        self.assertIsNotNone(module.clause_execution_scheduler.output.weight.grad)
+
     def test_v9r3_zero_init_adapter_matches_teacher_and_isolates_gradients(self):
         torch.manual_seed(92)
         module = EntityRelationAffordanceField(
@@ -2259,6 +2419,143 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             )
             restored_v98.load_checkpoint(v9r8_path)
 
+    def test_v98_to_v99_view_scheduler_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v98_path = root / "v98.pt"
+            v99_path = root / "v99.pt"
+            v98 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=9,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v98.mot.state_dict()},
+                base_path,
+            )
+            v98.load_checkpoint(base_path)
+            # Represent a trained V9.8 rather than relying on its initial
+            # zero route. V9.9 must preserve a non-trivial predecessor path.
+            v98_eraf_module = v98.policy_guard_modules[
+                "entity_relation_affordance"
+            ]
+            with torch.no_grad():
+                v98_eraf_module.query_delta_projection.weight.normal_(std=0.02)
+                v98_eraf_module.query_delta_projection.bias.normal_(std=0.02)
+                v98_eraf_module.embedding_delta_projection.weight.normal_(std=0.02)
+                v98_eraf_module.embedding_delta_projection.bias.normal_(std=0.02)
+                v98_eraf_module.clause_activation_adapter.active_output.weight.normal_(
+                    std=0.02
+                )
+                v98_eraf_module.clause_activation_adapter.active_output.bias.normal_(
+                    std=0.02
+                )
+            v98.save_checkpoint(v98_path, step=3750)
+
+            v99 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=10,
+            )
+            v99.load_checkpoint(v98_path)
+            v98_state = v98.policy_guard_modules.state_dict()
+            v99_state = v99.policy_guard_modules.state_dict()
+            for key, value in v98_state.items():
+                self.assertTrue(torch.equal(value, v99_state[key]), key)
+            eraf = v99.policy_guard_modules["entity_relation_affordance"]
+            self.assertIsNotNone(eraf.entity_grounder.view_fusion_adapter)
+            self.assertIsNotNone(eraf.clause_execution_scheduler)
+            self.assertEqual(
+                int(
+                    eraf.entity_grounder.view_fusion_adapter.output.weight
+                    .count_nonzero()
+                    .item()
+                ),
+                0,
+            )
+            self.assertEqual(
+                int(eraf.clause_execution_scheduler.output.weight.count_nonzero()),
+                0,
+            )
+            eraf_inputs = {
+                "base_goal_queries": torch.randn(2, 3, 12),
+                "base_goal_embedding": torch.randn(2, 8),
+                "language_hidden": torch.randn(2, 5, 10),
+                "language_mask": torch.ones(2, 5, dtype=torch.bool),
+                "current_video_hidden": torch.randn(2, 8, 16),
+            }
+            v98.eval()
+            v99.eval()
+            with torch.no_grad():
+                v98_output = v98_eraf_module(**eraf_inputs)
+                v99_output = eraf(**eraf_inputs)
+            torch.testing.assert_close(
+                v99_output[0], v98_output[0], rtol=0.0, atol=1.0e-6
+            )
+            torch.testing.assert_close(
+                v99_output[1], v98_output[1], rtol=0.0, atol=1.0e-6
+            )
+            self.assertTrue(
+                torch.equal(
+                    v99_output[2]["subject_attention"],
+                    v99_output[2]["subject_base_attention"],
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    v99_output[2]["clause_routing_multiplier"],
+                    torch.ones_like(
+                        v99_output[2]["clause_routing_multiplier"]
+                    ),
+                )
+            )
+            v99.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v99.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            allowed = (
+                "balanced_role_binding_adapter",
+                "clause_activation_adapter",
+                "view_visibility_head",
+                "view_fusion_adapter",
+                "clause_execution_scheduler",
+            )
+            self.assertTrue(
+                all(any(part in name for part in allowed) for name in trainable)
+            )
+            self.assertTrue(any("view_fusion_adapter" in name for name in trainable))
+            self.assertTrue(
+                any("clause_execution_scheduler" in name for name in trainable)
+            )
+            v99.save_checkpoint(v99_path, step=4750)
+            metadata = torch.load(
+                v99_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 10)
+            self.assertEqual(
+                metadata["eraf_view_fusion_contract"],
+                "per_view_local_attention_visibility_gated_zero_init_residual",
+            )
+            self.assertEqual(
+                metadata["eraf_clause_scheduler_contract"],
+                "first_active_unfinished_predicate_zero_init_residual_route",
+            )
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "clause_activation_plus_balanced_role_plus_"
+                "visibility_gated_view_fusion_plus_unfinished_clause_scheduler",
+            )
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=10,
+            )
+            restored.load_checkpoint(v99_path)
+
     def test_stage_trainability_optimizer_contract_and_deployment_inputs(self):
         expected_modules = {
             "grounding": {"entity_relation_affordance"},
@@ -2366,6 +2663,33 @@ class PGCERAFGroundingGateTest(unittest.TestCase):
         report = compute_grounding_gate_report([bad] * 5)
         self.assertFalse(report["passed"])
         self.assertFalse(report["checks"]["relation_macro_f1_at_least_90pct"])
+
+        v99_good = dict(
+            good,
+            single_visible_view_selection_correct=[True, True],
+            clause_scheduler_correct=[True],
+            clause_scheduler_confidence=[0.95],
+        )
+        report = compute_grounding_gate_report(
+            [v99_good] * 5,
+            require_view_scheduler=True,
+        )
+        self.assertTrue(report["passed"])
+        self.assertEqual(
+            report["metrics"]["single_visible_view_selection_accuracy"], 1.0
+        )
+        v99_bad = dict(
+            v99_good,
+            single_visible_view_selection_correct=[False, True],
+        )
+        report = compute_grounding_gate_report(
+            [v99_bad] * 5,
+            require_view_scheduler=True,
+        )
+        self.assertFalse(report["passed"])
+        self.assertFalse(
+            report["checks"]["single_visible_view_selection_at_least_80pct"]
+        )
 
     def test_role_residual_audit_separates_overlap_from_binding_failure(self):
         base = {

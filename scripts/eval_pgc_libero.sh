@@ -206,7 +206,7 @@ if version == 9:
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
     objective = int(metadata.get("eraf_grounding_objective_version", -1))
-    if objective not in set(range(1, 10)):
+    if objective not in set(range(1, 11)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -222,6 +222,13 @@ if version == 9:
         != "multi_clause_exact_at_least_80pct"
     ):
         raise SystemExit("PGC v9.8 checkpoint lacks clause calibration contract")
+    if objective >= 10 and (
+        metadata.get("eraf_view_fusion_contract")
+        != "per_view_local_attention_visibility_gated_zero_init_residual"
+        or metadata.get("eraf_clause_scheduler_contract")
+        != "first_active_unfinished_predicate_zero_init_residual_route"
+    ):
+        raise SystemExit("PGC v9.9 checkpoint lacks view/scheduler contract")
 else:
     objective = 0
     training_stage = "grounding"
@@ -325,6 +332,18 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
       "model.policy_guard.entity_relation_grounding.clause_worst_slot_weight=2.0"
       "model.policy_guard.entity_relation_grounding.clause_multi_group_weight=1.0"
       "model.policy_guard.entity_relation_grounding.clause_adapter_energy_weight=0.01"
+    )
+  fi
+  if (( PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 10 )); then
+    EXTRA_OVERRIDES+=(
+      "model.policy_guard.entity_relation_grounding.view_fusion_adapter_hidden_dim=256"
+      "model.policy_guard.entity_relation_grounding.view_fusion_residual_max_abs=4.0"
+      "model.policy_guard.entity_relation_grounding.view_fusion_weight=2.0"
+      "model.policy_guard.entity_relation_grounding.view_fusion_energy_weight=0.01"
+      "model.policy_guard.entity_relation_grounding.clause_scheduler_hidden_dim=256"
+      "model.policy_guard.entity_relation_grounding.clause_scheduler_residual_max_abs=1.0"
+      "model.policy_guard.entity_relation_grounding.clause_scheduler_weight=1.0"
+      "model.policy_guard.entity_relation_grounding.clause_scheduler_energy_weight=0.01"
     )
   fi
   if [[ "${ERAF_SHADOW_AUDIT}" == "true" ]]; then

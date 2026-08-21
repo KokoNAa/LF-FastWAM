@@ -660,6 +660,9 @@ class FastWAM(torch.nn.Module):
         clause_activation_grounding = (
             self.policy_guard_eraf_grounding_objective_version >= 9
         )
+        view_scheduler_grounding = (
+            self.policy_guard_eraf_grounding_objective_version >= 10
+        )
         self.policy_guard_eraf_role_adapter_hidden_dim = int(
             eraf_config.get("role_adapter_hidden_dim", 256)
         )
@@ -674,6 +677,18 @@ class FastWAM(torch.nn.Module):
         )
         self.policy_guard_eraf_clause_activation_residual_max_abs = float(
             eraf_config.get("clause_activation_residual_max_abs", 4.0)
+        )
+        self.policy_guard_eraf_view_fusion_adapter_hidden_dim = int(
+            eraf_config.get("view_fusion_adapter_hidden_dim", 256)
+        )
+        self.policy_guard_eraf_view_fusion_residual_max_abs = float(
+            eraf_config.get("view_fusion_residual_max_abs", 4.0)
+        )
+        self.policy_guard_eraf_clause_scheduler_hidden_dim = int(
+            eraf_config.get("clause_scheduler_hidden_dim", 256)
+        )
+        self.policy_guard_eraf_clause_scheduler_residual_max_abs = float(
+            eraf_config.get("clause_scheduler_residual_max_abs", 1.0)
         )
         self.policy_guard_eraf_loss_weights = ERAFLossWeights(
             objective_version=(
@@ -819,6 +834,30 @@ class FastWAM(torch.nn.Module):
                 eraf_config.get(
                     "clause_adapter_energy_weight",
                     0.01 if clause_activation_grounding else 0.0,
+                )
+            ),
+            view_fusion=float(
+                eraf_config.get(
+                    "view_fusion_weight",
+                    2.0 if view_scheduler_grounding else 0.0,
+                )
+            ),
+            view_fusion_energy=float(
+                eraf_config.get(
+                    "view_fusion_energy_weight",
+                    0.01 if view_scheduler_grounding else 0.0,
+                )
+            ),
+            clause_scheduler=float(
+                eraf_config.get(
+                    "clause_scheduler_weight",
+                    1.0 if view_scheduler_grounding else 0.0,
+                )
+            ),
+            clause_scheduler_energy=float(
+                eraf_config.get(
+                    "clause_scheduler_energy_weight",
+                    0.01 if view_scheduler_grounding else 0.0,
                 )
             ),
             phase=float(eraf_config.get("phase_weight", 1.0)),
@@ -1148,10 +1187,11 @@ class FastWAM(torch.nn.Module):
                     7,
                     8,
                     9,
+                    10,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "1, 2, 3, 4, 5, 6, 7, 8, or 9."
+                        "1, 2, 3, 4, 5, 6, 7, 8, 9, or 10."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1163,6 +1203,10 @@ class FastWAM(torch.nn.Module):
                     self.policy_guard_eraf_loss_weights.clause_cardinality,
                     self.policy_guard_eraf_loss_weights.clause_worst_slot,
                     self.policy_guard_eraf_loss_weights.clause_adapter_energy,
+                    self.policy_guard_eraf_loss_weights.view_fusion,
+                    self.policy_guard_eraf_loss_weights.view_fusion_energy,
+                    self.policy_guard_eraf_loss_weights.clause_scheduler,
+                    self.policy_guard_eraf_loss_weights.clause_scheduler_energy,
                 ) < 0:
                     raise ValueError(
                         "PGC v9 ERAF role-assignment weights must be non-negative."
@@ -1174,6 +1218,18 @@ class FastWAM(torch.nn.Module):
                 if self.policy_guard_eraf_clause_activation_residual_max_abs <= 0:
                     raise ValueError(
                         "PGC v9 ERAF clause activation residual bound must be positive."
+                    )
+                if self.policy_guard_eraf_view_fusion_residual_max_abs <= 0:
+                    raise ValueError(
+                        "PGC v9 ERAF view-fusion residual bound must be positive."
+                    )
+                if not (
+                    0
+                    < self.policy_guard_eraf_clause_scheduler_residual_max_abs
+                    <= 1
+                ):
+                    raise ValueError(
+                        "PGC v9 ERAF scheduler residual bound must be in (0,1]."
                     )
                 if (
                     self.policy_guard_eraf_loss_weights.role_assignment_temperature
@@ -1531,6 +1587,26 @@ class FastWAM(torch.nn.Module):
                             clause_activation_residual_max_abs=(
                                 self.policy_guard_eraf_clause_activation_residual_max_abs
                             ),
+                            view_fusion_enabled=(
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 10
+                            ),
+                            view_fusion_adapter_hidden_dim=(
+                                self.policy_guard_eraf_view_fusion_adapter_hidden_dim
+                            ),
+                            view_fusion_residual_max_abs=(
+                                self.policy_guard_eraf_view_fusion_residual_max_abs
+                            ),
+                            clause_scheduler_enabled=(
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 10
+                            ),
+                            clause_scheduler_hidden_dim=(
+                                self.policy_guard_eraf_clause_scheduler_hidden_dim
+                            ),
+                            clause_scheduler_residual_max_abs=(
+                                self.policy_guard_eraf_clause_scheduler_residual_max_abs
+                            ),
                         )
                     if self.policy_guard_version in {6, 7}:
                         binder_kwargs = {
@@ -1881,9 +1957,10 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_modules.requires_grad_(True)
                 if self.policy_guard_version == 9:
                     if self.policy_guard_eraf_grounding_objective_version >= 4:
-                        # V9.3 preserves V9.1 and V9.4 preserves V9.3. Each
-                        # grounding repair learns only its newest zero-init
-                        # role adapter; action/verifier freeze both adapters.
+                        # Grounding repairs keep the policy sidecars frozen.
+                        # V9.9 jointly calibrates the previously trained role
+                        # query with its new visibility fusion and scheduler;
+                        # action/verifier continue to freeze the entire ERAF.
                         for module in self.policy_guard_modules.values():
                             module.eval()
                             module.requires_grad_(False)
@@ -1892,6 +1969,29 @@ class FastWAM(torch.nn.Module):
                                 "entity_relation_affordance"
                             ]
                             if (
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 10
+                            ):
+                                trainable_repairs = [
+                                    eraf.balanced_role_binding_adapter,
+                                    eraf.clause_activation_adapter,
+                                    eraf.entity_grounder.view_visibility_head,
+                                    eraf.entity_grounder.view_fusion_adapter,
+                                    eraf.clause_execution_scheduler,
+                                ]
+                                if any(
+                                    repair is None for repair in trainable_repairs
+                                ):
+                                    raise RuntimeError(
+                                        "V9.9 grounding requires balanced role, "
+                                        "clause-activation, view-fusion, visibility, "
+                                        "and clause-scheduler modules."
+                                    )
+                                for repair in trainable_repairs:
+                                    repair.train()
+                                    repair.requires_grad_(True)
+                                role_adapter = None
+                            elif (
                                 self.policy_guard_eraf_grounding_objective_version
                                 >= 9
                             ):
@@ -1929,8 +2029,9 @@ class FastWAM(torch.nn.Module):
                                     raise RuntimeError(
                                         "V9.3 grounding requires its role adapter."
                                     )
-                            role_adapter.train()
-                            role_adapter.requires_grad_(True)
+                            if role_adapter is not None:
+                                role_adapter.train()
+                                role_adapter.requires_grad_(True)
                         elif self.policy_guard_eraf_training_stage == "action":
                             proposal = self.policy_guard_modules[
                                 "action_chunk_proposal"
@@ -2591,6 +2692,8 @@ class FastWAM(torch.nn.Module):
                 "predicate_logits",
                 "subject_attention",
                 "reference_attention",
+                "subject_base_attention",
+                "reference_base_attention",
                 "subject_position",
                 "reference_position",
                 "subject_view_visibility_logits",
@@ -2599,11 +2702,22 @@ class FastWAM(torch.nn.Module):
                 "reference_view_centers",
                 "subject_view_attention_mass",
                 "reference_view_attention_mass",
+                "subject_base_view_attention_mass",
+                "reference_base_view_attention_mass",
+                "subject_view_gate_residual_logits",
+                "reference_view_gate_residual_logits",
+                "subject_view_attention_delta",
+                "reference_view_attention_delta",
                 "grasp_anchor",
                 "goal_anchor",
                 "interaction_anchor",
                 "predicate_truth_logits",
                 "phase_logits",
+                "clause_execution_logits",
+                "clause_execution_probability",
+                "clause_routing_residual",
+                "clause_routing_multiplier",
+                "view_scheduler_enabled",
                 "spatial_coordinates",
                 "camera_ids",
             )
@@ -10008,6 +10122,18 @@ class FastWAM(torch.nn.Module):
                 and self.policy_guard_eraf_grounding_objective_version >= 9
                 else None
             ),
+            "eraf_view_fusion_contract": (
+                "per_view_local_attention_visibility_gated_zero_init_residual"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 10
+                else None
+            ),
+            "eraf_clause_scheduler_contract": (
+                "first_active_unfinished_predicate_zero_init_residual_route"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 10
+                else None
+            ),
             "eraf_attention_mask_weight": (
                 self.policy_guard_eraf_loss_weights.attention_mask
                 if is_v9
@@ -10088,6 +10214,26 @@ class FastWAM(torch.nn.Module):
                 if is_v9
                 else None
             ),
+            "eraf_view_fusion_weight": (
+                self.policy_guard_eraf_loss_weights.view_fusion
+                if is_v9
+                else None
+            ),
+            "eraf_view_fusion_energy_weight": (
+                self.policy_guard_eraf_loss_weights.view_fusion_energy
+                if is_v9
+                else None
+            ),
+            "eraf_clause_scheduler_weight": (
+                self.policy_guard_eraf_loss_weights.clause_scheduler
+                if is_v9
+                else None
+            ),
+            "eraf_clause_scheduler_energy_weight": (
+                self.policy_guard_eraf_loss_weights.clause_scheduler_energy
+                if is_v9
+                else None
+            ),
             "eraf_role_adapter_hidden_dim": (
                 self.policy_guard_eraf_role_adapter_hidden_dim
                 if is_v9
@@ -10096,7 +10242,13 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_role_adapter_trainable_scope": (
                 (
-                    "clause_activation_calibration_adapter_only"
+                    (
+                        "clause_activation_plus_balanced_role_plus_"
+                        "visibility_gated_view_fusion_plus_unfinished_"
+                        "clause_scheduler"
+                        if self.policy_guard_eraf_grounding_objective_version >= 10
+                        else "clause_activation_calibration_adapter_only"
+                    )
                     if self.policy_guard_eraf_grounding_objective_version >= 9
                     else (
                         (
@@ -10144,6 +10296,30 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_eraf_clause_activation_residual_max_abs
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 9
+                else None
+            ),
+            "eraf_view_fusion_adapter_hidden_dim": (
+                self.policy_guard_eraf_view_fusion_adapter_hidden_dim
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 10
+                else None
+            ),
+            "eraf_view_fusion_residual_max_abs": (
+                self.policy_guard_eraf_view_fusion_residual_max_abs
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 10
+                else None
+            ),
+            "eraf_clause_scheduler_hidden_dim": (
+                self.policy_guard_eraf_clause_scheduler_hidden_dim
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 10
+                else None
+            ),
+            "eraf_clause_scheduler_residual_max_abs": (
+                self.policy_guard_eraf_clause_scheduler_residual_max_abs
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 10
                 else None
             ),
             "eraf_role_attention_preservation_weight": (
@@ -10658,6 +10834,14 @@ class FastWAM(torch.nn.Module):
             and int(self.policy_guard_version) == 9
             and saved_eraf_grounding_objective == 8
             and self.policy_guard_eraf_grounding_objective_version == 9
+            and self.policy_guard_eraf_training_stage == "grounding"
+            and metadata.get("eraf_training_stage") == "grounding"
+        )
+        migrate_v9_to_view_scheduler = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 9
+            and self.policy_guard_eraf_grounding_objective_version == 10
             and self.policy_guard_eraf_training_stage == "grounding"
             and metadata.get("eraf_training_stage") == "grounding"
         )
@@ -11342,6 +11526,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 9
                             )
+                            or (
+                                saved_grounding_objective == 9
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 10
+                            )
                         )
                         objective_upgrade = (
                             objective_upgrade
@@ -11424,7 +11613,13 @@ class FastWAM(torch.nn.Module):
                                     )
                         if saved_grounding_objective >= 4 and not objective_upgrade:
                             expected_scope = (
-                                "clause_activation_calibration_adapter_only"
+                                (
+                                    "clause_activation_plus_balanced_role_plus_"
+                                    "visibility_gated_view_fusion_plus_unfinished_"
+                                    "clause_scheduler"
+                                    if saved_grounding_objective >= 10
+                                    else "clause_activation_calibration_adapter_only"
+                                )
                                 if saved_grounding_objective >= 9
                                 else (
                                     (
@@ -11677,6 +11872,83 @@ class FastWAM(torch.nn.Module):
                                     f"{saved_clause_hidden_dim}, model="
                                     f"{self.policy_guard_eraf_clause_activation_adapter_hidden_dim}."
                                 )
+                        if saved_grounding_objective >= 10 and not objective_upgrade:
+                            expected_v99_contract = {
+                                "eraf_view_fusion_contract": (
+                                    "per_view_local_attention_visibility_gated_"
+                                    "zero_init_residual"
+                                ),
+                                "eraf_clause_scheduler_contract": (
+                                    "first_active_unfinished_predicate_zero_init_"
+                                    "residual_route"
+                                ),
+                            }
+                            for name, expected in expected_v99_contract.items():
+                                if metadata.get(name) != expected:
+                                    raise ValueError(
+                                        "PGC V9.9 checkpoint contract mismatch: "
+                                        f"{name}={metadata.get(name)!r}, "
+                                        f"expected={expected!r}."
+                                    )
+                            for metadata_name, expected_value in {
+                                "eraf_view_fusion_weight": (
+                                    self.policy_guard_eraf_loss_weights.view_fusion
+                                ),
+                                "eraf_view_fusion_energy_weight": (
+                                    self.policy_guard_eraf_loss_weights.view_fusion_energy
+                                ),
+                                "eraf_clause_scheduler_weight": (
+                                    self.policy_guard_eraf_loss_weights.clause_scheduler
+                                ),
+                                "eraf_clause_scheduler_energy_weight": (
+                                    self.policy_guard_eraf_loss_weights.clause_scheduler_energy
+                                ),
+                                "eraf_view_fusion_residual_max_abs": (
+                                    self.policy_guard_eraf_view_fusion_residual_max_abs
+                                ),
+                                "eraf_clause_scheduler_residual_max_abs": (
+                                    self.policy_guard_eraf_clause_scheduler_residual_max_abs
+                                ),
+                            }.items():
+                                try:
+                                    saved_value = float(metadata[metadata_name])
+                                except (KeyError, TypeError, ValueError) as exc:
+                                    raise ValueError(
+                                        "PGC V9.9 checkpoint is missing valid "
+                                        f"calibration value {metadata_name!r}."
+                                    ) from exc
+                                if not math.isclose(
+                                    saved_value,
+                                    float(expected_value),
+                                    rel_tol=0.0,
+                                    abs_tol=1.0e-9,
+                                ):
+                                    raise ValueError(
+                                        f"PGC V9.9 {metadata_name} mismatch: "
+                                        f"checkpoint={saved_value}, "
+                                        f"model={expected_value}."
+                                    )
+                            for metadata_name, expected_value in {
+                                "eraf_view_fusion_adapter_hidden_dim": (
+                                    self.policy_guard_eraf_view_fusion_adapter_hidden_dim
+                                ),
+                                "eraf_clause_scheduler_hidden_dim": (
+                                    self.policy_guard_eraf_clause_scheduler_hidden_dim
+                                ),
+                            }.items():
+                                try:
+                                    saved_value = int(metadata[metadata_name])
+                                except (KeyError, TypeError, ValueError) as exc:
+                                    raise ValueError(
+                                        "PGC V9.9 checkpoint is missing valid "
+                                        f"dimension {metadata_name!r}."
+                                    ) from exc
+                                if saved_value != int(expected_value):
+                                    raise ValueError(
+                                        f"PGC V9.9 {metadata_name} mismatch: "
+                                        f"checkpoint={saved_value}, "
+                                        f"model={expected_value}."
+                                    )
                         if (
                             bool(metadata.get("eraf_entity_only", False))
                             != self.policy_guard_eraf_entity_only
@@ -11744,6 +12016,7 @@ class FastWAM(torch.nn.Module):
                 or migrate_v9_to_structured_role_adapter
                 or migrate_v9_to_balanced_role_adapter
                 or migrate_v9_to_clause_activation_adapter
+                or migrate_v9_to_view_scheduler
             )
             incompatible = self.policy_guard_modules.load_state_dict(
                 guard_state, strict=not migrate_with_new_modules
@@ -11841,6 +12114,25 @@ class FastWAM(torch.nn.Module):
                         f"incompatible sidecars: missing={missing}, "
                         f"unexpected={unexpected}."
                     )
+            elif migrate_v9_to_view_scheduler:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                allowed_prefixes = (
+                    "entity_relation_affordance.entity_grounder."
+                    "view_fusion_adapter.",
+                    "entity_relation_affordance.clause_execution_scheduler.",
+                )
+                disallowed_missing = [
+                    key
+                    for key in missing
+                    if not key.startswith(allowed_prefixes)
+                ]
+                if disallowed_missing or unexpected or not missing:
+                    raise ValueError(
+                        "PGC v9.8 -> v9.9 view/scheduler warm start has "
+                        f"incompatible sidecars: missing={missing}, "
+                        f"unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -11857,6 +12149,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v9_to_structured_role_adapter
                 and not migrate_v9_to_balanced_role_adapter
                 and not migrate_v9_to_clause_activation_adapter
+                and not migrate_v9_to_view_scheduler
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -11917,6 +12210,15 @@ class FastWAM(torch.nn.Module):
                 logger.info(
                     "Warm-started PGC v9.8 from frozen V9.7 ERAF at %s "
                     "(base=%s restored=%d new_clause_adapter=%d).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
+                    len(incompatible.missing_keys),
+                )
+            elif migrate_v9_to_view_scheduler:
+                logger.info(
+                    "Warm-started PGC v9.9 from frozen V9.8 ERAF at %s "
+                    "(base=%s restored=%d new_view_scheduler=%d).",
                     path,
                     resolved_base,
                     len(guard_state),

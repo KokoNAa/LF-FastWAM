@@ -174,6 +174,107 @@ class PredicateRoleDecoder(nn.Module):
         }
 
 
+class VisibilityGatedViewFusionAdapter(nn.Module):
+    """Zero-init camera fusion that turns visibility into a routing signal.
+
+    The historical ERAF grounder applies one softmax over all camera patches.
+    It predicts per-view visibility only after that decision, so an occluded
+    agent view can dominate a clearly visible wrist view.  This adapter keeps
+    the independently normalized within-view heatmaps and learns only a
+    residual over the historical camera masses.  Its final projection is zero
+    initialized; at migration the gate delta, attention delta, and token delta
+    are therefore exactly zero.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        adapter_hidden_dim: int,
+        camera_count: int,
+        residual_max_abs: float = 4.0,
+    ) -> None:
+        super().__init__()
+        if min(hidden_dim, adapter_hidden_dim, camera_count) <= 0:
+            raise ValueError("ERAF view-fusion dimensions must be positive.")
+        if residual_max_abs <= 0:
+            raise ValueError("ERAF view-fusion residual bound must be positive.")
+        self.hidden_dim = int(hidden_dim)
+        self.camera_count = int(camera_count)
+        self.residual_max_abs = float(residual_max_abs)
+        self.input_norm = nn.LayerNorm(hidden_dim * 2 + 2)
+        self.input_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 2, adapter_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(adapter_hidden_dim, adapter_hidden_dim),
+            nn.GELU(approximate="tanh"),
+        )
+        self.output = nn.Linear(adapter_hidden_dim, 1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(
+        self,
+        *,
+        role_queries: torch.Tensor,
+        view_tokens: torch.Tensor,
+        view_visibility_logits: torch.Tensor,
+        base_view_mass: torch.Tensor,
+        normalized_view_attention: torch.Tensor,
+        base_attention: torch.Tensor,
+        base_token: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if role_queries.ndim != 3 or role_queries.shape[-1] != self.hidden_dim:
+            raise ValueError("ERAF view-fusion role queries must be [B,C,D].")
+        expected_view_shape = (*role_queries.shape[:2], self.camera_count)
+        if view_tokens.shape != (*expected_view_shape, self.hidden_dim):
+            raise ValueError("ERAF view-fusion tokens have an invalid shape.")
+        if (
+            view_visibility_logits.shape != expected_view_shape
+            or base_view_mass.shape != expected_view_shape
+            or normalized_view_attention.shape[:3] != expected_view_shape
+        ):
+            raise ValueError("ERAF view-fusion camera tensors must share [B,C,V].")
+        role = role_queries.unsqueeze(2).expand_as(view_tokens)
+        log_mass = base_view_mass.float().clamp_min(1.0e-8).log()
+        features = torch.cat(
+            (
+                role,
+                view_tokens,
+                view_visibility_logits.to(view_tokens.dtype).unsqueeze(-1),
+                log_mass.to(view_tokens.dtype).unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        raw_residual = self.output(
+            self.input_projection(self.input_norm(features))
+        ).squeeze(-1)
+        residual_logits = (
+            torch.tanh(raw_residual.float()) * self.residual_max_abs
+        )
+        # Subtract the same softmax evaluated at the historical logits.  This
+        # makes the identity contract exact at zero initialization without a
+        # special inference branch or a non-differentiable switch.
+        base_gate = torch.softmax(log_mass, dim=-1)
+        calibrated_gate = torch.softmax(log_mass + residual_logits, dim=-1)
+        gate_delta = calibrated_gate - base_gate
+        attention_delta = torch.einsum(
+            "bcv,bcvn->bcn", gate_delta, normalized_view_attention.float()
+        )
+        token_delta = torch.einsum(
+            "bcv,bcvd->bcd", gate_delta.to(view_tokens.dtype), view_tokens
+        )
+        return {
+            "attention": base_attention + attention_delta.to(base_attention.dtype),
+            "token": base_token + token_delta.to(base_token.dtype),
+            "gate_weights": calibrated_gate,
+            "base_gate_weights": base_gate,
+            "gate_residual_logits": residual_logits,
+            "attention_delta": attention_delta,
+            "token_delta": token_delta,
+        }
+
+
 class MultiViewEntityGrounder(nn.Module):
     """Ground semantic role queries in camera-aware spatial video patches."""
 
@@ -185,6 +286,9 @@ class MultiViewEntityGrounder(nn.Module):
         camera_count: int = 2,
         visual_aspect_ratio: float = 2.0,
         temperature: float = 0.07,
+        view_fusion_enabled: bool = False,
+        view_fusion_adapter_hidden_dim: int = 256,
+        view_fusion_residual_max_abs: float = 4.0,
     ) -> None:
         super().__init__()
         if min(video_dim, hidden_dim, camera_count) <= 0:
@@ -196,6 +300,7 @@ class MultiViewEntityGrounder(nn.Module):
         self.camera_count = int(camera_count)
         self.visual_aspect_ratio = float(visual_aspect_ratio)
         self.temperature = float(temperature)
+        self.view_fusion_enabled = bool(view_fusion_enabled)
         self.visual_projection = nn.Sequential(
             nn.LayerNorm(video_dim),
             nn.Linear(video_dim, hidden_dim),
@@ -223,6 +328,16 @@ class MultiViewEntityGrounder(nn.Module):
             nn.Linear(hidden_dim + 1, hidden_dim),
             nn.GELU(approximate="tanh"),
             nn.Linear(hidden_dim, 1),
+        )
+        self.view_fusion_adapter = (
+            VisibilityGatedViewFusionAdapter(
+                hidden_dim=hidden_dim,
+                adapter_hidden_dim=view_fusion_adapter_hidden_dim,
+                camera_count=camera_count,
+                residual_max_abs=view_fusion_residual_max_abs,
+            )
+            if self.view_fusion_enabled
+            else None
         )
 
     def _spatial_visual(
@@ -276,7 +391,11 @@ class MultiViewEntityGrounder(nn.Module):
         return self.visual_norm(visual), coordinates, camera_ids, view_coordinates
 
     def ground(
-        self, role_queries: torch.Tensor, visual_hidden: torch.Tensor
+        self,
+        role_queries: torch.Tensor,
+        visual_hidden: torch.Tensor,
+        *,
+        apply_view_fusion: bool = True,
     ) -> dict[str, torch.Tensor]:
         if role_queries.ndim != 3 or role_queries.shape[-1] != self.hidden_dim:
             raise ValueError("ERAF role queries must be [B,C,hidden_dim].")
@@ -290,16 +409,20 @@ class MultiViewEntityGrounder(nn.Module):
         query = F.normalize(self.role_norm(role_queries).float(), dim=-1, eps=1e-6)
         key = F.normalize(visual.float(), dim=-1, eps=1e-6)
         similarity = torch.einsum("bcd,bnd->bcn", query, key)
-        attention = torch.softmax(similarity / self.temperature, dim=-1)
-        tokens = torch.einsum("bcn,bnd->bcd", attention.to(visual.dtype), visual)
+        base_attention = torch.softmax(similarity / self.temperature, dim=-1)
+        base_tokens = torch.einsum(
+            "bcn,bnd->bcd", base_attention.to(visual.dtype), visual
+        )
         camera_membership = (
             F.one_hot(camera_ids, num_classes=self.camera_count)
             .transpose(0, 1)
-            .to(attention.dtype)
+            .to(base_attention.dtype)
         )
-        view_attention = attention.unsqueeze(2) * camera_membership[None, None]
-        view_mass = view_attention.sum(dim=-1)
-        normalized_view_attention = view_attention / view_mass.clamp_min(
+        view_attention = (
+            base_attention.unsqueeze(2) * camera_membership[None, None]
+        )
+        base_view_mass = view_attention.sum(dim=-1)
+        normalized_view_attention = view_attention / base_view_mass.clamp_min(
             1.0e-8
         ).unsqueeze(-1)
         view_tokens = torch.einsum(
@@ -314,13 +437,43 @@ class MultiViewEntityGrounder(nn.Module):
         )
         view_visibility_logits = self.view_visibility_head(
             torch.cat(
-                (view_tokens, view_mass.to(view_tokens.dtype).unsqueeze(-1)),
+                (
+                    view_tokens,
+                    base_view_mass.to(view_tokens.dtype).unsqueeze(-1),
+                ),
                 dim=-1,
             )
         ).squeeze(-1)
+        if self.view_fusion_adapter is not None and apply_view_fusion:
+            fused = self.view_fusion_adapter(
+                role_queries=role_queries,
+                view_tokens=view_tokens,
+                view_visibility_logits=view_visibility_logits,
+                base_view_mass=base_view_mass,
+                normalized_view_attention=normalized_view_attention,
+                base_attention=base_attention,
+                base_token=base_tokens,
+            )
+            attention = fused["attention"]
+            tokens = fused["token"]
+            view_mass = fused["gate_weights"]
+            view_gate_residual_logits = fused["gate_residual_logits"]
+            view_attention_delta = fused["attention_delta"]
+            view_token_delta = fused["token_delta"]
+        else:
+            attention = base_attention
+            tokens = base_tokens
+            view_mass = base_view_mass
+            view_gate_residual_logits = base_view_mass.new_zeros(
+                base_view_mass.shape
+            )
+            view_attention_delta = base_attention.new_zeros(base_attention.shape)
+            view_token_delta = base_tokens.new_zeros(base_tokens.shape)
         return {
             "attention": attention,
+            "base_attention": base_attention,
             "token": tokens,
+            "base_token": base_tokens,
             # Kept only inside the transient ERAF output dictionary so the
             # verifier can form a same-state wrong-entity candidate.  This is
             # still an RGB-derived deployment feature, never a simulator label.
@@ -330,6 +483,10 @@ class MultiViewEntityGrounder(nn.Module):
             "view_visibility_logits": view_visibility_logits,
             "view_centers": view_centers,
             "view_attention_mass": view_mass,
+            "base_view_attention_mass": base_view_mass,
+            "view_gate_residual_logits": view_gate_residual_logits,
+            "view_attention_delta": view_attention_delta,
+            "view_token_delta": view_token_delta,
             # Mask BCE needs unbounded logits.  Cosine similarity itself is
             # confined to [-1,1], so expose the same temperature-scaled logits
             # used by the spatial softmax.
@@ -831,6 +988,119 @@ class ClauseActivationCalibrationAdapter(nn.Module):
         }
 
 
+class UnfinishedClauseScheduler(nn.Module):
+    """Route execution toward the first active predicate not yet satisfied.
+
+    Predicate truth is already well calibrated in the closed-loop audit, but
+    V9.8 only feeds it back as an undifferentiated relation feature.  The
+    scheduler predicts a bounded per-clause routing multiplier from clause,
+    activity, truth, phase, and slot-order features.  Its output is zero
+    initialized, hence a migrated checkpoint initially multiplies every clause
+    by exactly one and preserves the complete V9.8 route.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        adapter_hidden_dim: int,
+        max_clauses: int,
+        phase_count: int = 3,
+        residual_max_abs: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if min(hidden_dim, adapter_hidden_dim, max_clauses, phase_count) <= 0:
+            raise ValueError("ERAF clause-scheduler dimensions must be positive.")
+        if not 0 < residual_max_abs <= 1:
+            raise ValueError(
+                "ERAF clause-scheduler residual bound must be in (0,1]."
+            )
+        self.hidden_dim = int(hidden_dim)
+        self.max_clauses = int(max_clauses)
+        self.phase_count = int(phase_count)
+        self.residual_max_abs = float(residual_max_abs)
+        feature_dim = hidden_dim + phase_count + 3
+        self.input_norm = nn.LayerNorm(feature_dim)
+        self.input_projection = nn.Sequential(
+            nn.Linear(feature_dim, adapter_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(adapter_hidden_dim, adapter_hidden_dim),
+            nn.GELU(approximate="tanh"),
+        )
+        self.clause_embedding = nn.Parameter(
+            torch.zeros(max_clauses, adapter_hidden_dim)
+        )
+        nn.init.normal_(self.clause_embedding, std=0.02)
+        self.output = nn.Linear(adapter_hidden_dim, 1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(
+        self,
+        *,
+        clause_hidden: torch.Tensor,
+        active_logits: torch.Tensor,
+        predicate_truth_logits: torch.Tensor,
+        phase_logits: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if clause_hidden.ndim != 3 or clause_hidden.shape[-1] != self.hidden_dim:
+            raise ValueError("ERAF scheduler clauses must be [B,C,hidden_dim].")
+        if clause_hidden.shape[1] != self.max_clauses:
+            raise ValueError("ERAF scheduler clause count does not match config.")
+        if (
+            active_logits.shape != clause_hidden.shape[:2]
+            or predicate_truth_logits.shape != clause_hidden.shape[:2]
+            or phase_logits.shape
+            != (*clause_hidden.shape[:2], self.phase_count)
+        ):
+            raise ValueError("ERAF scheduler state tensors have invalid shapes.")
+        active_probability = torch.sigmoid(active_logits.float())
+        truth_probability = torch.sigmoid(predicate_truth_logits.float())
+        phase_probability = torch.softmax(phase_logits.float(), dim=-1)
+        slot_position = torch.linspace(
+            0.0,
+            1.0,
+            self.max_clauses,
+            device=clause_hidden.device,
+            dtype=clause_hidden.dtype,
+        )
+        slot_position = slot_position.view(1, self.max_clauses, 1).expand(
+            clause_hidden.shape[0], -1, -1
+        )
+        features = torch.cat(
+            (
+                clause_hidden,
+                active_probability.to(clause_hidden.dtype).unsqueeze(-1),
+                truth_probability.to(clause_hidden.dtype).unsqueeze(-1),
+                phase_probability.to(clause_hidden.dtype),
+                slot_position,
+            ),
+            dim=-1,
+        )
+        hidden = self.input_projection(self.input_norm(features))
+        hidden = hidden + self.clause_embedding.unsqueeze(0)
+        execution_logits = self.output(hidden).squeeze(-1).float()
+        routing_residual = (
+            torch.tanh(execution_logits) * self.residual_max_abs
+        )
+        routing_multiplier = 1.0 + routing_residual
+        # This probability is diagnostic and is also supervised against the
+        # first unfinished ground-truth clause.  Activity and truth provide a
+        # useful causal prior without changing the zero-init routing path.
+        unfinished_log_prior = (
+            active_probability * (1.0 - truth_probability)
+        ).clamp_min(1.0e-6).log()
+        execution_probability = torch.softmax(
+            execution_logits + unfinished_log_prior, dim=-1
+        )
+        return {
+            "execution_logits": execution_logits,
+            "execution_probability": execution_probability,
+            "routing_residual": routing_residual,
+            "routing_multiplier": routing_multiplier,
+        }
+
+
 class EntityRelationAffordanceField(nn.Module):
     """Complete RGB+language ERAF deployment path used by PGC V9."""
 
@@ -859,6 +1129,12 @@ class EntityRelationAffordanceField(nn.Module):
         clause_activation_adapter_enabled: bool = False,
         clause_activation_adapter_hidden_dim: int = 256,
         clause_activation_residual_max_abs: float = 4.0,
+        view_fusion_enabled: bool = False,
+        view_fusion_adapter_hidden_dim: int = 256,
+        view_fusion_residual_max_abs: float = 4.0,
+        clause_scheduler_enabled: bool = False,
+        clause_scheduler_hidden_dim: int = 256,
+        clause_scheduler_residual_max_abs: float = 1.0,
     ) -> None:
         super().__init__()
         self.text_dim = int(text_dim)
@@ -889,6 +1165,14 @@ class EntityRelationAffordanceField(nn.Module):
         self.clause_activation_residual_max_abs = float(
             clause_activation_residual_max_abs
         )
+        self.view_fusion_enabled = bool(view_fusion_enabled)
+        self.view_fusion_adapter_hidden_dim = int(view_fusion_adapter_hidden_dim)
+        self.view_fusion_residual_max_abs = float(view_fusion_residual_max_abs)
+        self.clause_scheduler_enabled = bool(clause_scheduler_enabled)
+        self.clause_scheduler_hidden_dim = int(clause_scheduler_hidden_dim)
+        self.clause_scheduler_residual_max_abs = float(
+            clause_scheduler_residual_max_abs
+        )
         self.role_decoder = PredicateRoleDecoder(
             text_dim=text_dim,
             hidden_dim=hidden_dim,
@@ -901,6 +1185,9 @@ class EntityRelationAffordanceField(nn.Module):
             camera_count=camera_count,
             visual_aspect_ratio=visual_aspect_ratio,
             temperature=temperature,
+            view_fusion_enabled=view_fusion_enabled,
+            view_fusion_adapter_hidden_dim=view_fusion_adapter_hidden_dim,
+            view_fusion_residual_max_abs=view_fusion_residual_max_abs,
         )
         self.relation_reasoner = RelationAffordanceReasoner(
             hidden_dim=hidden_dim,
@@ -944,6 +1231,17 @@ class EntityRelationAffordanceField(nn.Module):
                 residual_max_abs=clause_activation_residual_max_abs,
             )
             if self.clause_activation_adapter_enabled
+            else None
+        )
+        self.clause_execution_scheduler = (
+            UnfinishedClauseScheduler(
+                hidden_dim=hidden_dim,
+                adapter_hidden_dim=clause_scheduler_hidden_dim,
+                max_clauses=max_clauses,
+                phase_count=self.relation_reasoner.phase_count,
+                residual_max_abs=clause_scheduler_residual_max_abs,
+            )
+            if self.clause_scheduler_enabled
             else None
         )
         self.entity_only_projection = nn.Sequential(
@@ -1089,11 +1387,17 @@ class EntityRelationAffordanceField(nn.Module):
             reference_position=reference_position,
             active_logits=outputs["active_logits"],
         )
+        routing_multiplier = outputs.get("clause_routing_multiplier")
+        if routing_multiplier is None:
+            routing_multiplier = torch.ones_like(outputs["active_logits"])
+        routing_multiplier = routing_multiplier.to(
+            negative["relation_hidden"].dtype
+        ).unsqueeze(-1)
         queries, embedding, _ = self._route_relation(
             base_goal_queries=base_goal_queries,
             base_goal_embedding=base_goal_embedding,
-            relation_hidden=negative["relation_hidden"],
-            embedding_tokens=negative["embedding_tokens"],
+            relation_hidden=negative["relation_hidden"] * routing_multiplier,
+            embedding_tokens=negative["embedding_tokens"] * routing_multiplier,
         )
         return queries, embedding
 
@@ -1149,10 +1453,14 @@ class EntityRelationAffordanceField(nn.Module):
                 teacher_reference_queries = base_reference_queries
             with torch.no_grad():
                 teacher_subject = self.entity_grounder.ground(
-                    teacher_subject_queries, current_video_hidden
+                    teacher_subject_queries,
+                    current_video_hidden,
+                    apply_view_fusion=False,
                 )
                 teacher_reference = self.entity_grounder.ground(
-                    teacher_reference_queries, current_video_hidden
+                    teacher_reference_queries,
+                    current_video_hidden,
+                    apply_view_fusion=False,
                 )
                 teacher_affordance = (
                     self._decode_affordance(
@@ -1254,13 +1562,42 @@ class EntityRelationAffordanceField(nn.Module):
             reference_position=reference["position"],
             active_logits=roles["active_logits"],
         )
+        if self.clause_execution_scheduler is not None:
+            execution = self.clause_execution_scheduler(
+                clause_hidden=roles["clause_hidden"],
+                active_logits=roles["active_logits"],
+                predicate_truth_logits=affordance["predicate_truth_logits"],
+                phase_logits=affordance["phase_logits"],
+            )
+        else:
+            execution_logits = roles["active_logits"].new_zeros(
+                roles["active_logits"].shape, dtype=torch.float32
+            )
+            execution_probability = torch.softmax(
+                roles["active_logits"].float(), dim=-1
+            )
+            execution = {
+                "execution_logits": execution_logits,
+                "execution_probability": execution_probability,
+                "routing_residual": execution_logits,
+                "routing_multiplier": execution_logits + 1.0,
+            }
+        routing_multiplier = execution["routing_multiplier"].to(
+            affordance["relation_hidden"].dtype
+        )
+        scheduled_relation_hidden = (
+            affordance["relation_hidden"] * routing_multiplier.unsqueeze(-1)
+        )
+        scheduled_embedding_tokens = (
+            affordance["embedding_tokens"] * routing_multiplier.unsqueeze(-1)
+        )
         # Do not renormalize here: both zero bridge projections must make a
         # freshly migrated V9 bitwise identical to the V5 sidecar path.
         routed_queries, routed_embedding, query_attention = self._route_relation(
             base_goal_queries=base_goal_queries,
             base_goal_embedding=base_goal_embedding,
-            relation_hidden=affordance["relation_hidden"],
-            embedding_tokens=affordance["embedding_tokens"],
+            relation_hidden=scheduled_relation_hidden,
+            embedding_tokens=scheduled_embedding_tokens,
         )
         subject_probs = subject["attention"].float().clamp_min(1e-8)
         reference_probs = reference["attention"].float().clamp_min(1e-8)
@@ -1319,6 +1656,22 @@ class EntityRelationAffordanceField(nn.Module):
                 .float()
                 .mean()
             ),
+            "pgc_v9_view_gate_residual_rms": (
+                0.5
+                * (
+                    subject["view_gate_residual_logits"].float().pow(2).mean()
+                    + reference["view_gate_residual_logits"]
+                    .float()
+                    .pow(2)
+                    .mean()
+                )
+            ).sqrt(),
+            "pgc_v9_clause_execution_residual_rms": (
+                execution["routing_residual"].float().pow(2).mean().sqrt()
+            ),
+            "pgc_v9_clause_execution_top1_probability": (
+                execution["execution_probability"].float().max(dim=-1).values.mean()
+            ),
         }
         outputs = {
             **roles,
@@ -1327,6 +1680,8 @@ class EntityRelationAffordanceField(nn.Module):
             "clause_cardinality_logits": clause_cardinality_logits,
             "subject_attention": subject["attention"],
             "reference_attention": reference["attention"],
+            "subject_base_attention": subject["base_attention"],
+            "reference_base_attention": reference["base_attention"],
             "subject_similarity": subject["similarity"],
             "reference_similarity": reference["similarity"],
             "subject_token": subject["token"],
@@ -1342,6 +1697,20 @@ class EntityRelationAffordanceField(nn.Module):
             "reference_view_centers": reference["view_centers"],
             "subject_view_attention_mass": subject["view_attention_mass"],
             "reference_view_attention_mass": reference["view_attention_mass"],
+            "subject_base_view_attention_mass": subject[
+                "base_view_attention_mass"
+            ],
+            "reference_base_view_attention_mass": reference[
+                "base_view_attention_mass"
+            ],
+            "subject_view_gate_residual_logits": subject[
+                "view_gate_residual_logits"
+            ],
+            "reference_view_gate_residual_logits": reference[
+                "view_gate_residual_logits"
+            ],
+            "subject_view_attention_delta": subject["view_attention_delta"],
+            "reference_view_attention_delta": reference["view_attention_delta"],
             "spatial_coordinates": subject["coordinates"],
             "camera_ids": subject["camera_ids"],
             "subject_role_delta": subject_role_delta,
@@ -1350,6 +1719,21 @@ class EntityRelationAffordanceField(nn.Module):
             "structured_reference_role_delta": structured_reference_role_delta,
             "balanced_subject_role_delta": balanced_subject_role_delta,
             "balanced_reference_role_delta": balanced_reference_role_delta,
+            "clause_execution_logits": execution["execution_logits"],
+            "clause_execution_probability": execution[
+                "execution_probability"
+            ],
+            "clause_routing_residual": execution["routing_residual"],
+            "clause_routing_multiplier": execution["routing_multiplier"],
+            "view_scheduler_enabled": torch.full(
+                (roles["active_logits"].shape[0],),
+                bool(
+                    self.view_fusion_enabled
+                    and self.clause_scheduler_enabled
+                ),
+                device=roles["active_logits"].device,
+                dtype=torch.bool,
+            ),
             **affordance,
         }
         if teacher is not None:
@@ -1388,6 +1772,10 @@ class ERAFLossWeights:
     clause_worst_slot: float = 0.0
     clause_multi_group_weight: float = 1.0
     clause_adapter_energy: float = 0.0
+    view_fusion: float = 0.0
+    view_fusion_energy: float = 0.0
+    clause_scheduler: float = 0.0
+    clause_scheduler_energy: float = 0.0
     phase: float = 0.25
 
 
@@ -2021,6 +2409,8 @@ def entity_relation_affordance_loss(
     view_visibility_losses: list[torch.Tensor] = []
     view_center_losses: list[torch.Tensor] = []
     attention_mask_losses: list[torch.Tensor] = []
+    view_fusion_losses: list[torch.Tensor] = []
+    view_fusion_accuracies: list[torch.Tensor] = []
     hit_metrics: list[torch.Tensor] = []
     role_heatmap_predictions: dict[str, torch.Tensor] = {}
     role_attentions: dict[str, torch.Tensor] = {}
@@ -2053,6 +2443,49 @@ def entity_relation_affordance_loss(
         attention_mask_losses.append(
             _masked_mean(-attention_mass.clamp_min(1.0e-8).log(), valid)
         )
+        if int(weights.objective_version) >= 10:
+            camera_ids = outputs["camera_ids"].long()
+            camera_count = int(outputs[f"{role}_view_attention_mass"].shape[-1])
+            camera_membership = (
+                F.one_hot(camera_ids, num_classes=camera_count)
+                .transpose(0, 1)
+                .to(target.dtype)
+            )
+            target_view_mass = torch.einsum(
+                "bcn,vn->bcv", target.float(), camera_membership.float()
+            )
+            target_view_valid = valid & (target_view_mass.sum(dim=-1) > 1.0e-8)
+            target_view_probability = target_view_mass / target_view_mass.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0e-8)
+            predicted_view_probability = outputs[
+                f"{role}_view_attention_mass"
+            ].float().clamp_min(1.0e-8)
+            predicted_view_probability = predicted_view_probability / (
+                predicted_view_probability.sum(dim=-1, keepdim=True).clamp_min(
+                    1.0e-8
+                )
+            )
+            view_fusion_losses.append(
+                _masked_mean(
+                    -(
+                        target_view_probability * predicted_view_probability.log()
+                    ).sum(dim=-1),
+                    target_view_valid,
+                )
+            )
+            view_fusion_accuracies.append(
+                _masked_mean(
+                    (
+                        predicted_view_probability.argmax(dim=-1)
+                        == target_view_probability.argmax(dim=-1)
+                    ).float(),
+                    target_view_valid,
+                )
+            )
+        else:
+            view_fusion_losses.append(attention.sum() * 0.0)
+            view_fusion_accuracies.append((attention.sum() * 0.0).detach())
         top1 = attention.argmax(dim=-1)
         hit = torch.gather((target > 0).float(), -1, top1.unsqueeze(-1)).squeeze(-1)
         hit_metrics.append(_masked_mean(hit, valid))
@@ -2096,6 +2529,8 @@ def entity_relation_affordance_loss(
         + view_center_loss
     ) / 3.0
     attention_mask_loss = torch.stack(attention_mask_losses).mean()
+    view_fusion_loss = torch.stack(view_fusion_losses).mean()
+    view_fusion_accuracy = torch.stack(view_fusion_accuracies).mean()
 
     position_losses = []
     for role in ("subject", "reference"):
@@ -2396,6 +2831,60 @@ def entity_relation_affordance_loss(
         clause_metrics["multi_exact_gain"] = (
             clause_metrics["multi_exact"] - clause_metrics["base_multi_exact"]
         ).detach()
+    view_fusion_energy_loss = zero
+    clause_scheduler_loss = zero
+    clause_scheduler_energy_loss = zero
+    clause_scheduler_accuracy = zero.detach()
+    unfinished_clause_fraction = zero.detach()
+    if int(weights.objective_version) >= 10:
+        required_v99_outputs = {
+            "subject_view_gate_residual_logits",
+            "reference_view_gate_residual_logits",
+            "clause_execution_logits",
+            "clause_routing_residual",
+        }
+        missing_v99_outputs = sorted(required_v99_outputs.difference(outputs))
+        if missing_v99_outputs:
+            raise ValueError(
+                "V9.9 view fusion and clause scheduling require their adapter "
+                f"outputs; missing={missing_v99_outputs}."
+            )
+        view_fusion_energy_loss = 0.5 * (
+            outputs["subject_view_gate_residual_logits"].float().pow(2).mean()
+            + outputs["reference_view_gate_residual_logits"]
+            .float()
+            .pow(2)
+            .mean()
+        )
+        truth_valid = labels["predicate_truth_valid"].bool()
+        unfinished = (
+            clause_valid
+            & truth_valid
+            & (labels["predicate_truth"].float() < 0.5)
+        )
+        unfinished_sample_valid = unfinished.any(dim=-1)
+        first_unfinished = unfinished.float().argmax(dim=-1)
+        execution_logits = outputs["clause_execution_logits"].float().masked_fill(
+            ~clause_valid, -1.0e4
+        )
+        clause_scheduler_loss = _masked_mean(
+            F.cross_entropy(
+                execution_logits,
+                first_unfinished,
+                reduction="none",
+            ),
+            unfinished_sample_valid,
+        )
+        clause_scheduler_accuracy = _masked_mean(
+            (execution_logits.argmax(dim=-1) == first_unfinished).float(),
+            unfinished_sample_valid,
+        ).detach()
+        unfinished_clause_fraction = _masked_mean(
+            unfinished_sample_valid.float(), clause_valid.any(dim=-1)
+        ).detach()
+        clause_scheduler_energy_loss = outputs["clause_routing_residual"].float().pow(
+            2
+        ).mean()
     # Penalize attention assigned exclusively to the other semantic role.
     # Pixels shared by overlapping objects/containers are excluded so an
     # object entering a basket is not trained as a false negative.
@@ -2616,6 +3105,10 @@ def entity_relation_affordance_loss(
         + weights.clause_cardinality * clause_cardinality_loss
         + weights.clause_worst_slot * clause_worst_slot_loss
         + weights.clause_adapter_energy * clause_adapter_energy_loss
+        + weights.view_fusion * view_fusion_loss
+        + weights.view_fusion_energy * view_fusion_energy_loss
+        + weights.clause_scheduler * clause_scheduler_loss
+        + weights.clause_scheduler_energy * clause_scheduler_energy_loss
         + weights.phase * phase_loss
     )
     predicate_prediction = outputs["predicate_logits"].argmax(dim=-1)
@@ -2662,6 +3155,12 @@ def entity_relation_affordance_loss(
         "loss_pgc_v9_clause_cardinality": clause_cardinality_loss.detach(),
         "loss_pgc_v9_clause_worst_slot": clause_worst_slot_loss.detach(),
         "loss_pgc_v9_clause_adapter_energy": clause_adapter_energy_loss.detach(),
+        "loss_pgc_v9_view_fusion": view_fusion_loss.detach(),
+        "loss_pgc_v9_view_fusion_energy": view_fusion_energy_loss.detach(),
+        "loss_pgc_v9_clause_scheduler": clause_scheduler_loss.detach(),
+        "loss_pgc_v9_clause_scheduler_energy": (
+            clause_scheduler_energy_loss.detach()
+        ),
         "loss_pgc_v9_phase": phase_loss.detach(),
         "loss_pgc_v9_predicate": predicate_loss.detach(),
         "loss_pgc_v9_role_entity_contrastive": role_entity_loss.detach(),
@@ -2778,6 +3277,9 @@ def entity_relation_affordance_loss(
         "pgc_v9_clause_activation_multi_exact_gain": clause_metrics[
             "multi_exact_gain"
         ],
+        "pgc_v9_view_fusion_accuracy": view_fusion_accuracy.detach(),
+        "pgc_v9_clause_scheduler_accuracy": clause_scheduler_accuracy,
+        "pgc_v9_unfinished_clause_fraction": unfinished_clause_fraction,
         "pgc_v9_teacher_preservation_fraction": teacher_preservation_fraction,
         "pgc_v9_teacher_predicate_max_abs_error": (teacher_predicate_max_abs_error),
         "pgc_v9_teacher_active_max_abs_error": teacher_active_max_abs_error,

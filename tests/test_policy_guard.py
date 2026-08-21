@@ -241,6 +241,22 @@ def tiny_pgc_fastwam(
                 "clause_adapter_energy_weight": (
                     0.01 if v9_grounding_objective_version >= 9 else 0.0
                 ),
+                "view_fusion_adapter_hidden_dim": 8,
+                "view_fusion_residual_max_abs": 4.0,
+                "view_fusion_weight": (
+                    2.0 if v9_grounding_objective_version >= 10 else 0.0
+                ),
+                "view_fusion_energy_weight": (
+                    0.01 if v9_grounding_objective_version >= 10 else 0.0
+                ),
+                "clause_scheduler_hidden_dim": 8,
+                "clause_scheduler_residual_max_abs": 1.0,
+                "clause_scheduler_weight": (
+                    1.0 if v9_grounding_objective_version >= 10 else 0.0
+                ),
+                "clause_scheduler_energy_weight": (
+                    0.01 if v9_grounding_objective_version >= 10 else 0.0
+                ),
                 "role_attention_preservation_weight": (
                     (
                         5.0
