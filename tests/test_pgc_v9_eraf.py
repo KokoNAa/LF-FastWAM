@@ -1109,6 +1109,8 @@ class PGCERAFModuleTest(unittest.TestCase):
         )
         self.assertFalse(torch.equal(routed_queries, base_queries))
         self.assertFalse(torch.equal(routed_embedding, base_embedding))
+        self.assertEqual(routed_queries.dtype, base_queries.dtype)
+        self.assertEqual(routed_embedding.dtype, base_embedding.dtype)
         with self.assertRaisesRegex(RuntimeError, "evaluation-only"):
             self.module.route_oracle(
                 base_goal_queries=base_queries,

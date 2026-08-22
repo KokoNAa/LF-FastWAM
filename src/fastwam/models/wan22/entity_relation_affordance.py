@@ -2042,11 +2042,11 @@ class EntityRelationAffordanceField(nn.Module):
             torch.full_like(routing_multiplier, 20.0),
             torch.full_like(routing_multiplier, -20.0),
         )
-        scheduled_relation = (
-            affordance["relation_hidden"] * routing_multiplier.unsqueeze(-1)
+        scheduled_relation = affordance["relation_hidden"] * (
+            routing_multiplier.to(affordance["relation_hidden"].dtype).unsqueeze(-1)
         )
-        scheduled_embedding = (
-            affordance["embedding_tokens"] * routing_multiplier.unsqueeze(-1)
+        scheduled_embedding = affordance["embedding_tokens"] * (
+            routing_multiplier.to(affordance["embedding_tokens"].dtype).unsqueeze(-1)
         )
         routed_queries, routed_embedding, query_attention = self._route_relation(
             base_goal_queries=base_goal_queries,
