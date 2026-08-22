@@ -170,17 +170,30 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("rollout/evaluation step alignment", source)
         self.assertIn("raw_fp32_pairwise_advantage", source)
 
-    def test_v912_evaluation_restores_rebinding_checkpoint_contract(self):
+    def test_v9_evaluation_restores_eraf_contract_from_checkpoint_metadata(self):
         source = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
             encoding="utf-8"
         )
+        self.assertIn("PGC_V9_METADATA_OVERRIDES", source)
         self.assertIn(
-            "PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 13", source
+            '"eraf_closed_loop_rebinding_hidden_dim": '
+            '"closed_loop_rebinding_hidden_dim"',
+            source,
         )
-        self.assertIn("closed_loop_rebinding_hidden_dim=256", source)
-        self.assertIn("closed_loop_query_residual_max_abs=1.0", source)
-        self.assertIn("closed_loop_state_residual_max_abs=2.0", source)
-        self.assertIn("phase_rebinding_energy_weight=0.01", source)
+        self.assertIn(
+            '"eraf_phase_rebinding_energy_weight": '
+            '"phase_rebinding_energy_weight"',
+            source,
+        )
+        self.assertIn(
+            '"eraf_role_attention_preservation_weight": (', source
+        )
+        self.assertIn(
+            '"eraf_clause_activation_balance_weight": '
+            '"clause_activation_balance_weight"',
+            source,
+        )
+        self.assertNotIn("phase_rebinding_energy_weight=0.01", source)
 
 
 if __name__ == "__main__":

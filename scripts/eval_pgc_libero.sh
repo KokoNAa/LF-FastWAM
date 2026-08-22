@@ -337,57 +337,102 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
     "EVALUATION.entity_relation_diagnostics=${ERAF_DIAGNOSTICS}"
     "EVALUATION.entity_relation_shadow_audit=${ERAF_SHADOW_AUDIT}"
   )
+  # Reconstruct ERAF with the exact checkpoint architecture/loss contract.
+  # These values are not merely training diagnostics: the strict V9 loader
+  # validates them before restoring sidecar modules. Hard-coding defaults here
+  # made a V9.12 checkpoint inherit V9.11's non-zero frozen-path weights and
+  # fail identically in every evaluation worker during model construction.
+  PGC_V9_METADATA_OVERRIDES="$("${PYTHON_BIN}" - "${PGC_CHECKPOINT}" <<'PY'
+import sys
+import torch
+
+payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+metadata = payload.get("architecture_metadata") or {}
+mapping = {
+    "eraf_hidden_dim": "hidden_dim",
+    "eraf_num_heads": "num_heads",
+    "eraf_max_clauses": "max_clauses",
+    "eraf_camera_count": "camera_count",
+    "eraf_visual_aspect_ratio": "visual_aspect_ratio",
+    "eraf_temperature": "temperature",
+    "eraf_attention_mask_weight": "attention_mask_weight",
+    "eraf_role_swap_weight": "role_swap_weight",
+    "eraf_role_overlap_weight": "role_overlap_weight",
+    "eraf_role_swap_margin": "role_swap_margin",
+    "eraf_role_assignment_weight": "role_assignment_weight",
+    "eraf_role_assignment_temperature": "role_assignment_temperature",
+    "eraf_role_assignment_hard_weight": "role_assignment_hard_weight",
+    "eraf_structured_assignment_weight": "structured_assignment_weight",
+    "eraf_structured_assignment_temperature": "structured_assignment_temperature",
+    "eraf_structured_assignment_hard_weight": "structured_assignment_hard_weight",
+    "eraf_multi_clause_consistency_weight": "multi_clause_consistency_weight",
+    "eraf_clause_tuple_assignment_weight": "clause_tuple_assignment_weight",
+    "eraf_clause_tuple_temperature": "clause_tuple_temperature",
+    "eraf_clause_tuple_hard_weight": "clause_tuple_hard_weight",
+    "eraf_clause_tuple_multi_consistency_weight": (
+        "clause_tuple_multi_consistency_weight"
+    ),
+    "eraf_clause_activation_balance_weight": "clause_activation_balance_weight",
+    "eraf_clause_cardinality_weight": "clause_cardinality_weight",
+    "eraf_clause_worst_slot_weight": "clause_worst_slot_weight",
+    "eraf_clause_multi_group_weight": "clause_multi_group_weight",
+    "eraf_clause_adapter_energy_weight": "clause_adapter_energy_weight",
+    "eraf_view_fusion_weight": "view_fusion_weight",
+    "eraf_view_fusion_energy_weight": "view_fusion_energy_weight",
+    "eraf_clause_scheduler_weight": "clause_scheduler_weight",
+    "eraf_clause_scheduler_energy_weight": "clause_scheduler_energy_weight",
+    "eraf_phase_rebinding_energy_weight": "phase_rebinding_energy_weight",
+    "eraf_role_adapter_hidden_dim": "role_adapter_hidden_dim",
+    "eraf_structured_role_adapter_hidden_dim": (
+        "structured_role_adapter_hidden_dim"
+    ),
+    "eraf_balanced_role_adapter_hidden_dim": "balanced_role_adapter_hidden_dim",
+    "eraf_clause_activation_adapter_hidden_dim": (
+        "clause_activation_adapter_hidden_dim"
+    ),
+    "eraf_clause_activation_residual_max_abs": (
+        "clause_activation_residual_max_abs"
+    ),
+    "eraf_view_fusion_adapter_hidden_dim": "view_fusion_adapter_hidden_dim",
+    "eraf_view_fusion_residual_max_abs": "view_fusion_residual_max_abs",
+    "eraf_clause_scheduler_hidden_dim": "clause_scheduler_hidden_dim",
+    "eraf_clause_scheduler_residual_max_abs": (
+        "clause_scheduler_residual_max_abs"
+    ),
+    "eraf_closed_loop_rebinding_hidden_dim": "closed_loop_rebinding_hidden_dim",
+    "eraf_closed_loop_query_residual_max_abs": (
+        "closed_loop_query_residual_max_abs"
+    ),
+    "eraf_closed_loop_state_residual_max_abs": (
+        "closed_loop_state_residual_max_abs"
+    ),
+    "eraf_role_attention_preservation_weight": (
+        "role_attention_preservation_weight"
+    ),
+    "eraf_role_position_preservation_weight": (
+        "role_position_preservation_weight"
+    ),
+    "eraf_role_anchor_preservation_weight": "role_anchor_preservation_weight",
+    "eraf_role_relation_preservation_weight": (
+        "role_relation_preservation_weight"
+    ),
+    "eraf_role_adapter_energy_weight": "role_adapter_energy_weight",
+}
+prefix = "model.policy_guard.entity_relation_grounding."
+for metadata_key, config_key in mapping.items():
+    value = metadata.get(metadata_key)
+    if value is None:
+        continue
+    if isinstance(value, bool):
+        value = str(value).lower()
+    print(f"{prefix}{config_key}={value}")
+PY
+)"
+  while IFS= read -r override; do
+    [[ -z "${override}" ]] || EXTRA_OVERRIDES+=("${override}")
+  done <<< "${PGC_V9_METADATA_OVERRIDES}"
   if [[ "${ERAF_DIAGNOSTICS}" == "true" ]]; then
     EXTRA_OVERRIDES+=("EVALUATION.entity_relation_overlay_dir=${ERAF_OVERLAY_DIR}")
-  fi
-  if (( PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 9 )); then
-    EXTRA_OVERRIDES+=(
-      "model.policy_guard.entity_relation_grounding.role_assignment_weight=1.0"
-      "model.policy_guard.entity_relation_grounding.role_assignment_hard_weight=0.5"
-      "model.policy_guard.entity_relation_grounding.structured_assignment_weight=2.0"
-      "model.policy_guard.entity_relation_grounding.structured_assignment_hard_weight=1.0"
-      "model.policy_guard.entity_relation_grounding.multi_clause_consistency_weight=2.0"
-      "model.policy_guard.entity_relation_grounding.role_attention_preservation_weight=5.0"
-      "model.policy_guard.entity_relation_grounding.role_position_preservation_weight=2.0"
-      "model.policy_guard.entity_relation_grounding.role_anchor_preservation_weight=10.0"
-      "model.policy_guard.entity_relation_grounding.role_relation_preservation_weight=2.0"
-      "model.policy_guard.entity_relation_grounding.role_adapter_energy_weight=0.01"
-      "model.policy_guard.entity_relation_grounding.clause_activation_adapter_hidden_dim=256"
-      "model.policy_guard.entity_relation_grounding.clause_activation_residual_max_abs=4.0"
-      "model.policy_guard.entity_relation_grounding.clause_activation_balance_weight=1.0"
-      "model.policy_guard.entity_relation_grounding.clause_cardinality_weight=1.0"
-      "model.policy_guard.entity_relation_grounding.clause_worst_slot_weight=2.0"
-      "model.policy_guard.entity_relation_grounding.clause_multi_group_weight=1.0"
-      "model.policy_guard.entity_relation_grounding.clause_adapter_energy_weight=0.01"
-    )
-  fi
-  if (( PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 10 )); then
-    EXTRA_OVERRIDES+=(
-      "model.policy_guard.entity_relation_grounding.view_fusion_adapter_hidden_dim=256"
-      "model.policy_guard.entity_relation_grounding.view_fusion_residual_max_abs=4.0"
-      "model.policy_guard.entity_relation_grounding.view_fusion_weight=2.0"
-      "model.policy_guard.entity_relation_grounding.view_fusion_energy_weight=0.01"
-      "model.policy_guard.entity_relation_grounding.clause_scheduler_hidden_dim=256"
-      "model.policy_guard.entity_relation_grounding.clause_scheduler_residual_max_abs=1.0"
-      "model.policy_guard.entity_relation_grounding.clause_scheduler_weight=1.0"
-      "model.policy_guard.entity_relation_grounding.clause_scheduler_energy_weight=0.01"
-    )
-  fi
-  if (( PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 12 )); then
-    EXTRA_OVERRIDES+=(
-      "model.policy_guard.entity_relation_grounding.clause_tuple_assignment_weight=4.0"
-      "model.policy_guard.entity_relation_grounding.clause_tuple_temperature=0.10"
-      "model.policy_guard.entity_relation_grounding.clause_tuple_hard_weight=1.0"
-      "model.policy_guard.entity_relation_grounding.clause_tuple_multi_consistency_weight=2.0"
-    )
-  fi
-  if (( PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 13 )); then
-    EXTRA_OVERRIDES+=(
-      "model.policy_guard.entity_relation_grounding.closed_loop_rebinding_hidden_dim=256"
-      "model.policy_guard.entity_relation_grounding.closed_loop_query_residual_max_abs=1.0"
-      "model.policy_guard.entity_relation_grounding.closed_loop_state_residual_max_abs=2.0"
-      "model.policy_guard.entity_relation_grounding.phase_rebinding_energy_weight=0.01"
-    )
   fi
   if [[ "${ERAF_SHADOW_AUDIT}" == "true" ]]; then
     if [[ "${GATE_MODE}" != "base" ]]; then
