@@ -2810,6 +2810,7 @@ class FastWAM(torch.nn.Module):
         language_context_len: Optional[int] = None,
         current_visual_hidden: Optional[torch.Tensor] = None,
         policy_guard_state: Optional[Mapping[str, torch.Tensor]] = None,
+        policy_guard_eraf_oracle: Optional[Mapping[str, torch.Tensor]] = None,
         proprio: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if not self.policy_guard_enabled:
@@ -2835,6 +2836,7 @@ class FastWAM(torch.nn.Module):
                     context_mask=context_mask,
                     language_context_len=int(language_context_len),
                     policy_guard_state=policy_guard_state,
+                    policy_guard_eraf_oracle=policy_guard_eraf_oracle,
                     proprio=proprio,
                 )
             )
@@ -2895,6 +2897,7 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         language_context_len: int,
         policy_guard_state: Optional[Mapping[str, torch.Tensor]] = None,
+        policy_guard_eraf_oracle: Optional[Mapping[str, torch.Tensor]] = None,
         proprio: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
@@ -2952,6 +2955,19 @@ class FastWAM(torch.nn.Module):
             policy_state=policy_guard_state,
             proprio=proprio,
         )
+        if policy_guard_eraf_oracle is not None:
+            if torch.is_grad_enabled():
+                raise RuntimeError(
+                    "Oracle ERAF labels are forbidden during training."
+                )
+            routed_queries, routed_embedding, eraf_outputs = (
+                eraf_module.route_oracle(
+                    base_goal_queries=base_goal_queries.detach(),
+                    base_goal_embedding=base_goal_embedding.detach(),
+                    outputs=eraf_outputs,
+                    oracle=policy_guard_eraf_oracle,
+                )
+            )
         # ``prepare_trainable_parameters`` intentionally leaves the frozen root
         # model in eval mode and toggles only the active sidecar module.  Root
         # ``self.training`` is therefore false during every PGC stage; use the
@@ -3058,6 +3074,12 @@ class FastWAM(torch.nn.Module):
                 "spatial_coordinates",
                 "camera_ids",
             )
+            if "oracle_eraf_enabled" in eraf_outputs:
+                diagnostic_names = diagnostic_names + (
+                    "oracle_eraf_enabled",
+                    "oracle_selected_clause",
+                    "oracle_clause_valid",
+                )
             self._policy_guard_last_eraf_diagnostics = {
                 name: eraf_outputs[name].detach().float().cpu()
                 if eraf_outputs[name].is_floating_point()
@@ -9105,6 +9127,7 @@ class FastWAM(torch.nn.Module):
         test_action_with_infer_action: bool = True,
         mask_language: bool = False,
         policy_guard_state: Optional[Mapping[str, torch.Tensor]] = None,
+        policy_guard_eraf_oracle: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         self.eval()
         action_only_pred = None
@@ -9125,6 +9148,7 @@ class FastWAM(torch.nn.Module):
                 proprio=proprio.clone() if proprio is not None else None,
                 mask_language=mask_language,
                 policy_guard_state=policy_guard_state,
+                policy_guard_eraf_oracle=policy_guard_eraf_oracle,
             )
             action_only_out = action_only_pred["action"]
         
@@ -9320,8 +9344,13 @@ class FastWAM(torch.nn.Module):
         tiled: bool = False,
         mask_language: bool = False,
         policy_guard_state: Optional[Mapping[str, torch.Tensor]] = None,
+        policy_guard_eraf_oracle: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         self.eval()
+        if policy_guard_eraf_oracle is not None and not (
+            self.policy_guard_enabled and self.policy_guard_version == 9
+        ):
+            raise ValueError("Oracle ERAF input requires PGC v9.")
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError(
                 "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
@@ -9520,6 +9549,7 @@ class FastWAM(torch.nn.Module):
                 language_context_len=language_context_len,
                 current_visual_hidden=video_pre["tokens"],
                 policy_guard_state=policy_guard_state,
+                policy_guard_eraf_oracle=policy_guard_eraf_oracle,
                 proprio=proprio,
             )
             policy_guard_current_video_hidden = final_video_hidden[:, : int(

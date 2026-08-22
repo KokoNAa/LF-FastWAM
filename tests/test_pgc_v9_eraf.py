@@ -1003,6 +1003,7 @@ class PGCERAFModuleTest(unittest.TestCase):
             labels[f"{role}_entity_ids"] = torch.tensor(
                 [[entity_ids[0], -1, -1, -1], [entity_ids[1], -1, -1, -1]]
             )
+
         for name in ("grasp", "goal", "interaction"):
             labels[f"{name}_anchors"] = torch.zeros(2, 4, 3)
             labels[f"{name}_anchor_valid"] = labels["clause_valid"].clone()
@@ -1046,6 +1047,75 @@ class PGCERAFModuleTest(unittest.TestCase):
         )
         self.assertEqual(unary_metrics["loss_pgc_v9_role_swap"].item(), 0.0)
         self.assertEqual(unary_metrics["loss_pgc_v9_role_overlap"].item(), 0.0)
+
+    def test_oracle_route_replaces_grounding_and_keeps_learned_bridge(self):
+        base_queries, base_embedding, (_, _, outputs, _) = self._forward()
+        with torch.no_grad():
+            self.module.query_delta_projection.weight.normal_(std=0.02)
+            self.module.embedding_delta_projection.weight.normal_(std=0.02)
+        clause_valid = torch.tensor(
+            [[True, True, False, False], [True, False, False, False]]
+        )
+        subject_masks = torch.zeros(2, 4, 8, 16)
+        reference_masks = torch.zeros_like(subject_masks)
+        subject_masks[:, :, :4, :4] = 1
+        reference_masks[:, :, 4:, 12:] = 1
+        oracle = {
+            "clause_valid": clause_valid,
+            "predicate_ids": torch.tensor([[1, 2, 0, 0], [2, 0, 0, 0]]),
+            "subject_masks": subject_masks,
+            "reference_masks": reference_masks,
+            "subject_mask_valid": clause_valid,
+            "reference_mask_valid": clause_valid,
+            "subject_positions": torch.full((2, 4, 3), -0.25),
+            "reference_positions": torch.full((2, 4, 3), 0.25),
+            "subject_position_valid": clause_valid,
+            "reference_position_valid": clause_valid,
+            "goal_anchors": torch.full((2, 4, 3), 0.5),
+            "goal_anchor_valid": clause_valid,
+            "predicate_truth": torch.tensor(
+                [[True, False, False, False], [False, False, False, False]]
+            ),
+            "phase_ids": torch.tensor([[2, 0, 0, 0], [0, 0, 0, 0]]),
+            "phase_valid": clause_valid,
+        }
+        with torch.no_grad():
+            routed_queries, routed_embedding, routed = self.module.route_oracle(
+                base_goal_queries=base_queries,
+                base_goal_embedding=base_embedding,
+                outputs=outputs,
+                oracle=oracle,
+            )
+        self.assertEqual(
+            routed["predicate_logits"].argmax(-1).tolist(),
+            [[1, 2, 0, 0], [2, 0, 0, 0]],
+        )
+        self.assertEqual(
+            routed["phase_logits"].argmax(-1).tolist(),
+            [[2, 0, 0, 0], [0, 0, 0, 0]],
+        )
+        self.assertEqual(routed["oracle_selected_clause"].tolist(), [1, 0])
+        self.assertEqual(
+            routed["clause_routing_multiplier"].tolist(),
+            [[0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+        )
+        torch.testing.assert_close(
+            routed["subject_position"][clause_valid],
+            oracle["subject_positions"][clause_valid],
+        )
+        torch.testing.assert_close(
+            routed["goal_anchor"][clause_valid],
+            oracle["goal_anchors"][clause_valid],
+        )
+        self.assertFalse(torch.equal(routed_queries, base_queries))
+        self.assertFalse(torch.equal(routed_embedding, base_embedding))
+        with self.assertRaisesRegex(RuntimeError, "evaluation-only"):
+            self.module.route_oracle(
+                base_goal_queries=base_queries,
+                base_goal_embedding=base_embedding,
+                outputs=outputs,
+                oracle=oracle,
+            )
 
     def test_v99_view_fusion_and_scheduler_are_zero_init_and_trainable(self):
         torch.manual_seed(919)

@@ -27,10 +27,12 @@ ERAF_CLOSED_LOOP_CAPTURE_STAGES="${PGC_ERAF_CLOSED_LOOP_CAPTURE_STAGES:-initial_
 V9_ABLATION="${PGC_V9_ABLATION:-full}"
 ERAF_SHADOW_AUDIT="${PGC_ERAF_SHADOW_AUDIT:-false}"
 ERAF_SHADOW_SIDECAR_DIR="${PGC_ERAF_SHADOW_SIDECAR_DIR:-}"
+ERAF_ORACLE="${PGC_ERAF_ORACLE:-false}"
+ERAF_ORACLE_SIDECAR_DIR="${PGC_ERAF_ORACLE_SIDECAR_DIR:-}"
 ERAF_STATELESS_REPLAN_ABLATION="${PGC_ERAF_STATELESS_REPLAN_ABLATION:-false}"
 ERAF_COMPLETION_ONLY_MEMORY_ABLATION="${PGC_ERAF_COMPLETION_ONLY_MEMORY_ABLATION:-false}"
 ERAF_DIAGNOSTICS_DEFAULT=true
-if [[ "${ERAF_SHADOW_AUDIT}" == "true" ]]; then
+if [[ "${ERAF_SHADOW_AUDIT}" == "true" || "${ERAF_ORACLE}" == "true" ]]; then
   # A shadow audit scores every replan directly in JSON. Avoid writing several
   # thousand PNG/NPZ overlays unless the caller opts in explicitly.
   ERAF_DIAGNOSTICS_DEFAULT=false
@@ -77,6 +79,17 @@ case "${ERAF_SHADOW_AUDIT}" in
     exit 1
     ;;
 esac
+case "${ERAF_ORACLE}" in
+  true|false) ;;
+  *)
+    echo "PGC_ERAF_ORACLE must be true or false." >&2
+    exit 1
+    ;;
+esac
+if [[ "${ERAF_ORACLE}" == "true" && "${ERAF_SHADOW_AUDIT}" == "true" ]]; then
+  echo "Oracle ERAF and passive ERAF shadow audit are mutually exclusive." >&2
+  exit 1
+fi
 case "${ERAF_STATELESS_REPLAN_ABLATION}" in
   true|false) ;;
   *)
@@ -335,6 +348,28 @@ if [[ "${ERAF_SHADOW_AUDIT}" == "true" && "${PGC_CHECKPOINT_VERSION}" != "9" ]];
   echo "PGC ERAF shadow audit requires a PGC v9 checkpoint." >&2
   exit 1
 fi
+if [[ "${ERAF_ORACLE}" == "true" ]]; then
+  if [[ "${PGC_CHECKPOINT_VERSION}" != "9" ]]; then
+    echo "Oracle ERAF requires a PGC v9 checkpoint." >&2
+    exit 1
+  fi
+  if [[ "${GATE_MODE}" != "counterfactual" ]]; then
+    echo "Oracle ERAF requires PGC_GATE_MODE=counterfactual." >&2
+    exit 1
+  fi
+  if [[ "${CONDITION}" != "correct" && "${CONDITION}" != "counterfactual" ]]; then
+    echo "Oracle ERAF supports only correct or counterfactual." >&2
+    exit 1
+  fi
+  if [[ -z "${ERAF_ORACLE_SIDECAR_DIR}" ]]; then
+    echo "Set PGC_ERAF_ORACLE_SIDECAR_DIR for oracle workspace/mask metadata." >&2
+    exit 1
+  fi
+  if [[ ! -f "${ERAF_ORACLE_SIDECAR_DIR%/}/index.json" && ! -f "${ERAF_ORACLE_SIDECAR_DIR}" ]]; then
+    echo "Oracle ERAF sidecar index not found: ${ERAF_ORACLE_SIDECAR_DIR}" >&2
+    exit 1
+  fi
+fi
 if [[ "${ERAF_STATELESS_REPLAN_ABLATION}" == "true" || "${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}" == "true" ]]; then
   if [[ "${PGC_CHECKPOINT_VERSION}" != "9" || "${PGC_V9_GROUNDING_OBJECTIVE_VERSION}" -lt 14 ]]; then
     echo "Policy-state ablations require a PGC V9.13+ phase-memory checkpoint." >&2
@@ -410,6 +445,7 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
     "model.policy_guard.entity_relation_grounding.use_anchors=${V9_USE_ANCHORS}"
     "EVALUATION.entity_relation_diagnostics=${ERAF_DIAGNOSTICS}"
     "EVALUATION.entity_relation_shadow_audit=${ERAF_SHADOW_AUDIT}"
+    "EVALUATION.entity_relation_oracle=${ERAF_ORACLE}"
     "EVALUATION.entity_relation_stateless_replan_ablation=${ERAF_STATELESS_REPLAN_ABLATION}"
     "EVALUATION.entity_relation_completion_only_memory_ablation=${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}"
   )
@@ -544,6 +580,11 @@ PY
       "EVALUATION.entity_relation_shadow_sidecar_dir=${ERAF_SHADOW_SIDECAR_DIR}"
     )
   fi
+  if [[ "${ERAF_ORACLE}" == "true" ]]; then
+    EXTRA_OVERRIDES+=(
+      "EVALUATION.entity_relation_oracle_sidecar_dir=${ERAF_ORACLE_SIDECAR_DIR}"
+    )
+  fi
 fi
 if [[ -n "${MANIFEST_PATH}" ]]; then
   EXTRA_OVERRIDES+=("EVALUATION.language_intervention_manifest=${MANIFEST_PATH}")
@@ -603,6 +644,8 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
   echo "  eraf_overlay_dir=${ERAF_OVERLAY_DIR}"
   echo "  eraf_shadow_audit=${ERAF_SHADOW_AUDIT}"
   echo "  eraf_shadow_sidecar=${ERAF_SHADOW_SIDECAR_DIR:-disabled}"
+  echo "  eraf_oracle=${ERAF_ORACLE}"
+  echo "  eraf_oracle_sidecar=${ERAF_ORACLE_SIDECAR_DIR:-disabled}"
   if [[ "${ERAF_STATELESS_REPLAN_ABLATION}" == "true" ]]; then
     ERAF_POLICY_STATE_MODE=reset_each_replan
   elif [[ "${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}" == "true" ]]; then

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from experiments.libero.eraf_shadow_audit import (
+    ERAFOracleProvider,
     ERAFShadowAuditor,
     ERAFShadowContract,
     _clause_statuses,
@@ -177,6 +178,20 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
             "agentview_segmentation_element": segmentation,
             "robot0_eye_in_hand_segmentation_element": segmentation,
         }
+
+        oracle = ERAFOracleProvider(
+            env=env,
+            policy_instruction="put object on basket",
+            instruction_condition="correct",
+            contract=contract,
+            counterfactual_metadata=None,
+        ).policy_input(obs=obs, episode_idx=0)
+        self.assertEqual(oracle["clause_valid"].tolist(), [True, False, False, False])
+        self.assertEqual(oracle["predicate_ids"][0], 2)
+        self.assertTrue(oracle["subject_mask_valid"][0])
+        self.assertTrue(oracle["reference_mask_valid"][0])
+        self.assertEqual(oracle["phase_ids"][0], 0)
+        self.assertFalse(oracle["predicate_truth"][0])
         predicate_logits = np.zeros((1, 4, len(PGC_ENTITY_RELATION_PREDICATES)))
         predicate_logits[0, 0, PGC_ENTITY_RELATION_PREDICATES.index("on")] = 5.0
         subject_attention = np.zeros((1, 4, 8), dtype=np.float32)

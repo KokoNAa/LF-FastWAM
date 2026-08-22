@@ -41,6 +41,7 @@ from experiments.libero.counterfactual_diagnostics import (
     empty_behavior_counts,
 )
 from experiments.libero.eraf_shadow_audit import (
+    ERAFOracleProvider,
     ERAFShadowAuditor,
     ERAFShadowContract,
     summarize_eraf_shadow_records,
@@ -721,6 +722,7 @@ def _predict_action_chunk(
     input_h: int,
     model_device: str,
     policy_guard_state: Optional[dict[str, Any]] = None,
+    policy_guard_eraf_oracle: Optional[dict[str, Any]] = None,
 ) -> tuple[
     np.ndarray,
     dict,
@@ -786,6 +788,15 @@ def _predict_action_chunk(
         and "policy_guard_state" in inspect.signature(inference_method).parameters
     ):
         infer_kwargs["policy_guard_state"] = policy_guard_state
+    if policy_guard_eraf_oracle is not None:
+        if "policy_guard_eraf_oracle" not in inspect.signature(
+            inference_method
+        ).parameters:
+            raise ValueError(
+                "Oracle ERAF evaluation requires an inference method with a "
+                "`policy_guard_eraf_oracle` argument."
+            )
+        infer_kwargs["policy_guard_eraf_oracle"] = policy_guard_eraf_oracle
 
     with torch.no_grad():
         if str(model_device).startswith("cuda"):
@@ -851,9 +862,12 @@ def _predict_action_chunk(
         eraf_shadow_enabled = bool(
             cfg.EVALUATION.get("entity_relation_shadow_audit", False)
         )
+        eraf_oracle_enabled = bool(
+            cfg.EVALUATION.get("entity_relation_oracle", False)
+        )
         if bool(cfg.EVALUATION.get("entity_relation_diagnostics", False)) or (
             eraf_shadow_enabled
-        ):
+        ) or eraf_oracle_enabled:
             eraf = pred.get("policy_guard_eraf_diagnostics")
             if eraf is None:
                 raise RuntimeError(
@@ -1128,6 +1142,7 @@ def run_single_episode(
     model_device: str,
     counterfactual_metadata: Optional[dict[str, Any]] = None,
     eraf_shadow_auditor: Optional[ERAFShadowAuditor] = None,
+    eraf_oracle_provider: Optional[ERAFOracleProvider] = None,
 ) -> tuple[
     bool,
     list,
@@ -1336,12 +1351,40 @@ def run_single_episode(
                 input_h=input_h,
                 model_device=model_device,
                 policy_guard_state=policy_guard_state.state_for_replan(),
+                policy_guard_eraf_oracle=(
+                    eraf_oracle_provider.policy_input(
+                        obs=obs,
+                        episode_idx=episode_idx,
+                    )
+                    if eraf_oracle_provider is not None
+                    else None
+                ),
             )
             policy_guard_state.accept_model_state(next_policy_guard_state)
             inference_latencies_ms.append(inference_latency_ms)
             if policy_guard_diagnostics is not None:
                 eraf_raw = policy_guard_diagnostics.pop("_entity_relation_raw", None)
                 if eraf_raw is not None:
+                    if eraf_oracle_provider is not None:
+                        oracle_enabled = bool(
+                            np.asarray(
+                                eraf_raw.get("oracle_eraf_enabled", False)
+                            ).reshape(-1)[0]
+                        )
+                        if not oracle_enabled:
+                            raise RuntimeError(
+                                "Oracle ERAF was requested but the model did "
+                                "not acknowledge the privileged intervention."
+                            )
+                        selected_clause = int(
+                            np.asarray(
+                                eraf_raw["oracle_selected_clause"]
+                            ).reshape(-1)[0]
+                        )
+                        policy_guard_diagnostics["entity_relation_oracle"] = {
+                            "enabled": True,
+                            "selected_clause": selected_clause,
+                        }
                     if eraf_shadow_auditor is not None:
                         shadow_record = eraf_shadow_auditor.observe(
                             obs=obs,
@@ -1547,6 +1590,9 @@ def run_single_task(
     eraf_shadow_enabled = bool(
         cfg.EVALUATION.get("entity_relation_shadow_audit", False)
     )
+    eraf_oracle_enabled = bool(
+        cfg.EVALUATION.get("entity_relation_oracle", False)
+    )
     stateless_replan_ablation = bool(
         cfg.EVALUATION.get(
             "entity_relation_stateless_replan_ablation", False
@@ -1581,7 +1627,9 @@ def run_single_task(
         task,
         LIBERO_ENV_RESOLUTION,
         cfg.get("seed"),
-        camera_segmentations="element" if eraf_shadow_enabled else None,
+        camera_segmentations=(
+            "element" if eraf_shadow_enabled or eraf_oracle_enabled else None
+        ),
     )
     (
         instruction_condition,
@@ -1656,6 +1704,47 @@ def run_single_task(
                 >= 11
             ),
         )
+    eraf_oracle_provider = None
+    if eraf_oracle_enabled:
+        if eraf_shadow_enabled:
+            raise ValueError(
+                "Oracle ERAF and passive ERAF shadow audit are mutually exclusive."
+            )
+        if instruction_condition not in {"correct", "counterfactual"}:
+            raise ValueError(
+                "EVALUATION.entity_relation_oracle supports only correct or "
+                "counterfactual instructions."
+            )
+        if (
+            not bool(getattr(model, "policy_guard_enabled", False))
+            or int(getattr(model, "policy_guard_version", -1)) != 9
+        ):
+            raise ValueError("Oracle ERAF requires a PGC v9 checkpoint.")
+        if bool(model.training):
+            raise ValueError("Oracle ERAF requires model.eval().")
+        if str(getattr(model, "policy_guard_gate_mode", "")) != "counterfactual":
+            raise ValueError(
+                "Oracle ERAF must execute the Proposal and therefore requires "
+                "model.policy_guard.gate_mode=counterfactual."
+            )
+        if bool(cfg.EVALUATION.get("visualize_future_video", False)):
+            raise ValueError(
+                "Oracle ERAF does not support future-video visualization."
+            )
+        sidecar_value = cfg.EVALUATION.get("entity_relation_oracle_sidecar_dir")
+        if sidecar_value in (None, "", "null"):
+            raise ValueError(
+                "Oracle ERAF requires "
+                "EVALUATION.entity_relation_oracle_sidecar_dir."
+            )
+        eraf_oracle_provider = ERAFOracleProvider(
+            env=env,
+            policy_instruction=policy_instruction,
+            instruction_condition=instruction_condition,
+            contract=ERAFShadowContract.load(str(sidecar_value)),
+            counterfactual_metadata=counterfactual_metadata,
+            all_entity_role_gate=True,
+        )
     counterfactual_diagnostics_enabled = bool(
         cfg.EVALUATION.get("counterfactual_diagnostics", False)
     )
@@ -1720,6 +1809,19 @@ def run_single_task(
             ),
             "records": [],
         }
+    if eraf_oracle_enabled:
+        results["eraf_oracle"] = {
+            "enabled": True,
+            "causal_intervention": True,
+            "privileged_labels": "evaluation_only_mujoco_bddl",
+            "executed_policy": "forced_proposal",
+            "intervention_scope": (
+                "clause_predicate_entity_geometry_truth_phase_scheduler"
+            ),
+            "learned_components_unchanged": (
+                "eraf_relation_reasoner_bridge_and_action_proposal"
+            ),
+        }
     if intervention_record is not None:
         results["pair_id"] = intervention_record.get("pair_id")
     if counterfactual_metadata is not None:
@@ -1760,6 +1862,7 @@ def run_single_task(
                 counterfactual_metadata if counterfactual_diagnostics_enabled else None
             ),
             eraf_shadow_auditor=eraf_shadow_auditor,
+            eraf_oracle_provider=eraf_oracle_provider,
         )
         results["inference_latencies_ms"].extend(inference_latencies_ms)
         results["episode_policy_steps"].append(policy_steps_executed)

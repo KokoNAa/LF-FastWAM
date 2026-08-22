@@ -1856,6 +1856,255 @@ class EntityRelationAffordanceField(nn.Module):
         ).to(base_goal_embedding.dtype)
         return routed_queries, routed_embedding, query_attention
 
+    def route_oracle(
+        self,
+        *,
+        base_goal_queries: torch.Tensor,
+        base_goal_embedding: torch.Tensor,
+        outputs: Mapping[str, torch.Tensor],
+        oracle: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Route simulator-perfect ERAF state through the learned action bridge.
+
+        This is an evaluation-only causal intervention.  It replaces ERAF's
+        clause activity, predicate identity, entity heatmaps/positions,
+        predicate truth, phase, goal anchor, and unfinished-clause routing with
+        same-state privileged labels.  It deliberately leaves the learned
+        ERAF-to-GoalGraph projections and ActionChunkProposal untouched, so an
+        online failure isolates that interface rather than grounding quality.
+        """
+        if torch.is_grad_enabled():
+            raise RuntimeError("Oracle ERAF routing is evaluation-only.")
+        required = {
+            "clause_valid",
+            "predicate_ids",
+            "subject_masks",
+            "reference_masks",
+            "subject_mask_valid",
+            "reference_mask_valid",
+            "subject_positions",
+            "reference_positions",
+            "subject_position_valid",
+            "reference_position_valid",
+            "goal_anchors",
+            "goal_anchor_valid",
+            "predicate_truth",
+            "phase_ids",
+            "phase_valid",
+        }
+        missing = sorted(required - set(oracle))
+        if missing:
+            raise ValueError(f"Oracle ERAF input is missing fields: {missing}.")
+
+        device = outputs["clause_hidden"].device
+        batch_size, clause_count, _ = outputs["clause_hidden"].shape
+
+        def value(name: str, *, dtype: torch.dtype) -> torch.Tensor:
+            tensor = torch.as_tensor(oracle[name], device=device, dtype=dtype)
+            if tensor.ndim > 0 and tensor.shape[0] != batch_size:
+                tensor = tensor.unsqueeze(0)
+            return tensor
+
+        clause_valid = value("clause_valid", dtype=torch.bool)
+        predicate_ids = value("predicate_ids", dtype=torch.long)
+        expected_clause_shape = (batch_size, clause_count)
+        if clause_valid.shape != expected_clause_shape:
+            raise ValueError(
+                "Oracle ERAF clause_valid must have shape "
+                f"{expected_clause_shape}, got {tuple(clause_valid.shape)}."
+            )
+        if predicate_ids.shape != expected_clause_shape:
+            raise ValueError("Oracle ERAF predicate_ids shape is invalid.")
+        if bool(
+            ((predicate_ids < 0) | (predicate_ids >= len(ERAF_PREDICATES))).any()
+        ):
+            raise ValueError("Oracle ERAF predicate_ids contain an invalid ID.")
+
+        token_count = int(outputs["visual_tokens"].shape[1])
+        subject_masks = value("subject_masks", dtype=torch.float32)
+        reference_masks = value("reference_masks", dtype=torch.float32)
+        subject_attention, subject_visible = masks_to_patch_distributions(
+            subject_masks, token_count=token_count
+        )
+        reference_attention, reference_visible = masks_to_patch_distributions(
+            reference_masks, token_count=token_count
+        )
+        subject_mask_valid = value("subject_mask_valid", dtype=torch.bool)
+        reference_mask_valid = value("reference_mask_valid", dtype=torch.bool)
+        subject_mask_valid = subject_mask_valid & subject_visible & clause_valid
+        reference_mask_valid = reference_mask_valid & reference_visible & clause_valid
+        subject_attention = torch.where(
+            subject_mask_valid.unsqueeze(-1),
+            subject_attention,
+            outputs["subject_attention"].float(),
+        )
+        reference_attention = torch.where(
+            reference_mask_valid.unsqueeze(-1),
+            reference_attention,
+            outputs["reference_attention"].float(),
+        )
+        visual_tokens = outputs["visual_tokens"]
+        subject_token = torch.einsum(
+            "bct,btd->bcd", subject_attention.to(visual_tokens.dtype), visual_tokens
+        )
+        reference_token = torch.einsum(
+            "bct,btd->bcd",
+            reference_attention.to(visual_tokens.dtype),
+            visual_tokens,
+        )
+
+        subject_positions = value("subject_positions", dtype=torch.float32)
+        reference_positions = value("reference_positions", dtype=torch.float32)
+        subject_position_valid = value(
+            "subject_position_valid", dtype=torch.bool
+        ) & clause_valid
+        reference_position_valid = value(
+            "reference_position_valid", dtype=torch.bool
+        ) & clause_valid
+        subject_position = torch.where(
+            subject_position_valid.unsqueeze(-1),
+            subject_positions,
+            outputs["subject_position"].float(),
+        )
+        reference_position = torch.where(
+            reference_position_valid.unsqueeze(-1),
+            reference_positions,
+            outputs["reference_position"].float(),
+        )
+
+        predicted_predicate = torch.matmul(
+            torch.softmax(outputs["predicate_logits"].float(), dim=-1).to(
+                outputs["clause_hidden"].dtype
+            ),
+            self.role_decoder.predicate_embedding.weight,
+        )
+        oracle_predicate = self.role_decoder.predicate_embedding(predicate_ids).to(
+            outputs["clause_hidden"].dtype
+        )
+        clause_hidden = (
+            outputs["clause_hidden"] - predicted_predicate + oracle_predicate
+        )
+        active_logits = torch.where(
+            clause_valid,
+            torch.full(expected_clause_shape, 20.0, device=device),
+            torch.full(expected_clause_shape, -20.0, device=device),
+        )
+        affordance = self._decode_affordance(
+            clause_hidden=clause_hidden,
+            subject_token=subject_token,
+            reference_token=reference_token,
+            subject_position=subject_position,
+            reference_position=reference_position,
+            active_logits=active_logits,
+        )
+        predicate_truth = value("predicate_truth", dtype=torch.bool) & clause_valid
+        phase_ids = value("phase_ids", dtype=torch.long)
+        phase_valid = value("phase_valid", dtype=torch.bool) & clause_valid
+        if phase_ids.shape != expected_clause_shape or phase_valid.shape != expected_clause_shape:
+            raise ValueError("Oracle ERAF phase tensors have invalid shapes.")
+        if bool(((phase_ids < 0) | (phase_ids >= 3)).any()):
+            raise ValueError("Oracle ERAF phase_ids contain an invalid ID.")
+        predicate_truth_logits = torch.where(
+            predicate_truth,
+            torch.full(expected_clause_shape, 20.0, device=device),
+            torch.full(expected_clause_shape, -20.0, device=device),
+        )
+        phase_logits = torch.full(
+            (*expected_clause_shape, 3), -20.0, device=device
+        )
+        phase_logits.scatter_(-1, phase_ids.unsqueeze(-1), 20.0)
+        phase_logits = torch.where(
+            phase_valid.unsqueeze(-1), phase_logits, affordance["phase_logits"].float()
+        )
+
+        goal_anchors = value("goal_anchors", dtype=torch.float32)
+        goal_anchor_valid = value("goal_anchor_valid", dtype=torch.bool) & clause_valid
+        goal_anchor = torch.where(
+            goal_anchor_valid.unsqueeze(-1),
+            goal_anchors,
+            affordance["goal_anchor"].float(),
+        )
+        # A perfect scheduler executes the first unfinished valid clause.  The
+        # bridge sees a unit multiplier rather than an arbitrarily amplified
+        # oracle value, keeping the intervention on its training scale.
+        completed = clause_valid & predicate_truth & (phase_ids == 2)
+        unfinished = clause_valid & ~completed
+        selected_index = unfinished.float().argmax(dim=-1)
+        has_unfinished = unfinished.any(dim=-1)
+        execution_probability = F.one_hot(
+            selected_index, num_classes=clause_count
+        ).float()
+        execution_probability = execution_probability * has_unfinished.unsqueeze(-1)
+        routing_multiplier = execution_probability
+        execution_logits = torch.where(
+            routing_multiplier.bool(),
+            torch.full_like(routing_multiplier, 20.0),
+            torch.full_like(routing_multiplier, -20.0),
+        )
+        scheduled_relation = (
+            affordance["relation_hidden"] * routing_multiplier.unsqueeze(-1)
+        )
+        scheduled_embedding = (
+            affordance["embedding_tokens"] * routing_multiplier.unsqueeze(-1)
+        )
+        routed_queries, routed_embedding, query_attention = self._route_relation(
+            base_goal_queries=base_goal_queries,
+            base_goal_embedding=base_goal_embedding,
+            relation_hidden=scheduled_relation,
+            embedding_tokens=scheduled_embedding,
+        )
+
+        next_state_ids = torch.where(
+            completed,
+            torch.full_like(phase_ids, PhaseSafeClauseMemory.COMPLETED),
+            torch.full_like(phase_ids, PhaseSafeClauseMemory.PENDING),
+        )
+        oracle_outputs = dict(outputs)
+        oracle_outputs.update(
+            {
+                "clause_hidden": clause_hidden,
+                "active_logits": active_logits,
+                "predicate_logits": F.one_hot(
+                    predicate_ids, num_classes=len(ERAF_PREDICATES)
+                ).float()
+                * 40.0
+                - 20.0,
+                "subject_attention": subject_attention,
+                "reference_attention": reference_attention,
+                "subject_token": subject_token,
+                "reference_token": reference_token,
+                "subject_position": subject_position,
+                "reference_position": reference_position,
+                "predicate_truth_logits": predicate_truth_logits,
+                "phase_logits": phase_logits,
+                "goal_anchor": goal_anchor,
+                "grasp_anchor": subject_position,
+                "interaction_anchor": goal_anchor,
+                "relation_hidden": affordance["relation_hidden"],
+                "action_tokens": affordance["action_tokens"],
+                "embedding_tokens": affordance["embedding_tokens"],
+                "clause_execution_logits": execution_logits,
+                "clause_execution_probability": execution_probability,
+                "clause_routing_residual": routing_multiplier - 1.0,
+                "clause_routing_multiplier": routing_multiplier,
+                "phase_safe_memory_next_state_ids": next_state_ids,
+                "phase_safe_memory_next_state_valid": clause_valid,
+                "phase_safe_memory_completed_sticky": completed,
+                "phase_safe_memory_released_unsatisfied_retry": (
+                    clause_valid & ~predicate_truth & (phase_ids == 1)
+                ),
+                "oracle_eraf_enabled": torch.ones(
+                    batch_size, device=device, dtype=torch.bool
+                ),
+                "oracle_selected_clause": torch.where(
+                    has_unfinished, selected_index, torch.full_like(selected_index, -1)
+                ),
+                "oracle_clause_valid": clause_valid,
+                "query_attention": query_attention,
+            }
+        )
+        return routed_queries, routed_embedding, oracle_outputs
+
     def negative_goal_queries(
         self,
         *,

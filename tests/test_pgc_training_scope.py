@@ -270,6 +270,15 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("previous_state_invalid_rate", stateless_audit_source)
 
+    def test_v9_evaluation_supports_privileged_eraf_oracle(self):
+        source = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PGC_ERAF_ORACLE", source)
+        self.assertIn("PGC_ERAF_ORACLE_SIDECAR_DIR", source)
+        self.assertIn("EVALUATION.entity_relation_oracle=", source)
+        self.assertIn("Oracle ERAF requires PGC_GATE_MODE=counterfactual", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,9 +1,10 @@
-"""Passive closed-loop ERAF audit for LIBERO.
+"""Privileged closed-loop ERAF diagnostics for LIBERO.
 
-The observer in this module is deliberately privileged and evaluation-only.
-It reads MuJoCo element segmentation and BDDL predicates to score ERAF while
-the deployed action remains the immutable Base action.  None of the labels
-constructed here are passed back into the policy.
+The shadow observer is passive: it reads MuJoCo element segmentation and BDDL
+predicates only to score ERAF while the deployed action remains immutable
+Base.  The separate Oracle provider is an explicit evaluation-only causal
+intervention that passes the same privileged state into ERAF.  Production
+rollouts never instantiate either class.
 """
 
 from __future__ import annotations
@@ -1226,6 +1227,111 @@ class ERAFShadowAuditor:
             }
         )
         return record
+
+
+class ERAFOracleProvider(ERAFShadowAuditor):
+    """Build perfect same-state ERAF inputs for an oracle action-gap test."""
+
+    def policy_input(
+        self,
+        *,
+        obs: Mapping[str, Any],
+        episode_idx: int,
+    ) -> dict[str, np.ndarray]:
+        masks = _entity_masks(
+            obs,
+            self.geom_ids,
+            height=self.contract.mask_height,
+            width=self.contract.mask_width,
+        )
+        count = self.contract.max_clauses
+        clause_valid = np.zeros(count, dtype=np.bool_)
+        predicate_ids = np.zeros(count, dtype=np.int64)
+        subject_masks = np.zeros(
+            (count, self.contract.mask_height, self.contract.mask_width),
+            dtype=np.bool_,
+        )
+        reference_masks = np.zeros_like(subject_masks)
+        subject_mask_valid = np.zeros(count, dtype=np.bool_)
+        reference_mask_valid = np.zeros(count, dtype=np.bool_)
+        subject_positions = np.zeros((count, 3), dtype=np.float32)
+        reference_positions = np.zeros((count, 3), dtype=np.float32)
+        subject_position_valid = np.zeros(count, dtype=np.bool_)
+        reference_position_valid = np.zeros(count, dtype=np.bool_)
+        goal_anchors = np.zeros((count, 3), dtype=np.float32)
+        goal_anchor_valid = np.zeros(count, dtype=np.bool_)
+        predicate_truth = np.zeros(count, dtype=np.bool_)
+        subject_grasped = np.zeros(count, dtype=np.bool_)
+        if self._episode_idx != int(episode_idx):
+            self._episode_idx = int(episode_idx)
+            self._ever_grasped.fill(False)
+        for index, clause in enumerate(self.clauses):
+            clause_valid[index] = True
+            predicate_ids[index] = int(clause["predicate_id"])
+            subject = str(clause["subject"])
+            reference = str(clause["reference"])
+            subject_masks[index] = masks[subject]
+            reference_masks[index] = masks[reference]
+            subject_mask_valid[index] = bool(masks[subject].any())
+            reference_mask_valid[index] = bool(masks[reference].any())
+            subject_position, subject_valid = _body_position(self.env, subject)
+            subject_position_valid[index] = bool(subject_valid)
+            if subject_valid:
+                subject_positions[index] = _normalize_position(
+                    subject_position,
+                    self.contract.workspace_min,
+                    self.contract.workspace_max,
+                )
+            reference_position, reference_valid = _body_position(
+                self.env, reference
+            )
+            reference_position_valid[index] = bool(reference_valid)
+            if reference_valid:
+                reference_positions[index] = _normalize_position(
+                    reference_position,
+                    self.contract.workspace_min,
+                    self.contract.workspace_max,
+                )
+            goal_anchor, anchor_valid = _region_anchor(
+                self.env, clause, self.problem
+            )
+            goal_anchor_valid[index] = bool(anchor_valid)
+            if anchor_valid:
+                goal_anchors[index] = _normalize_position(
+                    goal_anchor,
+                    self.contract.workspace_min,
+                    self.contract.workspace_max,
+                )
+            predicate_truth[index] = _clause_truth(self.env, clause["raw"])
+            subject_grasped[index] = _is_grasped(self.env, subject)
+        self._ever_grasped |= subject_grasped
+        _, phase_ids, _ = _clause_statuses(
+            clause_valid=clause_valid,
+            predicate_truth=predicate_truth,
+            subject_grasped=subject_grasped,
+            subject_ever_grasped=self._ever_grasped,
+        )
+        # A spatial predicate can become transiently true while the object is
+        # still inside the gripper over its receptacle.  That is HOLDING, not
+        # terminal completion; keep routing the same clause until release.
+        phase_ids[clause_valid & subject_grasped] = 1
+        return {
+            "clause_valid": clause_valid,
+            "predicate_ids": predicate_ids,
+            "subject_masks": subject_masks,
+            "reference_masks": reference_masks,
+            "subject_mask_valid": subject_mask_valid,
+            "reference_mask_valid": reference_mask_valid,
+            "subject_positions": subject_positions,
+            "reference_positions": reference_positions,
+            "subject_position_valid": subject_position_valid,
+            "reference_position_valid": reference_position_valid,
+            "goal_anchors": goal_anchors,
+            "goal_anchor_valid": goal_anchor_valid,
+            "predicate_truth": predicate_truth,
+            "phase_ids": phase_ids,
+            "phase_valid": clause_valid.copy(),
+        }
 
 
 def _optional_rate(values: Sequence[Any]) -> float | None:
