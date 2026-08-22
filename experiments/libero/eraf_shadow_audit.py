@@ -823,6 +823,7 @@ class ERAFShadowAuditor:
         instruction_condition: str,
         contract: ERAFShadowContract,
         counterfactual_metadata: Mapping[str, Any] | None,
+        all_entity_role_gate: bool = False,
     ) -> None:
         if instruction_condition not in {"correct", "counterfactual"}:
             raise ValueError(
@@ -832,6 +833,7 @@ class ERAFShadowAuditor:
         self.policy_instruction = str(policy_instruction)
         self.instruction_condition = str(instruction_condition)
         self.contract = contract
+        self.all_entity_role_gate = bool(all_entity_role_gate)
         inner = _inner_env(env)
         if instruction_condition == "counterfactual":
             if counterfactual_metadata is None:
@@ -999,6 +1001,7 @@ class ERAFShadowAuditor:
             dataset_kind="online_closed_loop",
             dataset_label=self.instruction_condition,
             predicate_vocabulary=self.contract.predicate_vocabulary,
+            all_entity_role_gate=self.all_entity_role_gate,
         )
         extended = _extended_clause_diagnostics(
             diagnostics=diagnostics,

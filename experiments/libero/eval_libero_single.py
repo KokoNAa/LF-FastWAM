@@ -1373,6 +1373,16 @@ def run_single_task(
             instruction_condition=instruction_condition,
             contract=ERAFShadowContract.load(str(sidecar_value)),
             counterfactual_metadata=counterfactual_metadata,
+            all_entity_role_gate=(
+                int(
+                    getattr(
+                        model,
+                        "policy_guard_eraf_grounding_objective_version",
+                        0,
+                    )
+                )
+                >= 11
+            ),
         )
     counterfactual_diagnostics_enabled = bool(
         cfg.EVALUATION.get("counterfactual_diagnostics", False)

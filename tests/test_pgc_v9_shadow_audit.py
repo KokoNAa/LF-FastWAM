@@ -168,6 +168,7 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
             instruction_condition="correct",
             contract=contract,
             counterfactual_metadata=None,
+            all_entity_role_gate=True,
         )
         segmentation = np.zeros((4, 4, 1), dtype=np.int32)
         segmentation[:2, :2, 0] = 1
@@ -252,6 +253,7 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
             policy_step=0,
         )
         self.assertEqual(record["clause_count"], 1)
+        self.assertTrue(record["all_entity_role_gate"])
         self.assertEqual(record["online_stage"], "pregrasp")
         self.assertEqual(record["online_stage_v2"], "initial_search")
         self.assertEqual(record["clause_statuses"], ["initial_search"])
