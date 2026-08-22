@@ -444,7 +444,7 @@ if [[ -n "${ERAF_CLOSED_LOOP_CAPTURE_DIR}" ]]; then
     "+EVALUATION.entity_relation_closed_loop_capture_dir=${ERAF_CLOSED_LOOP_CAPTURE_DIR}"
     "+EVALUATION.entity_relation_closed_loop_capture_stride_replans=${ERAF_CLOSED_LOOP_CAPTURE_STRIDE}"
     "+EVALUATION.entity_relation_closed_loop_capture_max_states_per_episode=${ERAF_CLOSED_LOOP_CAPTURE_MAX_STATES}"
-    "+EVALUATION.entity_relation_closed_loop_capture_stages=${ERAF_CLOSED_LOOP_CAPTURE_STAGES}"
+    "+EVALUATION.entity_relation_closed_loop_capture_stages='${ERAF_CLOSED_LOOP_CAPTURE_STAGES}'"
   )
 fi
 
