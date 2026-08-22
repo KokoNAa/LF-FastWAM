@@ -2004,6 +2004,10 @@ class EntityRelationAffordanceField(nn.Module):
             raise ValueError("Oracle ERAF phase tensors have invalid shapes.")
         if bool(((phase_ids < 0) | (phase_ids >= 3)).any()):
             raise ValueError("Oracle ERAF phase_ids contain an invalid ID.")
+        if bool((clause_valid & ~phase_valid).any()):
+            raise ValueError(
+                "Every active Oracle ERAF clause must declare a valid phase."
+            )
         predicate_truth_logits = torch.where(
             predicate_truth,
             torch.full(expected_clause_shape, 20.0, device=device),
@@ -2013,9 +2017,6 @@ class EntityRelationAffordanceField(nn.Module):
             (*expected_clause_shape, 3), -20.0, device=device
         )
         phase_logits.scatter_(-1, phase_ids.unsqueeze(-1), 20.0)
-        phase_logits = torch.where(
-            phase_valid.unsqueeze(-1), phase_logits, affordance["phase_logits"].float()
-        )
 
         goal_anchors = value("goal_anchors", dtype=torch.float32)
         goal_anchor_valid = value("goal_anchor_valid", dtype=torch.bool) & clause_valid
