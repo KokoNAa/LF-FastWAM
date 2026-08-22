@@ -415,6 +415,89 @@ PGC_V9_STAGE_STEPS=2 CUDA_VISIBLE_DEVICES=0,1,2,3 RUN_TAG=v9-grounding-smoke \
 
 同样将 `grounding`/初始化 checkpoint 替换为 `action`/`$GROUND_CKPT` 和 `verifier`/`$ACTION_CKPT`，确认对应 loss、梯度范数和日志均有限。
 
+### 5.6 V9.13：Phase-Safe Clause Memory（PSCM）
+
+V9.12 在闭环状态上重新生成 subject/reference query，虽然能直接修复部分 post-grasp
+语义，但也会移动 V9.11 已经可靠的 heatmap、entity token 和 anchor。V9.13 因此不从
+V9.12 续训，而是从 objective-v12、step 6250 的 V9.11 checkpoint 直接迁移，并冻结
+完整 V9.11 ERAF 几何路径。新增的 PSCM 只读取冻结的 clause/entity/truth/phase 表示、
+proprio 和上一次重规划显式返回的状态，然后调整 clause routing。
+
+每个 clause 的调用方状态只有四类：`pending=0`、`holding=1`、`retry=2`、
+`completed=3`。状态不保存在共享模型内部；LIBERO 与 RoboTwin runner 都在每个 episode
+开始时置空，并在相邻 replanning call 之间传递。已完成 clause 保持 sticky；物体仍被
+夹持时，即使空间 predicate 暂时为 true，也不会提前切换 clause；释放后 predicate
+为 false 时回到同一个 clause 的 retry，而不是错误推进到下一个目标。
+
+V9.13 复用 V9.12 已审计的 713 个 immutable-Base closed-loop snapshots，并按
+`offline native : closed-loop native : historical CF : strict CF = 1:1:1:1`
+训练。holding 样本同时覆盖 `pending->holding` 和 `holding->holding`，成功释放后的
+next-clause 样本同时覆盖 `holding->completed` 和 `completed->completed`，避免把独立快照
+误当成始终已经具有历史状态的序列。只有 `phase_safe_clause_memory` 可训练；所有旧
+grounding、role、anchor、truth、phase 与 query-rebinding loss 均为零。
+
+```bash
+V911_CKPT=/absolute/path/to/pgc-v911/checkpoints/weights/step_006250.pt
+CLOSED_LOOP_DATA=/absolute/path/to/libero_10_pgc_v912_closed_loop_grounding_lerobot
+CLOSED_LOOP_SIDECAR=/absolute/path/to/sidecars/libero_10_v912_closed_loop_eraf
+V913_TAG=v913-libero10-phase-safe-memory-1000-4gpu-seed42-v1
+V913_LOG=/root/gpufree-data/pgc_v913_libero10_phase_safe_memory.log
+
+nohup env \
+  CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  PGC_V9_GROUNDING_OBJECTIVE_VERSION=14 \
+  PGC_V9_CLOSED_LOOP_GROUNDING_DATASET="$CLOSED_LOOP_DATA" \
+  PGC_V9_CLOSED_LOOP_GROUNDING_SIDECAR="$CLOSED_LOOP_SIDECAR" \
+  RUN_TAG="$V913_TAG" \
+  bash scripts/train_pgc_v9_libero_stage.sh \
+    libero_10 grounding-phase-memory 4 \
+    "$BASE" "$V911_CKPT" \
+    "$HISTORICAL_CF" "$STRICT_DATASET" \
+    "$NATIVE_SIDECAR" "$HISTORICAL_SIDECAR" "$STRICT_SIDECAR" \
+    42 full \
+  > "$V913_LOG" 2>&1 &
+```
+
+该阶段累计训练到 step 7250，实际 LR 为 `1e-5`，每 250 steps 保存 weights。
+进入 Proposal 联合训练前必须先做 Base-mode shadow audit：Base action chunk 逐元素完全
+一致、memory 前后 geometry max-abs 必须为 0、completed sticky violation 必须为 0，
+memory state 覆盖率必须为 100%、总体 state accuracy 与 released-unfinished retry rate
+均必须至少达到 90%，post-grasp clause scheduler accuracy 也必须至少达到 90%，
+并分别报告 initial search、holding、released-unfinished、
+next-clause-search 的 state accuracy。在 shadow gate 通过且闭环 corrective action 已审计
+之前，训练脚本会主动拒绝 objective-v14 的 action/verifier stage；这避免把只有状态
+标签、动作是 padding/dummy 的 713 个 snapshot 错当作 Proposal 正监督。后续 Proposal
+联合阶段必须另行接入同状态 expert corrective action，不能直接复用当前
+grounding-only snapshot 的动作列。
+
+训练完成后先跑 50 个 Base-mode Correct episode；PSCM 仍在 shadow 中更新显式状态，
+但动作始终强制来自不可变 Base：
+
+```bash
+V913_CKPT=/absolute/path/to/pgc-v913/checkpoints/weights/step_007250.pt
+V913_SHADOW=/root/gpufree-data/LF-FastWAM/evaluate_results/pgc_v913_libero10_correct_shadow_seed42_trials5
+V913_SHADOW_SUMMARY=/root/gpufree-data/pgc_v913_libero10_shadow_summary.json
+
+PGC_CHECKPOINT="$V913_CKPT" \
+PGC_EVAL_SUITES='[libero_10]' \
+PGC_GATE_MODE=base \
+PGC_ERAF_SHADOW_AUDIT=true \
+PGC_ERAF_SHADOW_SIDECAR_DIR="$NATIVE_SIDECAR" \
+PGC_MAX_POLICY_STEPS=600 \
+OUTPUT_ROOT="$V913_SHADOW" \
+bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
+
+/opt/conda/bin/python scripts/summarize_pgc_v9_shadow_audit.py \
+  --results "$V913_SHADOW" \
+  --output "$V913_SHADOW_SUMMARY" \
+  --require-extended \
+  --require-phase-safe-memory
+```
+
+这里使用 `--require-phase-safe-memory`，而不是旧的 `--require-pass`。前者只检查本阶段
+规定的状态、retry、post-grasp scheduler、几何零漂移和 Base action 完整性；后者还会
+重新施加历史离线 grounding gate，不能替代 PSCM 的独立闭环准入结论。
+
 ## 6. 评测顺序
 
 ### 6.1 Base mode 与 Correct gate
@@ -514,7 +597,8 @@ V9 checkpoint 格式为 `fastwam_policy_guard_v9`，并声明：
 - `warm_start_contract=exact_pgc_v5_sidecars`；
 - `grounding=predicate_entity_relation_affordance_field`；
 - `privileged_supervision=training_only`；
-- `deployment_inputs=rgb_language_proprio`；
+- objective v1--v13：`deployment_inputs=rgb_language_proprio`；
+- objective v14（V9.13）：`deployment_inputs=rgb_language_proprio_previous_policy_state`；
 - `policy_protection=single_immutable_base_plus_conservative_hard_gate`。
 
 加载器严格验证 version、结构维度、温度、视觉比例、消融类型、Base 引用和所有 sidecar tensors；V5→V9 只允许新增 `entity_relation_affordance.*` 参数。Base、Video Expert 和冻结 sidecar 不会进入优化器。

@@ -247,6 +247,43 @@ def _extended_clause_diagnostics(
         execution_selected_index = None
         execution_target_index = None
         execution_selection_correct = None
+    phase_safe_memory_available = bool(
+        np.asarray(diagnostics.get("phase_safe_memory_enabled", False))
+        .reshape(-1)[0]
+    ) and all(
+        name in diagnostics
+        for name in (
+            "phase_safe_memory_previous_state_ids",
+            "phase_safe_memory_previous_state_valid",
+            "phase_safe_memory_next_state_ids",
+            "phase_safe_memory_next_state_valid",
+            "phase_safe_memory_completed_sticky",
+            "phase_safe_memory_released_unsatisfied_retry",
+        )
+    )
+    if phase_safe_memory_available:
+        memory_previous_ids = _diagnostic_array(
+            diagnostics, "phase_safe_memory_previous_state_ids"
+        ).astype(np.int64)
+        memory_previous_valid = _diagnostic_array(
+            diagnostics, "phase_safe_memory_previous_state_valid"
+        ).astype(bool)
+        memory_next_ids = _diagnostic_array(
+            diagnostics, "phase_safe_memory_next_state_ids"
+        ).astype(np.int64)
+        memory_next_valid = _diagnostic_array(
+            diagnostics, "phase_safe_memory_next_state_valid"
+        ).astype(bool)
+        memory_completed_sticky = _diagnostic_array(
+            diagnostics, "phase_safe_memory_completed_sticky"
+        ).astype(bool)
+        memory_released_retry = _diagnostic_array(
+            diagnostics, "phase_safe_memory_released_unsatisfied_retry"
+        ).astype(bool)
+    else:
+        memory_previous_ids = memory_previous_valid = None
+        memory_next_ids = memory_next_valid = None
+        memory_completed_sticky = memory_released_retry = None
     scale = (workspace_max - workspace_min) / 2.0
     half_width = int(subject_masks.shape[-1] // len(CAMERA_NAMES))
     mask_height = int(subject_masks.shape[-2])
@@ -260,6 +297,14 @@ def _extended_clause_diagnostics(
 
     rows: list[dict[str, Any]] = []
     for index in np.flatnonzero(clause_valid):
+        status = status_by_index[int(index)]
+        expected_memory_state = {
+            "initial_search": 0,
+            "holding": 1,
+            "released_unfinished": 2,
+            "next_clause_search": 0,
+            "completed": 3,
+        }[status]
         subject_target = subject_targets[index]
         reference_target = reference_targets[index]
         subject_hit = (
@@ -441,7 +486,7 @@ def _extended_clause_diagnostics(
                 "clause_index": int(index),
                 "task": task,
                 "predicate": str(clauses[index]["predicate"]),
-                "status": status_by_index[int(index)],
+                "status": status,
                 "active_correct": bool(active_prediction[index]),
                 "predicate_correct": bool(
                     predicate_prediction[index] == predicate_ids[index]
@@ -481,6 +526,48 @@ def _extended_clause_diagnostics(
                     if routing_multiplier is not None
                     else None
                 ),
+                "phase_safe_memory_available": phase_safe_memory_available,
+                "phase_safe_memory_expected_state": expected_memory_state,
+                "phase_safe_memory_previous_state": (
+                    int(memory_previous_ids[index])
+                    if phase_safe_memory_available
+                    and bool(memory_previous_valid[index])
+                    else None
+                ),
+                "phase_safe_memory_next_state": (
+                    int(memory_next_ids[index])
+                    if phase_safe_memory_available and bool(memory_next_valid[index])
+                    else None
+                ),
+                "phase_safe_memory_state_valid": (
+                    bool(memory_next_valid[index])
+                    if phase_safe_memory_available
+                    else None
+                ),
+                "phase_safe_memory_state_correct": (
+                    bool(memory_next_ids[index] == expected_memory_state)
+                    if phase_safe_memory_available and bool(memory_next_valid[index])
+                    else None
+                ),
+                "phase_safe_memory_completed_sticky_violation": (
+                    bool(
+                        memory_previous_valid[index]
+                        and memory_previous_ids[index] == 3
+                        and memory_next_ids[index] != 3
+                    )
+                    if phase_safe_memory_available
+                    else None
+                ),
+                "phase_safe_memory_completed_sticky_applied": (
+                    bool(memory_completed_sticky[index])
+                    if phase_safe_memory_available
+                    else None
+                ),
+                "phase_safe_memory_retry_transition": (
+                    bool(memory_released_retry[index])
+                    if phase_safe_memory_available
+                    else None
+                ),
                 "subject_grasped": bool(subject_grasped[index]),
                 "subject_ever_grasped": bool(subject_ever_grasped[index]),
                 "subject_visible": bool(subject_valid[index]),
@@ -503,6 +590,7 @@ def _extended_clause_diagnostics(
         "missing_diagnostics": [],
         "v99_view_fusion_available": v99_view_available,
         "v99_clause_scheduler_available": v99_scheduler_available,
+        "phase_safe_memory_available": phase_safe_memory_available,
         "clauses": rows,
     }
 
@@ -1003,6 +1091,41 @@ class ERAFShadowAuditor:
             predicate_vocabulary=self.contract.predicate_vocabulary,
             all_entity_role_gate=self.all_entity_role_gate,
         )
+        phase_safe_memory_enabled = bool(
+            np.asarray(diagnostics.get("phase_safe_memory_enabled", False))
+            .reshape(-1)[0]
+        )
+        memory_geometry_max_abs: float | None = None
+        if phase_safe_memory_enabled:
+            geometry_pairs = (
+                ("subject_attention", "pre_memory_subject_attention"),
+                ("reference_attention", "pre_memory_reference_attention"),
+                ("subject_position", "pre_memory_subject_position"),
+                ("reference_position", "pre_memory_reference_position"),
+                ("goal_anchor", "pre_memory_goal_anchor"),
+            )
+            missing = sorted(
+                name
+                for pair in geometry_pairs
+                for name in pair
+                if name not in diagnostics
+            )
+            if missing:
+                raise ValueError(
+                    "V9.13 shadow diagnostics are missing frozen-geometry "
+                    f"comparison outputs: {missing}."
+                )
+            memory_geometry_max_abs = max(
+                float(
+                    np.max(
+                        np.abs(
+                            _diagnostic_array(diagnostics, post).astype(np.float64)
+                            - _diagnostic_array(diagnostics, pre).astype(np.float64)
+                        )
+                    )
+                )
+                for post, pre in geometry_pairs
+            )
         rebinding_enabled = bool(
             np.asarray(
                 diagnostics.get("closed_loop_rebinding_enabled", False)
@@ -1092,6 +1215,8 @@ class ERAFShadowAuditor:
                 "subject_ever_grasped": self._ever_grasped[clause_valid].tolist(),
                 "extended_diagnostics": extended,
                 "closed_loop_rebinding_enabled": rebinding_enabled,
+                "phase_safe_memory_enabled": phase_safe_memory_enabled,
+                "phase_safe_memory_geometry_max_abs": memory_geometry_max_abs,
                 "pre_rebinding_record": pre_rebinding_record,
             }
         )
@@ -1214,6 +1339,22 @@ def _summarize_clause_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 abs(row["routing_residual"])
                 for row in rows
                 if row.get("routing_residual") is not None
+            ]
+        ),
+        "phase_safe_memory_state_accuracy": _optional_rate(
+            [row.get("phase_safe_memory_state_correct") for row in rows]
+        ),
+        "phase_safe_memory_completed_sticky_violation_rate": _optional_rate(
+            [
+                row.get("phase_safe_memory_completed_sticky_violation")
+                for row in rows
+            ]
+        ),
+        "phase_safe_memory_retry_transition_rate": _optional_rate(
+            [
+                row.get("phase_safe_memory_retry_transition")
+                for row in rows
+                if row.get("status") == "released_unfinished"
             ]
         ),
         "subject_top1_in_gt_mask": _optional_rate(
@@ -1501,6 +1642,79 @@ def summarize_eraf_shadow_records(
                 "metrics": report["metrics"],
             }
     extended = _extended_shadow_summary(rows)
+    phase_safe_memory_records = [
+        row for row in rows if bool(row.get("phase_safe_memory_enabled", False))
+    ]
+    phase_safe_memory_clause_rows = [
+        clause
+        for row in phase_safe_memory_records
+        for clause in row.get("extended_diagnostics", {}).get("clauses", [])
+    ]
+    phase_safe_memory_summary = {
+        "available": bool(phase_safe_memory_records),
+        "admission_thresholds": {
+            "state_coverage": 1.0,
+            "state_accuracy": 0.90,
+            "released_unfinished_retry_rate": 0.90,
+            "postgrasp_clause_scheduler_accuracy": 0.90,
+            "completed_sticky_violation_rate": 0.0,
+            "geometry_max_abs": 0.0,
+        },
+        "record_coverage": (
+            float(len(phase_safe_memory_records) / len(rows)) if rows else 0.0
+        ),
+        "state_accuracy": _optional_rate(
+            [
+                clause.get("phase_safe_memory_state_correct")
+                for clause in phase_safe_memory_clause_rows
+            ]
+        ),
+        "state_coverage": _optional_rate(
+            [
+                clause.get("phase_safe_memory_state_valid")
+                for clause in phase_safe_memory_clause_rows
+            ]
+        ),
+        "completed_sticky_violation_rate": _optional_rate(
+            [
+                clause.get("phase_safe_memory_completed_sticky_violation")
+                for clause in phase_safe_memory_clause_rows
+            ]
+        ),
+        "released_unfinished_retry_rate": _optional_rate(
+            [
+                clause.get("phase_safe_memory_retry_transition")
+                for clause in phase_safe_memory_clause_rows
+                if clause.get("status") == "released_unfinished"
+            ]
+        ),
+        "clause_scheduler_accuracy": _optional_rate(
+            [
+                clause.get("execution_selection_correct")
+                for clause in phase_safe_memory_clause_rows
+            ]
+        ),
+        "postgrasp_clause_scheduler_accuracy": _optional_rate(
+            [
+                clause.get("execution_selection_correct")
+                for clause in phase_safe_memory_clause_rows
+                if clause.get("status")
+                in {"holding", "released_unfinished", "next_clause_search"}
+            ]
+        ),
+        "geometry_max_abs": (
+            max(
+                float(row["phase_safe_memory_geometry_max_abs"])
+                for row in phase_safe_memory_records
+                if row.get("phase_safe_memory_geometry_max_abs") is not None
+            )
+            if any(
+                row.get("phase_safe_memory_geometry_max_abs") is not None
+                for row in phase_safe_memory_records
+            )
+            else None
+        ),
+    }
     pre_rebinding_rows = [
         dict(row["pre_rebinding_record"])
         for row in rows
@@ -1523,6 +1737,23 @@ def summarize_eraf_shadow_records(
                 ),
             }
         )
+    phase_safe_memory_admission = bool(
+        phase_safe_memory_summary["available"]
+        and phase_safe_memory_summary["record_coverage"] == 1.0
+        and phase_safe_memory_summary["state_coverage"] == 1.0
+        and phase_safe_memory_summary["state_accuracy"] is not None
+        and phase_safe_memory_summary["state_accuracy"] >= 0.90
+        and phase_safe_memory_summary["released_unfinished_retry_rate"] is not None
+        and phase_safe_memory_summary["released_unfinished_retry_rate"] >= 0.90
+        and phase_safe_memory_summary["postgrasp_clause_scheduler_accuracy"]
+        is not None
+        and phase_safe_memory_summary["postgrasp_clause_scheduler_accuracy"] >= 0.90
+        and phase_safe_memory_summary["geometry_max_abs"] == 0.0
+        and phase_safe_memory_summary["completed_sticky_violation_rate"] == 0.0
+        and action_summary["chunks"] == len(rows)
+        and action_summary["exact_rate"] == 1.0
+        and action_summary["max_abs_error"] == 0.0
+    )
     return {
         "format": "pgc_v9_eraf_shadow_audit_v2",
         "decisions": len(rows),
@@ -1534,10 +1765,16 @@ def summarize_eraf_shadow_records(
         "by_replan_window": by_replan_window,
         "extended_diagnostics": extended,
         "same_state_rebinding": same_state_rebinding,
+        "phase_safe_clause_memory": phase_safe_memory_summary,
+        "phase_safe_memory_admission_passed": phase_safe_memory_admission,
         "passed": bool(
             gate["passed"]
             and action_summary["chunks"] == len(rows)
             and action_summary["exact_rate"] == 1.0
             and action_summary["max_abs_error"] == 0.0
+            and (
+                not phase_safe_memory_summary["available"]
+                or phase_safe_memory_summary["geometry_max_abs"] == 0.0
+            )
         ),
     }

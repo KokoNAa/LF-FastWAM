@@ -419,6 +419,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_v9_hard_role_curriculum: bool = False,
         pgc_v9_hard_role_index_path: Optional[str] = None,
         pgc_v9_closed_loop_rebinding: bool = False,
+        pgc_v9_phase_safe_memory: bool = False,
         pgc_v9_closed_loop_native_dataset_count: int = 0,
     ):
         native_dataset_dirs = [str(path) for path in dataset_dirs]
@@ -507,6 +508,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             else str(pgc_v9_hard_role_index_path)
         )
         self.pgc_v9_closed_loop_rebinding = bool(pgc_v9_closed_loop_rebinding)
+        self.pgc_v9_phase_safe_memory = bool(pgc_v9_phase_safe_memory)
+        if self.pgc_v9_closed_loop_rebinding and self.pgc_v9_phase_safe_memory:
+            raise ValueError(
+                "PGC V9.12 rebinding and V9.13 phase-safe memory are mutually "
+                "exclusive."
+            )
+        self.pgc_v9_closed_loop_grounding = bool(
+            self.pgc_v9_closed_loop_rebinding or self.pgc_v9_phase_safe_memory
+        )
         self.pgc_v9_closed_loop_native_dataset_count = int(
             pgc_v9_closed_loop_native_dataset_count
         )
@@ -517,23 +527,23 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 "PGC V9.12 closed-loop native dataset count must leave at "
                 "least one offline native dataset."
             )
-        if self.pgc_v9_closed_loop_rebinding:
+        if self.pgc_v9_closed_loop_grounding:
             if self.pgc_v9_closed_loop_native_dataset_count <= 0:
                 raise ValueError(
-                    "PGC V9.12 requires a trailing closed-loop native dataset."
+                    "PGC closed-loop grounding requires a trailing native dataset."
                 )
             if not self.pgc_v9_balanced_sampling:
                 raise ValueError(
-                    "PGC V9.12 closed-loop rebinding requires balanced sampling."
+                    "PGC closed-loop grounding requires balanced sampling."
                 )
             if self.pgc_v9_hard_role_curriculum:
                 raise ValueError(
-                    "PGC V9.12 replaces the V9.11 hard curriculum with its "
+                    "PGC closed-loop grounding replaces the V9.11 hard curriculum with its "
                     "four-way closed-loop mixture."
                 )
         elif self.pgc_v9_closed_loop_native_dataset_count:
             raise ValueError(
-                "Closed-loop native datasets require pgc_v9_closed_loop_rebinding."
+                "Closed-loop native datasets require V9.12 rebinding or V9.13 memory."
             )
         if self.pgc_v9_structured_role_sampling and not self.pgc_v9_balanced_sampling:
             raise ValueError(
@@ -629,7 +639,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                         f"{dataset_index}: sidecar={audited_dataset} "
                         f"dataset={os.path.realpath(dataset_dir)}."
                     )
-            if self.pgc_v9_closed_loop_rebinding:
+            if self.pgc_v9_closed_loop_grounding:
                 closed_loop_start = (
                     self.pgc_native_dataset_count
                     - self.pgc_v9_closed_loop_native_dataset_count
@@ -644,7 +654,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                         != "immutable_base_closed_loop_replan"
                     ):
                         raise ValueError(
-                            "PGC V9.12 closed-loop sidecars must declare "
+                            "PGC closed-loop sidecars must declare "
                             "dataset_kind=native and state_distribution="
                             "immutable_base_closed_loop_replan."
                         )
@@ -863,7 +873,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     original_dataset_index
                 )
                 strict_role_categories = _dataset_pair_categories(strict_dataset_index)
-            if self.pgc_v9_closed_loop_rebinding:
+            if self.pgc_v9_closed_loop_grounding:
                 offline_native = list(range(self.pgc_offline_native_frame_count))
                 closed_loop_native = list(
                     range(
@@ -894,18 +904,18 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                             stage = str(records[episode_index]["online_stage_v2"])
                         except KeyError as exc:
                             raise KeyError(
-                                "PGC V9.12 closed-loop sidecar is missing its "
+                                "PGC closed-loop sidecar is missing its "
                                 f"phase for dataset/episode {dataset_index}/"
                                 f"{episode_index}."
                             ) from exc
                         if stage not in allowed_stages:
                             raise ValueError(
-                                f"PGC V9.12 has unsupported online stage {stage!r}."
+                                f"PGC closed-loop data has unsupported online stage {stage!r}."
                             )
                         closed_loop_stages.append(stage)
                 if len(closed_loop_stages) != len(closed_loop_native):
                     raise ValueError(
-                        "PGC V9.12 closed-loop stage/frame mismatch: "
+                        "PGC closed-loop stage/frame mismatch: "
                         f"stages={len(closed_loop_stages)} "
                         f"frames={len(closed_loop_native)}."
                     )
@@ -921,7 +931,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     strict_relation_categories=strict_categories,
                 )
                 logger.info(
-                    "PGC V9.12 curriculum: offline_native=%d "
+                    "PGC closed-loop grounding curriculum: offline_native=%d "
                     "closed_loop_native=%d historical_cf=%d strict_cf=%d",
                     *(
                         self.pgc_v9_closed_loop_group_ids.count(group)
@@ -1087,10 +1097,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 self.pgc_effective_closed_loop_corrective_sample_count,
                 self.pgc_balance_native_counterfactual,
             )
-        if self.pgc_v9_closed_loop_rebinding:
+        if self.pgc_v9_closed_loop_grounding:
             logger.info(
-                "PGC V9.12 effective closed-loop ERAF samples=%d.",
+                "PGC effective closed-loop ERAF samples=%d (phase_safe_memory=%s).",
                 self.pgc_effective_eraf_closed_loop_sample_count,
+                self.pgc_v9_phase_safe_memory,
             )
 
         self.num_frames = num_frames
@@ -1617,10 +1628,126 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"{episode_index} with {frame_count} frames."
             )
         result: dict[str, torch.Tensor] = {}
+        is_closed_loop = bool(
+            self.pgc_v9_closed_loop_grounding
+            and self.pgc_offline_native_dataset_count
+            <= int(dataset_index)
+            < self.pgc_native_dataset_count
+        )
+        episode_record = self.pgc_entity_relation_indices[int(dataset_index)][
+            "episodes_by_index"
+        ][int(episode_index)]
+        online_stage = str(episode_record.get("online_stage_v2", ""))
+        stage_to_id = {
+            "initial_search": 0,
+            "holding": 1,
+            "released_unfinished": 2,
+            "next_clause_search": 3,
+        }
+        if is_closed_loop and online_stage not in stage_to_id:
+            raise ValueError(
+                "PGC V9.13 closed-loop memory requires an audited online stage; "
+                f"dataset/episode={dataset_index}/{episode_index} "
+                f"stage={online_stage!r}."
+            )
         for role, output_prefix in (("target", ""), ("source", "source_")):
             for name in PGC_ENTITY_RELATION_ARRAY_NAMES:
                 result[f"pgc_eraf_{output_prefix}{name}"] = torch.from_numpy(
                     np.asarray(payload[f"{role}_{name}"][int(frame_index)]).copy()
+                )
+            if self.pgc_v9_phase_safe_memory:
+                clause_valid = result[
+                    f"pgc_eraf_{output_prefix}clause_valid"
+                ].bool()
+                truth_valid = result[
+                    f"pgc_eraf_{output_prefix}predicate_truth_valid"
+                ].bool()
+                truth = result[
+                    f"pgc_eraf_{output_prefix}predicate_truth"
+                ].float()
+                phase_ids = result[
+                    f"pgc_eraf_{output_prefix}phase_ids"
+                ].long()
+                phase_valid = result[
+                    f"pgc_eraf_{output_prefix}phase_valid"
+                ].bool()
+                # On closed-loop snapshots, phase=2 is the audited completed
+                # state.  Predicate truth alone is insufficient because an
+                # object may already overlap its receptacle while still held.
+                completed = (
+                    clause_valid & phase_valid & (phase_ids == 2)
+                    if is_closed_loop
+                    else clause_valid & truth_valid & (truth >= 0.5)
+                )
+                unfinished = clause_valid & ~completed
+                previous_state = torch.zeros_like(clause_valid, dtype=torch.long)
+                target_state = torch.zeros_like(clause_valid, dtype=torch.long)
+                previous_state[completed] = 3
+                target_state[completed] = 3
+                if (
+                    is_closed_loop
+                    and online_stage == "next_clause_search"
+                    and bool(completed.any())
+                ):
+                    # ``next_clause_search`` is observed immediately after a
+                    # successful release.  Alternate the most recently
+                    # completed clause between holding->completed and
+                    # completed->completed so the independent snapshots teach
+                    # both the transition and its sticky persistence.
+                    completed_indices = torch.nonzero(
+                        completed, as_tuple=False
+                    ).flatten()
+                    transition_index = int(completed_indices[-1].item())
+                    previous_state[transition_index] = (
+                        1 if int(episode_index) % 2 == 0 else 3
+                    )
+                execution_valid = bool(is_closed_loop and unfinished.any())
+                current_phase = clause_valid & phase_valid & (phase_ids == 1)
+                if is_closed_loop and online_stage in {
+                    "holding",
+                    "released_unfinished",
+                }:
+                    if not bool(current_phase.any()):
+                        raise ValueError(
+                            "PGC V9.13 holding/release snapshot has no audited "
+                            "phase-1 clause."
+                        )
+                    execution_target = int(current_phase.float().argmax().item())
+                else:
+                    execution_target = int(unfinished.float().argmax().item())
+                if execution_valid:
+                    if online_stage == "released_unfinished":
+                        previous_state[execution_target] = 1
+                    if online_stage == "holding":
+                        # The capture dataset stores independent replanning
+                        # snapshots.  Alternate deterministic labels so the
+                        # memory learns both the first pending->holding edge
+                        # and subsequent holding->holding persistence that it
+                        # will encounter in an online episode.
+                        previous_state[execution_target] = (
+                            0 if int(episode_index) % 2 == 0 else 1
+                        )
+                        target_state[execution_target] = 1
+                    elif online_stage == "released_unfinished":
+                        target_state[execution_target] = 2
+                    else:
+                        target_state[execution_target] = 0
+                state_valid = clause_valid & bool(is_closed_loop)
+                prefix = f"pgc_eraf_{output_prefix}phase_safe_memory_"
+                result[f"{prefix}previous_state_ids"] = previous_state
+                result[f"{prefix}target_state_ids"] = target_state
+                result[f"{prefix}state_valid"] = state_valid
+                result[f"{prefix}execution_target"] = torch.tensor(
+                    execution_target, dtype=torch.long
+                )
+                result[f"{prefix}execution_valid"] = torch.tensor(
+                    execution_valid, dtype=torch.bool
+                )
+                result[f"{prefix}stage_id"] = torch.tensor(
+                    stage_to_id.get(online_stage, 0), dtype=torch.long
+                )
+                result[f"{prefix}stage_valid"] = torch.tensor(
+                    is_closed_loop, dtype=torch.bool
                 )
         return result
 
@@ -1738,7 +1865,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         dataset_index = int(torch.as_tensor(sample.get("dataset_index", 0)).item())
         pgc_is_counterfactual = dataset_index >= self.pgc_native_dataset_count
         pgc_is_eraf_closed_loop = bool(
-            self.pgc_v9_closed_loop_rebinding
+            self.pgc_v9_closed_loop_grounding
             and self.pgc_offline_native_dataset_count
             <= dataset_index
             < self.pgc_native_dataset_count

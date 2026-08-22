@@ -36,6 +36,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exit 2 unless every record contains the expanded V2 diagnostics.",
     )
+    parser.add_argument(
+        "--require-phase-safe-memory",
+        action="store_true",
+        help=(
+            "Exit 2 unless the V9.13 phase-safe memory admission passes. "
+            "This gate is independent of the legacy offline grounding gate."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -168,6 +176,10 @@ def main() -> None:
     if args.require_extended and (
         not extended.get("available")
         or float(extended.get("record_coverage", 0.0)) != 1.0
+    ):
+        raise SystemExit(2)
+    if args.require_phase_safe_memory and not summary.get(
+        "phase_safe_memory_admission_passed", False
     ):
         raise SystemExit(2)
 

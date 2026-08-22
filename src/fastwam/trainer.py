@@ -226,6 +226,13 @@ class Wan22Trainer:
                         False,
                     )
                 )
+                phase_safe_memory = bool(
+                    getattr(
+                        self.train_dataset,
+                        "pgc_v9_phase_safe_memory",
+                        False,
+                    )
+                )
                 if (
                     objective_version == 13
                     and training_stage == "grounding"
@@ -241,6 +248,22 @@ class Wan22Trainer:
                     raise ValueError(
                         "PGC V9.12 closed-loop rebinding data is valid only for "
                         "objective-v13 grounding repair."
+                    )
+                if (
+                    objective_version == 14
+                    and training_stage == "grounding"
+                    and not phase_safe_memory
+                ):
+                    raise ValueError(
+                        "PGC V9.13 grounding requires the audited four-way "
+                        "phase-safe memory curriculum."
+                    )
+                if phase_safe_memory and not (
+                    objective_version == 14 and training_stage == "grounding"
+                ):
+                    raise ValueError(
+                        "PGC V9.13 memory data is valid only for objective-v14 "
+                        "grounding repair."
                     )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.

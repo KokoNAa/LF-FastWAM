@@ -108,4 +108,7 @@ train:
   # closed-loop replanning states and is mixed 1:1:1:1 with offline native,
   # historical CF, and strict CF guard data.
   pgc_v9_closed_loop_rebinding: false
+  # V9.13: train explicit caller-owned clause memory while preserving frozen
+  # V9.11 visual geometry on the same four-way closed-loop curriculum.
+  pgc_v9_phase_safe_memory: false
   pgc_v9_closed_loop_native_dataset_count: 0

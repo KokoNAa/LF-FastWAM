@@ -180,6 +180,9 @@ class WorldActionRobotWinPolicy:
         self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
+        # V9.13 policy state is caller-owned and reset for every RoboTwin
+        # episode; the shared model never retains environment-specific memory.
+        self.policy_guard_state: Optional[dict[str, Any]] = None
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
@@ -254,9 +257,16 @@ class WorldActionRobotWinPolicy:
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
+        if (
+            self.policy_guard_state is not None
+            and "policy_guard_state"
+            in inspect.signature(self.model.infer_action).parameters
+        ):
+            infer_kwargs["policy_guard_state"] = self.policy_guard_state
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
+        self.policy_guard_state = pred.get("policy_guard_state")
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
@@ -306,6 +316,7 @@ class WorldActionRobotWinPolicy:
 
     def reset(self) -> None:
         self.pending_actions.clear()
+        self.policy_guard_state = None
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()

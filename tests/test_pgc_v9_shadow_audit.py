@@ -384,6 +384,90 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
             0.0,
         )
 
+    def test_v913_shadow_admission_requires_exact_action_and_frozen_geometry(self):
+        records = []
+        for _ in range(3):
+            record = _good_record()
+            record["online_stage_v2"] = "released_unfinished"
+            record["phase_safe_memory_enabled"] = True
+            record["phase_safe_memory_geometry_max_abs"] = 0.0
+            clauses = []
+            for _ in range(2):
+                clause = _extended_clause("released_unfinished")
+                clause.update(
+                    {
+                        "phase_safe_memory_state_valid": True,
+                        "phase_safe_memory_state_correct": True,
+                        "phase_safe_memory_completed_sticky_violation": False,
+                        "phase_safe_memory_retry_transition": True,
+                        "execution_selection_correct": True,
+                    }
+                )
+                clauses.append(clause)
+            record["extended_diagnostics"] = {
+                "available": True,
+                "missing_diagnostics": [],
+                "clauses": clauses,
+            }
+            records.append(record)
+        integrity = [
+            {
+                "exact": True,
+                "max_abs_error": 0.0,
+                "rms_error": 0.0,
+                "gate_mode": "base",
+            }
+            for _ in records
+        ]
+        summary = summarize_eraf_shadow_records(
+            records, action_integrity=integrity
+        )
+        memory = summary["phase_safe_clause_memory"]
+        self.assertTrue(summary["phase_safe_memory_admission_passed"])
+        self.assertEqual(memory["record_coverage"], 1.0)
+        self.assertEqual(memory["state_coverage"], 1.0)
+        self.assertEqual(memory["state_accuracy"], 1.0)
+        self.assertEqual(memory["released_unfinished_retry_rate"], 1.0)
+        self.assertEqual(memory["postgrasp_clause_scheduler_accuracy"], 1.0)
+        self.assertEqual(memory["completed_sticky_violation_rate"], 0.0)
+        self.assertEqual(memory["geometry_max_abs"], 0.0)
+
+        records[0]["phase_safe_memory_geometry_max_abs"] = 1.0e-6
+        failed = summarize_eraf_shadow_records(
+            records, action_integrity=integrity
+        )
+        self.assertFalse(failed["phase_safe_memory_admission_passed"])
+
+        for record in records:
+            for clause in record["extended_diagnostics"]["clauses"]:
+                clause["phase_safe_memory_retry_transition"] = True
+                clause["execution_selection_correct"] = False
+        failed = summarize_eraf_shadow_records(
+            records, action_integrity=integrity
+        )
+        self.assertFalse(failed["phase_safe_memory_admission_passed"])
+
+        records[0]["phase_safe_memory_geometry_max_abs"] = 0.0
+        for record in records:
+            for clause in record["extended_diagnostics"]["clauses"]:
+                clause["execution_selection_correct"] = True
+        records[0]["extended_diagnostics"]["clauses"][0][
+            "phase_safe_memory_state_correct"
+        ] = False
+        failed = summarize_eraf_shadow_records(
+            records, action_integrity=integrity
+        )
+        self.assertFalse(failed["phase_safe_memory_admission_passed"])
+
+        for record in records:
+            for clause in record["extended_diagnostics"]["clauses"]:
+                clause["phase_safe_memory_state_correct"] = True
+                clause["phase_safe_memory_retry_transition"] = False
+        failed = summarize_eraf_shadow_records(
+            records, action_integrity=integrity
+        )
+        self.assertFalse(failed["phase_safe_memory_admission_passed"])
+
     def test_non_sticky_clause_statuses_separate_second_search_and_release(self):
         statuses, phases, stage = _clause_statuses(
             clause_valid=np.asarray([True, True, False, False]),

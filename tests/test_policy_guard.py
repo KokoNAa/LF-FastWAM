@@ -261,7 +261,19 @@ def tiny_pgc_fastwam(
                 "closed_loop_query_residual_max_abs": 1.0,
                 "closed_loop_state_residual_max_abs": 2.0,
                 "phase_rebinding_energy_weight": (
-                    0.01 if v9_grounding_objective_version >= 13 else 0.0
+                    0.01 if v9_grounding_objective_version == 13 else 0.0
+                ),
+                "phase_safe_memory_hidden_dim": 8,
+                "phase_safe_memory_state_count": 4,
+                "phase_safe_memory_routing_residual_max_abs": 1.0,
+                "phase_safe_memory_state_weight": (
+                    1.0 if v9_grounding_objective_version >= 14 else 0.0
+                ),
+                "phase_safe_memory_scheduler_weight": (
+                    1.0 if v9_grounding_objective_version >= 14 else 0.0
+                ),
+                "phase_safe_memory_energy_weight": (
+                    0.01 if v9_grounding_objective_version >= 14 else 0.0
                 ),
                 "role_attention_preservation_weight": (
                     (

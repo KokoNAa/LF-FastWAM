@@ -719,11 +719,13 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    policy_guard_state: Optional[dict[str, Any]] = None,
 ) -> tuple[
     np.ndarray,
     dict,
     Optional[list[Image.Image]],
     float,
+    Optional[dict[str, Any]],
     Optional[dict[str, Any]],
 ]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
@@ -778,6 +780,11 @@ def _predict_action_chunk(
                 "`mask_language` argument."
             )
         infer_kwargs["mask_language"] = True
+    if (
+        policy_guard_state is not None
+        and "policy_guard_state" in inspect.signature(inference_method).parameters
+    ):
+        infer_kwargs["policy_guard_state"] = policy_guard_state
 
     with torch.no_grad():
         if str(model_device).startswith("cuda"):
@@ -887,6 +894,7 @@ def _predict_action_chunk(
         predicted_future_frames,
         inference_latency_ms,
         policy_guard_diagnostics,
+        pred.get("policy_guard_state"),
     )
 
 
@@ -1168,6 +1176,9 @@ def run_single_episode(
     current_replan_idx = -1
     inference_latencies_ms: list[float] = []
     policy_guard_decisions: list[dict[str, Any]] = []
+    # Explicit per-episode state: never retained on the model, shared between
+    # environments, or carried across LIBERO trials.
+    policy_guard_state: Optional[dict[str, Any]] = None
     closed_loop_capture_enabled = cfg.EVALUATION.get("closed_loop_capture_dir") not in (
         None,
         "",
@@ -1284,6 +1295,7 @@ def run_single_episode(
                 predicted_future_frames,
                 inference_latency_ms,
                 policy_guard_diagnostics,
+                next_policy_guard_state,
             ) = _predict_action_chunk(
                 obs=obs,
                 policy_instruction=policy_instruction,
@@ -1295,7 +1307,9 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                policy_guard_state=policy_guard_state,
             )
+            policy_guard_state = next_policy_guard_state
             inference_latencies_ms.append(inference_latency_ms)
             if policy_guard_diagnostics is not None:
                 eraf_raw = policy_guard_diagnostics.pop("_entity_relation_raw", None)

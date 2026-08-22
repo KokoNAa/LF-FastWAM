@@ -189,6 +189,12 @@ if version == 8 and (
 ):
     raise SystemExit("PGC v8 checkpoint lacks its audited corrective contract")
 if version == 9:
+    objective = int(metadata.get("eraf_grounding_objective_version", -1))
+    expected_deployment_inputs = (
+        "rgb_language_proprio_previous_policy_state"
+        if objective >= 14
+        else "rgb_language_proprio"
+    )
     expected_ablation = {
         "full": (False, True),
         "entity-only": (True, False),
@@ -204,13 +210,12 @@ if version == 9:
         or metadata.get("grounding")
         != "predicate_entity_relation_affordance_field"
         or metadata.get("privileged_supervision") != "training_only"
-        or metadata.get("deployment_inputs") != "rgb_language_proprio"
+        or metadata.get("deployment_inputs") != expected_deployment_inputs
         or bool(metadata.get("eraf_entity_only", False)) != entity_only
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    objective = int(metadata.get("eraf_grounding_objective_version", -1))
-    if objective not in set(range(1, 14)):
+    if objective not in set(range(1, 15)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -247,7 +252,7 @@ if version == 9:
         != "v9_10_audit_native_hard_easy_plus_historical_strict_1_1_1_1"
     ):
         raise SystemExit("PGC v9.11 checkpoint lacks clause-tuple contract")
-    if objective >= 13 and (
+    if objective == 13 and (
         metadata.get("eraf_closed_loop_rebinding_contract")
         != "zero_init_second_pass_role_truth_phase_and_clause_route"
         or metadata.get("eraf_closed_loop_state_contract")
@@ -256,6 +261,23 @@ if version == 9:
         != "offline_native_closed_loop_native_historical_strict_1_1_1_1"
     ):
         raise SystemExit("PGC v9.12 checkpoint lacks closed-loop rebinding contract")
+    if objective >= 14 and (
+        metadata.get("eraf_closed_loop_state_contract")
+        != "immutable_base_correct_replan_exact_simulator_state"
+        or metadata.get("eraf_closed_loop_curriculum_contract")
+        != "offline_native_closed_loop_native_historical_strict_1_1_1_1"
+        or metadata.get("eraf_phase_safe_memory_contract")
+        != "explicit_cross_replan_pending_holding_retry_completed"
+        or metadata.get("eraf_geometry_protection_contract")
+        != "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
+        or metadata.get("eraf_release_transition_contract")
+        != "release_true_advance_release_false_retry"
+        or metadata.get("eraf_policy_state_contract")
+        != "explicit_caller_owned_reset_per_episode"
+        or metadata.get("eraf_phase_safe_memory_warm_start")
+        != "exact_v9_11_geometry"
+    ):
+        raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
 else:
     objective = 0
     training_stage = "grounding"
@@ -382,6 +404,11 @@ mapping = {
     "eraf_clause_scheduler_weight": "clause_scheduler_weight",
     "eraf_clause_scheduler_energy_weight": "clause_scheduler_energy_weight",
     "eraf_phase_rebinding_energy_weight": "phase_rebinding_energy_weight",
+    "eraf_phase_safe_memory_state_weight": "phase_safe_memory_state_weight",
+    "eraf_phase_safe_memory_scheduler_weight": (
+        "phase_safe_memory_scheduler_weight"
+    ),
+    "eraf_phase_safe_memory_energy_weight": "phase_safe_memory_energy_weight",
     "eraf_role_adapter_hidden_dim": "role_adapter_hidden_dim",
     "eraf_structured_role_adapter_hidden_dim": (
         "structured_role_adapter_hidden_dim"
@@ -405,6 +432,11 @@ mapping = {
     ),
     "eraf_closed_loop_state_residual_max_abs": (
         "closed_loop_state_residual_max_abs"
+    ),
+    "eraf_phase_safe_memory_hidden_dim": "phase_safe_memory_hidden_dim",
+    "eraf_phase_safe_memory_state_count": "phase_safe_memory_state_count",
+    "eraf_phase_safe_memory_routing_residual_max_abs": (
+        "phase_safe_memory_routing_residual_max_abs"
     ),
     "eraf_role_attention_preservation_weight": (
         "role_attention_preservation_weight"

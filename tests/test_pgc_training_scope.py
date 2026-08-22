@@ -195,6 +195,33 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         )
         self.assertNotIn("phase_rebinding_energy_weight=0.01", source)
 
+    def test_v913_launcher_uses_v911_geometry_and_phase_safe_memory_only(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("grounding-phase-memory", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=14", source)
+        self.assertIn("START_STEP=6250", source)
+        self.assertIn(
+            "V9.13 must warm-start directly from the completed V9.11", source
+        )
+        self.assertIn("data.train.pgc_v9_phase_safe_memory=", source)
+        self.assertIn(
+            "model.policy_guard.entity_relation_grounding."
+            "phase_safe_memory_state_weight=",
+            source,
+        )
+        self.assertIn(
+            "V9.13 stops at phase-memory shadow admission", source
+        )
+
+    def test_v913_shadow_summary_has_an_independent_admission_gate(self):
+        source = (
+            REPO_ROOT / "scripts/summarize_pgc_v9_shadow_audit.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--require-phase-safe-memory", source)
+        self.assertIn("phase_safe_memory_admission_passed", source)
+
 
 if __name__ == "__main__":
     unittest.main()

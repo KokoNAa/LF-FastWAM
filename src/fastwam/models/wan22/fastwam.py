@@ -1,7 +1,7 @@
 import copy
 import math
 from pathlib import Path
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Mapping, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -54,6 +54,23 @@ from .transition_contract import (
 )
 
 logger = get_logger(__name__)
+
+
+PGC_PHASE_SAFE_MEMORY_CLAUSE_LABEL_NAMES = (
+    "phase_safe_memory_previous_state_ids",
+    "phase_safe_memory_target_state_ids",
+    "phase_safe_memory_state_valid",
+)
+PGC_PHASE_SAFE_MEMORY_SAMPLE_LABEL_NAMES = (
+    "phase_safe_memory_execution_target",
+    "phase_safe_memory_execution_valid",
+    "phase_safe_memory_stage_id",
+    "phase_safe_memory_stage_valid",
+)
+PGC_PHASE_SAFE_MEMORY_LABEL_NAMES = (
+    *PGC_PHASE_SAFE_MEMORY_CLAUSE_LABEL_NAMES,
+    *PGC_PHASE_SAFE_MEMORY_SAMPLE_LABEL_NAMES,
+)
 
 
 class FastWAM(torch.nn.Module):
@@ -667,7 +684,10 @@ class FastWAM(torch.nn.Module):
             self.policy_guard_eraf_grounding_objective_version >= 12
         )
         closed_loop_rebinding_grounding = (
-            self.policy_guard_eraf_grounding_objective_version >= 13
+            self.policy_guard_eraf_grounding_objective_version == 13
+        )
+        phase_safe_memory_grounding = (
+            self.policy_guard_eraf_grounding_objective_version >= 14
         )
         self.policy_guard_eraf_role_adapter_hidden_dim = int(
             eraf_config.get("role_adapter_hidden_dim", 256)
@@ -704,6 +724,17 @@ class FastWAM(torch.nn.Module):
         )
         self.policy_guard_eraf_closed_loop_state_residual_max_abs = float(
             eraf_config.get("closed_loop_state_residual_max_abs", 2.0)
+        )
+        self.policy_guard_eraf_phase_safe_memory_hidden_dim = int(
+            eraf_config.get("phase_safe_memory_hidden_dim", 256)
+        )
+        self.policy_guard_eraf_phase_safe_memory_state_count = int(
+            eraf_config.get("phase_safe_memory_state_count", 4)
+        )
+        self.policy_guard_eraf_phase_safe_memory_routing_residual_max_abs = float(
+            eraf_config.get(
+                "phase_safe_memory_routing_residual_max_abs", 1.0
+            )
         )
         self.policy_guard_eraf_loss_weights = ERAFLossWeights(
             objective_version=(
@@ -900,6 +931,24 @@ class FastWAM(torch.nn.Module):
                 eraf_config.get(
                     "phase_rebinding_energy_weight",
                     0.01 if closed_loop_rebinding_grounding else 0.0,
+                )
+            ),
+            phase_safe_memory_state=float(
+                eraf_config.get(
+                    "phase_safe_memory_state_weight",
+                    1.0 if phase_safe_memory_grounding else 0.0,
+                )
+            ),
+            phase_safe_memory_scheduler=float(
+                eraf_config.get(
+                    "phase_safe_memory_scheduler_weight",
+                    1.0 if phase_safe_memory_grounding else 0.0,
+                )
+            ),
+            phase_safe_memory_energy=float(
+                eraf_config.get(
+                    "phase_safe_memory_energy_weight",
+                    0.01 if phase_safe_memory_grounding else 0.0,
                 )
             ),
             phase=float(eraf_config.get("phase_weight", 1.0)),
@@ -1233,10 +1282,11 @@ class FastWAM(torch.nn.Module):
                     11,
                     12,
                     13,
+                    14,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, or 13."
+                        "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, or 14."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1256,6 +1306,9 @@ class FastWAM(torch.nn.Module):
                     self.policy_guard_eraf_loss_weights.clause_scheduler,
                     self.policy_guard_eraf_loss_weights.clause_scheduler_energy,
                     self.policy_guard_eraf_loss_weights.phase_rebinding_energy,
+                    self.policy_guard_eraf_loss_weights.phase_safe_memory_state,
+                    self.policy_guard_eraf_loss_weights.phase_safe_memory_scheduler,
+                    self.policy_guard_eraf_loss_weights.phase_safe_memory_energy,
                 ) < 0:
                     raise ValueError(
                         "PGC v9 ERAF role-assignment weights must be non-negative."
@@ -1316,6 +1369,8 @@ class FastWAM(torch.nn.Module):
                     self.policy_guard_eraf_structured_role_adapter_hidden_dim,
                     self.policy_guard_eraf_balanced_role_adapter_hidden_dim,
                     self.policy_guard_eraf_closed_loop_rebinding_hidden_dim,
+                    self.policy_guard_eraf_phase_safe_memory_hidden_dim,
+                    self.policy_guard_eraf_phase_safe_memory_state_count,
                 ) <= 0:
                     raise ValueError("PGC v9 ERAF dimensions must be positive.")
                 if (
@@ -1331,10 +1386,23 @@ class FastWAM(torch.nn.Module):
                     self.policy_guard_eraf_learning_rate,
                     self.policy_guard_eraf_closed_loop_query_residual_max_abs,
                     self.policy_guard_eraf_closed_loop_state_residual_max_abs,
+                    self.policy_guard_eraf_phase_safe_memory_routing_residual_max_abs,
                 ) <= 0:
                     raise ValueError(
                         "PGC v9 ERAF aspect ratio, temperature, and LR must "
                         "be positive."
+                    )
+                if self.policy_guard_eraf_phase_safe_memory_state_count != 4:
+                    raise ValueError(
+                        "PGC V9.13 phase-safe memory requires four states."
+                    )
+                if not (
+                    0
+                    < self.policy_guard_eraf_phase_safe_memory_routing_residual_max_abs
+                    <= 1
+                ):
+                    raise ValueError(
+                        "PGC V9.13 phase-safe routing residual bound must be in (0,1]."
                     )
                 if min(
                     self.policy_guard_eraf_grounding_aux_weight,
@@ -1665,7 +1733,7 @@ class FastWAM(torch.nn.Module):
                             ),
                             closed_loop_rebinding_enabled=(
                                 self.policy_guard_eraf_grounding_objective_version
-                                >= 13
+                                == 13
                             ),
                             closed_loop_rebinding_hidden_dim=(
                                 self.policy_guard_eraf_closed_loop_rebinding_hidden_dim
@@ -1675,6 +1743,19 @@ class FastWAM(torch.nn.Module):
                             ),
                             closed_loop_state_residual_max_abs=(
                                 self.policy_guard_eraf_closed_loop_state_residual_max_abs
+                            ),
+                            phase_safe_memory_enabled=(
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 14
+                            ),
+                            phase_safe_memory_hidden_dim=(
+                                self.policy_guard_eraf_phase_safe_memory_hidden_dim
+                            ),
+                            phase_safe_memory_state_count=(
+                                self.policy_guard_eraf_phase_safe_memory_state_count
+                            ),
+                            phase_safe_memory_routing_residual_max_abs=(
+                                self.policy_guard_eraf_phase_safe_memory_routing_residual_max_abs
                             ),
                         )
                     if self.policy_guard_version in {6, 7}:
@@ -2038,6 +2119,16 @@ class FastWAM(torch.nn.Module):
                                 "entity_relation_affordance"
                             ]
                             if (
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 14
+                            ):
+                                role_adapter = eraf.phase_safe_clause_memory
+                                if role_adapter is None:
+                                    raise RuntimeError(
+                                        "V9.13 grounding requires its phase-safe "
+                                        "clause memory."
+                                    )
+                            elif (
                                 self.policy_guard_eraf_grounding_objective_version
                                 >= 13
                             ):
@@ -2601,6 +2692,8 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         language_context_len: Optional[int] = None,
         current_visual_hidden: Optional[torch.Tensor] = None,
+        policy_guard_state: Optional[Mapping[str, torch.Tensor]] = None,
+        proprio: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if not self.policy_guard_enabled:
             raise RuntimeError("PGC goal encoding requires policy_guard.enabled=true.")
@@ -2624,6 +2717,8 @@ class FastWAM(torch.nn.Module):
                     context=context,
                     context_mask=context_mask,
                     language_context_len=int(language_context_len),
+                    policy_guard_state=policy_guard_state,
+                    proprio=proprio,
                 )
             )
             return goal_queries, goal_embedding, goal_metrics
@@ -2682,6 +2777,8 @@ class FastWAM(torch.nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         language_context_len: int,
+        policy_guard_state: Optional[Mapping[str, torch.Tensor]] = None,
+        proprio: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2732,6 +2829,8 @@ class FastWAM(torch.nn.Module):
             current_video_hidden=(
                 current_visual_hidden[:, :current_token_count].detach()
             ),
+            policy_state=policy_guard_state,
+            proprio=proprio,
         )
         # ``prepare_trainable_parameters`` intentionally leaves the frozen root
         # model in eval mode and toggles only the active sidecar module.  Root
@@ -2821,6 +2920,21 @@ class FastWAM(torch.nn.Module):
                 "pre_rebinding_clause_execution_probability",
                 "pre_rebinding_clause_routing_residual",
                 "closed_loop_rebinding_enabled",
+                "phase_safe_memory_enabled",
+                "phase_safe_memory_state_logits",
+                "phase_safe_memory_state_probability",
+                "phase_safe_memory_previous_state_ids",
+                "phase_safe_memory_previous_state_valid",
+                "phase_safe_memory_next_state_ids",
+                "phase_safe_memory_next_state_valid",
+                "phase_safe_memory_routing_residual",
+                "phase_safe_memory_completed_sticky",
+                "phase_safe_memory_released_unsatisfied_retry",
+                "pre_memory_subject_attention",
+                "pre_memory_reference_attention",
+                "pre_memory_subject_position",
+                "pre_memory_reference_position",
+                "pre_memory_goal_anchor",
                 "spatial_coordinates",
                 "camera_ids",
             )
@@ -5047,6 +5161,14 @@ class FastWAM(torch.nn.Module):
                 missing.append(input_name)
             else:
                 labels[name] = value
+        if self.policy_guard_eraf_grounding_objective_version >= 14:
+            for name in PGC_PHASE_SAFE_MEMORY_LABEL_NAMES:
+                input_name = f"pgc_eraf_{prefix}{name}"
+                value = inputs.get(input_name)
+                if value is None:
+                    missing.append(input_name)
+                else:
+                    labels[name] = value
         if missing:
             raise ValueError(
                 "PGC v9 requires audited entity-relation labels: "
@@ -5114,6 +5236,29 @@ class FastWAM(torch.nn.Module):
         eraf_binding_loss = base_action.sum() * 0.0
         if self.policy_guard_version == 9:
             language_context_len = int(inputs["language_context_len"])
+            target_labels = self._policy_guard_v9_labels(inputs)
+            source_labels = self._policy_guard_v9_labels(
+                inputs, prefix="source_"
+            )
+            target_policy_state = None
+            source_policy_state = None
+            if self.policy_guard_eraf_grounding_objective_version >= 14:
+                target_policy_state = {
+                    "phase_safe_memory_state_ids": target_labels[
+                        "phase_safe_memory_previous_state_ids"
+                    ],
+                    "phase_safe_memory_valid": target_labels[
+                        "phase_safe_memory_state_valid"
+                    ],
+                }
+                source_policy_state = {
+                    "phase_safe_memory_state_ids": source_labels[
+                        "phase_safe_memory_previous_state_ids"
+                    ],
+                    "phase_safe_memory_valid": source_labels[
+                        "phase_safe_memory_state_valid"
+                    ],
+                }
             (
                 goal_queries,
                 goal_embedding,
@@ -5126,6 +5271,8 @@ class FastWAM(torch.nn.Module):
                 context=inputs["context"],
                 context_mask=full_context_mask,
                 language_context_len=language_context_len,
+                policy_guard_state=target_policy_state,
+                proprio=inputs.get("proprio_current"),
             )
             (
                 source_goal_queries,
@@ -5139,10 +5286,8 @@ class FastWAM(torch.nn.Module):
                 context=source_context,
                 context_mask=source_context_mask,
                 language_context_len=language_context_len,
-            )
-            target_labels = self._policy_guard_v9_labels(inputs)
-            source_labels = self._policy_guard_v9_labels(
-                inputs, prefix="source_"
+                policy_guard_state=source_policy_state,
+                proprio=inputs.get("proprio_current"),
             )
             target_eraf_loss, target_eraf_metrics = (
                 entity_relation_affordance_loss(
@@ -6799,7 +6944,16 @@ class FastWAM(torch.nn.Module):
                 f"pgc_eraf_{prefix}{name}"
             )
             for prefix in ("", "source_")
-            for name in PGC_ENTITY_RELATION_ARRAY_NAMES
+            for name in (
+                *PGC_ENTITY_RELATION_ARRAY_NAMES,
+                *(
+                    PGC_PHASE_SAFE_MEMORY_LABEL_NAMES
+                    if self.policy_guard_enabled
+                    and self.policy_guard_version == 9
+                    and self.policy_guard_eraf_grounding_objective_version >= 14
+                    else ()
+                ),
+            )
         }
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
@@ -7267,9 +7421,34 @@ class FastWAM(torch.nn.Module):
                 "reference_entity_ids",
             )
             for name, value in tuple(pgc_eraf_labels.items()):
+                if name.endswith(PGC_PHASE_SAFE_MEMORY_SAMPLE_LABEL_NAMES):
+                    if name.endswith(
+                        (
+                            "phase_safe_memory_execution_valid",
+                            "phase_safe_memory_stage_valid",
+                        )
+                    ):
+                        dtype = torch.bool
+                    else:
+                        dtype = torch.long
+                    converted = torch.as_tensor(
+                        value,
+                        device=self.device,
+                        dtype=dtype,
+                    )
+                    if converted.ndim == 0:
+                        converted = converted.expand(batch_size)
+                    if converted.shape != (batch_size,):
+                        raise ValueError(f"`{name}` must be [B].")
+                    pgc_eraf_labels[name] = converted
+                    continue
                 if name.endswith(bool_suffixes):
                     dtype = torch.bool
+                elif name.endswith("phase_safe_memory_state_valid"):
+                    dtype = torch.bool
                 elif name.endswith(long_suffixes):
+                    dtype = torch.long
+                elif name.endswith(PGC_PHASE_SAFE_MEMORY_CLAUSE_LABEL_NAMES):
                     dtype = torch.long
                 else:
                     dtype = torch.float32
@@ -8786,6 +8965,7 @@ class FastWAM(torch.nn.Module):
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
         mask_language: bool = False,
+        policy_guard_state: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         self.eval()
         action_only_pred = None
@@ -8805,6 +8985,7 @@ class FastWAM(torch.nn.Module):
                 tiled=tiled,
                 proprio=proprio.clone() if proprio is not None else None,
                 mask_language=mask_language,
+                policy_guard_state=policy_guard_state,
             )
             action_only_out = action_only_pred["action"]
         
@@ -8975,6 +9156,8 @@ class FastWAM(torch.nn.Module):
                 "policy_guard_gate_mode",
                 "policy_guard_base_action",
                 "policy_guard_counterfactual_action",
+                "policy_guard_eraf_diagnostics",
+                "policy_guard_state",
             ):
                 if key in action_only_pred:
                     result[key] = action_only_pred[key]
@@ -8997,6 +9180,7 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         mask_language: bool = False,
+        policy_guard_state: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -9196,6 +9380,8 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 language_context_len=language_context_len,
                 current_visual_hidden=video_pre["tokens"],
+                policy_guard_state=policy_guard_state,
+                proprio=proprio,
             )
             policy_guard_current_video_hidden = final_video_hidden[:, : int(
                 video_pre["meta"]["tokens_per_frame"]
@@ -9393,6 +9579,19 @@ class FastWAM(torch.nn.Module):
                 result["policy_guard_eraf_diagnostics"] = (
                     self._policy_guard_last_eraf_diagnostics
                 )
+                if self.policy_guard_eraf_grounding_objective_version >= 14:
+                    result["policy_guard_state"] = {
+                        "phase_safe_memory_state_ids": (
+                            self._policy_guard_last_eraf_diagnostics[
+                                "phase_safe_memory_next_state_ids"
+                            ].clone()
+                        ),
+                        "phase_safe_memory_valid": (
+                            self._policy_guard_last_eraf_diagnostics[
+                                "phase_safe_memory_next_state_valid"
+                            ].clone()
+                        ),
+                    }
             return result
 
         if (
@@ -9649,7 +9848,11 @@ class FastWAM(torch.nn.Module):
         eraf_role_adapter_trainable_scope = None
         if is_v9 and self.policy_guard_eraf_grounding_objective_version >= 4:
             objective_version = self.policy_guard_eraf_grounding_objective_version
-            if objective_version >= 13:
+            if objective_version >= 14:
+                eraf_role_adapter_trainable_scope = (
+                    "phase_safe_temporal_clause_memory_only"
+                )
+            elif objective_version >= 13:
                 eraf_role_adapter_trainable_scope = (
                     "closed_loop_phase_rebinding_adapter_only"
                 )
@@ -9704,7 +9907,12 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "privileged_supervision": "training_only" if is_v9 else None,
-            "deployment_inputs": "rgb_language_proprio" if is_v9 else None,
+            "deployment_inputs": (
+                "rgb_language_proprio_previous_policy_state"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 14
+                else ("rgb_language_proprio" if is_v9 else None)
+            ),
             "base_policy": "frozen_released_fastwam",
             "base_action_interface": "query_free_joint_mot",
             "counterfactual_policy": (
@@ -10344,7 +10552,7 @@ class FastWAM(torch.nn.Module):
             "eraf_closed_loop_rebinding_contract": (
                 "zero_init_second_pass_role_truth_phase_and_clause_route"
                 if is_v9
-                and self.policy_guard_eraf_grounding_objective_version >= 13
+                and self.policy_guard_eraf_grounding_objective_version == 13
                 else None
             ),
             "eraf_closed_loop_state_contract": (
@@ -10357,6 +10565,36 @@ class FastWAM(torch.nn.Module):
                 "offline_native_closed_loop_native_historical_strict_1_1_1_1"
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 13
+                else None
+            ),
+            "eraf_phase_safe_memory_contract": (
+                "explicit_cross_replan_pending_holding_retry_completed"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 14
+                else None
+            ),
+            "eraf_geometry_protection_contract": (
+                "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 14
+                else None
+            ),
+            "eraf_release_transition_contract": (
+                "release_true_advance_release_false_retry"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 14
+                else None
+            ),
+            "eraf_policy_state_contract": (
+                "explicit_caller_owned_reset_per_episode"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 14
+                else None
+            ),
+            "eraf_phase_safe_memory_warm_start": (
+                "exact_v9_11_geometry"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 14
                 else None
             ),
             "eraf_attention_mask_weight": (
@@ -10484,6 +10722,21 @@ class FastWAM(torch.nn.Module):
                 if is_v9
                 else None
             ),
+            "eraf_phase_safe_memory_state_weight": (
+                self.policy_guard_eraf_loss_weights.phase_safe_memory_state
+                if is_v9
+                else None
+            ),
+            "eraf_phase_safe_memory_scheduler_weight": (
+                self.policy_guard_eraf_loss_weights.phase_safe_memory_scheduler
+                if is_v9
+                else None
+            ),
+            "eraf_phase_safe_memory_energy_weight": (
+                self.policy_guard_eraf_loss_weights.phase_safe_memory_energy
+                if is_v9
+                else None
+            ),
             "eraf_role_adapter_hidden_dim": (
                 self.policy_guard_eraf_role_adapter_hidden_dim
                 if is_v9
@@ -10544,19 +10797,37 @@ class FastWAM(torch.nn.Module):
             "eraf_closed_loop_rebinding_hidden_dim": (
                 self.policy_guard_eraf_closed_loop_rebinding_hidden_dim
                 if is_v9
-                and self.policy_guard_eraf_grounding_objective_version >= 13
+                and self.policy_guard_eraf_grounding_objective_version == 13
                 else None
             ),
             "eraf_closed_loop_query_residual_max_abs": (
                 self.policy_guard_eraf_closed_loop_query_residual_max_abs
                 if is_v9
-                and self.policy_guard_eraf_grounding_objective_version >= 13
+                and self.policy_guard_eraf_grounding_objective_version == 13
                 else None
             ),
             "eraf_closed_loop_state_residual_max_abs": (
                 self.policy_guard_eraf_closed_loop_state_residual_max_abs
                 if is_v9
-                and self.policy_guard_eraf_grounding_objective_version >= 13
+                and self.policy_guard_eraf_grounding_objective_version == 13
+                else None
+            ),
+            "eraf_phase_safe_memory_hidden_dim": (
+                self.policy_guard_eraf_phase_safe_memory_hidden_dim
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 14
+                else None
+            ),
+            "eraf_phase_safe_memory_state_count": (
+                self.policy_guard_eraf_phase_safe_memory_state_count
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 14
+                else None
+            ),
+            "eraf_phase_safe_memory_routing_residual_max_abs": (
+                self.policy_guard_eraf_phase_safe_memory_routing_residual_max_abs
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 14
                 else None
             ),
             "eraf_role_attention_preservation_weight": (
@@ -11106,6 +11377,14 @@ class FastWAM(torch.nn.Module):
             and self.policy_guard_eraf_training_stage == "grounding"
             and metadata.get("eraf_training_stage") == "grounding"
         )
+        migrate_v9_to_phase_safe_memory = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 12
+            and self.policy_guard_eraf_grounding_objective_version == 14
+            and self.policy_guard_eraf_training_stage == "grounding"
+            and metadata.get("eraf_training_stage") == "grounding"
+        )
         if migrate_v9_to_exclusive_all_entity:
             expected_v99_warm_start = {
                 "eraf_view_fusion_contract": (
@@ -11161,6 +11440,23 @@ class FastWAM(torch.nn.Module):
                 if metadata.get(name) != expected:
                     raise ValueError(
                         "PGC V9.12 requires the completed V9.11 checkpoint "
+                        f"contract: {name}={metadata.get(name)!r}, "
+                        f"expected={expected!r}."
+                    )
+        if migrate_v9_to_phase_safe_memory:
+            expected_v911_warm_start = {
+                "eraf_clause_tuple_contract": (
+                    "exclusive_same_state_subject_predicate_reference_assignment"
+                ),
+                "eraf_role_adapter_trainable_scope": (
+                    "audited_hard_clause_tuple_balanced_visual_"
+                    "role_binding_adapter_only"
+                ),
+            }
+            for name, expected in expected_v911_warm_start.items():
+                if metadata.get(name) != expected:
+                    raise ValueError(
+                        "PGC V9.13 requires the completed V9.11 checkpoint "
                         f"contract: {name}={metadata.get(name)!r}, "
                         f"expected={expected!r}."
                     )
@@ -11799,6 +12095,11 @@ class FastWAM(torch.nn.Module):
                                 "PGC v8 checkpoint has negative corrective weights."
                             )
                     elif saved_policy_guard_version == 9:
+                        expected_deployment_inputs = (
+                            "rgb_language_proprio_previous_policy_state"
+                            if int(saved_eraf_grounding_objective or 1) >= 14
+                            else "rgb_language_proprio"
+                        )
                         if (
                             metadata.get("warm_start_contract")
                             != "exact_pgc_v5_sidecars"
@@ -11807,7 +12108,7 @@ class FastWAM(torch.nn.Module):
                             or metadata.get("privileged_supervision")
                             != "training_only"
                             or metadata.get("deployment_inputs")
-                            != "rgb_language_proprio"
+                            != expected_deployment_inputs
                         ):
                             raise ValueError(
                                 "PGC v9 checkpoint does not declare its ERAF "
@@ -11865,6 +12166,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 13
                             )
+                            or (
+                                saved_grounding_objective == 12
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 14
+                            )
                         )
                         objective_upgrade = (
                             objective_upgrade
@@ -11882,7 +12188,17 @@ class FastWAM(torch.nn.Module):
                                 "model="
                                 f"{self.policy_guard_eraf_grounding_objective_version}."
                             )
-                        if saved_grounding_objective >= 2:
+                        # V9.13 intentionally freezes the complete V9.11 ERAF
+                        # geometry and disables every legacy grounding loss.
+                        # Those loss weights are training-time hyperparameters,
+                        # not part of the restored geometry contract, so a
+                        # V9.11 -> V9.13 warm start must not compare them with
+                        # the zeroed V9.13 values.  Structural V9.11 metadata
+                        # and exact sidecar tensors are validated separately.
+                        if (
+                            saved_grounding_objective >= 2
+                            and not migrate_v9_to_phase_safe_memory
+                        ):
                             for metadata_name, expected_value in {
                                 "eraf_attention_mask_weight": (
                                     self.policy_guard_eraf_loss_weights.attention_mask
@@ -11915,7 +12231,10 @@ class FastWAM(torch.nn.Module):
                                         f"checkpoint={saved_value}, "
                                         f"model={expected_value}."
                                     )
-                        if saved_grounding_objective >= 3:
+                        if (
+                            saved_grounding_objective >= 3
+                            and not migrate_v9_to_phase_safe_memory
+                        ):
                             for metadata_name, expected_value in {
                                 "eraf_role_assignment_weight": (
                                     self.policy_guard_eraf_loss_weights.role_assignment
@@ -11946,7 +12265,11 @@ class FastWAM(torch.nn.Module):
                                         f"model={expected_value}."
                                     )
                         if saved_grounding_objective >= 4 and not objective_upgrade:
-                            if saved_grounding_objective >= 13:
+                            if saved_grounding_objective >= 14:
+                                expected_scope = (
+                                    "phase_safe_temporal_clause_memory_only"
+                                )
+                            elif saved_grounding_objective == 13:
                                 expected_scope = (
                                     "closed_loop_phase_rebinding_adapter_only"
                                 )
@@ -12367,7 +12690,7 @@ class FastWAM(torch.nn.Module):
                                         f"checkpoint={saved_value}, "
                                         f"model={expected_value}."
                                     )
-                        if saved_grounding_objective >= 13 and not objective_upgrade:
+                        if saved_grounding_objective == 13 and not objective_upgrade:
                             expected_v912_contract = {
                                 "eraf_closed_loop_rebinding_contract": (
                                     "zero_init_second_pass_role_truth_phase_and_"
@@ -12441,6 +12764,94 @@ class FastWAM(torch.nn.Module):
                                     "model="
                                     f"{self.policy_guard_eraf_closed_loop_rebinding_hidden_dim}."
                                 )
+                        if saved_grounding_objective >= 14 and not objective_upgrade:
+                            expected_v913_contract = {
+                                "eraf_closed_loop_state_contract": (
+                                    "immutable_base_correct_replan_exact_simulator_"
+                                    "state"
+                                ),
+                                "eraf_closed_loop_curriculum_contract": (
+                                    "offline_native_closed_loop_native_historical_"
+                                    "strict_1_1_1_1"
+                                ),
+                                "eraf_phase_safe_memory_contract": (
+                                    "explicit_cross_replan_pending_holding_retry_"
+                                    "completed"
+                                ),
+                                "eraf_geometry_protection_contract": (
+                                    "frozen_v9_11_no_query_token_anchor_or_heatmap_"
+                                    "residual"
+                                ),
+                                "eraf_release_transition_contract": (
+                                    "release_true_advance_release_false_retry"
+                                ),
+                                "eraf_policy_state_contract": (
+                                    "explicit_caller_owned_reset_per_episode"
+                                ),
+                                "eraf_phase_safe_memory_warm_start": (
+                                    "exact_v9_11_geometry"
+                                ),
+                            }
+                            for name, expected in expected_v913_contract.items():
+                                if metadata.get(name) != expected:
+                                    raise ValueError(
+                                        "PGC V9.13 checkpoint contract mismatch: "
+                                        f"{name}={metadata.get(name)!r}, "
+                                        f"expected={expected!r}."
+                                    )
+                            for metadata_name, expected_value in {
+                                "eraf_phase_safe_memory_state_weight": (
+                                    self.policy_guard_eraf_loss_weights.phase_safe_memory_state
+                                ),
+                                "eraf_phase_safe_memory_scheduler_weight": (
+                                    self.policy_guard_eraf_loss_weights.phase_safe_memory_scheduler
+                                ),
+                                "eraf_phase_safe_memory_energy_weight": (
+                                    self.policy_guard_eraf_loss_weights.phase_safe_memory_energy
+                                ),
+                                "eraf_phase_safe_memory_routing_residual_max_abs": (
+                                    self.policy_guard_eraf_phase_safe_memory_routing_residual_max_abs
+                                ),
+                            }.items():
+                                try:
+                                    saved_value = float(metadata[metadata_name])
+                                except (KeyError, TypeError, ValueError) as exc:
+                                    raise ValueError(
+                                        "PGC V9.13 checkpoint is missing valid "
+                                        f"memory value {metadata_name!r}."
+                                    ) from exc
+                                if not math.isclose(
+                                    saved_value,
+                                    float(expected_value),
+                                    rel_tol=0.0,
+                                    abs_tol=1.0e-9,
+                                ):
+                                    raise ValueError(
+                                        f"PGC V9.13 {metadata_name} mismatch: "
+                                        f"checkpoint={saved_value}, "
+                                        f"model={expected_value}."
+                                    )
+                            for metadata_name, expected_value in {
+                                "eraf_phase_safe_memory_hidden_dim": (
+                                    self.policy_guard_eraf_phase_safe_memory_hidden_dim
+                                ),
+                                "eraf_phase_safe_memory_state_count": (
+                                    self.policy_guard_eraf_phase_safe_memory_state_count
+                                ),
+                            }.items():
+                                try:
+                                    saved_value = int(metadata[metadata_name])
+                                except (KeyError, TypeError, ValueError) as exc:
+                                    raise ValueError(
+                                        "PGC V9.13 checkpoint is missing valid "
+                                        f"memory dimension {metadata_name!r}."
+                                    ) from exc
+                                if saved_value != int(expected_value):
+                                    raise ValueError(
+                                        f"PGC V9.13 {metadata_name} mismatch: "
+                                        f"checkpoint={saved_value}, "
+                                        f"model={expected_value}."
+                                    )
                         if (
                             bool(metadata.get("eraf_entity_only", False))
                             != self.policy_guard_eraf_entity_only
@@ -12510,6 +12921,7 @@ class FastWAM(torch.nn.Module):
                 or migrate_v9_to_clause_activation_adapter
                 or migrate_v9_to_view_scheduler
                 or migrate_v9_to_phase_rebinding
+                or migrate_v9_to_phase_safe_memory
             )
             incompatible = self.policy_guard_modules.load_state_dict(
                 guard_state, strict=not migrate_with_new_modules
@@ -12642,6 +13054,21 @@ class FastWAM(torch.nn.Module):
                         f"incompatible sidecars: missing={missing}, "
                         f"unexpected={unexpected}."
                     )
+            elif migrate_v9_to_phase_safe_memory:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                allowed_prefix = (
+                    "entity_relation_affordance.phase_safe_clause_memory."
+                )
+                disallowed_missing = [
+                    key for key in missing if not key.startswith(allowed_prefix)
+                ]
+                if disallowed_missing or unexpected or not missing:
+                    raise ValueError(
+                        "PGC v9.11 -> v9.13 phase-safe-memory warm start has "
+                        f"incompatible sidecars: missing={missing}, "
+                        f"unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -12662,6 +13089,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v9_to_exclusive_all_entity
                 and not migrate_v9_to_clause_tuple
                 and not migrate_v9_to_phase_rebinding
+                and not migrate_v9_to_phase_safe_memory
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -12756,6 +13184,15 @@ class FastWAM(torch.nn.Module):
                 logger.info(
                     "Warm-started PGC v9.12 from frozen V9.11 ERAF at %s "
                     "(base=%s restored=%d new_phase_rebinding=%d).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
+                    len(incompatible.missing_keys),
+                )
+            elif migrate_v9_to_phase_safe_memory:
+                logger.info(
+                    "Warm-started PGC v9.13 from frozen V9.11 ERAF at %s "
+                    "(base=%s restored=%d new_phase_safe_memory=%d).",
                     path,
                     resolved_base,
                     len(guard_state),

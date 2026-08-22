@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from collections import Counter, OrderedDict
+from dataclasses import replace
 from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
     ClauseActivationCalibrationAdapter,
     ERAFLossWeights,
     EntityRelationAffordanceField,
+    PhaseSafeClauseMemory,
     _balanced_bipartite_assignment_loss,
     _balanced_clause_tuple_assignment_loss,
     _balanced_exclusive_all_entity_assignment_loss,
@@ -1197,6 +1199,246 @@ class PGCERAFModuleTest(unittest.TestCase):
         self.assertIsNotNone(adapter.reference_output.weight.grad)
         self.assertIsNotNone(adapter.truth_output.weight.grad)
         self.assertIsNotNone(adapter.phase_output.weight.grad)
+
+    def test_v913_zero_init_memory_preserves_v911_geometry_and_routes_only(self):
+        torch.manual_seed(913)
+        common = dict(
+            text_dim=10,
+            video_dim=16,
+            action_dim=12,
+            projection_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            max_clauses=4,
+            camera_count=2,
+            visual_aspect_ratio=2.0,
+            role_adapter_enabled=True,
+            role_adapter_hidden_dim=8,
+            role_adapter_teacher_enabled=True,
+            balanced_role_adapter_enabled=True,
+            balanced_role_adapter_hidden_dim=8,
+            clause_activation_adapter_enabled=True,
+            clause_activation_adapter_hidden_dim=8,
+            view_fusion_enabled=True,
+            view_fusion_adapter_hidden_dim=8,
+            clause_scheduler_enabled=True,
+            clause_scheduler_hidden_dim=8,
+        )
+        v911 = EntityRelationAffordanceField(**common).eval()
+        v913 = EntityRelationAffordanceField(
+            **common,
+            phase_safe_memory_enabled=True,
+            phase_safe_memory_hidden_dim=8,
+            phase_safe_memory_state_count=4,
+        ).eval()
+        incompatible = v913.load_state_dict(v911.state_dict(), strict=False)
+        self.assertFalse(incompatible.unexpected_keys)
+        self.assertTrue(incompatible.missing_keys)
+        self.assertTrue(
+            all(
+                key.startswith("phase_safe_clause_memory.")
+                for key in incompatible.missing_keys
+            )
+        )
+        inputs = {
+            "base_goal_queries": torch.randn(2, 3, 12),
+            "base_goal_embedding": torch.randn(2, 8),
+            "language_hidden": torch.randn(2, 6, 10),
+            "language_mask": torch.ones(2, 6, dtype=torch.bool),
+            "current_video_hidden": torch.randn(2, 8, 16),
+            "policy_state": {
+                "phase_safe_memory_state_ids": torch.zeros(2, 4, dtype=torch.long),
+                "phase_safe_memory_valid": torch.ones(2, 4, dtype=torch.bool),
+            },
+            "proprio": torch.randn(2, 7),
+        }
+        base_inputs = {
+            name: value
+            for name, value in inputs.items()
+            if name not in {"policy_state", "proprio"}
+        }
+        output911 = v911(**base_inputs)
+        output913 = v913(**inputs)
+        torch.testing.assert_close(output913[0], output911[0], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(output913[1], output911[1], rtol=0.0, atol=0.0)
+        for name in (
+            "subject_attention",
+            "reference_attention",
+            "subject_position",
+            "reference_position",
+            "predicate_truth_logits",
+            "phase_logits",
+            "goal_anchor",
+        ):
+            torch.testing.assert_close(
+                output913[2][name], output911[2][name], rtol=0.0, atol=0.0
+            )
+        self.assertEqual(
+            int(output913[2]["phase_safe_memory_routing_residual"].count_nonzero()),
+            0,
+        )
+        self.assertEqual(
+            float(output913[3]["pgc_v9_phase_safe_memory_geometry_max_abs"]),
+            0.0,
+        )
+
+        v913.train()
+        trained = v913(**inputs)[2]
+        (
+            trained["phase_safe_memory_state_logits"].sum()
+            + trained["clause_execution_logits"].sum()
+        ).backward()
+        memory = v913.phase_safe_clause_memory
+        self.assertIsNotNone(memory)
+        self.assertIsNotNone(memory.state_output.weight.grad)
+        self.assertIsNotNone(memory.scheduler_output.weight.grad)
+
+    def test_v913_memory_enforces_completed_sticky_and_release_retry(self):
+        memory = PhaseSafeClauseMemory(
+            hidden_dim=8,
+            adapter_hidden_dim=8,
+            num_heads=2,
+            max_clauses=2,
+            phase_count=3,
+            state_count=4,
+        ).eval()
+        common = {
+            "clause_hidden": torch.randn(1, 2, 8),
+            "subject_tokens": torch.randn(1, 2, 8),
+            "reference_tokens": torch.randn(1, 2, 8),
+            "active_logits": torch.full((1, 2), 10.0),
+            "predicate_truth_logits": torch.full((1, 2), -10.0),
+            "phase_logits": torch.tensor([[[10.0, -10.0, -10.0]] * 2]),
+            "base_execution_logits": torch.zeros(1, 2),
+            "base_execution_probability": torch.full((1, 2), 0.5),
+            "base_routing_multiplier": torch.ones(1, 2),
+            "policy_state": {
+                "phase_safe_memory_state_ids": torch.tensor(
+                    [[memory.HOLDING, memory.COMPLETED]]
+                ),
+                "phase_safe_memory_valid": torch.ones(1, 2, dtype=torch.bool),
+            },
+        }
+        output = memory(**common)
+        self.assertEqual(int(output["next_state_ids"][0, 0]), memory.RETRY)
+        self.assertEqual(int(output["next_state_ids"][0, 1]), memory.COMPLETED)
+        self.assertTrue(bool(output["released_unsatisfied_retry"][0, 0]))
+        self.assertTrue(bool(output["completed_sticky"][0, 1]))
+
+        common["active_logits"] = torch.tensor([[10.0, -10.0]])
+        output = memory(**common)
+        self.assertEqual(int(output["next_state_ids"][0, 1]), memory.COMPLETED)
+        self.assertTrue(bool(output["next_state_valid"][0, 1]))
+        self.assertTrue(bool(output["completed_sticky"][0, 1]))
+        common["active_logits"] = torch.full((1, 2), 10.0)
+
+        common["predicate_truth_logits"] = torch.tensor([[10.0, -10.0]])
+        common["phase_logits"] = torch.tensor(
+            [[[-10.0, 10.0, -10.0], [10.0, -10.0, -10.0]]]
+        )
+        output = memory(**common)
+        self.assertNotEqual(
+            int(output["next_state_ids"][0, 0]), memory.COMPLETED
+        )
+
+        with torch.no_grad():
+            memory.state_output.bias[memory.COMPLETED] = 20.0
+        output = memory(**common)
+        self.assertNotEqual(
+            int(output["next_state_ids"][0, 0]), memory.COMPLETED
+        )
+
+        common["phase_logits"] = torch.tensor(
+            [[[-10.0, -10.0, 10.0], [10.0, -10.0, -10.0]]]
+        )
+        output = memory(**common)
+        self.assertEqual(int(output["next_state_ids"][0, 0]), memory.COMPLETED)
+
+    def test_v913_build_inputs_preserves_temporal_memory_labels(self):
+        model = tiny_pgc_fastwam(
+            version=9,
+            v9_stage="grounding",
+            v9_grounding_objective_version=14,
+        )
+        model._encode_input_image_latents_tensor = (
+            lambda *_args, **_kwargs: torch.zeros(1, 2, 1, 16, 16)
+        )
+        batch_size = 2
+        clause_count = 4
+        sample = {
+            "video": torch.randn(batch_size, 3, 5, 16, 16),
+            "action": torch.randn(batch_size, 4, 3),
+            "context": torch.randn(batch_size, 6, 10),
+            "context_mask": torch.ones(batch_size, 6, dtype=torch.bool),
+            "pgc_is_counterfactual": torch.tensor([False, True]),
+            "pgc_direct_action_valid": torch.ones(batch_size, dtype=torch.bool),
+            "pgc_goal_id": torch.tensor([1, 2]),
+            "pgc_source_context": torch.randn(batch_size, 6, 10),
+            "pgc_source_context_mask": torch.ones(
+                batch_size, 6, dtype=torch.bool
+            ),
+            "pgc_source_goal_id": torch.tensor([3, 4]),
+            "pgc_paired_language_valid": torch.ones(
+                batch_size, dtype=torch.bool
+            ),
+        }
+        for prefix in ("", "source_"):
+            for name in PGC_ENTITY_RELATION_ARRAY_NAMES:
+                sample[f"pgc_eraf_{prefix}{name}"] = torch.zeros(
+                    batch_size, clause_count
+                )
+            sample[
+                f"pgc_eraf_{prefix}phase_safe_memory_previous_state_ids"
+            ] = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
+            sample[
+                f"pgc_eraf_{prefix}phase_safe_memory_target_state_ids"
+            ] = torch.tensor([[1, 1, 2, 3], [3, 2, 2, 0]])
+            sample[
+                f"pgc_eraf_{prefix}phase_safe_memory_state_valid"
+            ] = torch.ones(batch_size, clause_count, dtype=torch.bool)
+            sample[
+                f"pgc_eraf_{prefix}phase_safe_memory_execution_target"
+            ] = torch.tensor([0, 2])
+            sample[
+                f"pgc_eraf_{prefix}phase_safe_memory_execution_valid"
+            ] = torch.tensor([True, False])
+            sample[f"pgc_eraf_{prefix}phase_safe_memory_stage_id"] = (
+                torch.tensor([1, 2])
+            )
+            sample[f"pgc_eraf_{prefix}phase_safe_memory_stage_valid"] = (
+                torch.ones(batch_size, dtype=torch.bool)
+            )
+
+        inputs = model.build_inputs(sample)
+        for prefix in ("", "source_"):
+            self.assertEqual(
+                inputs[
+                    f"pgc_eraf_{prefix}phase_safe_memory_previous_state_ids"
+                ].dtype,
+                torch.long,
+            )
+            self.assertEqual(
+                tuple(
+                    inputs[
+                        f"pgc_eraf_{prefix}phase_safe_memory_previous_state_ids"
+                    ].shape
+                ),
+                (batch_size, clause_count),
+            )
+            self.assertEqual(
+                inputs[
+                    f"pgc_eraf_{prefix}phase_safe_memory_execution_valid"
+                ].dtype,
+                torch.bool,
+            )
+            self.assertEqual(
+                tuple(
+                    inputs[
+                        f"pgc_eraf_{prefix}phase_safe_memory_execution_target"
+                    ].shape
+                ),
+                (batch_size,),
+            )
 
     def test_v99_loss_supervises_camera_fusion_and_first_unfinished_clause(self):
         torch.manual_seed(920)
@@ -3258,6 +3500,111 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             for name, value in expected_state.items():
                 self.assertTrue(torch.equal(value, restored_state[name]), name)
 
+    def test_v911_to_v913_phase_safe_memory_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v911_path = root / "v911.pt"
+            v913_path = root / "v913.pt"
+            v911 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=12,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v911.mot.state_dict()},
+                base_path,
+            )
+            v911.load_checkpoint(base_path)
+            v911.save_checkpoint(v911_path, step=6250)
+
+            v913 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=14,
+            )
+            # The production V9.13 wrapper disables every frozen V9.11
+            # auxiliary loss.  These values intentionally differ from the
+            # source checkpoint and must not be treated as restored geometry.
+            v913.policy_guard_eraf_loss_weights = replace(
+                v913.policy_guard_eraf_loss_weights,
+                attention_mask=0.0,
+                role_swap=0.0,
+                role_overlap=0.0,
+                role_assignment=0.0,
+                role_assignment_hard_weight=0.0,
+            )
+            v913.load_checkpoint(v911_path)
+            eraf = v913.policy_guard_modules["entity_relation_affordance"]
+            self.assertIsNone(eraf.closed_loop_phase_rebinding_adapter)
+            self.assertIsNotNone(eraf.phase_safe_clause_memory)
+            self.assertEqual(
+                int(eraf.phase_safe_clause_memory.state_output.weight.count_nonzero()),
+                0,
+            )
+            self.assertEqual(
+                int(
+                    eraf.phase_safe_clause_memory.scheduler_output.weight.count_nonzero()
+                ),
+                0,
+            )
+
+            v913.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v913.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all("phase_safe_clause_memory" in name for name in trainable)
+            )
+            self.assertFalse(any(p.requires_grad for p in v913.mot.parameters()))
+            v913.save_checkpoint(v913_path, step=7250)
+            payload = torch.load(v913_path, map_location="cpu", weights_only=False)
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 14)
+            self.assertEqual(
+                metadata["deployment_inputs"],
+                "rgb_language_proprio_previous_policy_state",
+            )
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "phase_safe_temporal_clause_memory_only",
+            )
+            self.assertEqual(
+                metadata["eraf_phase_safe_memory_contract"],
+                "explicit_cross_replan_pending_holding_retry_completed",
+            )
+            self.assertEqual(
+                metadata["eraf_geometry_protection_contract"],
+                "frozen_v9_11_no_query_token_anchor_or_heatmap_residual",
+            )
+            self.assertEqual(
+                metadata["eraf_policy_state_contract"],
+                "explicit_caller_owned_reset_per_episode",
+            )
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=14,
+            )
+            restored.policy_guard_eraf_loss_weights = replace(
+                restored.policy_guard_eraf_loss_weights,
+                attention_mask=0.0,
+                role_swap=0.0,
+                role_overlap=0.0,
+                role_assignment=0.0,
+                role_assignment_hard_weight=0.0,
+            )
+            restored.load_checkpoint(v913_path)
+            expected_state = v913.policy_guard_modules.state_dict()
+            restored_state = restored.policy_guard_modules.state_dict()
+            self.assertEqual(expected_state.keys(), restored_state.keys())
+            for name, value in expected_state.items():
+                self.assertTrue(torch.equal(value, restored_state[name]), name)
+
     def test_stage_trainability_optimizer_contract_and_deployment_inputs(self):
         expected_modules = {
             "grounding": {"entity_relation_affordance"},
@@ -3298,6 +3645,8 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 "language_hidden",
                 "language_mask",
                 "current_video_hidden",
+                "policy_state",
+                "proprio",
             },
         )
 

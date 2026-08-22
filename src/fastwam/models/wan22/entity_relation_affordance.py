@@ -1276,6 +1276,316 @@ class ClosedLoopPhaseRebindingAdapter(nn.Module):
         }
 
 
+class PhaseSafeClauseMemory(nn.Module):
+    """Caller-owned temporal clause state that cannot alter ERAF geometry.
+
+    V9.12 attempted to repair closed-loop drift by changing the visual role
+    queries and running the grounder for a second time.  That improved some
+    semantic decisions but also moved already-valid heatmaps and anchors.  The
+    V9.13 memory is deliberately downstream of grounding: it reads frozen
+    V9.11 clause/entity/phase features and can change only the per-clause
+    execution multiplier.
+
+    State is explicit rather than stored on the module so batched and parallel
+    environments cannot leak history into one another.  The caller owns and
+    resets ``state_ids`` / ``state_valid`` at episode boundaries.
+    """
+
+    PENDING = 0
+    HOLDING = 1
+    RETRY = 2
+    COMPLETED = 3
+    STATE_NAMES = ("pending", "holding", "retry", "completed")
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        adapter_hidden_dim: int,
+        num_heads: int,
+        max_clauses: int,
+        phase_count: int = 3,
+        state_count: int = 4,
+        routing_residual_max_abs: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if min(
+            hidden_dim,
+            adapter_hidden_dim,
+            num_heads,
+            max_clauses,
+            phase_count,
+            state_count,
+        ) <= 0:
+            raise ValueError("ERAF phase-safe memory dimensions must be positive.")
+        if adapter_hidden_dim % num_heads:
+            raise ValueError(
+                "ERAF phase-safe memory hidden dimension must be divisible by heads."
+            )
+        if state_count != len(self.STATE_NAMES):
+            raise ValueError("ERAF phase-safe memory requires exactly four states.")
+        if not 0 < routing_residual_max_abs <= 1:
+            raise ValueError(
+                "ERAF phase-safe memory routing residual bound must be in (0,1]."
+            )
+        self.hidden_dim = int(hidden_dim)
+        self.max_clauses = int(max_clauses)
+        self.phase_count = int(phase_count)
+        self.state_count = int(state_count)
+        self.routing_residual_max_abs = float(routing_residual_max_abs)
+
+        self.state_embedding = nn.Embedding(state_count, adapter_hidden_dim)
+        # clause + subject + reference, activity/truth/execution, phase, two
+        # proprio summary values, and the embedded previous categorical state.
+        feature_dim = hidden_dim * 3 + phase_count + 6 + adapter_hidden_dim
+        self.input_norm = nn.LayerNorm(feature_dim)
+        self.input_projection = nn.Linear(feature_dim, adapter_hidden_dim)
+        self.clause_embedding = nn.Parameter(
+            torch.zeros(max_clauses, adapter_hidden_dim)
+        )
+        nn.init.normal_(self.clause_embedding, std=0.02)
+        self.encoder = nn.TransformerEncoderLayer(
+            d_model=adapter_hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=adapter_hidden_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.output_norm = nn.LayerNorm(adapter_hidden_dim)
+        self.state_output = nn.Linear(adapter_hidden_dim, state_count)
+        self.scheduler_output = nn.Linear(adapter_hidden_dim, 1)
+        # Exact V9.11 warm start: neither the predicted memory residual nor its
+        # scheduler residual can affect deployment before V9.13 optimization.
+        nn.init.zeros_(self.state_output.weight)
+        nn.init.zeros_(self.state_output.bias)
+        nn.init.zeros_(self.scheduler_output.weight)
+        nn.init.zeros_(self.scheduler_output.bias)
+
+    def _normalize_policy_state(
+        self,
+        *,
+        clause_hidden: torch.Tensor,
+        policy_state: Mapping[str, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, clause_count = clause_hidden.shape[:2]
+        if policy_state is None:
+            return (
+                torch.full(
+                    (batch_size, clause_count),
+                    self.PENDING,
+                    device=clause_hidden.device,
+                    dtype=torch.long,
+                ),
+                torch.zeros(
+                    (batch_size, clause_count),
+                    device=clause_hidden.device,
+                    dtype=torch.bool,
+                ),
+            )
+        if not isinstance(policy_state, Mapping):
+            raise TypeError("ERAF policy_state must be a mapping or None.")
+        raw_ids = policy_state.get("phase_safe_memory_state_ids")
+        raw_valid = policy_state.get("phase_safe_memory_valid")
+        if raw_ids is None or raw_valid is None:
+            raise ValueError(
+                "ERAF policy_state requires phase_safe_memory_state_ids and "
+                "phase_safe_memory_valid."
+            )
+        state_ids = torch.as_tensor(raw_ids, device=clause_hidden.device).long()
+        state_valid = torch.as_tensor(raw_valid, device=clause_hidden.device).bool()
+        expected = (batch_size, clause_count)
+        # A single-environment state may be serialized without its batch axis.
+        if state_ids.shape == (clause_count,):
+            state_ids = state_ids.unsqueeze(0)
+        if state_valid.shape == (clause_count,):
+            state_valid = state_valid.unsqueeze(0)
+        if state_ids.shape != expected or state_valid.shape != expected:
+            raise ValueError(
+                "ERAF phase-safe policy state must match [batch, clauses]; "
+                f"expected={expected} ids={tuple(state_ids.shape)} "
+                f"valid={tuple(state_valid.shape)}."
+            )
+        if bool(((state_ids < 0) | (state_ids >= self.state_count)).any()):
+            raise ValueError("ERAF phase-safe policy state contains an invalid ID.")
+        return state_ids, state_valid
+
+    def forward(
+        self,
+        *,
+        clause_hidden: torch.Tensor,
+        subject_tokens: torch.Tensor,
+        reference_tokens: torch.Tensor,
+        active_logits: torch.Tensor,
+        predicate_truth_logits: torch.Tensor,
+        phase_logits: torch.Tensor,
+        base_execution_logits: torch.Tensor,
+        base_execution_probability: torch.Tensor,
+        base_routing_multiplier: torch.Tensor,
+        policy_state: Mapping[str, torch.Tensor] | None = None,
+        proprio: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        expected = clause_hidden.shape
+        if clause_hidden.ndim != 3 or clause_hidden.shape[-1] != self.hidden_dim:
+            raise ValueError("ERAF phase-safe clauses must be [B,C,hidden_dim].")
+        if clause_hidden.shape[1] != self.max_clauses:
+            raise ValueError("ERAF phase-safe clause count does not match config.")
+        if subject_tokens.shape != expected or reference_tokens.shape != expected:
+            raise ValueError("ERAF phase-safe entity tokens must match clauses.")
+        if (
+            active_logits.shape != expected[:2]
+            or predicate_truth_logits.shape != expected[:2]
+            or base_execution_logits.shape != expected[:2]
+            or base_execution_probability.shape != expected[:2]
+            or base_routing_multiplier.shape != expected[:2]
+            or phase_logits.shape != (*expected[:2], self.phase_count)
+        ):
+            raise ValueError("ERAF phase-safe state tensors have invalid shapes.")
+
+        previous_state_ids, previous_state_valid = self._normalize_policy_state(
+            clause_hidden=clause_hidden, policy_state=policy_state
+        )
+        active_probability = torch.sigmoid(active_logits.float())
+        truth_probability = torch.sigmoid(predicate_truth_logits.float())
+        phase_probability = torch.softmax(phase_logits.float(), dim=-1)
+        if proprio is None:
+            proprio_summary = clause_hidden.new_zeros(expected[0], 2)
+        else:
+            proprio = torch.as_tensor(proprio, device=clause_hidden.device)
+            if proprio.ndim != 2 or proprio.shape[0] != expected[0]:
+                raise ValueError("ERAF phase-safe proprio must be [B,D].")
+            if proprio.shape[-1] >= 2:
+                proprio_summary = proprio[:, -2:].to(clause_hidden.dtype)
+            else:
+                proprio_summary = F.pad(
+                    proprio.to(clause_hidden.dtype), (2 - proprio.shape[-1], 0)
+                )
+        proprio_summary = proprio_summary.unsqueeze(1).expand(-1, expected[1], -1)
+        effective_previous_ids = torch.where(
+            previous_state_valid,
+            previous_state_ids,
+            torch.full_like(previous_state_ids, self.PENDING),
+        )
+        previous_embedding = self.state_embedding(effective_previous_ids).to(
+            clause_hidden.dtype
+        )
+        features = torch.cat(
+            (
+                clause_hidden,
+                subject_tokens,
+                reference_tokens,
+                active_probability.to(clause_hidden.dtype).unsqueeze(-1),
+                truth_probability.to(clause_hidden.dtype).unsqueeze(-1),
+                phase_probability.to(clause_hidden.dtype),
+                base_execution_probability.to(clause_hidden.dtype).unsqueeze(-1),
+                previous_state_valid.to(clause_hidden.dtype).unsqueeze(-1),
+                proprio_summary,
+                previous_embedding,
+            ),
+            dim=-1,
+        )
+        hidden = self.input_projection(self.input_norm(features))
+        hidden = hidden + self.clause_embedding.unsqueeze(0)
+        hidden = self.output_norm(self.encoder(hidden))
+        state_logits = self.state_output(hidden).float()
+        scheduler_logits = self.scheduler_output(hidden).squeeze(-1).float()
+        routing_residual = (
+            torch.tanh(scheduler_logits) * self.routing_residual_max_abs
+        )
+        routing_multiplier = base_routing_multiplier.float() * (
+            1.0 + routing_residual
+        )
+        active_mask = active_probability >= 0.5
+        execution_logits = base_execution_logits.float() + scheduler_logits
+        execution_logits = execution_logits.masked_fill(~active_mask, -1.0e4)
+        execution_probability = torch.softmax(execution_logits, dim=-1)
+
+        predicted_state_ids = state_logits.argmax(dim=-1)
+        # Safety semantics independent of the learned classifier:
+        # completed predicates are sticky.  A spatial predicate becoming true
+        # while the object is still held must not advance the conjunction, so
+        # a new completion additionally requires either the frozen phase head
+        # or the learned state head to report COMPLETED.  If a prior HOLDING
+        # state is no longer classified as holding while truth remains false,
+        # keep the same clause in RETRY instead of silently returning to a
+        # generic pending state.
+        phase_ids = phase_probability.argmax(dim=-1)
+        learned_release_completion = (
+            (predicted_state_ids == self.COMPLETED) & (phase_ids != 1)
+        )
+        previous_completed = previous_state_valid & (
+            previous_state_ids == self.COMPLETED
+        )
+        # Once a caller-owned clause is complete, a transient active-logit miss
+        # must not erase that history.  New completion still requires an active
+        # clause, but sticky completion is independent of the current frame's
+        # language/activation prediction.
+        completed = previous_completed | (
+            active_mask
+            & (truth_probability >= 0.5)
+            & ((phase_ids == 2) | learned_release_completion)
+        )
+        released_unsatisfied = (
+            (~previous_completed)
+            & (truth_probability < 0.5)
+            & (
+                (predicted_state_ids == self.RETRY)
+                | (
+                    previous_state_valid
+                    & (previous_state_ids == self.HOLDING)
+                    & (predicted_state_ids != self.HOLDING)
+                )
+            )
+            & active_mask
+        )
+        next_state_ids = torch.where(
+            completed,
+            torch.full_like(predicted_state_ids, self.COMPLETED),
+            predicted_state_ids,
+        )
+        # A learned COMPLETED prediction must not leak around the guarded
+        # ``completed`` condition above.  In particular, spatial overlap can
+        # become true while the object is still in the gripper.  Keep that
+        # clause in HOLDING until a later replan observes release/phase-2.
+        held_completion_blocked = (
+            (~previous_completed)
+            & active_mask
+            & (phase_ids == 1)
+            & (predicted_state_ids == self.COMPLETED)
+        )
+        next_state_ids = torch.where(
+            held_completion_blocked,
+            torch.full_like(next_state_ids, self.HOLDING),
+            next_state_ids,
+        )
+        next_state_ids = torch.where(
+            released_unsatisfied,
+            torch.full_like(next_state_ids, self.RETRY),
+            next_state_ids,
+        )
+        next_state_ids = torch.where(
+            active_mask | previous_state_valid,
+            next_state_ids,
+            torch.full_like(next_state_ids, self.PENDING),
+        )
+        next_state_valid = active_mask | previous_state_valid
+        return {
+            "state_logits": state_logits,
+            "state_probability": torch.softmax(state_logits, dim=-1),
+            "previous_state_ids": previous_state_ids,
+            "previous_state_valid": previous_state_valid,
+            "next_state_ids": next_state_ids,
+            "next_state_valid": next_state_valid,
+            "execution_logits": execution_logits,
+            "execution_probability": execution_probability,
+            "routing_residual": routing_residual,
+            "routing_multiplier": routing_multiplier,
+            "completed_sticky": completed,
+            "released_unsatisfied_retry": released_unsatisfied,
+        }
+
+
 class EntityRelationAffordanceField(nn.Module):
     """Complete RGB+language ERAF deployment path used by PGC V9."""
 
@@ -1314,6 +1624,10 @@ class EntityRelationAffordanceField(nn.Module):
         closed_loop_rebinding_hidden_dim: int = 256,
         closed_loop_query_residual_max_abs: float = 1.0,
         closed_loop_state_residual_max_abs: float = 2.0,
+        phase_safe_memory_enabled: bool = False,
+        phase_safe_memory_hidden_dim: int = 256,
+        phase_safe_memory_state_count: int = 4,
+        phase_safe_memory_routing_residual_max_abs: float = 1.0,
     ) -> None:
         super().__init__()
         self.text_dim = int(text_dim)
@@ -1362,6 +1676,17 @@ class EntityRelationAffordanceField(nn.Module):
         self.closed_loop_state_residual_max_abs = float(
             closed_loop_state_residual_max_abs
         )
+        self.phase_safe_memory_enabled = bool(phase_safe_memory_enabled)
+        self.phase_safe_memory_hidden_dim = int(phase_safe_memory_hidden_dim)
+        self.phase_safe_memory_state_count = int(phase_safe_memory_state_count)
+        self.phase_safe_memory_routing_residual_max_abs = float(
+            phase_safe_memory_routing_residual_max_abs
+        )
+        if self.closed_loop_rebinding_enabled and self.phase_safe_memory_enabled:
+            raise ValueError(
+                "ERAF V9.12 query rebinding and V9.13 phase-safe memory are "
+                "mutually exclusive."
+            )
         self.role_decoder = PredicateRoleDecoder(
             text_dim=text_dim,
             hidden_dim=hidden_dim,
@@ -1444,6 +1769,21 @@ class EntityRelationAffordanceField(nn.Module):
                 state_residual_max_abs=closed_loop_state_residual_max_abs,
             )
             if self.closed_loop_rebinding_enabled
+            else None
+        )
+        self.phase_safe_clause_memory = (
+            PhaseSafeClauseMemory(
+                hidden_dim=hidden_dim,
+                adapter_hidden_dim=phase_safe_memory_hidden_dim,
+                num_heads=num_heads,
+                max_clauses=max_clauses,
+                phase_count=self.relation_reasoner.phase_count,
+                state_count=phase_safe_memory_state_count,
+                routing_residual_max_abs=(
+                    phase_safe_memory_routing_residual_max_abs
+                ),
+            )
+            if self.phase_safe_memory_enabled
             else None
         )
         self.entity_only_projection = nn.Sequential(
@@ -1611,6 +1951,8 @@ class EntityRelationAffordanceField(nn.Module):
         language_hidden: torch.Tensor,
         language_mask: torch.Tensor,
         current_video_hidden: torch.Tensor,
+        policy_state: Mapping[str, torch.Tensor] | None = None,
+        proprio: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]
     ]:
@@ -1857,6 +2199,65 @@ class EntityRelationAffordanceField(nn.Module):
             phase_rebinding_phase_residual = torch.zeros_like(
                 affordance["phase_logits"]
             )
+        # V9.13 starts from frozen V9.11 geometry and applies memory only to
+        # clause scheduling.  Keep explicit aliases so both tests and online
+        # audits can prove that no heatmap, entity token, or anchor was changed.
+        pre_memory_subject_attention = subject["attention"]
+        pre_memory_reference_attention = reference["attention"]
+        pre_memory_subject_position = subject["position"]
+        pre_memory_reference_position = reference["position"]
+        pre_memory_goal_anchor = affordance["goal_anchor"]
+        if self.phase_safe_clause_memory is not None:
+            memory = self.phase_safe_clause_memory(
+                clause_hidden=roles["clause_hidden"],
+                subject_tokens=subject["token"],
+                reference_tokens=reference["token"],
+                active_logits=roles["active_logits"],
+                predicate_truth_logits=affordance["predicate_truth_logits"],
+                phase_logits=affordance["phase_logits"],
+                base_execution_logits=execution["execution_logits"],
+                base_execution_probability=execution["execution_probability"],
+                base_routing_multiplier=execution["routing_multiplier"],
+                policy_state=policy_state,
+                proprio=proprio,
+            )
+            execution = {
+                "execution_logits": memory["execution_logits"],
+                "execution_probability": memory["execution_probability"],
+                "routing_residual": memory["routing_multiplier"] - 1.0,
+                "routing_multiplier": memory["routing_multiplier"],
+            }
+        else:
+            batch_size, clause_count = roles["active_logits"].shape
+            memory = {
+                "state_logits": roles["active_logits"].new_zeros(
+                    (batch_size, clause_count, 4), dtype=torch.float32
+                ),
+                "state_probability": roles["active_logits"].new_full(
+                    (batch_size, clause_count, 4), 0.25, dtype=torch.float32
+                ),
+                "previous_state_ids": roles["active_logits"].new_zeros(
+                    (batch_size, clause_count), dtype=torch.long
+                ),
+                "previous_state_valid": roles["active_logits"].new_zeros(
+                    (batch_size, clause_count), dtype=torch.bool
+                ),
+                "next_state_ids": roles["active_logits"].new_zeros(
+                    (batch_size, clause_count), dtype=torch.long
+                ),
+                "next_state_valid": roles["active_logits"].new_zeros(
+                    (batch_size, clause_count), dtype=torch.bool
+                ),
+                "routing_residual": roles["active_logits"].new_zeros(
+                    (batch_size, clause_count), dtype=torch.float32
+                ),
+                "completed_sticky": roles["active_logits"].new_zeros(
+                    (batch_size, clause_count), dtype=torch.bool
+                ),
+                "released_unsatisfied_retry": roles["active_logits"].new_zeros(
+                    (batch_size, clause_count), dtype=torch.bool
+                ),
+            }
         routing_multiplier = execution["routing_multiplier"].to(
             affordance["relation_hidden"].dtype
         )
@@ -1959,6 +2360,36 @@ class EntityRelationAffordanceField(nn.Module):
             "pgc_v9_phase_rebinding_phase_residual_rms": (
                 phase_rebinding_phase_residual.float().pow(2).mean().sqrt()
             ),
+            "pgc_v9_phase_safe_memory_state_confidence": (
+                memory["state_probability"].float().max(dim=-1).values.mean()
+            ),
+            "pgc_v9_phase_safe_memory_routing_residual_rms": (
+                memory["routing_residual"].float().pow(2).mean().sqrt()
+            ),
+            "pgc_v9_phase_safe_memory_geometry_max_abs": torch.stack(
+                (
+                    (subject["attention"] - pre_memory_subject_attention)
+                    .float()
+                    .abs()
+                    .max(),
+                    (reference["attention"] - pre_memory_reference_attention)
+                    .float()
+                    .abs()
+                    .max(),
+                    (subject["position"] - pre_memory_subject_position)
+                    .float()
+                    .abs()
+                    .max(),
+                    (reference["position"] - pre_memory_reference_position)
+                    .float()
+                    .abs()
+                    .max(),
+                    (affordance["goal_anchor"] - pre_memory_goal_anchor)
+                    .float()
+                    .abs()
+                    .max(),
+                )
+            ).max(),
         }
         outputs = {
             **roles,
@@ -2048,6 +2479,43 @@ class EntityRelationAffordanceField(nn.Module):
                 device=roles["active_logits"].device,
                 dtype=torch.bool,
             ),
+            "phase_safe_memory_enabled": torch.tensor(
+                self.phase_safe_clause_memory is not None,
+                device=roles["active_logits"].device,
+                dtype=torch.bool,
+            ),
+            "phase_safe_memory_state_logits": memory["state_logits"],
+            "phase_safe_memory_state_probability": memory[
+                "state_probability"
+            ],
+            "phase_safe_memory_previous_state_ids": memory[
+                "previous_state_ids"
+            ],
+            "phase_safe_memory_previous_state_valid": memory[
+                "previous_state_valid"
+            ],
+            "phase_safe_memory_next_state_ids": memory["next_state_ids"],
+            "phase_safe_memory_next_state_valid": memory[
+                "next_state_valid"
+            ],
+            "phase_safe_memory_routing_residual": memory[
+                "routing_residual"
+            ],
+            "phase_safe_memory_completed_sticky": memory[
+                "completed_sticky"
+            ],
+            "phase_safe_memory_released_unsatisfied_retry": memory[
+                "released_unsatisfied_retry"
+            ],
+            "pre_memory_subject_attention": pre_memory_subject_attention.detach(),
+            "pre_memory_reference_attention": (
+                pre_memory_reference_attention.detach()
+            ),
+            "pre_memory_subject_position": pre_memory_subject_position.detach(),
+            "pre_memory_reference_position": (
+                pre_memory_reference_position.detach()
+            ),
+            "pre_memory_goal_anchor": pre_memory_goal_anchor.detach(),
             "clause_execution_logits": execution["execution_logits"],
             "clause_execution_probability": execution[
                 "execution_probability"
@@ -2110,6 +2578,9 @@ class ERAFLossWeights:
     clause_scheduler: float = 0.0
     clause_scheduler_energy: float = 0.0
     phase_rebinding_energy: float = 0.0
+    phase_safe_memory_state: float = 0.0
+    phase_safe_memory_scheduler: float = 0.0
+    phase_safe_memory_energy: float = 0.0
     phase: float = 0.25
 
 
@@ -3681,7 +4152,7 @@ def entity_relation_affordance_loss(
             2
         ).mean()
     phase_rebinding_energy_loss = zero
-    if int(weights.objective_version) >= 13:
+    if int(weights.objective_version) == 13:
         required_rebinding_outputs = {
             "phase_rebinding_subject_delta",
             "phase_rebinding_reference_delta",
@@ -3700,6 +4171,81 @@ def entity_relation_affordance_loss(
             outputs[name].float().pow(2).mean()
             for name in sorted(required_rebinding_outputs)
         )
+    phase_safe_memory_state_loss = zero
+    phase_safe_memory_scheduler_loss = zero
+    phase_safe_memory_energy_loss = zero
+    phase_safe_memory_state_accuracy = zero.detach()
+    phase_safe_memory_scheduler_accuracy = zero.detach()
+    phase_safe_memory_valid_fraction = zero.detach()
+    if int(weights.objective_version) >= 14:
+        required_memory_outputs = {
+            "phase_safe_memory_state_logits",
+            "phase_safe_memory_routing_residual",
+            "clause_execution_logits",
+        }
+        required_memory_labels = {
+            "phase_safe_memory_target_state_ids",
+            "phase_safe_memory_state_valid",
+            "phase_safe_memory_execution_target",
+            "phase_safe_memory_execution_valid",
+        }
+        missing_memory_outputs = sorted(required_memory_outputs.difference(outputs))
+        missing_memory_labels = sorted(required_memory_labels.difference(labels))
+        if missing_memory_outputs or missing_memory_labels:
+            raise ValueError(
+                "V9.13 phase-safe memory requires explicit temporal labels; "
+                f"missing_outputs={missing_memory_outputs} "
+                f"missing_labels={missing_memory_labels}."
+            )
+        memory_state_valid = (
+            labels["phase_safe_memory_state_valid"].bool() & clause_valid
+        )
+        memory_target_state = labels[
+            "phase_safe_memory_target_state_ids"
+        ].long()
+        memory_state_logits = outputs[
+            "phase_safe_memory_state_logits"
+        ].float()
+        phase_safe_memory_state_loss = _masked_mean(
+            F.cross_entropy(
+                memory_state_logits.transpose(1, 2),
+                memory_target_state,
+                reduction="none",
+            ),
+            memory_state_valid,
+        )
+        phase_safe_memory_state_accuracy = _masked_mean(
+            (memory_state_logits.argmax(dim=-1) == memory_target_state).float(),
+            memory_state_valid,
+        ).detach()
+        memory_execution_valid = labels[
+            "phase_safe_memory_execution_valid"
+        ].bool()
+        memory_execution_target = labels[
+            "phase_safe_memory_execution_target"
+        ].long()
+        memory_execution_logits = outputs[
+            "clause_execution_logits"
+        ].float().masked_fill(~clause_valid, -1.0e4)
+        phase_safe_memory_scheduler_loss = _masked_mean(
+            F.cross_entropy(
+                memory_execution_logits,
+                memory_execution_target,
+                reduction="none",
+            ),
+            memory_execution_valid,
+        )
+        phase_safe_memory_scheduler_accuracy = _masked_mean(
+            (
+                memory_execution_logits.argmax(dim=-1)
+                == memory_execution_target
+            ).float(),
+            memory_execution_valid,
+        ).detach()
+        phase_safe_memory_energy_loss = outputs[
+            "phase_safe_memory_routing_residual"
+        ].float().pow(2).mean()
+        phase_safe_memory_valid_fraction = memory_state_valid.float().mean().detach()
     # Penalize attention assigned exclusively to the other semantic role.
     # Pixels shared by overlapping objects/containers are excluded so an
     # object entering a basket is not trained as a false negative.
@@ -3928,6 +4474,10 @@ def entity_relation_affordance_loss(
         + weights.clause_scheduler * clause_scheduler_loss
         + weights.clause_scheduler_energy * clause_scheduler_energy_loss
         + weights.phase_rebinding_energy * phase_rebinding_energy_loss
+        + weights.phase_safe_memory_state * phase_safe_memory_state_loss
+        + weights.phase_safe_memory_scheduler
+        * phase_safe_memory_scheduler_loss
+        + weights.phase_safe_memory_energy * phase_safe_memory_energy_loss
         + weights.phase * phase_loss
     )
     predicate_prediction = outputs["predicate_logits"].argmax(dim=-1)
@@ -3993,6 +4543,24 @@ def entity_relation_affordance_loss(
         ),
         "loss_pgc_v9_phase_rebinding_energy": (
             phase_rebinding_energy_loss.detach()
+        ),
+        "loss_pgc_v9_phase_safe_memory_state": (
+            phase_safe_memory_state_loss.detach()
+        ),
+        "loss_pgc_v9_phase_safe_memory_scheduler": (
+            phase_safe_memory_scheduler_loss.detach()
+        ),
+        "loss_pgc_v9_phase_safe_memory_energy": (
+            phase_safe_memory_energy_loss.detach()
+        ),
+        "pgc_v9_phase_safe_memory_state_accuracy": (
+            phase_safe_memory_state_accuracy
+        ),
+        "pgc_v9_phase_safe_memory_scheduler_accuracy": (
+            phase_safe_memory_scheduler_accuracy
+        ),
+        "pgc_v9_phase_safe_memory_valid_fraction": (
+            phase_safe_memory_valid_fraction
         ),
         "loss_pgc_v9_phase": phase_loss.detach(),
         "loss_pgc_v9_predicate": predicate_loss.detach(),
