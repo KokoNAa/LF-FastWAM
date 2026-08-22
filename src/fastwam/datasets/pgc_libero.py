@@ -28,6 +28,8 @@ PGC_CLOSED_LOOP_CORRECTIVE_FORMAT = "pgc_libero_closed_loop_corrective_v1"
 PGC_CLOSED_LOOP_CORRECTIVE_INDEX = Path("meta/pgc_v8_closed_loop/index.json")
 PGC_ENTITY_RELATION_FORMAT = "pgc_libero_entity_relation_v1"
 PGC_ENTITY_RELATION_INDEX = Path("index.json")
+PGC_ENTITY_RELATION_WORKSPACE_MIN = (-0.8, -0.8, 0.0)
+PGC_ENTITY_RELATION_WORKSPACE_MAX = (0.8, 0.8, 1.2)
 PGC_ACTION_CONVENTION_FASTWAM = "fastwam_gripper_open_1_close_0"
 PGC_ACTION_CONVENTION_LIBERO_ENV = (
     "libero_env_gripper_open_minus1_close_plus1"
@@ -82,6 +84,35 @@ LIBERO_SUITES = (
     "libero_10",
 )
 PGC_STATE_TRANSFER_MODES = ("flat_exact", "named_joint_remap")
+
+
+def pgc_entity_relation_workspace_bounds(
+    indices: Mapping[int, Mapping[str, Any]],
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Return the shared ERAF workspace or reject mixed coordinate frames."""
+    bounds = {
+        (
+            tuple(
+                float(value)
+                for value in np.asarray(
+                    index["workspace_min"], dtype=np.float32
+                ).tolist()
+            ),
+            tuple(
+                float(value)
+                for value in np.asarray(
+                    index["workspace_max"], dtype=np.float32
+                ).tolist()
+            ),
+        )
+        for index in indices.values()
+    }
+    if len(bounds) != 1:
+        raise ValueError(
+            "PGC v9 sidecars disagree on workspace bounds: "
+            f"{sorted(bounds)!r}."
+        )
+    return next(iter(bounds))
 
 
 def _validated_libero_actions(actions: np.ndarray) -> np.ndarray:

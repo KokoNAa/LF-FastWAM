@@ -33,6 +33,8 @@ from fastwam.datasets.pgc_libero import (  # noqa: E402
     PGC_ENTITY_RELATION_FORMAT,
     PGC_ENTITY_RELATION_INDEX,
     PGC_ENTITY_RELATION_PREDICATES,
+    PGC_ENTITY_RELATION_WORKSPACE_MAX,
+    PGC_ENTITY_RELATION_WORKSPACE_MIN,
     array_sha256,
     atomic_write_json,
     libero_lerobot_features,
@@ -96,10 +98,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-clauses", type=int, default=4)
     parser.add_argument("--state-atol", type=float, default=1.0e-7)
     parser.add_argument(
-        "--workspace-min", type=float, nargs=3, default=(-0.65, -0.60, 0.70)
+        "--workspace-min",
+        type=float,
+        nargs=3,
+        default=PGC_ENTITY_RELATION_WORKSPACE_MIN,
     )
     parser.add_argument(
-        "--workspace-max", type=float, nargs=3, default=(0.65, 0.60, 1.45)
+        "--workspace-max",
+        type=float,
+        nargs=3,
+        default=PGC_ENTITY_RELATION_WORKSPACE_MAX,
     )
     parser.add_argument(
         "--video-codec",

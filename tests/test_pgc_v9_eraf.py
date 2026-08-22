@@ -23,12 +23,15 @@ from fastwam.datasets.pgc_libero import (
     PGC_ACTION_CONVENTION_LIBERO_ENV,
     PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV,
     PGC_ENTITY_RELATION_ARRAY_NAMES,
+    PGC_ENTITY_RELATION_WORKSPACE_MAX,
+    PGC_ENTITY_RELATION_WORKSPACE_MIN,
     array_sha256,
     classify_strict_conflict,
     fastwam_actions_to_libero_env,
     libero_env_actions_to_fastwam,
     load_pgc_entity_relation_index,
     parse_libero_goal_clauses,
+    pgc_entity_relation_workspace_bounds,
     provenance_pair,
     state_sha256,
     validate_strict_conflict_audit,
@@ -47,6 +50,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
 )
 from fastwam.models.wan22.policy_guard import infer_spatial_patch_grid
 import scripts.build_pgc_libero_entity_relations as eraf_builder
+import scripts.build_pgc_v912_closed_loop_grounding_data as v912_builder
 from scripts.build_pgc_libero_entity_relations import (
     ARRAY_NAMES,
     _match_native_demo,
@@ -61,6 +65,48 @@ from fastwam.utils.samplers import ResumableEpochSampler
 
 
 class PGCERAFParsingTest(unittest.TestCase):
+    def test_v912_builder_uses_the_shared_eraf_workspace_contract(self):
+        with patch(
+            "sys.argv",
+            [
+                "build_pgc_v912_closed_loop_grounding_data.py",
+                "--captures",
+                "/tmp/captures",
+                "--output",
+                "/tmp/dataset",
+                "--sidecar-output",
+                "/tmp/sidecar",
+                "--suite",
+                "libero_10",
+            ],
+        ):
+            args = v912_builder._parse_args()
+        self.assertEqual(
+            tuple(args.workspace_min), PGC_ENTITY_RELATION_WORKSPACE_MIN
+        )
+        self.assertEqual(
+            tuple(args.workspace_max), PGC_ENTITY_RELATION_WORKSPACE_MAX
+        )
+
+    def test_eraf_workspace_contract_rejects_mixed_coordinate_frames(self):
+        canonical = {
+            "workspace_min": list(PGC_ENTITY_RELATION_WORKSPACE_MIN),
+            "workspace_max": list(PGC_ENTITY_RELATION_WORKSPACE_MAX),
+        }
+        lower, upper = pgc_entity_relation_workspace_bounds(
+            {0: canonical, 1: canonical}
+        )
+        np.testing.assert_allclose(lower, PGC_ENTITY_RELATION_WORKSPACE_MIN)
+        np.testing.assert_allclose(upper, PGC_ENTITY_RELATION_WORKSPACE_MAX)
+        incompatible = {
+            "workspace_min": [-0.65, -0.60, 0.70],
+            "workspace_max": [0.65, 0.60, 1.45],
+        }
+        with self.assertRaisesRegex(ValueError, "disagree on workspace bounds"):
+            pgc_entity_relation_workspace_bounds(
+                {0: canonical, 1: incompatible}
+            )
+
     def test_eraf_array_contract_is_shared_by_builder_loader_and_model(self):
         self.assertEqual(ARRAY_NAMES, PGC_ENTITY_RELATION_ARRAY_NAMES)
         for name in (

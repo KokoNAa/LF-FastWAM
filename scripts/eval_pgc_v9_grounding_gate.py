@@ -860,6 +860,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     from fastwam.utils import misc
     from fastwam.utils.pytorch_utils import set_global_seed
+    from fastwam.datasets.pgc_libero import (
+        pgc_entity_relation_workspace_bounds,
+    )
 
     checkpoint = args.checkpoint.expanduser().resolve()
     config_path = (
@@ -934,17 +937,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "objective v13 at step 7250."
         )
     model = model.to(args.device).eval()
-    sidecars = list(dataset.pgc_entity_relation_indices.values())
-    workspace_bounds = {
-        (
-            tuple(float(value) for value in index["workspace_min"]),
-            tuple(float(value) for value in index["workspace_max"]),
-        )
-        for index in sidecars
-    }
-    if len(workspace_bounds) != 1:
-        raise ValueError("PGC v9 sidecars disagree on workspace bounds.")
-    lower, upper = next(iter(workspace_bounds))
+    lower, upper = pgc_entity_relation_workspace_bounds(
+        dataset.pgc_entity_relation_indices
+    )
     workspace_min = np.asarray(lower, dtype=np.float32)
     workspace_max = np.asarray(upper, dtype=np.float32)
 

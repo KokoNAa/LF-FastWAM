@@ -30,6 +30,8 @@ from fastwam.datasets.pgc_libero import (  # noqa: E402
     PGC_ENTITY_RELATION_ARRAY_NAMES,
     PGC_ENTITY_RELATION_FORMAT,
     PGC_ENTITY_RELATION_INDEX,
+    PGC_ENTITY_RELATION_WORKSPACE_MAX,
+    PGC_ENTITY_RELATION_WORKSPACE_MIN,
     array_sha256,
     atomic_write_json,
     canonical_state_array,
@@ -81,10 +83,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--state-atol", type=float, default=1.0e-7)
     parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument(
-        "--workspace-min", nargs=3, type=float, default=(-0.8, -0.8, 0.0)
+        "--workspace-min",
+        nargs=3,
+        type=float,
+        default=PGC_ENTITY_RELATION_WORKSPACE_MIN,
     )
     parser.add_argument(
-        "--workspace-max", nargs=3, type=float, default=(0.8, 0.8, 1.2)
+        "--workspace-max",
+        nargs=3,
+        type=float,
+        default=PGC_ENTITY_RELATION_WORKSPACE_MAX,
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()

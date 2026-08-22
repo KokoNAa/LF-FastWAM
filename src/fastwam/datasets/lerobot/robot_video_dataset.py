@@ -30,6 +30,7 @@ from ..pgc_libero import (
     load_pgc_entity_relation_index,
     load_pgc_episode_language_pairs,
     load_pgc_target_mask_index,
+    pgc_entity_relation_workspace_bounds,
     read_jsonl,
     state_sha256,
 )
@@ -657,8 +658,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     f"{sorted(eraf_mask_shapes)}."
                 )
             self.pgc_entity_relation_mask_shape = next(iter(eraf_mask_shapes))
+            self.pgc_entity_relation_workspace_bounds = (
+                pgc_entity_relation_workspace_bounds(
+                    self.pgc_entity_relation_indices
+                )
+            )
         else:
             self.pgc_entity_relation_mask_shape = (56, 112)
+            self.pgc_entity_relation_workspace_bounds = None
         self._pgc_entity_relation_cache: OrderedDict[
             tuple[int, int], dict[str, np.ndarray]
         ] = OrderedDict()
