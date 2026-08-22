@@ -12449,8 +12449,24 @@ class FastWAM(torch.nn.Module):
                                     )
                         if saved_grounding_objective >= 4 and not objective_upgrade:
                             if saved_grounding_objective >= 14:
+                                saved_action_joint_training = bool(
+                                    metadata.get(
+                                        "eraf_action_joint_training", False
+                                    )
+                                )
+                                saved_action_stage = (
+                                    metadata.get("eraf_training_stage") == "action"
+                                )
                                 expected_scope = (
-                                    "phase_safe_temporal_clause_memory_only"
+                                    "frozen_eraf_perception_action_bridge_"
+                                    "plus_proposal"
+                                    if (
+                                        saved_action_joint_training
+                                        and saved_action_stage
+                                    )
+                                    else (
+                                        "phase_safe_temporal_clause_memory_only"
+                                    )
                                 )
                             elif saved_grounding_objective == 13:
                                 expected_scope = (
