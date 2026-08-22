@@ -210,10 +210,17 @@ if version == 8 and (
     raise SystemExit("PGC v8 checkpoint lacks its audited corrective contract")
 if version == 9:
     objective = int(metadata.get("eraf_grounding_objective_version", -1))
+    completion_only_memory = bool(
+        metadata.get("eraf_completion_only_memory", False)
+    )
     expected_deployment_inputs = (
-        "rgb_language_proprio_previous_policy_state"
-        if objective >= 14
-        else "rgb_language_proprio"
+        "rgb_language_proprio_completed_clause_bitset"
+        if completion_only_memory
+        else (
+            "rgb_language_proprio_previous_policy_state"
+            if objective >= 14
+            else "rgb_language_proprio"
+        )
     )
     expected_ablation = {
         "full": (False, True),
@@ -293,11 +300,26 @@ if version == 9:
         or metadata.get("eraf_release_transition_contract")
         != "release_true_advance_release_false_retry"
         or metadata.get("eraf_policy_state_contract")
-        != "explicit_caller_owned_reset_per_episode"
+        != (
+            "monotonic_completed_bitset_no_pending_holding_retry_recurrence"
+            if completion_only_memory
+            else "explicit_caller_owned_reset_per_episode"
+        )
         or metadata.get("eraf_phase_safe_memory_warm_start")
         != "exact_v9_11_geometry"
     ):
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
+    if completion_only_memory and (
+        training_stage != "action"
+        or metadata.get("eraf_action_joint_training") is not True
+        or metadata.get("eraf_action_joint_contract")
+        != "frozen_eraf_perception_plus_action_bridge_and_proposal"
+        or metadata.get("eraf_action_trainable_scope")
+        != "base_query_projection_relation_attention_query_embedding_delta_plus_action_chunk_proposal"
+        or metadata.get("eraf_role_adapter_trainable_scope")
+        != "frozen_eraf_perception_action_bridge_plus_proposal"
+    ):
+        raise SystemExit("PGC v9.14 checkpoint lacks its joint-action contract")
 else:
     objective = 0
     training_stage = "grounding"
@@ -409,6 +431,9 @@ mapping = {
     "eraf_camera_count": "camera_count",
     "eraf_visual_aspect_ratio": "visual_aspect_ratio",
     "eraf_temperature": "temperature",
+    "eraf_grounding_aux_weight": "grounding_aux_weight",
+    "eraf_completion_only_memory": "completion_only_memory",
+    "eraf_action_joint_training": "action_joint_training",
     "eraf_attention_mask_weight": "attention_mask_weight",
     "eraf_role_swap_weight": "role_swap_weight",
     "eraf_role_overlap_weight": "role_overlap_weight",

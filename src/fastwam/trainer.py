@@ -233,6 +233,20 @@ class Wan22Trainer:
                         False,
                     )
                 )
+                completion_only_memory = bool(
+                    getattr(
+                        self.model,
+                        "policy_guard_eraf_completion_only_memory",
+                        False,
+                    )
+                )
+                action_joint_training = bool(
+                    getattr(
+                        self.model,
+                        "policy_guard_eraf_action_joint_training",
+                        False,
+                    )
+                )
                 if (
                     objective_version == 13
                     and training_stage == "grounding"
@@ -258,12 +272,29 @@ class Wan22Trainer:
                         "PGC V9.13 grounding requires the audited four-way "
                         "phase-safe memory curriculum."
                     )
-                if phase_safe_memory and not (
-                    objective_version == 14 and training_stage == "grounding"
+                valid_phase_safe_stage = objective_version == 14 and (
+                    training_stage == "grounding"
+                    or (
+                        training_stage == "action"
+                        and completion_only_memory
+                        and action_joint_training
+                    )
+                )
+                if phase_safe_memory and not valid_phase_safe_stage:
+                    raise ValueError(
+                        "PGC phase-memory data is valid only for objective-v14 "
+                        "V9.13 grounding or V9.14 completion-only joint action "
+                        "training."
+                    )
+                if (
+                    objective_version == 14
+                    and training_stage == "action"
+                    and action_joint_training
+                    and not phase_safe_memory
                 ):
                     raise ValueError(
-                        "PGC V9.13 memory data is valid only for objective-v14 "
-                        "grounding repair."
+                        "PGC V9.14 joint action training requires the audited "
+                        "four-way phase-memory curriculum."
                     )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.

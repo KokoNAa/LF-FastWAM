@@ -3650,6 +3650,152 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             },
         )
 
+    def test_v914_completion_only_joint_action_contract(self):
+        model = tiny_pgc_fastwam(
+            version=9,
+            v9_stage="action",
+            v9_grounding_objective_version=14,
+            v9_completion_only_memory=True,
+            v9_action_joint_training=True,
+        )
+        state = {
+            "phase_safe_memory_state_ids": torch.tensor([[0, 1, 2, 3]]),
+            "phase_safe_memory_valid": torch.tensor(
+                [[True, True, True, True]]
+            ),
+        }
+        sanitized = model._policy_guard_completion_only_state(state)
+        self.assertTrue(
+            torch.equal(
+                sanitized["phase_safe_memory_state_ids"],
+                torch.tensor([[0, 0, 0, 3]]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                sanitized["phase_safe_memory_valid"],
+                torch.tensor([[False, False, False, True]]),
+            )
+        )
+        monotonic = model._policy_guard_completion_only_state(
+            {
+                "phase_safe_memory_state_ids": torch.tensor([[0, 0, 0, 0]]),
+                "phase_safe_memory_valid": torch.tensor(
+                    [[False, False, False, False]]
+                ),
+            },
+            previous_state=sanitized,
+        )
+        self.assertTrue(
+            torch.equal(
+                monotonic["phase_safe_memory_state_ids"],
+                torch.tensor([[0, 0, 0, 3]]),
+            )
+        )
+        self.assertTrue(monotonic["phase_safe_memory_valid"][0, 3])
+
+        model.prepare_trainable_parameters()
+        trainable = {
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        proposal_prefix = "policy_guard_modules.action_chunk_proposal."
+        bridge_prefixes = tuple(
+            "policy_guard_modules.entity_relation_affordance." + name + "."
+            for name in (
+                "base_query_projection",
+                "relation_attention",
+                "query_delta_projection",
+                "embedding_delta_projection",
+            )
+        )
+        self.assertTrue(trainable)
+        self.assertTrue(
+            all(
+                name.startswith(proposal_prefix)
+                or name.startswith(bridge_prefixes)
+                for name in trainable
+            )
+        )
+        self.assertTrue(any(name.startswith(proposal_prefix) for name in trainable))
+        for prefix in bridge_prefixes:
+            self.assertTrue(any(name.startswith(prefix) for name in trainable))
+        self.assertFalse(any(p.requires_grad for p in model.mot.parameters()))
+        groups = model.policy_guard_optimizer_groups(1.0e-4)
+        rates = {group["pgc_v9_group"]: group["lr"] for group in groups}
+        self.assertEqual(rates["entity_relation_affordance"], 2.0e-5)
+        self.assertEqual(rates["action_chunk_proposal"], 1.0e-4)
+
+    def test_v914_rejects_joint_action_without_completion_only_contract(self):
+        with self.assertRaisesRegex(ValueError, "completion-only memory"):
+            tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=14,
+                v9_action_joint_training=True,
+            )
+
+    def test_v913_to_v914_checkpoint_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v913_path = root / "v913.pt"
+            v914_path = root / "v914.pt"
+            v913 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=14,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v913.mot.state_dict()},
+                base_path,
+            )
+            v913.load_checkpoint(base_path)
+            v913.save_checkpoint(v913_path, step=7250)
+
+            v914 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=14,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v914.load_checkpoint(v913_path)
+            v914.save_checkpoint(v914_path, step=11250)
+            payload = torch.load(v914_path, map_location="cpu", weights_only=False)
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(
+                metadata["deployment_inputs"],
+                "rgb_language_proprio_completed_clause_bitset",
+            )
+            self.assertEqual(
+                metadata["eraf_policy_state_contract"],
+                "monotonic_completed_bitset_no_pending_holding_retry_recurrence",
+            )
+            self.assertEqual(
+                metadata["eraf_action_joint_contract"],
+                "frozen_eraf_perception_plus_action_bridge_and_proposal",
+            )
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "frozen_eraf_perception_action_bridge_plus_proposal",
+            )
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=14,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            restored.load_checkpoint(v914_path)
+            expected = v914.policy_guard_modules.state_dict()
+            actual = restored.policy_guard_modules.state_dict()
+            self.assertEqual(expected.keys(), actual.keys())
+            for name, value in expected.items():
+                self.assertTrue(torch.equal(value, actual[name]), name)
+
     def test_verifier_stage_builds_explicit_negatives_with_frozen_root(self):
         model = tiny_pgc_fastwam(version=9, v9_stage="verifier")
         model.prepare_trainable_parameters()

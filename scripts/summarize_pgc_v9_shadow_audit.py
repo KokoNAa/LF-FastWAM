@@ -119,6 +119,7 @@ def build_summary(
     action_integrity: list[dict[str, Any]] = []
     tasks: list[dict[str, Any]] = []
     policy_state_modes: set[str] = set()
+    deployed_completion_only_modes: set[bool] = set()
     for path in result_files:
         payload = json.loads(path.read_text(encoding="utf-8"))
         audit = payload.get("eraf_shadow_audit")
@@ -141,16 +142,29 @@ def build_summary(
         )
         if declared_stateless != (policy_state_mode == "reset_each_replan"):
             raise ValueError(f"Inconsistent stateless ablation metadata: {path}")
-        declared_completion_only = bool(
+        declared_completion_only_ablation = bool(
             audit.get(
                 "completion_only_memory_ablation",
-                policy_state_mode == "completion_only",
+                False,
             )
         )
-        if declared_completion_only != (policy_state_mode == "completion_only"):
-            raise ValueError(
-                f"Inconsistent completion-only ablation metadata: {path}"
+        declared_completion_only_deployed = bool(
+            audit.get("completion_only_memory_deployed", False)
+        )
+        effective_completion_only = (
+            not declared_stateless
+            and (
+                declared_completion_only_ablation
+                or declared_completion_only_deployed
             )
+        )
+        if effective_completion_only != (
+            policy_state_mode == "completion_only"
+        ):
+            raise ValueError(
+                f"Inconsistent completion-only policy-state metadata: {path}"
+            )
+        deployed_completion_only_modes.add(declared_completion_only_deployed)
         policy_state_modes.add(policy_state_mode)
         task_records = audit.get("records")
         if not isinstance(task_records, list) or not task_records:
@@ -193,6 +207,14 @@ def build_summary(
             f"{sorted(policy_state_modes)}."
         )
     policy_state_mode = next(iter(policy_state_modes))
+    if len(deployed_completion_only_modes) != 1:
+        raise ValueError(
+            "Cannot mix deployed completion-only contracts in one shadow "
+            "summary."
+        )
+    completion_only_memory_deployed = next(
+        iter(deployed_completion_only_modes)
+    )
     stateless_report = build_stateless_replan_report(
         records,
         enabled=policy_state_mode == "reset_each_replan",
@@ -211,6 +233,9 @@ def build_summary(
             "episodes": sum(item["episodes"] for item in tasks),
             "tasks": sorted(tasks, key=lambda item: item["task_id"]),
             "policy_state_mode": policy_state_mode,
+            "completion_only_memory_deployed": (
+                completion_only_memory_deployed
+            ),
             "stateless_replan_ablation": stateless_report,
             "completion_only_memory_ablation": completion_only_report,
         }

@@ -193,6 +193,14 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"clause_activation_balance_weight"',
             source,
         )
+        self.assertIn(
+            '"eraf_grounding_aux_weight": "grounding_aux_weight"',
+            source,
+        )
+        self.assertIn(
+            '"eraf_completion_only_memory": "completion_only_memory"',
+            source,
+        )
         self.assertNotIn("phase_rebinding_energy_weight=0.01", source)
 
     def test_v913_launcher_uses_v911_geometry_and_phase_safe_memory_only(self):
@@ -211,9 +219,22 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             "phase_safe_memory_state_weight=",
             source,
         )
+        self.assertIn("action-completion-only", source)
         self.assertIn(
-            "V9.13 stops at phase-memory shadow admission", source
+            "V9.14 must warm-start from the admitted V9.13 phase-memory",
+            source,
         )
+        self.assertIn(
+            "model.policy_guard.entity_relation_grounding."
+            "completion_only_memory=",
+            source,
+        )
+        self.assertIn(
+            "model.policy_guard.entity_relation_grounding."
+            "action_joint_training=",
+            source,
+        )
+        self.assertIn("grounding_aux:${GROUNDING_AUX_WEIGHT}", source)
 
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (

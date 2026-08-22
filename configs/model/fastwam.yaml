@@ -295,6 +295,9 @@ policy_guard:
     # role/truth/phase rebinder from immutable-Base closed-loop replan states.
     # Version 14 (V9.13) returns to frozen V9.11 geometry and learns only an
     # explicit pending/holding/retry/completed memory plus clause routing.
+    # V9.14 keeps that four-state predictor as a current-frame diagnostic but
+    # persists only a monotonic completed-clause bitset. During its action
+    # stage, only the ERAF-to-query bridge and ActionChunkProposal are trained.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -306,6 +309,8 @@ policy_guard:
     use_anchors: true
     learning_rate: 2.0e-5
     grounding_aux_weight: 0.25
+    completion_only_memory: false
+    action_joint_training: false
     mask_weight: 1.0
     attention_mask_weight: 2.0
     entity_weight: 1.0

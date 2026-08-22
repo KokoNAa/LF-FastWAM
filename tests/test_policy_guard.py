@@ -42,6 +42,8 @@ def tiny_pgc_fastwam(
     v9_entity_only: bool = False,
     v9_use_anchors: bool = True,
     v9_grounding_objective_version: int = 2,
+    v9_completion_only_memory: bool = False,
+    v9_action_joint_training: bool = False,
 ) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
@@ -180,7 +182,11 @@ def tiny_pgc_fastwam(
                 "visual_aspect_ratio": 2.0,
                 "temperature": 0.07,
                 "learning_rate": 2.0e-5,
-                "grounding_aux_weight": 0.25,
+                "grounding_aux_weight": (
+                    0.0 if v9_action_joint_training else 0.25
+                ),
+                "completion_only_memory": v9_completion_only_memory,
+                "action_joint_training": v9_action_joint_training,
                 "mask_weight": 1.0,
                 "attention_mask_weight": 2.0,
                 "entity_weight": 1.0,

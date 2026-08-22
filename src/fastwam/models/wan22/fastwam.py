@@ -71,6 +71,12 @@ PGC_PHASE_SAFE_MEMORY_LABEL_NAMES = (
     *PGC_PHASE_SAFE_MEMORY_CLAUSE_LABEL_NAMES,
     *PGC_PHASE_SAFE_MEMORY_SAMPLE_LABEL_NAMES,
 )
+PGC_ERAF_ACTION_BRIDGE_MODULE_NAMES = (
+    "base_query_projection",
+    "relation_attention",
+    "query_delta_projection",
+    "embedding_delta_projection",
+)
 
 
 class FastWAM(torch.nn.Module):
@@ -655,6 +661,16 @@ class FastWAM(torch.nn.Module):
         )
         self.policy_guard_eraf_grounding_aux_weight = float(
             eraf_config.get("grounding_aux_weight", 0.25)
+        )
+        # V9.14 retains only a monotonic completed-clause bitset across
+        # replans.  ``action_joint_training`` is intentionally separate from
+        # that deployment contract so a later verifier stage can preserve the
+        # same memory semantics without reopening the ERAF action bridge.
+        self.policy_guard_eraf_completion_only_memory = bool(
+            eraf_config.get("completion_only_memory", False)
+        )
+        self.policy_guard_eraf_action_joint_training = bool(
+            eraf_config.get("action_joint_training", False)
         )
         self.policy_guard_eraf_grounding_objective_version = int(
             eraf_config.get("grounding_objective_version", 1)
@@ -1359,6 +1375,32 @@ class FastWAM(torch.nn.Module):
                     raise ValueError(
                         "PGC v9 ERAF training_stage must be grounding, action, "
                         "or verifier."
+                    )
+                if (
+                    self.policy_guard_eraf_completion_only_memory
+                    and self.policy_guard_eraf_grounding_objective_version < 14
+                ):
+                    raise ValueError(
+                        "PGC V9.14 completion-only memory requires the "
+                        "objective-v14 phase-memory architecture."
+                    )
+                if self.policy_guard_eraf_action_joint_training and not (
+                    self.policy_guard_eraf_completion_only_memory
+                    and self.policy_guard_eraf_grounding_objective_version >= 14
+                    and self.policy_guard_eraf_training_stage == "action"
+                ):
+                    raise ValueError(
+                        "PGC V9.14 ERAF--Proposal joint training requires "
+                        "objective-v14, action stage, and completion-only memory."
+                    )
+                if (
+                    self.policy_guard_eraf_action_joint_training
+                    and self.policy_guard_eraf_grounding_aux_weight != 0.0
+                ):
+                    raise ValueError(
+                        "PGC V9.14 freezes the ERAF grounding core; "
+                        "grounding_aux_weight must be zero during joint action "
+                        "training."
                     )
                 if min(
                     self.policy_guard_eraf_hidden_dim,
@@ -2220,6 +2262,14 @@ class FastWAM(torch.nn.Module):
                             ]
                             proposal.train()
                             proposal.requires_grad_(True)
+                            if self.policy_guard_eraf_action_joint_training:
+                                eraf = self.policy_guard_modules[
+                                    "entity_relation_affordance"
+                                ]
+                                for module_name in PGC_ERAF_ACTION_BRIDGE_MODULE_NAMES:
+                                    bridge = getattr(eraf, module_name)
+                                    bridge.train()
+                                    bridge.requires_grad_(True)
                         else:
                             verifier = self.policy_guard_modules["verifier"]
                             verifier.train()
@@ -2400,6 +2450,73 @@ class FastWAM(torch.nn.Module):
                 "sidecars."
             )
         return groups
+
+    def _policy_guard_completion_only_state(
+        self,
+        policy_state: Optional[Mapping[str, torch.Tensor]],
+        *,
+        previous_state: Optional[Mapping[str, torch.Tensor]] = None,
+    ) -> Optional[dict[str, torch.Tensor]]:
+        """Enforce the V9.14 cross-replan state contract inside the model.
+
+        The learned four-state PSCM remains a current-frame diagnostic and
+        routing feature, but HOLDING/RETRY/PENDING predictions are never fed
+        back at the next replan.  Only an explicitly valid COMPLETED bit is
+        allowed through this boundary.  Keeping this enforcement in FastWAM
+        makes LIBERO and downstream RoboTwin callers share identical behavior
+        instead of relying on a benchmark-specific wrapper.
+        """
+        if policy_state is None:
+            return None
+        if not self.policy_guard_eraf_completion_only_memory:
+            return dict(policy_state)
+        state_ids = policy_state.get("phase_safe_memory_state_ids")
+        state_valid = policy_state.get("phase_safe_memory_valid")
+        if state_ids is None or state_valid is None:
+            raise ValueError(
+                "V9.14 completion-only policy state requires state IDs and "
+                "validity."
+            )
+        state_ids = torch.as_tensor(state_ids).long()
+        state_valid = torch.as_tensor(state_valid).bool()
+        if state_ids.shape != state_valid.shape:
+            raise ValueError(
+                "V9.14 completion-only state IDs and validity must have the "
+                "same shape."
+            )
+        completed = state_valid & (state_ids == 3)
+        if previous_state is not None:
+            previous_ids = previous_state.get("phase_safe_memory_state_ids")
+            previous_valid = previous_state.get("phase_safe_memory_valid")
+            if previous_ids is None or previous_valid is None:
+                raise ValueError(
+                    "V9.14 previous completion-only state requires state IDs "
+                    "and validity."
+                )
+            previous_ids = torch.as_tensor(previous_ids).to(
+                device=state_ids.device, dtype=torch.long
+            )
+            previous_valid = torch.as_tensor(previous_valid).to(
+                device=state_valid.device, dtype=torch.bool
+            )
+            if previous_ids.shape != state_ids.shape or (
+                previous_valid.shape != state_valid.shape
+            ):
+                raise ValueError(
+                    "V9.14 current and previous completion-only states must "
+                    "have identical shapes."
+                )
+            completed = completed | (
+                previous_valid & (previous_ids == 3)
+            )
+        sanitized = dict(policy_state)
+        sanitized["phase_safe_memory_state_ids"] = torch.where(
+            completed,
+            torch.full_like(state_ids, 3),
+            torch.zeros_like(state_ids),
+        )
+        sanitized["phase_safe_memory_valid"] = completed
+        return sanitized
 
     @classmethod
     def from_wan22_pretrained(
@@ -2816,6 +2933,9 @@ class FastWAM(torch.nn.Module):
             )
         )
         eraf_module = self.policy_guard_modules["entity_relation_affordance"]
+        policy_guard_state = self._policy_guard_completion_only_state(
+            policy_guard_state
+        )
         (
             routed_queries,
             routed_embedding,
@@ -5289,26 +5409,36 @@ class FastWAM(torch.nn.Module):
                 policy_guard_state=source_policy_state,
                 proprio=inputs.get("proprio_current"),
             )
-            target_eraf_loss, target_eraf_metrics = (
-                entity_relation_affordance_loss(
-                    eraf_outputs,
-                    target_labels,
-                    weights=self.policy_guard_eraf_loss_weights,
+            if (
+                self.policy_guard_eraf_training_stage == "action"
+                and self.policy_guard_eraf_grounding_aux_weight <= 0.0
+            ):
+                # V9.14 consumes the frozen ERAF representation but does not
+                # optimize or even materialize the large privileged grounding
+                # objective graph. Gradients still flow through the four
+                # trainable ERAF-to-action bridge modules above.
+                eraf_binding_loss = goal_embedding.sum() * 0.0
+            else:
+                target_eraf_loss, target_eraf_metrics = (
+                    entity_relation_affordance_loss(
+                        eraf_outputs,
+                        target_labels,
+                        weights=self.policy_guard_eraf_loss_weights,
+                    )
                 )
-            )
-            source_eraf_loss, source_eraf_metrics = (
-                entity_relation_affordance_loss(
-                    source_eraf_outputs,
-                    source_labels,
-                    weights=self.policy_guard_eraf_loss_weights,
+                source_eraf_loss, source_eraf_metrics = (
+                    entity_relation_affordance_loss(
+                        source_eraf_outputs,
+                        source_labels,
+                        weights=self.policy_guard_eraf_loss_weights,
+                    )
                 )
-            )
-            eraf_binding_loss = target_eraf_loss + 0.5 * source_eraf_loss
-            eraf_loss_metrics.update(target_eraf_metrics)
-            for name, value in source_eraf_metrics.items():
-                eraf_loss_metrics[
-                    f"pgc_v9_source_{name.removeprefix('pgc_v9_')}"
-                ] = value
+                eraf_binding_loss = target_eraf_loss + 0.5 * source_eraf_loss
+                eraf_loss_metrics.update(target_eraf_metrics)
+                for name, value in source_eraf_metrics.items():
+                    eraf_loss_metrics[
+                        f"pgc_v9_source_{name.removeprefix('pgc_v9_')}"
+                    ] = value
             zero = goal_embedding.sum() * 0.0
             binding_interaction_loss = zero
             binding_prototype_loss = zero
@@ -5949,6 +6079,15 @@ class FastWAM(torch.nn.Module):
                     ),
                     "pgc_v9_stage_verifier": float(
                         self.policy_guard_eraf_training_stage == "verifier"
+                    ),
+                    "pgc_v914_completion_only_memory": float(
+                        self.policy_guard_eraf_completion_only_memory
+                    ),
+                    "pgc_v914_eraf_proposal_joint": float(
+                        self.policy_guard_eraf_action_joint_training
+                    ),
+                    "pgc_v914_frozen_grounding_core": float(
+                        self.policy_guard_eraf_action_joint_training
                     ),
                 }
             )
@@ -9580,7 +9719,7 @@ class FastWAM(torch.nn.Module):
                     self._policy_guard_last_eraf_diagnostics
                 )
                 if self.policy_guard_eraf_grounding_objective_version >= 14:
-                    result["policy_guard_state"] = {
+                    next_policy_state = {
                         "phase_safe_memory_state_ids": (
                             self._policy_guard_last_eraf_diagnostics[
                                 "phase_safe_memory_next_state_ids"
@@ -9592,6 +9731,12 @@ class FastWAM(torch.nn.Module):
                             ].clone()
                         ),
                     }
+                    result["policy_guard_state"] = (
+                        self._policy_guard_completion_only_state(
+                            next_policy_state,
+                            previous_state=policy_guard_state,
+                        )
+                    )
             return result
 
         if (
@@ -9850,7 +9995,9 @@ class FastWAM(torch.nn.Module):
             objective_version = self.policy_guard_eraf_grounding_objective_version
             if objective_version >= 14:
                 eraf_role_adapter_trainable_scope = (
-                    "phase_safe_temporal_clause_memory_only"
+                    "frozen_eraf_perception_action_bridge_plus_proposal"
+                    if self.policy_guard_eraf_action_joint_training
+                    else "phase_safe_temporal_clause_memory_only"
                 )
             elif objective_version >= 13:
                 eraf_role_adapter_trainable_scope = (
@@ -9908,10 +10055,14 @@ class FastWAM(torch.nn.Module):
             ),
             "privileged_supervision": "training_only" if is_v9 else None,
             "deployment_inputs": (
-                "rgb_language_proprio_previous_policy_state"
-                if is_v9
-                and self.policy_guard_eraf_grounding_objective_version >= 14
-                else ("rgb_language_proprio" if is_v9 else None)
+                "rgb_language_proprio_completed_clause_bitset"
+                if is_v9 and self.policy_guard_eraf_completion_only_memory
+                else (
+                    "rgb_language_proprio_previous_policy_state"
+                    if is_v9
+                    and self.policy_guard_eraf_grounding_objective_version >= 14
+                    else ("rgb_language_proprio" if is_v9 else None)
+                )
             ),
             "base_policy": "frozen_released_fastwam",
             "base_action_interface": "query_free_joint_mot",
@@ -10455,6 +10606,27 @@ class FastWAM(torch.nn.Module):
                 if is_v9
                 else None
             ),
+            "eraf_completion_only_memory": (
+                self.policy_guard_eraf_completion_only_memory
+                if is_v9
+                else None
+            ),
+            "eraf_action_joint_training": (
+                self.policy_guard_eraf_action_joint_training
+                if is_v9
+                else None
+            ),
+            "eraf_action_joint_contract": (
+                "frozen_eraf_perception_plus_action_bridge_and_proposal"
+                if is_v9 and self.policy_guard_eraf_action_joint_training
+                else None
+            ),
+            "eraf_action_trainable_scope": (
+                "base_query_projection_relation_attention_query_embedding_"
+                "delta_plus_action_chunk_proposal"
+                if is_v9 and self.policy_guard_eraf_action_joint_training
+                else None
+            ),
             "eraf_hard_role_curriculum": (
                 (
                     "v9_10_audited_clause_tuple_native_hard_easy_1_1"
@@ -10586,10 +10758,14 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "eraf_policy_state_contract": (
-                "explicit_caller_owned_reset_per_episode"
-                if is_v9
-                and self.policy_guard_eraf_grounding_objective_version >= 14
-                else None
+                "monotonic_completed_bitset_no_pending_holding_retry_recurrence"
+                if is_v9 and self.policy_guard_eraf_completion_only_memory
+                else (
+                    "explicit_caller_owned_reset_per_episode"
+                    if is_v9
+                    and self.policy_guard_eraf_grounding_objective_version >= 14
+                    else None
+                )
             ),
             "eraf_phase_safe_memory_warm_start": (
                 "exact_v9_11_geometry"
@@ -11300,6 +11476,9 @@ class FastWAM(torch.nn.Module):
             int(metadata.get("eraf_grounding_objective_version", 1))
             if saved_policy_guard_version == 9
             else None
+        )
+        saved_eraf_completion_only_memory = bool(
+            metadata.get("eraf_completion_only_memory", False)
         )
         migrate_v5_to_target_binder = (
             saved_policy_guard_version == 5
@@ -12096,9 +12275,13 @@ class FastWAM(torch.nn.Module):
                             )
                     elif saved_policy_guard_version == 9:
                         expected_deployment_inputs = (
-                            "rgb_language_proprio_previous_policy_state"
-                            if int(saved_eraf_grounding_objective or 1) >= 14
-                            else "rgb_language_proprio"
+                            "rgb_language_proprio_completed_clause_bitset"
+                            if saved_eraf_completion_only_memory
+                            else (
+                                "rgb_language_proprio_previous_policy_state"
+                                if int(saved_eraf_grounding_objective or 1) >= 14
+                                else "rgb_language_proprio"
+                            )
                         )
                         if (
                             metadata.get("warm_start_contract")
@@ -12765,6 +12948,12 @@ class FastWAM(torch.nn.Module):
                                     f"{self.policy_guard_eraf_closed_loop_rebinding_hidden_dim}."
                                 )
                         if saved_grounding_objective >= 14 and not objective_upgrade:
+                            expected_policy_state_contract = (
+                                "monotonic_completed_bitset_no_pending_holding_"
+                                "retry_recurrence"
+                                if saved_eraf_completion_only_memory
+                                else "explicit_caller_owned_reset_per_episode"
+                            )
                             expected_v913_contract = {
                                 "eraf_closed_loop_state_contract": (
                                     "immutable_base_correct_replan_exact_simulator_"
@@ -12786,7 +12975,7 @@ class FastWAM(torch.nn.Module):
                                     "release_true_advance_release_false_retry"
                                 ),
                                 "eraf_policy_state_contract": (
-                                    "explicit_caller_owned_reset_per_episode"
+                                    expected_policy_state_contract
                                 ),
                                 "eraf_phase_safe_memory_warm_start": (
                                     "exact_v9_11_geometry"
@@ -12799,6 +12988,36 @@ class FastWAM(torch.nn.Module):
                                         f"{name}={metadata.get(name)!r}, "
                                         f"expected={expected!r}."
                                     )
+                            if saved_eraf_completion_only_memory:
+                                if not self.policy_guard_eraf_completion_only_memory:
+                                    raise ValueError(
+                                        "PGC V9.14 checkpoint requires the model's "
+                                        "completion-only memory contract."
+                                    )
+                                expected_v914_contract = {
+                                    "eraf_training_stage": "action",
+                                    "eraf_action_joint_training": True,
+                                    "eraf_action_joint_contract": (
+                                        "frozen_eraf_perception_plus_action_bridge_"
+                                        "and_proposal"
+                                    ),
+                                    "eraf_action_trainable_scope": (
+                                        "base_query_projection_relation_attention_"
+                                        "query_embedding_delta_plus_action_chunk_"
+                                        "proposal"
+                                    ),
+                                    "eraf_role_adapter_trainable_scope": (
+                                        "frozen_eraf_perception_action_bridge_"
+                                        "plus_proposal"
+                                    ),
+                                }
+                                for name, expected in expected_v914_contract.items():
+                                    if metadata.get(name) != expected:
+                                        raise ValueError(
+                                            "PGC V9.14 checkpoint contract mismatch: "
+                                            f"{name}={metadata.get(name)!r}, "
+                                            f"expected={expected!r}."
+                                        )
                             for metadata_name, expected_value in {
                                 "eraf_phase_safe_memory_state_weight": (
                                     self.policy_guard_eraf_loss_weights.phase_safe_memory_state

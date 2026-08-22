@@ -1177,6 +1177,13 @@ def run_single_episode(
     current_replan_idx = -1
     inference_latencies_ms: list[float] = []
     policy_guard_decisions: list[dict[str, Any]] = []
+    deployed_completion_only_memory = bool(
+        getattr(
+            model,
+            "policy_guard_eraf_completion_only_memory",
+            False,
+        )
+    )
     # Explicit per-episode state: never retained on the model, shared between
     # environments, or carried across LIBERO trials.  Evaluation can either
     # cut the recurrent PSCM channel completely or preserve only a monotonic
@@ -1189,8 +1196,14 @@ def run_single_episode(
             )
         ),
         completion_only=bool(
-            cfg.EVALUATION.get(
-                "entity_relation_completion_only_memory_ablation", False
+            not cfg.EVALUATION.get(
+                "entity_relation_stateless_replan_ablation", False
+            )
+            and (
+                deployed_completion_only_memory
+                or cfg.EVALUATION.get(
+                    "entity_relation_completion_only_memory_ablation", False
+                )
             )
         ),
     )
@@ -1544,6 +1557,13 @@ def run_single_task(
             "entity_relation_completion_only_memory_ablation", False
         )
     )
+    deployed_completion_only_memory = bool(
+        getattr(
+            model,
+            "policy_guard_eraf_completion_only_memory",
+            False,
+        )
+    )
     if stateless_replan_ablation and completion_only_ablation:
         raise ValueError(
             "Stateless and completion-only policy-state ablations are mutually "
@@ -1686,12 +1706,18 @@ def run_single_task(
                 if stateless_replan_ablation
                 else (
                     "completion_only"
-                    if completion_only_ablation
+                    if (
+                        completion_only_ablation
+                        or deployed_completion_only_memory
+                    )
                     else "recurrent"
                 )
             ),
             "stateless_replan_ablation": stateless_replan_ablation,
             "completion_only_memory_ablation": completion_only_ablation,
+            "completion_only_memory_deployed": (
+                deployed_completion_only_memory
+            ),
             "records": [],
         }
     if intervention_record is not None:
