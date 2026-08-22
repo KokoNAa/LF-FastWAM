@@ -643,6 +643,7 @@ fi
   "${CLOSED_LOOP_GROUNDING_DATASET:-null}" \
   "${CLOSED_LOOP_GROUNDING_SIDECAR:-null}" <<'PY'
 import json
+import math
 import pathlib
 import sys
 import torch
@@ -901,6 +902,7 @@ expected_action_contracts.extend(
         ("counterfactual", "libero_env_gripper_open_minus1_close_plus1", "identity"),
     )
 )
+workspace_contracts = []
 for dataset, sidecar, expected_contract in zip(
     datasets, sidecars, expected_action_contracts, strict=True
 ):
@@ -922,6 +924,21 @@ for dataset, sidecar, expected_contract in zip(
             f"Sidecar action contract mismatch at {index_path}: "
             f"expected={expected_contract} got={actual_contract}."
         )
+    try:
+        workspace_min = tuple(float(value) for value in index["workspace_min"])
+        workspace_max = tuple(float(value) for value in index["workspace_max"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"Invalid ERAF workspace contract at {index_path}: {exc}"
+        ) from exc
+    if len(workspace_min) != 3 or len(workspace_max) != 3:
+        raise SystemExit(
+            f"Invalid ERAF workspace dimensions at {index_path}: "
+            f"min={workspace_min} max={workspace_max}."
+        )
+    workspace_contracts.append(
+        (str(pathlib.Path(sidecar).resolve()), workspace_min, workspace_max)
+    )
     if dataset == closed_loop_dataset and (
         index.get("state_distribution")
         != "immutable_base_closed_loop_replan"
@@ -929,6 +946,26 @@ for dataset, sidecar, expected_contract in zip(
         raise SystemExit(
             "V9.12/V9.13 closed-loop sidecar has the wrong state-distribution contract."
         )
+reference_sidecar, reference_min, reference_max = workspace_contracts[0]
+workspace_mismatches = [
+    (sidecar, lower, upper)
+    for sidecar, lower, upper in workspace_contracts[1:]
+    if not all(
+        math.isclose(left, right, rel_tol=0.0, abs_tol=1.0e-6)
+        for left, right in zip(lower + upper, reference_min + reference_max)
+    )
+]
+if workspace_mismatches:
+    details = "\n".join(
+        f"  {sidecar}: min={lower} max={upper}"
+        for sidecar, lower, upper in workspace_contracts
+    )
+    raise SystemExit(
+        "ERAF workspace mismatch detected before distributed launch.\n"
+        f"Reference: {reference_sidecar}\n{details}\n"
+        "Select an already canonical sidecar or create an out-of-place copy "
+        "with scripts/migrate_pgc_eraf_workspace.py."
+    )
 PY
 
 json_array() {

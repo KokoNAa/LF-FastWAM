@@ -235,6 +235,11 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             source,
         )
         self.assertIn("grounding_aux:${GROUNDING_AUX_WEIGHT}", source)
+        self.assertIn(
+            "ERAF workspace mismatch detected before distributed launch",
+            source,
+        )
+        self.assertIn("migrate_pgc_eraf_workspace.py", source)
 
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (
