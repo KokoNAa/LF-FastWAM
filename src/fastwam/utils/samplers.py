@@ -39,8 +39,28 @@ class ResumableEpochSampler(Sampler[int]):
     def __iter__(self) -> Iterator[int]:
         g = torch.Generator(device="cpu")
         g.manual_seed(self.seed + self.epoch + self.epoch_offset)
-        curriculum_groups = getattr(
+        hard_curriculum_groups = getattr(
             self.dataset, "pgc_v9_hard_curriculum_group_ids", None
+        )
+        closed_loop_curriculum_groups = getattr(
+            self.dataset, "pgc_v9_closed_loop_group_ids", None
+        )
+        if (
+            hard_curriculum_groups is not None
+            and closed_loop_curriculum_groups is not None
+        ):
+            raise ValueError(
+                "PGC hard-role and closed-loop curricula are mutually exclusive."
+            )
+        curriculum_groups = (
+            closed_loop_curriculum_groups
+            if closed_loop_curriculum_groups is not None
+            else hard_curriculum_groups
+        )
+        curriculum_name = (
+            "PGC V9.12 closed-loop"
+            if closed_loop_curriculum_groups is not None
+            else "PGC V9.6 hard-role"
         )
         if curriculum_groups is None:
             indices = torch.randperm(len(self.dataset), generator=g).tolist()
@@ -48,13 +68,12 @@ class ResumableEpochSampler(Sampler[int]):
             groups = [int(value) for value in curriculum_groups]
             if len(groups) != len(self.dataset):
                 raise ValueError(
-                    "PGC V9.6 curriculum labels must match dataset length."
+                    f"{curriculum_name} curriculum labels must match dataset length."
                 )
             unique_groups = sorted(set(groups))
             if unique_groups != [0, 1, 2, 3]:
                 raise ValueError(
-                    "PGC V9.6 curriculum requires exactly four groups: "
-                    "native-hard, native-easy, historical-CF, strict-CF."
+                    f"{curriculum_name} curriculum requires exactly four groups."
                 )
             global_window = (
                 self.batch_size
@@ -63,7 +82,7 @@ class ResumableEpochSampler(Sampler[int]):
             )
             if global_window % 4 or self.gradient_accumulation_steps % 4:
                 raise ValueError(
-                    "PGC V9.6 requires gradient accumulation divisible by 4 "
+                    f"{curriculum_name} requires gradient accumulation divisible by 4 "
                     "so every rank and global optimizer window sees all four "
                     "curriculum groups."
                 )
@@ -76,7 +95,7 @@ class ResumableEpochSampler(Sampler[int]):
             for group, positions in grouped_positions.items():
                 if not positions:
                     raise ValueError(
-                        f"PGC V9.6 curriculum group {group} is empty."
+                        f"{curriculum_name} curriculum group {group} is empty."
                     )
                 order = torch.randperm(len(positions), generator=g).tolist()
                 grouped_positions[group] = [positions[index] for index in order]
@@ -88,7 +107,7 @@ class ResumableEpochSampler(Sampler[int]):
             group_size = len(grouped_positions[0])
             if any(len(values) != group_size for values in grouped_positions.values()):
                 raise ValueError(
-                    "PGC V9.6 curriculum groups must have equal cardinality."
+                    f"{curriculum_name} curriculum groups must have equal cardinality."
                 )
             window_groups = [
                 (microstep + process + batch_slot) % 4
@@ -101,7 +120,9 @@ class ResumableEpochSampler(Sampler[int]):
                 window_groups.count(group) != per_group_per_window
                 for group in range(4)
             ):
-                raise RuntimeError("PGC V9.6 rank-aware curriculum is imbalanced.")
+                raise RuntimeError(
+                    f"{curriculum_name} rank-aware curriculum is imbalanced."
+                )
             complete_windows, remainder = divmod(
                 group_size, per_group_per_window
             )

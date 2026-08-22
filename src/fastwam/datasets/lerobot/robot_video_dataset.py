@@ -330,6 +330,56 @@ def build_pgc_v96_sample_plan(
     return sample_indices, group_ids
 
 
+def build_pgc_v912_sample_plan(
+    *,
+    offline_native_indices: list[int],
+    closed_loop_native_indices: list[int],
+    original_counterfactual_indices: list[int],
+    strict_counterfactual_indices: list[int],
+    closed_loop_stage_categories: list[str],
+    strict_relation_categories: list[str],
+) -> tuple[list[int], list[int]]:
+    """Interleave V9.12 online repair and three offline guard groups 1:1:1:1.
+
+    Closed-loop rows are balanced over search/holding/release/next-clause
+    phases, while strict rows remain balanced over audited conflict type.  The
+    deterministic four-way cycle lets a resumable distributed sampler retain
+    the intended optimizer-window mixture.
+    """
+    offline = [int(index) for index in offline_native_indices]
+    closed_loop = [int(index) for index in closed_loop_native_indices]
+    original = [int(index) for index in original_counterfactual_indices]
+    strict = [int(index) for index in strict_counterfactual_indices]
+    if not all((offline, closed_loop, original, strict)):
+        raise ValueError(
+            "PGC V9.12 requires non-empty offline-native, closed-loop-native, "
+            "historical-CF, and strict-CF pools."
+        )
+    combined = offline + closed_loop + original + strict
+    if len(set(combined)) != len(combined):
+        raise ValueError("PGC V9.12 sample pools must be disjoint.")
+    closed_loop, _ = _balance_indices_by_category(
+        closed_loop, [str(value) for value in closed_loop_stage_categories]
+    )
+    strict, _ = _balance_indices_by_category(
+        strict, [str(value) for value in strict_relation_categories]
+    )
+    target_count = max(len(offline), len(closed_loop), len(original), len(strict))
+    groups = [
+        _repeat_indices(offline, target_count),
+        _repeat_indices(closed_loop, target_count),
+        _repeat_indices(original, target_count),
+        _repeat_indices(strict, target_count),
+    ]
+    sample_indices = [
+        groups[group][position]
+        for position in range(target_count)
+        for group in range(4)
+    ]
+    group_ids = [group for _ in range(target_count) for group in range(4)]
+    return sample_indices, group_ids
+
+
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -367,6 +417,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_v9_structured_role_sampling: bool = False,
         pgc_v9_hard_role_curriculum: bool = False,
         pgc_v9_hard_role_index_path: Optional[str] = None,
+        pgc_v9_closed_loop_rebinding: bool = False,
+        pgc_v9_closed_loop_native_dataset_count: int = 0,
     ):
         native_dataset_dirs = [str(path) for path in dataset_dirs]
         pgc_counterfactual_dataset_dirs = [
@@ -453,6 +505,35 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if pgc_v9_hard_role_index_path in (None, "")
             else str(pgc_v9_hard_role_index_path)
         )
+        self.pgc_v9_closed_loop_rebinding = bool(pgc_v9_closed_loop_rebinding)
+        self.pgc_v9_closed_loop_native_dataset_count = int(
+            pgc_v9_closed_loop_native_dataset_count
+        )
+        if not 0 <= self.pgc_v9_closed_loop_native_dataset_count < max(
+            1, self.pgc_native_dataset_count
+        ):
+            raise ValueError(
+                "PGC V9.12 closed-loop native dataset count must leave at "
+                "least one offline native dataset."
+            )
+        if self.pgc_v9_closed_loop_rebinding:
+            if self.pgc_v9_closed_loop_native_dataset_count <= 0:
+                raise ValueError(
+                    "PGC V9.12 requires a trailing closed-loop native dataset."
+                )
+            if not self.pgc_v9_balanced_sampling:
+                raise ValueError(
+                    "PGC V9.12 closed-loop rebinding requires balanced sampling."
+                )
+            if self.pgc_v9_hard_role_curriculum:
+                raise ValueError(
+                    "PGC V9.12 replaces the V9.11 hard curriculum with its "
+                    "four-way closed-loop mixture."
+                )
+        elif self.pgc_v9_closed_loop_native_dataset_count:
+            raise ValueError(
+                "Closed-loop native datasets require pgc_v9_closed_loop_rebinding."
+            )
         if self.pgc_v9_structured_role_sampling and not self.pgc_v9_balanced_sampling:
             raise ValueError(
                 "PGC v9.4 structured role sampling requires v9 balanced sampling."
@@ -547,6 +628,25 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                         f"{dataset_index}: sidecar={audited_dataset} "
                         f"dataset={os.path.realpath(dataset_dir)}."
                     )
+            if self.pgc_v9_closed_loop_rebinding:
+                closed_loop_start = (
+                    self.pgc_native_dataset_count
+                    - self.pgc_v9_closed_loop_native_dataset_count
+                )
+                for dataset_index in range(
+                    closed_loop_start, self.pgc_native_dataset_count
+                ):
+                    index = self.pgc_entity_relation_indices[dataset_index]
+                    if (
+                        index.get("dataset_kind") != "native"
+                        or index.get("state_distribution")
+                        != "immutable_base_closed_loop_replan"
+                    ):
+                        raise ValueError(
+                            "PGC V9.12 closed-loop sidecars must declare "
+                            "dataset_kind=native and state_distribution="
+                            "immutable_base_closed_loop_replan."
+                        )
             eraf_mask_shapes = {
                 tuple(index["mask_size"])
                 for index in self.pgc_entity_relation_indices.values()
@@ -600,6 +700,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.pgc_native_frame_count = sum(
             int(dataset.num_frames)
             for dataset in underlying[: self.pgc_native_dataset_count]
+        )
+        self.pgc_offline_native_dataset_count = (
+            self.pgc_native_dataset_count
+            - self.pgc_v9_closed_loop_native_dataset_count
+        )
+        self.pgc_offline_native_frame_count = sum(
+            int(dataset.num_frames)
+            for dataset in underlying[: self.pgc_offline_native_dataset_count]
         )
         offline_dataset_end = (
             self.pgc_native_dataset_count
@@ -748,7 +856,72 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     original_dataset_index
                 )
                 strict_role_categories = _dataset_pair_categories(strict_dataset_index)
-            if self.pgc_v9_hard_role_curriculum:
+            if self.pgc_v9_closed_loop_rebinding:
+                offline_native = list(range(self.pgc_offline_native_frame_count))
+                closed_loop_native = list(
+                    range(
+                        self.pgc_offline_native_frame_count,
+                        self.pgc_native_frame_count,
+                    )
+                )
+                closed_loop_stages: list[str] = []
+                allowed_stages = {
+                    "initial_search",
+                    "holding",
+                    "released_unfinished",
+                    "next_clause_search",
+                }
+                for dataset_index in range(
+                    self.pgc_offline_native_dataset_count,
+                    self.pgc_native_dataset_count,
+                ):
+                    dataset = underlying[dataset_index]
+                    records = self.pgc_entity_relation_indices[dataset_index][
+                        "episodes_by_index"
+                    ]
+                    for raw_episode_index in dataset.hf_dataset["episode_index"]:
+                        episode_index = int(
+                            torch.as_tensor(raw_episode_index).reshape(-1)[0].item()
+                        )
+                        try:
+                            stage = str(records[episode_index]["online_stage_v2"])
+                        except KeyError as exc:
+                            raise KeyError(
+                                "PGC V9.12 closed-loop sidecar is missing its "
+                                f"phase for dataset/episode {dataset_index}/"
+                                f"{episode_index}."
+                            ) from exc
+                        if stage not in allowed_stages:
+                            raise ValueError(
+                                f"PGC V9.12 has unsupported online stage {stage!r}."
+                            )
+                        closed_loop_stages.append(stage)
+                if len(closed_loop_stages) != len(closed_loop_native):
+                    raise ValueError(
+                        "PGC V9.12 closed-loop stage/frame mismatch: "
+                        f"stages={len(closed_loop_stages)} "
+                        f"frames={len(closed_loop_native)}."
+                    )
+                (
+                    self._sample_indices,
+                    self.pgc_v9_closed_loop_group_ids,
+                ) = build_pgc_v912_sample_plan(
+                    offline_native_indices=offline_native,
+                    closed_loop_native_indices=closed_loop_native,
+                    original_counterfactual_indices=original,
+                    strict_counterfactual_indices=strict,
+                    closed_loop_stage_categories=closed_loop_stages,
+                    strict_relation_categories=strict_categories,
+                )
+                logger.info(
+                    "PGC V9.12 curriculum: offline_native=%d "
+                    "closed_loop_native=%d historical_cf=%d strict_cf=%d",
+                    *(
+                        self.pgc_v9_closed_loop_group_ids.count(group)
+                        for group in range(4)
+                    ),
+                )
+            elif self.pgc_v9_hard_role_curriculum:
                 hard_index_path = Path(
                     str(self.pgc_v9_hard_role_index_path)
                 ).expanduser().resolve()
@@ -891,6 +1064,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             int(index >= self.pgc_offline_counterfactual_frame_end)
             for index in self._sample_indices
         )
+        self.pgc_effective_eraf_closed_loop_sample_count = sum(
+            int(
+                self.pgc_offline_native_frame_count
+                <= index
+                < self.pgc_native_frame_count
+            )
+            for index in self._sample_indices
+        )
         if self.pgc_has_counterfactual_data:
             logger.info(
                 "PGC sampling: native=%d counterfactual=%d closed_loop=%d balanced=%s",
@@ -898,6 +1079,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 self.pgc_effective_counterfactual_sample_count,
                 self.pgc_effective_closed_loop_corrective_sample_count,
                 self.pgc_balance_native_counterfactual,
+            )
+        if self.pgc_v9_closed_loop_rebinding:
+            logger.info(
+                "PGC V9.12 effective closed-loop ERAF samples=%d.",
+                self.pgc_effective_eraf_closed_loop_sample_count,
             )
 
         self.num_frames = num_frames
@@ -1544,6 +1730,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         task = sample["instruction"]
         dataset_index = int(torch.as_tensor(sample.get("dataset_index", 0)).item())
         pgc_is_counterfactual = dataset_index >= self.pgc_native_dataset_count
+        pgc_is_eraf_closed_loop = bool(
+            self.pgc_v9_closed_loop_rebinding
+            and self.pgc_offline_native_dataset_count
+            <= dataset_index
+            < self.pgc_native_dataset_count
+        )
         pgc_is_closed_loop_corrective = dataset_index >= (
             self.pgc_native_dataset_count
             + self.pgc_offline_counterfactual_dataset_count
@@ -1744,6 +1936,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             ),
             "pgc_is_closed_loop_corrective": torch.tensor(
                 pgc_is_closed_loop_corrective, dtype=torch.bool
+            ),
+            "pgc_is_eraf_closed_loop": torch.tensor(
+                pgc_is_eraf_closed_loop, dtype=torch.bool
             ),
             "pgc_direct_action_valid": torch.tensor(
                 (

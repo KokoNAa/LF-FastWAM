@@ -1101,6 +1101,181 @@ class UnfinishedClauseScheduler(nn.Module):
         }
 
 
+class ClosedLoopPhaseRebindingAdapter(nn.Module):
+    """Zero-init V9.12 repair for post-grasp closed-loop ERAF drift.
+
+    V9.11 is accurate on replayed demonstration states but its role queries,
+    predicate state, and unfinished-clause route drift after the immutable Base
+    changes the scene by grasping or releasing an object.  This adapter reads
+    the *current* grounded role tokens together with the first-pass phase and
+    scheduler state, exchanges evidence across clauses, and predicts bounded
+    residuals for a second grounding pass.
+
+    Every output projection is zero initialized.  Loading a V9.11 checkpoint
+    into V9.12 is therefore numerically identical before training; the repair
+    never introduces privileged inputs and remains RGB+language-only at
+    deployment.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        adapter_hidden_dim: int,
+        num_heads: int,
+        max_clauses: int,
+        phase_count: int = 3,
+        query_residual_max_abs: float = 1.0,
+        state_residual_max_abs: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if min(
+            hidden_dim,
+            adapter_hidden_dim,
+            num_heads,
+            max_clauses,
+            phase_count,
+        ) <= 0:
+            raise ValueError("ERAF closed-loop rebinding dimensions must be positive.")
+        if adapter_hidden_dim % num_heads:
+            raise ValueError(
+                "ERAF closed-loop rebinding hidden dimension must be divisible "
+                "by heads."
+            )
+        if query_residual_max_abs <= 0 or state_residual_max_abs <= 0:
+            raise ValueError("ERAF closed-loop rebinding bounds must be positive.")
+        self.hidden_dim = int(hidden_dim)
+        self.max_clauses = int(max_clauses)
+        self.phase_count = int(phase_count)
+        self.query_residual_max_abs = float(query_residual_max_abs)
+        self.state_residual_max_abs = float(state_residual_max_abs)
+        # clause + two queries + two current visual role tokens, followed by
+        # activity, truth, phase distribution, and execution probability.
+        feature_dim = hidden_dim * 5 + phase_count + 3
+        self.input_norm = nn.LayerNorm(feature_dim)
+        self.input_projection = nn.Linear(feature_dim, adapter_hidden_dim)
+        self.clause_embedding = nn.Parameter(
+            torch.zeros(max_clauses, adapter_hidden_dim)
+        )
+        nn.init.normal_(self.clause_embedding, std=0.02)
+        self.encoder = nn.TransformerEncoderLayer(
+            d_model=adapter_hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=adapter_hidden_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.output_norm = nn.LayerNorm(adapter_hidden_dim)
+        self.subject_output = nn.Linear(adapter_hidden_dim, hidden_dim)
+        self.reference_output = nn.Linear(adapter_hidden_dim, hidden_dim)
+        self.truth_output = nn.Linear(adapter_hidden_dim, 1)
+        self.phase_output = nn.Linear(adapter_hidden_dim, phase_count)
+        for output in (
+            self.subject_output,
+            self.reference_output,
+            self.truth_output,
+            self.phase_output,
+        ):
+            nn.init.zeros_(output.weight)
+            nn.init.zeros_(output.bias)
+
+    def forward(
+        self,
+        *,
+        clause_hidden: torch.Tensor,
+        subject_queries: torch.Tensor,
+        reference_queries: torch.Tensor,
+        subject_tokens: torch.Tensor,
+        reference_tokens: torch.Tensor,
+        active_logits: torch.Tensor,
+        predicate_truth_logits: torch.Tensor,
+        phase_logits: torch.Tensor,
+        execution_probability: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        expected = clause_hidden.shape
+        if clause_hidden.ndim != 3 or clause_hidden.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                "ERAF closed-loop rebinding clauses must be [B,C,hidden_dim]."
+            )
+        if clause_hidden.shape[1] != self.max_clauses:
+            raise ValueError(
+                "ERAF closed-loop rebinding clause count does not match config."
+            )
+        if not all(
+            value.shape == expected
+            for value in (
+                subject_queries,
+                reference_queries,
+                subject_tokens,
+                reference_tokens,
+            )
+        ):
+            raise ValueError(
+                "ERAF closed-loop rebinding query/token shapes must match clauses."
+            )
+        if (
+            active_logits.shape != expected[:2]
+            or predicate_truth_logits.shape != expected[:2]
+            or execution_probability.shape != expected[:2]
+            or phase_logits.shape != (*expected[:2], self.phase_count)
+        ):
+            raise ValueError("ERAF closed-loop rebinding state shapes are invalid.")
+
+        active_probability = torch.sigmoid(active_logits.float()).to(
+            clause_hidden.dtype
+        )
+        truth_probability = torch.sigmoid(predicate_truth_logits.float()).to(
+            clause_hidden.dtype
+        )
+        phase_probability = torch.softmax(phase_logits.float(), dim=-1).to(
+            clause_hidden.dtype
+        )
+        features = torch.cat(
+            (
+                clause_hidden,
+                subject_queries,
+                reference_queries,
+                subject_tokens,
+                reference_tokens,
+                active_probability.unsqueeze(-1),
+                truth_probability.unsqueeze(-1),
+                phase_probability,
+                execution_probability.to(clause_hidden.dtype).unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        hidden = self.input_projection(self.input_norm(features))
+        hidden = hidden + self.clause_embedding.unsqueeze(0)
+        hidden = self.output_norm(self.encoder(hidden))
+        active = active_probability.unsqueeze(-1)
+        subject_delta = (
+            torch.tanh(self.subject_output(hidden).float())
+            * self.query_residual_max_abs
+        ).to(subject_queries.dtype) * active
+        reference_delta = (
+            torch.tanh(self.reference_output(hidden).float())
+            * self.query_residual_max_abs
+        ).to(reference_queries.dtype) * active
+        truth_residual = (
+            torch.tanh(self.truth_output(hidden).squeeze(-1).float())
+            * self.state_residual_max_abs
+        ).to(predicate_truth_logits.dtype) * active.squeeze(-1)
+        phase_residual = (
+            torch.tanh(self.phase_output(hidden).float())
+            * self.state_residual_max_abs
+        ).to(phase_logits.dtype) * active
+        return {
+            "subject_queries": subject_queries + subject_delta,
+            "reference_queries": reference_queries + reference_delta,
+            "subject_delta": subject_delta,
+            "reference_delta": reference_delta,
+            "truth_residual": truth_residual,
+            "phase_residual": phase_residual,
+        }
+
+
 class EntityRelationAffordanceField(nn.Module):
     """Complete RGB+language ERAF deployment path used by PGC V9."""
 
@@ -1135,6 +1310,10 @@ class EntityRelationAffordanceField(nn.Module):
         clause_scheduler_enabled: bool = False,
         clause_scheduler_hidden_dim: int = 256,
         clause_scheduler_residual_max_abs: float = 1.0,
+        closed_loop_rebinding_enabled: bool = False,
+        closed_loop_rebinding_hidden_dim: int = 256,
+        closed_loop_query_residual_max_abs: float = 1.0,
+        closed_loop_state_residual_max_abs: float = 2.0,
     ) -> None:
         super().__init__()
         self.text_dim = int(text_dim)
@@ -1172,6 +1351,16 @@ class EntityRelationAffordanceField(nn.Module):
         self.clause_scheduler_hidden_dim = int(clause_scheduler_hidden_dim)
         self.clause_scheduler_residual_max_abs = float(
             clause_scheduler_residual_max_abs
+        )
+        self.closed_loop_rebinding_enabled = bool(closed_loop_rebinding_enabled)
+        self.closed_loop_rebinding_hidden_dim = int(
+            closed_loop_rebinding_hidden_dim
+        )
+        self.closed_loop_query_residual_max_abs = float(
+            closed_loop_query_residual_max_abs
+        )
+        self.closed_loop_state_residual_max_abs = float(
+            closed_loop_state_residual_max_abs
         )
         self.role_decoder = PredicateRoleDecoder(
             text_dim=text_dim,
@@ -1242,6 +1431,19 @@ class EntityRelationAffordanceField(nn.Module):
                 residual_max_abs=clause_scheduler_residual_max_abs,
             )
             if self.clause_scheduler_enabled
+            else None
+        )
+        self.closed_loop_phase_rebinding_adapter = (
+            ClosedLoopPhaseRebindingAdapter(
+                hidden_dim=hidden_dim,
+                adapter_hidden_dim=closed_loop_rebinding_hidden_dim,
+                num_heads=num_heads,
+                max_clauses=max_clauses,
+                phase_count=self.relation_reasoner.phase_count,
+                query_residual_max_abs=closed_loop_query_residual_max_abs,
+                state_residual_max_abs=closed_loop_state_residual_max_abs,
+            )
+            if self.closed_loop_rebinding_enabled
             else None
         )
         self.entity_only_projection = nn.Sequential(
@@ -1582,6 +1784,79 @@ class EntityRelationAffordanceField(nn.Module):
                 "routing_residual": execution_logits,
                 "routing_multiplier": execution_logits + 1.0,
             }
+        pre_rebinding_subject = subject
+        pre_rebinding_reference = reference
+        pre_rebinding_affordance = affordance
+        pre_rebinding_execution = execution
+        if self.closed_loop_phase_rebinding_adapter is not None:
+            rebound = self.closed_loop_phase_rebinding_adapter(
+                clause_hidden=roles["clause_hidden"],
+                subject_queries=roles["subject_queries"],
+                reference_queries=roles["reference_queries"],
+                subject_tokens=subject["token"],
+                reference_tokens=reference["token"],
+                active_logits=roles["active_logits"],
+                predicate_truth_logits=affordance["predicate_truth_logits"],
+                phase_logits=affordance["phase_logits"],
+                execution_probability=execution["execution_probability"],
+            )
+            roles = {
+                **roles,
+                "subject_queries": rebound["subject_queries"],
+                "reference_queries": rebound["reference_queries"],
+            }
+            subject = self.entity_grounder.ground(
+                roles["subject_queries"], current_video_hidden
+            )
+            reference = self.entity_grounder.ground(
+                roles["reference_queries"], current_video_hidden
+            )
+            affordance = self._decode_affordance(
+                clause_hidden=roles["clause_hidden"],
+                subject_token=subject["token"],
+                reference_token=reference["token"],
+                subject_position=subject["position"],
+                reference_position=reference["position"],
+                active_logits=roles["active_logits"],
+            )
+            affordance = {
+                **affordance,
+                "predicate_truth_logits": (
+                    affordance["predicate_truth_logits"]
+                    + rebound["truth_residual"]
+                ),
+                "phase_logits": (
+                    affordance["phase_logits"] + rebound["phase_residual"]
+                ),
+            }
+            if self.clause_execution_scheduler is None:
+                raise RuntimeError(
+                    "V9.12 closed-loop rebinding requires the frozen unfinished-"
+                    "clause scheduler."
+                )
+            execution = self.clause_execution_scheduler(
+                clause_hidden=roles["clause_hidden"],
+                active_logits=roles["active_logits"],
+                predicate_truth_logits=affordance["predicate_truth_logits"],
+                phase_logits=affordance["phase_logits"],
+            )
+            phase_rebinding_subject_delta = rebound["subject_delta"]
+            phase_rebinding_reference_delta = rebound["reference_delta"]
+            phase_rebinding_truth_residual = rebound["truth_residual"]
+            phase_rebinding_phase_residual = rebound["phase_residual"]
+        else:
+            phase_rebinding_subject_delta = torch.zeros_like(
+                roles["subject_queries"]
+            )
+            phase_rebinding_reference_delta = torch.zeros_like(
+                roles["reference_queries"]
+            )
+            phase_rebinding_truth_residual = torch.zeros_like(
+                affordance["predicate_truth_logits"]
+            )
+            phase_rebinding_phase_residual = torch.zeros_like(
+                affordance["phase_logits"]
+            )
         routing_multiplier = execution["routing_multiplier"].to(
             affordance["relation_hidden"].dtype
         )
@@ -1672,6 +1947,18 @@ class EntityRelationAffordanceField(nn.Module):
             "pgc_v9_clause_execution_top1_probability": (
                 execution["execution_probability"].float().max(dim=-1).values.mean()
             ),
+            "pgc_v9_phase_rebinding_subject_delta_rms": (
+                phase_rebinding_subject_delta.float().pow(2).mean().sqrt()
+            ),
+            "pgc_v9_phase_rebinding_reference_delta_rms": (
+                phase_rebinding_reference_delta.float().pow(2).mean().sqrt()
+            ),
+            "pgc_v9_phase_rebinding_truth_residual_rms": (
+                phase_rebinding_truth_residual.float().pow(2).mean().sqrt()
+            ),
+            "pgc_v9_phase_rebinding_phase_residual_rms": (
+                phase_rebinding_phase_residual.float().pow(2).mean().sqrt()
+            ),
         }
         outputs = {
             **roles,
@@ -1719,6 +2006,48 @@ class EntityRelationAffordanceField(nn.Module):
             "structured_reference_role_delta": structured_reference_role_delta,
             "balanced_subject_role_delta": balanced_subject_role_delta,
             "balanced_reference_role_delta": balanced_reference_role_delta,
+            "phase_rebinding_subject_delta": phase_rebinding_subject_delta,
+            "phase_rebinding_reference_delta": phase_rebinding_reference_delta,
+            "phase_rebinding_truth_residual": phase_rebinding_truth_residual,
+            "phase_rebinding_phase_residual": phase_rebinding_phase_residual,
+            "pre_rebinding_subject_attention": pre_rebinding_subject[
+                "attention"
+            ].detach(),
+            "pre_rebinding_reference_attention": pre_rebinding_reference[
+                "attention"
+            ].detach(),
+            "pre_rebinding_subject_position": pre_rebinding_subject[
+                "position"
+            ].detach(),
+            "pre_rebinding_reference_position": pre_rebinding_reference[
+                "position"
+            ].detach(),
+            "pre_rebinding_subject_view_attention_mass": pre_rebinding_subject[
+                "view_attention_mass"
+            ].detach(),
+            "pre_rebinding_reference_view_attention_mass": pre_rebinding_reference[
+                "view_attention_mass"
+            ].detach(),
+            "pre_rebinding_goal_anchor": pre_rebinding_affordance[
+                "goal_anchor"
+            ].detach(),
+            "pre_rebinding_predicate_truth_logits": pre_rebinding_affordance[
+                "predicate_truth_logits"
+            ].detach(),
+            "pre_rebinding_phase_logits": pre_rebinding_affordance[
+                "phase_logits"
+            ].detach(),
+            "pre_rebinding_clause_routing_residual": pre_rebinding_execution[
+                "routing_residual"
+            ].detach(),
+            "pre_rebinding_clause_execution_probability": pre_rebinding_execution[
+                "execution_probability"
+            ].detach(),
+            "closed_loop_rebinding_enabled": torch.tensor(
+                self.closed_loop_phase_rebinding_adapter is not None,
+                device=roles["active_logits"].device,
+                dtype=torch.bool,
+            ),
             "clause_execution_logits": execution["execution_logits"],
             "clause_execution_probability": execution[
                 "execution_probability"
@@ -1780,6 +2109,7 @@ class ERAFLossWeights:
     view_fusion_energy: float = 0.0
     clause_scheduler: float = 0.0
     clause_scheduler_energy: float = 0.0
+    phase_rebinding_energy: float = 0.0
     phase: float = 0.25
 
 
@@ -3350,6 +3680,26 @@ def entity_relation_affordance_loss(
         clause_scheduler_energy_loss = outputs["clause_routing_residual"].float().pow(
             2
         ).mean()
+    phase_rebinding_energy_loss = zero
+    if int(weights.objective_version) >= 13:
+        required_rebinding_outputs = {
+            "phase_rebinding_subject_delta",
+            "phase_rebinding_reference_delta",
+            "phase_rebinding_truth_residual",
+            "phase_rebinding_phase_residual",
+        }
+        missing_rebinding_outputs = sorted(
+            required_rebinding_outputs.difference(outputs)
+        )
+        if missing_rebinding_outputs:
+            raise ValueError(
+                "V9.12 closed-loop rebinding requires its zero-init adapter "
+                f"outputs; missing={missing_rebinding_outputs}."
+            )
+        phase_rebinding_energy_loss = 0.25 * sum(
+            outputs[name].float().pow(2).mean()
+            for name in sorted(required_rebinding_outputs)
+        )
     # Penalize attention assigned exclusively to the other semantic role.
     # Pixels shared by overlapping objects/containers are excluded so an
     # object entering a basket is not trained as a false negative.
@@ -3577,6 +3927,7 @@ def entity_relation_affordance_loss(
         + weights.view_fusion_energy * view_fusion_energy_loss
         + weights.clause_scheduler * clause_scheduler_loss
         + weights.clause_scheduler_energy * clause_scheduler_energy_loss
+        + weights.phase_rebinding_energy * phase_rebinding_energy_loss
         + weights.phase * phase_loss
     )
     predicate_prediction = outputs["predicate_logits"].argmax(dim=-1)
@@ -3639,6 +3990,9 @@ def entity_relation_affordance_loss(
         "loss_pgc_v9_clause_scheduler": clause_scheduler_loss.detach(),
         "loss_pgc_v9_clause_scheduler_energy": (
             clause_scheduler_energy_loss.detach()
+        ),
+        "loss_pgc_v9_phase_rebinding_energy": (
+            phase_rebinding_energy_loss.detach()
         ),
         "loss_pgc_v9_phase": phase_loss.detach(),
         "loss_pgc_v9_predicate": predicate_loss.detach(),

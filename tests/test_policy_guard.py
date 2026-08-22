@@ -257,6 +257,12 @@ def tiny_pgc_fastwam(
                 "clause_scheduler_energy_weight": (
                     0.01 if v9_grounding_objective_version >= 10 else 0.0
                 ),
+                "closed_loop_rebinding_hidden_dim": 8,
+                "closed_loop_query_residual_max_abs": 1.0,
+                "closed_loop_state_residual_max_abs": 2.0,
+                "phase_rebinding_energy_weight": (
+                    0.01 if v9_grounding_objective_version >= 13 else 0.0
+                ),
                 "role_attention_preservation_weight": (
                     (
                         5.0

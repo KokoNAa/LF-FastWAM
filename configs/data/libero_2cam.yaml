@@ -104,3 +104,8 @@ train:
   # native-easy, historical-CF, and strict-CF optimizer-window sampling.
   pgc_v9_hard_role_curriculum: false
   pgc_v9_hard_role_index_path: null
+  # V9.12: the trailing native dataset contains exact immutable-Base
+  # closed-loop replanning states and is mixed 1:1:1:1 with offline native,
+  # historical CF, and strict CF guard data.
+  pgc_v9_closed_loop_rebinding: false
+  pgc_v9_closed_loop_native_dataset_count: 0

@@ -291,6 +291,8 @@ policy_guard:
     # Version 12 (V9.11) adds an audited hard curriculum and binds each clause
     # to its complete (subject, predicate, reference) tuple, preventing subject
     # identity swaps when clauses share a plate, basket, or fixture.
+    # Version 13 (V9.12) freezes V9.11 and learns only a zero-init second-pass
+    # role/truth/phase rebinder from immutable-Base closed-loop replan states.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -340,6 +342,10 @@ policy_guard:
     clause_scheduler_residual_max_abs: 1.0
     clause_scheduler_weight: 0.0
     clause_scheduler_energy_weight: 0.0
+    closed_loop_rebinding_hidden_dim: 256
+    closed_loop_query_residual_max_abs: 1.0
+    closed_loop_state_residual_max_abs: 2.0
+    phase_rebinding_energy_weight: 0.0
     role_attention_preservation_weight: 0.0
     role_position_preservation_weight: 0.0
     role_anchor_preservation_weight: 0.0

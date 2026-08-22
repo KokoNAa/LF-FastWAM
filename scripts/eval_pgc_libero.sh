@@ -20,6 +20,10 @@ MAX_POLICY_STEPS="${PGC_MAX_POLICY_STEPS:-}"
 CLOSED_LOOP_CAPTURE_DIR="${PGC_CLOSED_LOOP_CAPTURE_DIR:-}"
 CLOSED_LOOP_CAPTURE_STRIDE="${PGC_CLOSED_LOOP_CAPTURE_STRIDE_REPLANS:-1}"
 CLOSED_LOOP_CAPTURE_MAX_STATES="${PGC_CLOSED_LOOP_CAPTURE_MAX_STATES_PER_EPISODE:-12}"
+ERAF_CLOSED_LOOP_CAPTURE_DIR="${PGC_ERAF_CLOSED_LOOP_CAPTURE_DIR:-}"
+ERAF_CLOSED_LOOP_CAPTURE_STRIDE="${PGC_ERAF_CLOSED_LOOP_CAPTURE_STRIDE_REPLANS:-1}"
+ERAF_CLOSED_LOOP_CAPTURE_MAX_STATES="${PGC_ERAF_CLOSED_LOOP_CAPTURE_MAX_STATES_PER_EPISODE:-48}"
+ERAF_CLOSED_LOOP_CAPTURE_STAGES="${PGC_ERAF_CLOSED_LOOP_CAPTURE_STAGES:-initial_search,holding,released_unfinished,next_clause_search}"
 V9_ABLATION="${PGC_V9_ABLATION:-full}"
 ERAF_SHADOW_AUDIT="${PGC_ERAF_SHADOW_AUDIT:-false}"
 ERAF_SHADOW_SIDECAR_DIR="${PGC_ERAF_SHADOW_SIDECAR_DIR:-}"
@@ -206,7 +210,7 @@ if version == 9:
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
     objective = int(metadata.get("eraf_grounding_objective_version", -1))
-    if objective not in set(range(1, 13)):
+    if objective not in set(range(1, 14)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -243,6 +247,15 @@ if version == 9:
         != "v9_10_audit_native_hard_easy_plus_historical_strict_1_1_1_1"
     ):
         raise SystemExit("PGC v9.11 checkpoint lacks clause-tuple contract")
+    if objective >= 13 and (
+        metadata.get("eraf_closed_loop_rebinding_contract")
+        != "zero_init_second_pass_role_truth_phase_and_clause_route"
+        or metadata.get("eraf_closed_loop_state_contract")
+        != "immutable_base_correct_replan_exact_simulator_state"
+        or metadata.get("eraf_closed_loop_curriculum_contract")
+        != "offline_native_closed_loop_native_historical_strict_1_1_1_1"
+    ):
+        raise SystemExit("PGC v9.12 checkpoint lacks closed-loop rebinding contract")
 else:
     objective = 0
     training_stage = "grounding"
@@ -414,6 +427,26 @@ if [[ -n "${CLOSED_LOOP_CAPTURE_DIR}" ]]; then
     "+EVALUATION.closed_loop_capture_max_states_per_episode=${CLOSED_LOOP_CAPTURE_MAX_STATES}"
   )
 fi
+if [[ -n "${ERAF_CLOSED_LOOP_CAPTURE_DIR}" ]]; then
+  if [[ "${PGC_CHECKPOINT_VERSION}" != "9" || "${ERAF_SHADOW_AUDIT}" != "true" ]]; then
+    echo "ERAF phase capture requires a PGC v9 passive shadow audit." >&2
+    exit 1
+  fi
+  if [[ "${CONDITION}" != "correct" || "${GATE_MODE}" != "base" ]]; then
+    echo "ERAF phase capture requires condition=correct and PGC_GATE_MODE=base." >&2
+    exit 1
+  fi
+  if ! [[ "${ERAF_CLOSED_LOOP_CAPTURE_STRIDE}" =~ ^[1-9][0-9]*$ ]] || ! [[ "${ERAF_CLOSED_LOOP_CAPTURE_MAX_STATES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERAF phase capture stride/max states must be positive integers." >&2
+    exit 1
+  fi
+  EXTRA_OVERRIDES+=(
+    "+EVALUATION.entity_relation_closed_loop_capture_dir=${ERAF_CLOSED_LOOP_CAPTURE_DIR}"
+    "+EVALUATION.entity_relation_closed_loop_capture_stride_replans=${ERAF_CLOSED_LOOP_CAPTURE_STRIDE}"
+    "+EVALUATION.entity_relation_closed_loop_capture_max_states_per_episode=${ERAF_CLOSED_LOOP_CAPTURE_MAX_STATES}"
+    "+EVALUATION.entity_relation_closed_loop_capture_stages=${ERAF_CLOSED_LOOP_CAPTURE_STAGES}"
+  )
+fi
 
 echo "[PGC-FastWAM] LIBERO ${CONDITION} evaluation"
 echo "  checkpoint=${PGC_CHECKPOINT}"
@@ -422,6 +455,7 @@ echo "  gate=${GATE_MODE} margin=${GATE_THRESHOLD} min_cf=${MIN_COUNTERFACTUAL_S
 echo "  max_policy_steps=${MAX_POLICY_STEPS:-suite_default}"
 echo "  output=${OUTPUT_ROOT}"
 echo "  closed_loop_capture=${CLOSED_LOOP_CAPTURE_DIR:-disabled}"
+echo "  eraf_phase_capture=${ERAF_CLOSED_LOOP_CAPTURE_DIR:-disabled}"
 if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
   echo "  v9_ablation=${V9_ABLATION} eraf_diagnostics=${ERAF_DIAGNOSTICS}"
   echo "  eraf_overlay_dir=${ERAF_OVERLAY_DIR}"

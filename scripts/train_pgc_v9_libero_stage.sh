@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|grounding-structured-role|grounding-balanced-role|grounding-hard-role|grounding-exclusive-role|grounding-clause-calibration|grounding-view-scheduler|grounding-all-entity-role|grounding-clause-tuple|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
+SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|grounding-structured-role|grounding-balanced-role|grounding-hard-role|grounding-exclusive-role|grounding-clause-calibration|grounding-view-scheduler|grounding-all-entity-role|grounding-clause-tuple|grounding-phase-rebinding|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
 STAGE="${2:?Missing V9 training stage}"
 NPROC_PER_NODE="${3:?Missing GPU count}"
 BASE_CHECKPOINT="${4:?Missing released FastWAM checkpoint}"
@@ -122,8 +122,20 @@ case "${STAGE}" in
     DEFAULT_GROUNDING_OBJECTIVE_VERSION=12
     SAVE_EVERY=250
     ;;
+  grounding-phase-rebinding)
+    START_STEP=6250
+    STAGE_START_STEP=6250
+    DEFAULT_STAGE_STEPS=1000
+    LEARNING_RATE="1.0e-5"
+    CONFIG_STAGE="grounding"
+    DEFAULT_GROUNDING_OBJECTIVE_VERSION=13
+    SAVE_EVERY=250
+    ;;
   action)
-    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "13" ]]; then
+      START_STEP=7250
+      STAGE_START_STEP=7250
+    elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
       START_STEP=6250
       STAGE_START_STEP=6250
     elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
@@ -158,7 +170,10 @@ case "${STAGE}" in
     SAVE_EVERY=500
     ;;
   verifier)
-    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
+    if [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "13" ]]; then
+      START_STEP=11250
+      STAGE_START_STEP=11250
+    elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "12" ]]; then
       START_STEP=10250
       STAGE_START_STEP=10250
     elif [[ "${REQUESTED_GROUNDING_OBJECTIVE_VERSION}" == "11" ]]; then
@@ -193,7 +208,7 @@ case "${STAGE}" in
     SAVE_EVERY=500
     ;;
   *)
-    echo "Stage must be grounding, grounding-role, grounding-role-adapter, grounding-structured-role, grounding-balanced-role, grounding-hard-role, grounding-exclusive-role, grounding-clause-calibration, grounding-view-scheduler, grounding-all-entity-role, grounding-clause-tuple, action, or verifier; got ${STAGE}." >&2
+    echo "Stage must be grounding, grounding-role, grounding-role-adapter, grounding-structured-role, grounding-balanced-role, grounding-hard-role, grounding-exclusive-role, grounding-clause-calibration, grounding-view-scheduler, grounding-all-entity-role, grounding-clause-tuple, grounding-phase-rebinding, action, or verifier; got ${STAGE}." >&2
     exit 1
     ;;
 esac
@@ -317,6 +332,37 @@ VIEW_FUSION_RESIDUAL_MAX_ABS="${PGC_V9_VIEW_FUSION_RESIDUAL_MAX_ABS:-4.0}"
 CLAUSE_SCHEDULER_WEIGHT="${PGC_V9_CLAUSE_SCHEDULER_WEIGHT:-${DEFAULT_CLAUSE_SCHEDULER_WEIGHT}}"
 CLAUSE_SCHEDULER_ENERGY_WEIGHT="${PGC_V9_CLAUSE_SCHEDULER_ENERGY_WEIGHT:-${DEFAULT_CLAUSE_SCHEDULER_ENERGY_WEIGHT}}"
 CLAUSE_SCHEDULER_RESIDUAL_MAX_ABS="${PGC_V9_CLAUSE_SCHEDULER_RESIDUAL_MAX_ABS:-1.0}"
+CLOSED_LOOP_REBINDING_HIDDEN_DIM="${PGC_V9_CLOSED_LOOP_REBINDING_HIDDEN_DIM:-256}"
+CLOSED_LOOP_QUERY_RESIDUAL_MAX_ABS="${PGC_V9_CLOSED_LOOP_QUERY_RESIDUAL_MAX_ABS:-1.0}"
+CLOSED_LOOP_STATE_RESIDUAL_MAX_ABS="${PGC_V9_CLOSED_LOOP_STATE_RESIDUAL_MAX_ABS:-2.0}"
+PHASE_REBINDING_ENERGY_WEIGHT="${PGC_V9_PHASE_REBINDING_ENERGY_WEIGHT:-0.01}"
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "13" ]]; then
+  # Only the new second-pass adapter is trainable. Losses on frozen-only
+  # outputs are disabled; role/tuple, state, phase, anchor, and scheduler
+  # supervision all backpropagate through the rebinding path.
+  ROLE_ASSIGNMENT_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_WEIGHT:-1.0}"
+  ROLE_ASSIGNMENT_HARD_WEIGHT="${PGC_V9_ROLE_ASSIGNMENT_HARD_WEIGHT:-0.5}"
+  STRUCTURED_ASSIGNMENT_WEIGHT="${PGC_V9_STRUCTURED_ASSIGNMENT_WEIGHT:-2.0}"
+  STRUCTURED_ASSIGNMENT_HARD_WEIGHT="${PGC_V9_STRUCTURED_ASSIGNMENT_HARD_WEIGHT:-1.0}"
+  MULTI_CLAUSE_CONSISTENCY_WEIGHT="${PGC_V9_MULTI_CLAUSE_CONSISTENCY_WEIGHT:-2.0}"
+  CLAUSE_TUPLE_ASSIGNMENT_WEIGHT="${PGC_V9_CLAUSE_TUPLE_ASSIGNMENT_WEIGHT:-4.0}"
+  CLAUSE_TUPLE_HARD_WEIGHT="${PGC_V9_CLAUSE_TUPLE_HARD_WEIGHT:-1.0}"
+  CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT="${PGC_V9_CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT:-2.0}"
+  CLAUSE_ACTIVATION_BALANCE_WEIGHT="${PGC_V9_CLAUSE_ACTIVATION_BALANCE_WEIGHT:-0.0}"
+  CLAUSE_CARDINALITY_WEIGHT="${PGC_V9_CLAUSE_CARDINALITY_WEIGHT:-0.0}"
+  CLAUSE_WORST_SLOT_WEIGHT="${PGC_V9_CLAUSE_WORST_SLOT_WEIGHT:-0.0}"
+  CLAUSE_ADAPTER_ENERGY_WEIGHT="${PGC_V9_CLAUSE_ADAPTER_ENERGY_WEIGHT:-0.0}"
+  VIEW_FUSION_WEIGHT="${PGC_V9_VIEW_FUSION_WEIGHT:-0.0}"
+  VIEW_FUSION_ENERGY_WEIGHT="${PGC_V9_VIEW_FUSION_ENERGY_WEIGHT:-0.0}"
+  CLAUSE_SCHEDULER_WEIGHT="${PGC_V9_CLAUSE_SCHEDULER_WEIGHT:-1.0}"
+  CLAUSE_SCHEDULER_ENERGY_WEIGHT="${PGC_V9_CLAUSE_SCHEDULER_ENERGY_WEIGHT:-0.0}"
+  ROLE_ATTENTION_PRESERVATION_WEIGHT="${PGC_V9_ROLE_ATTENTION_PRESERVATION_WEIGHT:-0.0}"
+  ROLE_POSITION_PRESERVATION_WEIGHT="${PGC_V9_ROLE_POSITION_PRESERVATION_WEIGHT:-0.0}"
+  ROLE_ANCHOR_PRESERVATION_WEIGHT="${PGC_V9_ROLE_ANCHOR_PRESERVATION_WEIGHT:-0.0}"
+  ROLE_RELATION_PRESERVATION_WEIGHT="${PGC_V9_ROLE_RELATION_PRESERVATION_WEIGHT:-0.0}"
+  ROLE_ADAPTER_ENERGY_WEIGHT="${PGC_V9_ROLE_ADAPTER_ENERGY_WEIGHT:-0.0}"
+  STRUCTURED_ROLE_SAMPLING=true
+fi
 case "${STAGE}" in
   grounding)
     if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" ]]; then
@@ -384,9 +430,15 @@ case "${STAGE}" in
       exit 1
     fi
     ;;
+  grounding-phase-rebinding)
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "13" ]]; then
+      echo "Formal V9.12 closed-loop phase rebinding requires objective version 13." >&2
+      exit 1
+    fi
+    ;;
   action|verifier)
-    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" && "${GROUNDING_OBJECTIVE_VERSION}" != "3" && "${GROUNDING_OBJECTIVE_VERSION}" != "4" && "${GROUNDING_OBJECTIVE_VERSION}" != "5" && "${GROUNDING_OBJECTIVE_VERSION}" != "6" && "${GROUNDING_OBJECTIVE_VERSION}" != "7" && "${GROUNDING_OBJECTIVE_VERSION}" != "8" && "${GROUNDING_OBJECTIVE_VERSION}" != "9" && "${GROUNDING_OBJECTIVE_VERSION}" != "10" && "${GROUNDING_OBJECTIVE_VERSION}" != "11" && "${GROUNDING_OBJECTIVE_VERSION}" != "12" ]]; then
-      echo "V9 action/verifier requires grounding objective version 2 through 12." >&2
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "2" && "${GROUNDING_OBJECTIVE_VERSION}" != "3" && "${GROUNDING_OBJECTIVE_VERSION}" != "4" && "${GROUNDING_OBJECTIVE_VERSION}" != "5" && "${GROUNDING_OBJECTIVE_VERSION}" != "6" && "${GROUNDING_OBJECTIVE_VERSION}" != "7" && "${GROUNDING_OBJECTIVE_VERSION}" != "8" && "${GROUNDING_OBJECTIVE_VERSION}" != "9" && "${GROUNDING_OBJECTIVE_VERSION}" != "10" && "${GROUNDING_OBJECTIVE_VERSION}" != "11" && "${GROUNDING_OBJECTIVE_VERSION}" != "12" && "${GROUNDING_OBJECTIVE_VERSION}" != "13" ]]; then
+      echo "V9 action/verifier requires grounding objective version 2 through 13." >&2
       exit 1
     fi
     ;;
@@ -400,6 +452,18 @@ if [[ "${STAGE}" == "grounding-hard-role" || "${STAGE}" == "grounding-exclusive-
     exit 1
   fi
   HARD_ROLE_INDEX_PATH="$(cd -- "$(dirname -- "${HARD_ROLE_INDEX_PATH}")" && pwd -P)/$(basename -- "${HARD_ROLE_INDEX_PATH}")"
+fi
+CLOSED_LOOP_GROUNDING_DATASET="${PGC_V9_CLOSED_LOOP_GROUNDING_DATASET:-}"
+CLOSED_LOOP_GROUNDING_SIDECAR="${PGC_V9_CLOSED_LOOP_GROUNDING_SIDECAR:-}"
+if [[ "${STAGE}" == "grounding-phase-rebinding" ]]; then
+  if [[ -z "${CLOSED_LOOP_GROUNDING_DATASET}" || ! -d "${CLOSED_LOOP_GROUNDING_DATASET}" ]]; then
+    echo "V9.12 requires PGC_V9_CLOSED_LOOP_GROUNDING_DATASET." >&2
+    exit 1
+  fi
+  if [[ -z "${CLOSED_LOOP_GROUNDING_SIDECAR}" || ! -d "${CLOSED_LOOP_GROUNDING_SIDECAR}" ]]; then
+    echo "V9.12 requires PGC_V9_CLOSED_LOOP_GROUNDING_SIDECAR." >&2
+    exit 1
+  fi
 fi
 MAX_STEPS=$((STAGE_START_STEP + STAGE_STEPS))
 case "${ABLATION}" in
@@ -479,18 +543,38 @@ STRICT_CF_DATASET="$(cd -- "${STRICT_CF_DATASET}" && pwd -P)"
 NATIVE_SIDECAR="$(cd -- "${NATIVE_SIDECAR}" && pwd -P)"
 ORIGINAL_CF_SIDECAR="$(cd -- "${ORIGINAL_CF_SIDECAR}" && pwd -P)"
 STRICT_CF_SIDECAR="$(cd -- "${STRICT_CF_SIDECAR}" && pwd -P)"
+if [[ "${STAGE}" == "grounding-phase-rebinding" ]]; then
+  CLOSED_LOOP_GROUNDING_DATASET="$(cd -- "${CLOSED_LOOP_GROUNDING_DATASET}" && pwd -P)"
+  CLOSED_LOOP_GROUNDING_SIDECAR="$(cd -- "${CLOSED_LOOP_GROUNDING_SIDECAR}" && pwd -P)"
+fi
 
 "${PYTHON_BIN}" - \
   "${STAGE}" "${START_STEP}" "${GROUNDING_OBJECTIVE_VERSION}" \
   "${BASE_CHECKPOINT}" "${INIT_CHECKPOINT}" \
   "${NATIVE_DATASET}" "${ORIGINAL_CF_DATASET}" "${STRICT_CF_DATASET}" \
-  "${NATIVE_SIDECAR}" "${ORIGINAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}" <<'PY'
+  "${NATIVE_SIDECAR}" "${ORIGINAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}" \
+  "${CLOSED_LOOP_GROUNDING_DATASET:-null}" \
+  "${CLOSED_LOOP_GROUNDING_SIDECAR:-null}" <<'PY'
 import json
 import pathlib
 import sys
 import torch
 
-stage, expected_step, requested_objective, base_checkpoint, checkpoint, *paths = sys.argv[1:]
+(
+    stage,
+    expected_step,
+    requested_objective,
+    base_checkpoint,
+    checkpoint,
+    native_dataset,
+    original_dataset,
+    strict_dataset,
+    native_sidecar,
+    original_sidecar,
+    strict_sidecar,
+    closed_loop_dataset,
+    closed_loop_sidecar,
+) = sys.argv[1:]
 payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
 fmt = str(payload.get("format", ""))
 version = int((payload.get("architecture_metadata") or {}).get("policy_guard_version", 0))
@@ -510,6 +594,7 @@ elif stage in {
     "grounding-view-scheduler",
     "grounding-all-entity-role",
     "grounding-clause-tuple",
+    "grounding-phase-rebinding",
 }:
     metadata = payload.get("architecture_metadata") or {}
     if fmt != "fastwam_policy_guard_v9" or version != 9:
@@ -525,6 +610,7 @@ elif stage in {
         "grounding-view-scheduler": 9,
         "grounding-all-entity-role": 10,
         "grounding-clause-tuple": 11,
+        "grounding-phase-rebinding": 12,
     }[stage]
     if (
         int(metadata.get("eraf_grounding_objective_version", -1))
@@ -552,6 +638,7 @@ elif stage in {
         "grounding-view-scheduler": 10,
         "grounding-all-entity-role": 11,
         "grounding-clause-tuple": 12,
+        "grounding-phase-rebinding": 13,
     }[stage]
     if int(requested_objective) != expected_objective:
         raise SystemExit(
@@ -623,6 +710,14 @@ elif stage in {
             "V9.11 must warm-start from the completed V9.10 all-entity "
             "checkpoint at step 5750."
         )
+    if stage == "grounding-phase-rebinding" and (
+        metadata.get("eraf_role_adapter_trainable_scope")
+        != "audited_hard_clause_tuple_balanced_visual_role_binding_adapter_only"
+    ):
+        raise SystemExit(
+            "V9.12 must warm-start from the completed V9.11 clause-tuple "
+            "checkpoint at step 6250."
+        )
 else:
     if fmt != "fastwam_policy_guard_v9" or version != 9:
         raise SystemExit(f"V9 {stage} must resume from a V9 checkpoint.")
@@ -663,25 +758,29 @@ if saved_base_path.resolve() != pathlib.Path(base_checkpoint).resolve():
         f"{saved_base_path.resolve()}, but the command supplied "
         f"{pathlib.Path(base_checkpoint).resolve()}."
     )
-expected_action_contracts = (
+datasets = [native_dataset]
+sidecars = [native_sidecar]
+expected_action_contracts = [
+    ("native", "fastwam_gripper_open_1_close_0", "fastwam_to_libero_env")
+]
+if stage == "grounding-phase-rebinding":
+    if closed_loop_dataset == "null" or closed_loop_sidecar == "null":
+        raise SystemExit("V9.12 closed-loop dataset/sidecar is missing.")
+    datasets.append(closed_loop_dataset)
+    sidecars.append(closed_loop_sidecar)
+    expected_action_contracts.append(
+        ("native", "fastwam_gripper_open_1_close_0", "fastwam_to_libero_env")
+    )
+datasets.extend((original_dataset, strict_dataset))
+sidecars.extend((original_sidecar, strict_sidecar))
+expected_action_contracts.extend(
     (
-        "native",
-        "fastwam_gripper_open_1_close_0",
-        "fastwam_to_libero_env",
-    ),
-    (
-        "counterfactual",
-        "libero_env_gripper_open_minus1_close_plus1",
-        "identity",
-    ),
-    (
-        "counterfactual",
-        "libero_env_gripper_open_minus1_close_plus1",
-        "identity",
-    ),
+        ("counterfactual", "libero_env_gripper_open_minus1_close_plus1", "identity"),
+        ("counterfactual", "libero_env_gripper_open_minus1_close_plus1", "identity"),
+    )
 )
 for dataset, sidecar, expected_contract in zip(
-    paths[:3], paths[3:], expected_action_contracts, strict=True
+    datasets, sidecars, expected_action_contracts, strict=True
 ):
     index_path = pathlib.Path(sidecar) / "index.json"
     index = json.loads(index_path.read_text(encoding="utf-8"))
@@ -701,14 +800,30 @@ for dataset, sidecar, expected_contract in zip(
             f"Sidecar action contract mismatch at {index_path}: "
             f"expected={expected_contract} got={actual_contract}."
         )
+    if dataset == closed_loop_dataset and (
+        index.get("state_distribution")
+        != "immutable_base_closed_loop_replan"
+    ):
+        raise SystemExit(
+            "V9.12 closed-loop sidecar has the wrong state-distribution contract."
+        )
 PY
 
 json_array() {
   "${PYTHON_BIN}" -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"
 }
-NATIVE_JSON="$(json_array "${NATIVE_DATASET}")"
+if [[ "${STAGE}" == "grounding-phase-rebinding" ]]; then
+  NATIVE_JSON="$(json_array "${NATIVE_DATASET}" "${CLOSED_LOOP_GROUNDING_DATASET}")"
+  SIDECAR_JSON="$(json_array "${NATIVE_SIDECAR}" "${CLOSED_LOOP_GROUNDING_SIDECAR}" "${ORIGINAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}")"
+  CLOSED_LOOP_REBINDING=true
+  CLOSED_LOOP_NATIVE_DATASET_COUNT=1
+else
+  NATIVE_JSON="$(json_array "${NATIVE_DATASET}")"
+  SIDECAR_JSON="$(json_array "${NATIVE_SIDECAR}" "${ORIGINAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}")"
+  CLOSED_LOOP_REBINDING=false
+  CLOSED_LOOP_NATIVE_DATASET_COUNT=0
+fi
 CF_JSON="$(json_array "${ORIGINAL_CF_DATASET}" "${STRICT_CF_DATASET}")"
-SIDECAR_JSON="$(json_array "${NATIVE_SIDECAR}" "${ORIGINAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}")"
 
 RUN_TAG="${RUN_TAG:-${SUITE}-pgc-v9-eraf-${ABLATION}-${STAGE}-seed${TRAIN_SEED}-v1}"
 echo "[PGC-FastWAM] V9 ERAF ${STAGE} training"
@@ -722,8 +837,15 @@ echo "  clause_tuple=assignment:${CLAUSE_TUPLE_ASSIGNMENT_WEIGHT} temperature:${
 echo "  clause_calibration=active:${CLAUSE_ACTIVATION_BALANCE_WEIGHT} cardinality:${CLAUSE_CARDINALITY_WEIGHT} worst_slot:${CLAUSE_WORST_SLOT_WEIGHT} multi_group:${CLAUSE_MULTI_GROUP_WEIGHT} energy:${CLAUSE_ADAPTER_ENERGY_WEIGHT} max_abs:${CLAUSE_ACTIVATION_RESIDUAL_MAX_ABS}"
 echo "  view_fusion=weight:${VIEW_FUSION_WEIGHT} energy:${VIEW_FUSION_ENERGY_WEIGHT} max_abs:${VIEW_FUSION_RESIDUAL_MAX_ABS}"
 echo "  clause_scheduler=weight:${CLAUSE_SCHEDULER_WEIGHT} energy:${CLAUSE_SCHEDULER_ENERGY_WEIGHT} max_abs:${CLAUSE_SCHEDULER_RESIDUAL_MAX_ABS}"
+echo "  phase_rebinding=enabled:${CLOSED_LOOP_REBINDING} hidden:${CLOSED_LOOP_REBINDING_HIDDEN_DIM} query_max_abs:${CLOSED_LOOP_QUERY_RESIDUAL_MAX_ABS} state_max_abs:${CLOSED_LOOP_STATE_RESIDUAL_MAX_ABS} energy:${PHASE_REBINDING_ENERGY_WEIGHT}"
 echo "  role_preservation=attention:${ROLE_ATTENTION_PRESERVATION_WEIGHT} position:${ROLE_POSITION_PRESERVATION_WEIGHT} anchor:${ROLE_ANCHOR_PRESERVATION_WEIGHT} relation:${ROLE_RELATION_PRESERVATION_WEIGHT} energy:${ROLE_ADAPTER_ENERGY_WEIGHT}"
-echo "  mixture=native:CF 1:1; CF=historical:strict 1:1; structured_task_balance=${STRUCTURED_ROLE_SAMPLING}"
+if [[ "${CLOSED_LOOP_REBINDING}" == "true" ]]; then
+  echo "  mixture=offline_native:closed_loop_native:historical_cf:strict_cf 1:1:1:1; closed_loop_phase_balanced=true"
+  echo "  closed_loop_native=${CLOSED_LOOP_GROUNDING_DATASET}"
+  echo "  closed_loop_sidecar=${CLOSED_LOOP_GROUNDING_SIDECAR}"
+else
+  echo "  mixture=native:CF 1:1; CF=historical:strict 1:1; structured_task_balance=${STRUCTURED_ROLE_SAMPLING}"
+fi
 echo "  hard_role_curriculum=${HARD_ROLE_CURRICULUM} hard_index=${HARD_ROLE_INDEX_PATH:-none}"
 echo "  init=${INIT_CHECKPOINT}"
 echo "  native=${NATIVE_DATASET}"
@@ -745,6 +867,8 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "data.train.pgc_v9_structured_role_sampling=${STRUCTURED_ROLE_SAMPLING}" \
   "data.train.pgc_v9_hard_role_curriculum=${HARD_ROLE_CURRICULUM}" \
   "data.train.pgc_v9_hard_role_index_path=${HARD_ROLE_INDEX_PATH:-null}" \
+  "data.train.pgc_v9_closed_loop_rebinding=${CLOSED_LOOP_REBINDING}" \
+  "data.train.pgc_v9_closed_loop_native_dataset_count=${CLOSED_LOOP_NATIVE_DATASET_COUNT}" \
   "++data.train.pretrained_norm_stats=${STATS_PATH}" \
   "data.train.text_embedding_cache_dir=${CACHE_DIR}" \
   "seed=${TRAIN_SEED}" \
@@ -805,6 +929,10 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.entity_relation_grounding.clause_scheduler_residual_max_abs=${CLAUSE_SCHEDULER_RESIDUAL_MAX_ABS}" \
   "model.policy_guard.entity_relation_grounding.clause_scheduler_weight=${CLAUSE_SCHEDULER_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.clause_scheduler_energy_weight=${CLAUSE_SCHEDULER_ENERGY_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.closed_loop_rebinding_hidden_dim=${CLOSED_LOOP_REBINDING_HIDDEN_DIM}" \
+  "model.policy_guard.entity_relation_grounding.closed_loop_query_residual_max_abs=${CLOSED_LOOP_QUERY_RESIDUAL_MAX_ABS}" \
+  "model.policy_guard.entity_relation_grounding.closed_loop_state_residual_max_abs=${CLOSED_LOOP_STATE_RESIDUAL_MAX_ABS}" \
+  "model.policy_guard.entity_relation_grounding.phase_rebinding_energy_weight=${PHASE_REBINDING_ENERGY_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.role_attention_preservation_weight=${ROLE_ATTENTION_PRESERVATION_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.role_position_preservation_weight=${ROLE_POSITION_PRESERVATION_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.role_anchor_preservation_weight=${ROLE_ANCHOR_PRESERVATION_WEIGHT}" \

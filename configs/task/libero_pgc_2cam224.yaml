@@ -51,6 +51,8 @@ data:
     pgc_v9_structured_role_sampling: false
     pgc_v9_hard_role_curriculum: false
     pgc_v9_hard_role_index_path: null
+    pgc_v9_closed_loop_rebinding: false
+    pgc_v9_closed_loop_native_dataset_count: 0
 
 lr_scheduler_type: cosine
 learning_rate: 1.0e-5

@@ -14,6 +14,7 @@ import torch
 from fastwam.datasets.lerobot.robot_video_dataset import (
     RobotVideoDataset,
     build_pgc_v96_sample_plan,
+    build_pgc_v912_sample_plan,
     build_pgc_v9_sample_indices,
 )
 from fastwam.datasets.lerobot.base_lerobot_dataset import BaseLerobotDataset
@@ -406,6 +407,38 @@ class PGCERAFSamplingTest(unittest.TestCase):
             else:
                 self.assertIn(index, {10, 11})
 
+    def test_v912_balances_closed_loop_phases_and_four_guard_pools(self):
+        indices, groups = build_pgc_v912_sample_plan(
+            offline_native_indices=[0, 1, 2, 3, 4],
+            closed_loop_native_indices=[5, 6, 7, 8, 9, 10],
+            original_counterfactual_indices=[11, 12],
+            strict_counterfactual_indices=[13, 14, 15],
+            closed_loop_stage_categories=[
+                "initial_search",
+                "initial_search",
+                "initial_search",
+                "holding",
+                "released_unfinished",
+                "next_clause_search",
+            ],
+            strict_relation_categories=["entity", "entity", "relation"],
+        )
+        self.assertEqual(len(indices), len(groups))
+        counts = Counter(groups)
+        self.assertEqual(len(set(counts.values())), 1)
+        self.assertEqual(set(counts), {0, 1, 2, 3})
+        for position in range(0, len(groups), 4):
+            self.assertEqual(groups[position : position + 4], [0, 1, 2, 3])
+        sampled = Counter(indices)
+        initial_search = sum(sampled[index] for index in (5, 6, 7))
+        holding = sampled[8]
+        released = sampled[9]
+        next_clause = sampled[10]
+        self.assertEqual(initial_search, holding)
+        self.assertEqual(holding, released)
+        self.assertEqual(released, next_clause)
+        self.assertEqual(sampled[13] + sampled[14], sampled[15])
+
     def test_v911_mines_only_multiclause_v910_native_failures(self):
         def record(
             raw_index: int,
@@ -495,6 +528,52 @@ class PGCERAFSamplingTest(unittest.TestCase):
                     Counter(window[process::3]),
                     Counter({0: 1, 1: 1, 2: 1, 3: 1}),
                 )
+
+    def test_v912_sampler_balances_every_global_optimizer_window(self):
+        class ClosedLoopCurriculumDataset:
+            pgc_v9_closed_loop_group_ids = [0, 1, 2, 3] * 12
+
+            def __len__(self):
+                return len(self.pgc_v9_closed_loop_group_ids)
+
+        dataset = ClosedLoopCurriculumDataset()
+        sampler = ResumableEpochSampler(
+            dataset=dataset,
+            seed=912,
+            batch_size=1,
+            num_processes=3,
+            gradient_accumulation_steps=4,
+        )
+        order = list(sampler)
+        labels = [dataset.pgc_v9_closed_loop_group_ids[index] for index in order]
+        for start in range(0, len(labels), 12):
+            window = labels[start : start + 12]
+            self.assertEqual(
+                Counter(window), Counter({0: 3, 1: 3, 2: 3, 3: 3})
+            )
+            for process in range(3):
+                self.assertEqual(
+                    Counter(window[process::3]),
+                    Counter({0: 1, 1: 1, 2: 1, 3: 1}),
+                )
+
+    def test_rejects_overlapping_v9_curriculum_contracts(self):
+        class InvalidCurriculumDataset:
+            pgc_v9_hard_curriculum_group_ids = [0, 1, 2, 3]
+            pgc_v9_closed_loop_group_ids = [0, 1, 2, 3]
+
+            def __len__(self):
+                return 4
+
+        sampler = ResumableEpochSampler(
+            dataset=InvalidCurriculumDataset(),
+            seed=42,
+            batch_size=1,
+            num_processes=1,
+            gradient_accumulation_steps=4,
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            list(sampler)
 
     def test_rejects_missing_or_overlapping_pools(self):
         with self.assertRaisesRegex(ValueError, "non-empty"):
@@ -987,6 +1066,91 @@ class PGCERAFModuleTest(unittest.TestCase):
             module.entity_grounder.view_fusion_adapter.output.weight.grad
         )
         self.assertIsNotNone(module.clause_execution_scheduler.output.weight.grad)
+
+    def test_v912_zero_init_rebinding_is_exact_and_receives_state_gradients(self):
+        torch.manual_seed(912)
+        common = dict(
+            text_dim=10,
+            video_dim=16,
+            action_dim=12,
+            projection_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            max_clauses=4,
+            camera_count=2,
+            visual_aspect_ratio=2.0,
+            role_adapter_enabled=True,
+            role_adapter_hidden_dim=8,
+            role_adapter_teacher_enabled=True,
+            balanced_role_adapter_enabled=True,
+            balanced_role_adapter_hidden_dim=8,
+            clause_activation_adapter_enabled=True,
+            clause_activation_adapter_hidden_dim=8,
+            view_fusion_enabled=True,
+            view_fusion_adapter_hidden_dim=8,
+            clause_scheduler_enabled=True,
+            clause_scheduler_hidden_dim=8,
+        )
+        v911 = EntityRelationAffordanceField(**common).eval()
+        v912 = EntityRelationAffordanceField(
+            **common,
+            closed_loop_rebinding_enabled=True,
+            closed_loop_rebinding_hidden_dim=8,
+        ).eval()
+        incompatible = v912.load_state_dict(v911.state_dict(), strict=False)
+        self.assertFalse(incompatible.unexpected_keys)
+        self.assertTrue(incompatible.missing_keys)
+        self.assertTrue(
+            all(
+                key.startswith("closed_loop_phase_rebinding_adapter.")
+                for key in incompatible.missing_keys
+            )
+        )
+        inputs = {
+            "base_goal_queries": torch.randn(2, 3, 12),
+            "base_goal_embedding": torch.randn(2, 8),
+            "language_hidden": torch.randn(2, 6, 10),
+            "language_mask": torch.ones(2, 6, dtype=torch.bool),
+            "current_video_hidden": torch.randn(2, 8, 16),
+        }
+        output911 = v911(**inputs)
+        output912 = v912(**inputs)
+        torch.testing.assert_close(output912[0], output911[0], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(output912[1], output911[1], rtol=0.0, atol=0.0)
+        for name in (
+            "subject_attention",
+            "reference_attention",
+            "predicate_truth_logits",
+            "phase_logits",
+            "clause_execution_probability",
+            "goal_anchor",
+        ):
+            torch.testing.assert_close(
+                output912[2][name], output911[2][name], rtol=0.0, atol=0.0
+            )
+        for name in (
+            "phase_rebinding_subject_delta",
+            "phase_rebinding_reference_delta",
+            "phase_rebinding_truth_residual",
+            "phase_rebinding_phase_residual",
+        ):
+            self.assertEqual(int(output912[2][name].count_nonzero()), 0)
+
+        v912.train()
+        output = v912(**inputs)[2]
+        repair_loss = (
+            output["subject_position"].float().square().sum()
+            + output["reference_position"].float().square().sum()
+            + output["predicate_truth_logits"].float().sum()
+            + output["phase_logits"].float().sum()
+        )
+        repair_loss.backward()
+        adapter = v912.closed_loop_phase_rebinding_adapter
+        self.assertIsNotNone(adapter)
+        self.assertIsNotNone(adapter.subject_output.weight.grad)
+        self.assertIsNotNone(adapter.reference_output.weight.grad)
+        self.assertIsNotNone(adapter.truth_output.weight.grad)
+        self.assertIsNotNone(adapter.phase_output.weight.grad)
 
     def test_v99_loss_supervises_camera_fusion_and_first_unfinished_clause(self):
         torch.manual_seed(920)
@@ -2963,6 +3127,90 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 v9_grounding_objective_version=12,
             )
             restored.load_checkpoint(v911_path)
+
+    def test_v911_to_v912_closed_loop_rebinding_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v911_path = root / "v911.pt"
+            v912_path = root / "v912.pt"
+            v911 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=12,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v911.mot.state_dict()},
+                base_path,
+            )
+            v911.load_checkpoint(base_path)
+            v911.save_checkpoint(v911_path, step=6250)
+
+            v912 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=13,
+            )
+            v912.load_checkpoint(v911_path)
+            adapter = v912.policy_guard_modules[
+                "entity_relation_affordance"
+            ].closed_loop_phase_rebinding_adapter
+            self.assertIsNotNone(adapter)
+            for output in (
+                adapter.subject_output,
+                adapter.reference_output,
+                adapter.truth_output,
+                adapter.phase_output,
+            ):
+                self.assertEqual(int(output.weight.count_nonzero()), 0)
+                self.assertEqual(int(output.bias.count_nonzero()), 0)
+
+            v912.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v912.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    "closed_loop_phase_rebinding_adapter" in name
+                    for name in trainable
+                )
+            )
+            self.assertFalse(any(parameter.requires_grad for parameter in v912.mot.parameters()))
+            v912.save_checkpoint(v912_path, step=7250)
+            payload = torch.load(v912_path, map_location="cpu", weights_only=False)
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 13)
+            self.assertEqual(
+                metadata["eraf_closed_loop_rebinding_contract"],
+                "zero_init_second_pass_role_truth_phase_and_clause_route",
+            )
+            self.assertEqual(
+                metadata["eraf_closed_loop_state_contract"],
+                "immutable_base_correct_replan_exact_simulator_state",
+            )
+            self.assertEqual(
+                metadata["eraf_closed_loop_curriculum_contract"],
+                "offline_native_closed_loop_native_historical_strict_1_1_1_1",
+            )
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "closed_loop_phase_rebinding_adapter_only",
+            )
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=13,
+            )
+            restored.load_checkpoint(v912_path)
+            expected_state = v912.policy_guard_modules.state_dict()
+            restored_state = restored.policy_guard_modules.state_dict()
+            self.assertEqual(expected_state.keys(), restored_state.keys())
+            for name, value in expected_state.items():
+                self.assertTrue(torch.equal(value, restored_state[name]), name)
 
     def test_stage_trainability_optimizer_contract_and_deployment_inputs(self):
         expected_modules = {

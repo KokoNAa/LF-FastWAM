@@ -903,6 +903,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         10: 4750,
         11: 5750,
         12: 6250,
+        13: 7250,
     }.get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
     intermediate_checkpoint = bool(args.allow_intermediate) and (
@@ -913,6 +914,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         or (objective_version == 10 and checkpoint_step in {4000, 4250, 4500})
         or (objective_version == 11 and checkpoint_step in {5000, 5250, 5500})
         or (objective_version == 12 and checkpoint_step == 6000)
+        or (
+            objective_version == 13
+            and checkpoint_step in {6500, 6750, 7000}
+        )
     )
     if (
         expected_step is None
@@ -925,7 +930,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "objective v3/v4 at step 2500, objective v5/v6 at step 3500, "
             "objective v7 at step 3000, objective v8 at step 3250, "
             "objective v9 at step 3750, objective v10 at step 4750, or "
-            "objective v11 at step 5750, or objective v12 at step 6250."
+            "objective v11 at step 5750, objective v12 at step 6250, or "
+            "objective v13 at step 7250."
         )
     model = model.to(args.device).eval()
     sidecars = list(dataset.pgc_entity_relation_indices.values())
@@ -1084,7 +1090,7 @@ def parse_args() -> argparse.Namespace:
             "Audit V9.3 steps 1750/2000/2250, V9.4/V9.5 steps "
             "2750/3000/3250, V9.6 step 2750, V9.8 step 3500, V9.9 "
             "steps 4000/4250/4500, V9.10 steps 5000/5250/5500, or V9.11 "
-            "step 6000 without "
+            "step 6000, or V9.12 steps 6500/6750/7000 without "
             "treating them as final action inputs."
         ),
     )

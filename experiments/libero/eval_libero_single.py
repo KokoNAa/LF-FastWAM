@@ -1013,6 +1013,95 @@ def _write_closed_loop_capture_records(
     return written
 
 
+def _write_eraf_closed_loop_capture_records(
+    *,
+    cfg: DictConfig,
+    episode_idx: int,
+    initial_state: np.ndarray,
+    task_description: str,
+    policy_instruction: str,
+    success: bool,
+    captured_states: list[dict[str, Any]],
+) -> int:
+    """Persist phase-labelled Base-rollout states for V9.12 rebinding.
+
+    This path is deliberately separate from the V8 acquisition capture above.
+    V9.12 captures Correct, immutable-Base rollouts after the privileged shadow
+    observer has assigned a state-derived phase.  The labels are never exposed
+    to inference; a later offline builder restores the exact simulator states
+    and constructs the ordinary training-only ERAF sidecar.
+    """
+    capture_root_value = cfg.EVALUATION.get(
+        "entity_relation_closed_loop_capture_dir"
+    )
+    if capture_root_value in (None, "", "null") or not captured_states:
+        return 0
+
+    suite_name = str(cfg.EVALUATION.task_suite_name)
+    task_id = int(cfg.EVALUATION.task_id)
+    trial_dir = (
+        Path(str(capture_root_value)).expanduser().resolve()
+        / suite_name
+        / f"task_{task_id:02d}"
+        / f"trial_{episode_idx:03d}"
+    )
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    initial_state = np.asarray(initial_state).copy()
+    written = 0
+    for item in captured_states:
+        replan_index = int(item["replan_index"])
+        stage = str(item["online_stage_v2"])
+        capture_id = (
+            f"{suite_name}_task{task_id:02d}_trial{episode_idx:03d}_"
+            f"replan{replan_index:04d}_{stage}"
+        )
+        state = np.asarray(item["state"]).copy()
+        state_path = trial_dir / f"{capture_id}.npz"
+        np.savez_compressed(
+            state_path,
+            simulator_state=state,
+            source_initial_state=initial_state,
+        )
+        record = {
+            "format": "pgc_v9_eraf_closed_loop_capture_v1",
+            "capture_id": capture_id,
+            "state_file": state_path.name,
+            "capture_state_sha256": _state_sha256(state),
+            "source_initial_state_sha256": _state_sha256(initial_state),
+            "task_suite_name": suite_name,
+            "task_id": task_id,
+            "trial_index": int(episode_idx),
+            "replan_index": replan_index,
+            "policy_step": int(item["policy_step"]),
+            "online_stage_v2": stage,
+            "clause_statuses": list(item["clause_statuses"]),
+            "phase_targets": [int(value) for value in item["phase_targets"]],
+            "predicate_truth": [bool(value) for value in item["predicate_truth"]],
+            "subject_grasped": [bool(value) for value in item["subject_grasped"]],
+            "subject_ever_grasped": [
+                bool(value) for value in item["subject_ever_grasped"]
+            ],
+            "correct_instruction": str(task_description),
+            "policy_instruction": str(policy_instruction),
+            "episode_success": bool(success),
+            "rollout_policy": "immutable_base",
+            "action_integrity": "selected_equals_immutable_base_exact",
+            "checkpoint": str(cfg.ckpt),
+            "seed": None if cfg.get("seed") is None else int(cfg.seed),
+            "privileged_supervision": "training_only",
+            "deployment_inputs": "rgb_language_proprio",
+        }
+        record_path = trial_dir / f"{capture_id}.json"
+        temporary_path = record_path.with_suffix(".json.tmp")
+        temporary_path.write_text(
+            json.dumps(record, indent=2, cls=NumpyEncoder) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, record_path)
+        written += 1
+    return written
+
+
 def run_single_episode(
     env,
     initial_state,
@@ -1095,6 +1184,51 @@ def run_single_episode(
     if closed_loop_capture_enabled and counterfactual_tracker is None:
         raise ValueError("PGC closed-loop capture requires counterfactual diagnostics.")
     captured_states: list[dict[str, Any]] = []
+    eraf_capture_enabled = cfg.EVALUATION.get(
+        "entity_relation_closed_loop_capture_dir"
+    ) not in (None, "", "null")
+    eraf_capture_stride = int(
+        cfg.EVALUATION.get(
+            "entity_relation_closed_loop_capture_stride_replans", 1
+        )
+    )
+    eraf_capture_max_states = int(
+        cfg.EVALUATION.get(
+            "entity_relation_closed_loop_capture_max_states_per_episode", 48
+        )
+    )
+    eraf_capture_stages = {
+        value.strip()
+        for value in str(
+            cfg.EVALUATION.get(
+                "entity_relation_closed_loop_capture_stages",
+                "initial_search,holding,released_unfinished,next_clause_search",
+            )
+        ).split(",")
+        if value.strip()
+    }
+    allowed_eraf_capture_stages = {
+        "initial_search",
+        "holding",
+        "released_unfinished",
+        "next_clause_search",
+    }
+    if eraf_capture_enabled:
+        if eraf_shadow_auditor is None:
+            raise ValueError(
+                "ERAF closed-loop capture requires the passive shadow auditor."
+            )
+        if eraf_capture_stride <= 0 or eraf_capture_max_states <= 0:
+            raise ValueError(
+                "ERAF closed-loop capture stride/max states must be positive."
+            )
+        unknown_stages = eraf_capture_stages - allowed_eraf_capture_stages
+        if unknown_stages:
+            raise ValueError(
+                "Unsupported ERAF closed-loop capture stages: "
+                f"{sorted(unknown_stages)}."
+            )
+    eraf_captured_states: list[dict[str, Any]] = []
     inference_replan_index = -1
 
     t = 0
@@ -1110,6 +1244,17 @@ def run_single_episode(
 
         if len(pending_actions) == 0:
             inference_replan_index += 1
+            eraf_capture_candidate = None
+            if (
+                eraf_capture_enabled
+                and inference_replan_index % eraf_capture_stride == 0
+                and len(eraf_captured_states) < eraf_capture_max_states
+            ):
+                eraf_capture_candidate = {
+                    "replan_index": inference_replan_index,
+                    "policy_step": policy_steps_executed,
+                    "state": _capture_libero_sim_state(env),
+                }
             capture_before_interaction = True
             if counterfactual_tracker is not None:
                 targets = counterfactual_tracker.counterfactual_target_objects
@@ -1156,15 +1301,44 @@ def run_single_episode(
                 eraf_raw = policy_guard_diagnostics.pop("_entity_relation_raw", None)
                 if eraf_raw is not None:
                     if eraf_shadow_auditor is not None:
-                        policy_guard_diagnostics["entity_relation_shadow"] = (
-                            eraf_shadow_auditor.observe(
-                                obs=obs,
-                                diagnostics=eraf_raw,
-                                episode_idx=episode_idx,
-                                replan_idx=inference_replan_index,
-                                policy_step=policy_steps_executed,
-                            )
+                        shadow_record = eraf_shadow_auditor.observe(
+                            obs=obs,
+                            diagnostics=eraf_raw,
+                            episode_idx=episode_idx,
+                            replan_idx=inference_replan_index,
+                            policy_step=policy_steps_executed,
                         )
+                        policy_guard_diagnostics[
+                            "entity_relation_shadow"
+                        ] = shadow_record
+                        if (
+                            eraf_capture_candidate is not None
+                            and shadow_record["online_stage_v2"]
+                            in eraf_capture_stages
+                        ):
+                            eraf_captured_states.append(
+                                {
+                                    **eraf_capture_candidate,
+                                    "online_stage_v2": shadow_record[
+                                        "online_stage_v2"
+                                    ],
+                                    "clause_statuses": shadow_record[
+                                        "clause_statuses"
+                                    ],
+                                    "phase_targets": shadow_record[
+                                        "phase_targets"
+                                    ],
+                                    "predicate_truth": shadow_record[
+                                        "predicate_truth"
+                                    ],
+                                    "subject_grasped": shadow_record[
+                                        "subject_grasped"
+                                    ],
+                                    "subject_ever_grasped": shadow_record[
+                                        "subject_ever_grasped"
+                                    ],
+                                }
+                            )
                     if bool(cfg.EVALUATION.get("entity_relation_diagnostics", False)):
                         policy_guard_diagnostics["entity_relation"] = (
                             _save_eraf_diagnostics(
@@ -1286,6 +1460,21 @@ def run_single_episode(
             captured_states=captured_states,
         )
         counterfactual_diagnostics["closed_loop_capture_count"] = int(capture_count)
+    if eraf_capture_enabled:
+        capture_count = _write_eraf_closed_loop_capture_records(
+            cfg=cfg,
+            episode_idx=episode_idx,
+            initial_state=np.asarray(initial_state),
+            task_description=task_description,
+            policy_instruction=policy_instruction,
+            success=bool(done),
+            captured_states=eraf_captured_states,
+        )
+        logging.info(
+            "Wrote %d V9.12 phase-labelled ERAF states for episode %d.",
+            capture_count,
+            episode_idx,
+        )
     return (
         bool(done),
         replay_images,

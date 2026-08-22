@@ -1003,6 +1003,63 @@ class ERAFShadowAuditor:
             predicate_vocabulary=self.contract.predicate_vocabulary,
             all_entity_role_gate=self.all_entity_role_gate,
         )
+        rebinding_enabled = bool(
+            np.asarray(
+                diagnostics.get("closed_loop_rebinding_enabled", False)
+            ).reshape(-1)[0]
+        )
+        pre_rebinding_record: dict[str, Any] | None = None
+        if rebinding_enabled:
+            pre_rebinding_names = {
+                "subject_attention": "pre_rebinding_subject_attention",
+                "reference_attention": "pre_rebinding_reference_attention",
+                "subject_position": "pre_rebinding_subject_position",
+                "reference_position": "pre_rebinding_reference_position",
+                "subject_view_attention_mass": (
+                    "pre_rebinding_subject_view_attention_mass"
+                ),
+                "reference_view_attention_mass": (
+                    "pre_rebinding_reference_view_attention_mass"
+                ),
+                "goal_anchor": "pre_rebinding_goal_anchor",
+                "predicate_truth_logits": (
+                    "pre_rebinding_predicate_truth_logits"
+                ),
+                "phase_logits": "pre_rebinding_phase_logits",
+                "clause_execution_probability": (
+                    "pre_rebinding_clause_execution_probability"
+                ),
+                "clause_routing_residual": (
+                    "pre_rebinding_clause_routing_residual"
+                ),
+            }
+            missing = sorted(
+                source
+                for source in pre_rebinding_names.values()
+                if source not in diagnostics
+            )
+            if missing:
+                raise ValueError(
+                    "V9.12 shadow diagnostics are missing pre-rebinding "
+                    f"same-state outputs: {missing}."
+                )
+            pre_rebinding_diagnostics = dict(diagnostics)
+            pre_rebinding_diagnostics.update(
+                {
+                    target: diagnostics[source]
+                    for target, source in pre_rebinding_names.items()
+                }
+            )
+            pre_rebinding_record = _sample_record(
+                pre_rebinding_diagnostics,
+                sample,
+                self.contract.workspace_min,
+                self.contract.workspace_max,
+                dataset_kind="online_closed_loop_pre_rebinding",
+                dataset_label=self.instruction_condition,
+                predicate_vocabulary=self.contract.predicate_vocabulary,
+                all_entity_role_gate=self.all_entity_role_gate,
+            )
         extended = _extended_clause_diagnostics(
             diagnostics=diagnostics,
             sample=sample,
@@ -1034,6 +1091,8 @@ class ERAFShadowAuditor:
                 "subject_grasped": subject_grasped[clause_valid].tolist(),
                 "subject_ever_grasped": self._ever_grasped[clause_valid].tolist(),
                 "extended_diagnostics": extended,
+                "closed_loop_rebinding_enabled": rebinding_enabled,
+                "pre_rebinding_record": pre_rebinding_record,
             }
         )
         return record
@@ -1333,6 +1392,37 @@ def summarize_eraf_shadow_records(
             require_view_scheduler=require_view_scheduler,
         )
 
+    delta_metric_names = (
+        "subject_top1_in_gt_mask",
+        "reference_top1_in_gt_mask",
+        "relation_macro_f1",
+        "all_entity_exclusive_role_accuracy",
+        "visible_goal_anchor_median_error_cm",
+        "clause_exact_match",
+        "multi_clause_exact_match",
+        "single_visible_view_selection_accuracy",
+        "clause_scheduler_accuracy",
+    )
+
+    def metric_deltas(
+        post_metrics: Mapping[str, Any], pre_metrics: Mapping[str, Any]
+    ) -> dict[str, float | None]:
+        result: dict[str, float | None] = {}
+        for name in delta_metric_names:
+            post_value = post_metrics.get(name)
+            pre_value = pre_metrics.get(name)
+            if post_value is None or pre_value is None:
+                result[name] = None
+                continue
+            post_value = float(post_value)
+            pre_value = float(pre_value)
+            result[name] = (
+                post_value - pre_value
+                if np.isfinite(post_value) and np.isfinite(pre_value)
+                else None
+            )
+        return result
+
     gate = gate_report(rows)
     require_view_scheduler = bool(rows) and all(
         bool(row.get("v99_view_scheduler_available")) for row in rows
@@ -1380,6 +1470,21 @@ def summarize_eraf_shadow_records(
                 "metrics": report["metrics"],
                 "extended": _extended_shadow_summary(subset),
             }
+            pre_subset = [
+                dict(row["pre_rebinding_record"])
+                for row in subset
+                if isinstance(row.get("pre_rebinding_record"), Mapping)
+            ]
+            if len(pre_subset) == len(subset):
+                pre_report = gate_report(pre_subset)
+                by_stage_v2[stage].update(
+                    {
+                        "pre_rebinding_metrics": pre_report["metrics"],
+                        "post_minus_pre_rebinding": metric_deltas(
+                            report["metrics"], pre_report["metrics"]
+                        ),
+                    }
+                )
     replan_windows = {
         "initial_0": lambda value: value == 0,
         "early_1_4": lambda value: 1 <= value <= 4,
@@ -1396,6 +1501,28 @@ def summarize_eraf_shadow_records(
                 "metrics": report["metrics"],
             }
     extended = _extended_shadow_summary(rows)
+    pre_rebinding_rows = [
+        dict(row["pre_rebinding_record"])
+        for row in rows
+        if isinstance(row.get("pre_rebinding_record"), Mapping)
+    ]
+    same_state_rebinding: dict[str, Any] = {
+        "available": bool(pre_rebinding_rows),
+        "record_coverage": (
+            float(len(pre_rebinding_rows) / len(rows)) if rows else 0.0
+        ),
+    }
+    if len(pre_rebinding_rows) == len(rows):
+        pre_rebinding_gate = gate_report(pre_rebinding_rows)
+        same_state_rebinding.update(
+            {
+                "pre_rebinding_metrics": pre_rebinding_gate["metrics"],
+                "post_rebinding_metrics": gate["metrics"],
+                "post_minus_pre_rebinding": metric_deltas(
+                    gate["metrics"], pre_rebinding_gate["metrics"]
+                ),
+            }
+        )
     return {
         "format": "pgc_v9_eraf_shadow_audit_v2",
         "decisions": len(rows),
@@ -1406,6 +1533,7 @@ def summarize_eraf_shadow_records(
         "by_online_stage_v2": by_stage_v2,
         "by_replan_window": by_replan_window,
         "extended_diagnostics": extended,
+        "same_state_rebinding": same_state_rebinding,
         "passed": bool(
             gate["passed"]
             and action_summary["chunks"] == len(rows)

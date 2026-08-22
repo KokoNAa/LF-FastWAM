@@ -245,6 +245,32 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
             "clause_routing_multiplier": np.ones((1, 4), dtype=np.float32),
             "view_scheduler_enabled": np.asarray([True]),
         }
+        diagnostics.update(
+            {
+                "closed_loop_rebinding_enabled": np.asarray([True]),
+                "pre_rebinding_subject_attention": subject_attention.copy(),
+                "pre_rebinding_reference_attention": reference_attention.copy(),
+                "pre_rebinding_subject_position": subject_position.copy(),
+                "pre_rebinding_reference_position": reference_position.copy(),
+                "pre_rebinding_subject_view_attention_mass": diagnostics[
+                    "subject_view_attention_mass"
+                ].copy(),
+                "pre_rebinding_reference_view_attention_mass": diagnostics[
+                    "reference_view_attention_mass"
+                ].copy(),
+                "pre_rebinding_goal_anchor": goal_anchor.copy(),
+                "pre_rebinding_predicate_truth_logits": diagnostics[
+                    "predicate_truth_logits"
+                ].copy(),
+                "pre_rebinding_phase_logits": phase_logits.copy(),
+                "pre_rebinding_clause_execution_probability": diagnostics[
+                    "clause_execution_probability"
+                ].copy(),
+                "pre_rebinding_clause_routing_residual": diagnostics[
+                    "clause_routing_residual"
+                ].copy(),
+            }
+        )
         record = auditor.observe(
             obs=obs,
             diagnostics=diagnostics,
@@ -276,6 +302,12 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
         self.assertEqual(record["relation_predictions"], [2])
         self.assertEqual(len(record["goal_anchor_errors_m"]), 1)
         self.assertAlmostEqual(record["goal_anchor_errors_m"][0], 0.0, places=6)
+        self.assertTrue(record["closed_loop_rebinding_enabled"])
+        self.assertIsNotNone(record["pre_rebinding_record"])
+        self.assertEqual(
+            record["pre_rebinding_record"]["clause_exact"],
+            record["clause_exact"],
+        )
 
     def test_summary_requires_grounding_and_action_integrity(self):
         records = [_good_record() for _ in range(5)]
@@ -312,6 +344,44 @@ class PGCERAFShadowAuditTest(unittest.TestCase):
         )
         self.assertEqual(
             summary["by_online_stage_v2"]["initial_search"]["decisions"], 5
+        )
+
+    def test_summary_reports_same_state_pre_post_rebinding_delta(self):
+        records = []
+        for _ in range(5):
+            record = _good_record()
+            record["online_stage_v2"] = "holding"
+            record["pre_rebinding_record"] = _good_record()
+            record["closed_loop_rebinding_enabled"] = True
+            record["extended_diagnostics"] = {
+                "available": True,
+                "missing_diagnostics": [],
+                "clauses": [_extended_clause("holding"), _extended_clause("holding")],
+            }
+            records.append(record)
+        integrity = [
+            {
+                "exact": True,
+                "max_abs_error": 0.0,
+                "rms_error": 0.0,
+                "gate_mode": "base",
+            }
+            for _ in records
+        ]
+        summary = summarize_eraf_shadow_records(
+            records, action_integrity=integrity
+        )
+        same_state = summary["same_state_rebinding"]
+        self.assertTrue(same_state["available"])
+        self.assertEqual(same_state["record_coverage"], 1.0)
+        self.assertEqual(
+            same_state["post_minus_pre_rebinding"]["clause_exact_match"], 0.0
+        )
+        self.assertEqual(
+            summary["by_online_stage_v2"]["holding"][
+                "post_minus_pre_rebinding"
+            ]["visible_goal_anchor_median_error_cm"],
+            0.0,
         )
 
     def test_non_sticky_clause_statuses_separate_second_search_and_release(self):

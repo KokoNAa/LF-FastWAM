@@ -219,6 +219,29 @@ class Wan22Trainer:
                         "PGC hard-role curriculum is valid only for "
                         "objective-v7/v8/v12 grounding repair."
                     )
+                closed_loop_rebinding = bool(
+                    getattr(
+                        self.train_dataset,
+                        "pgc_v9_closed_loop_rebinding",
+                        False,
+                    )
+                )
+                if (
+                    objective_version == 13
+                    and training_stage == "grounding"
+                    and not closed_loop_rebinding
+                ):
+                    raise ValueError(
+                        "PGC V9.12 grounding requires the audited four-way "
+                        "closed-loop rebinding curriculum."
+                    )
+                if closed_loop_rebinding and not (
+                    objective_version == 13 and training_stage == "grounding"
+                ):
+                    raise ValueError(
+                        "PGC V9.12 closed-loop rebinding data is valid only for "
+                        "objective-v13 grounding repair."
+                    )
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # In LoRA mode only adapters plus explicitly selected small modules are
