@@ -170,6 +170,18 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("rollout/evaluation step alignment", source)
         self.assertIn("raw_fp32_pairwise_advantage", source)
 
+    def test_v912_evaluation_restores_rebinding_checkpoint_contract(self):
+        source = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 13", source
+        )
+        self.assertIn("closed_loop_rebinding_hidden_dim=256", source)
+        self.assertIn("closed_loop_query_residual_max_abs=1.0", source)
+        self.assertIn("closed_loop_state_residual_max_abs=2.0", source)
+        self.assertIn("phase_rebinding_energy_weight=0.01", source)
+
 
 if __name__ == "__main__":
     unittest.main()

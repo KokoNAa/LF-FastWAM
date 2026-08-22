@@ -381,6 +381,14 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
       "model.policy_guard.entity_relation_grounding.clause_tuple_multi_consistency_weight=2.0"
     )
   fi
+  if (( PGC_V9_GROUNDING_OBJECTIVE_VERSION >= 13 )); then
+    EXTRA_OVERRIDES+=(
+      "model.policy_guard.entity_relation_grounding.closed_loop_rebinding_hidden_dim=256"
+      "model.policy_guard.entity_relation_grounding.closed_loop_query_residual_max_abs=1.0"
+      "model.policy_guard.entity_relation_grounding.closed_loop_state_residual_max_abs=2.0"
+      "model.policy_guard.entity_relation_grounding.phase_rebinding_energy_weight=0.01"
+    )
+  fi
   if [[ "${ERAF_SHADOW_AUDIT}" == "true" ]]; then
     if [[ "${GATE_MODE}" != "base" ]]; then
       echo "PGC ERAF shadow audit requires PGC_GATE_MODE=base." >&2
