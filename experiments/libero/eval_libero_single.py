@@ -52,6 +52,7 @@ from experiments.libero.language_interventions import (
     select_language_intervention_record,
     validate_counterfactual_problem,
 )
+from experiments.libero.policy_guard_state import PolicyGuardStateController
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.pgc_libero import state_sha256 as _canonical_state_sha256
 from fastwam.models.wan22.entity_relation_affordance import ERAF_PREDICATES
@@ -1177,8 +1178,17 @@ def run_single_episode(
     inference_latencies_ms: list[float] = []
     policy_guard_decisions: list[dict[str, Any]] = []
     # Explicit per-episode state: never retained on the model, shared between
-    # environments, or carried across LIBERO trials.
-    policy_guard_state: Optional[dict[str, Any]] = None
+    # environments, or carried across LIBERO trials.  The stateless ablation
+    # makes every invocation look like the first replan and discards the
+    # returned state, cutting the recurrent PSCM channel without changing the
+    # checkpoint or ERAF/scheduler weights.
+    policy_guard_state = PolicyGuardStateController(
+        reset_each_replan=bool(
+            cfg.EVALUATION.get(
+                "entity_relation_stateless_replan_ablation", False
+            )
+        )
+    )
     closed_loop_capture_enabled = cfg.EVALUATION.get("closed_loop_capture_dir") not in (
         None,
         "",
@@ -1307,9 +1317,9 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
-                policy_guard_state=policy_guard_state,
+                policy_guard_state=policy_guard_state.state_for_replan(),
             )
-            policy_guard_state = next_policy_guard_state
+            policy_guard_state.accept_model_state(next_policy_guard_state)
             inference_latencies_ms.append(inference_latency_ms)
             if policy_guard_diagnostics is not None:
                 eraf_raw = policy_guard_diagnostics.pop("_entity_relation_raw", None)
@@ -1519,6 +1529,17 @@ def run_single_task(
     eraf_shadow_enabled = bool(
         cfg.EVALUATION.get("entity_relation_shadow_audit", False)
     )
+    stateless_replan_ablation = bool(
+        cfg.EVALUATION.get(
+            "entity_relation_stateless_replan_ablation", False
+        )
+    )
+    if stateless_replan_ablation and not eraf_shadow_enabled:
+        raise ValueError(
+            "The stateless replan ablation requires the passive ERAF shadow "
+            "audit so the cut state channel and immutable Base action are "
+            "independently verified."
+        )
     env, task_description = get_libero_env(
         task,
         LIBERO_ENV_RESOLUTION,
@@ -1558,6 +1579,17 @@ def run_single_task(
             raise ValueError(
                 "ERAF shadow audit requires model.eval() so dropout cannot "
                 "perturb the Base rollout."
+            )
+        if stateless_replan_ablation and int(
+            getattr(
+                model,
+                "policy_guard_eraf_grounding_objective_version",
+                0,
+            )
+        ) < 14:
+            raise ValueError(
+                "The stateless replan ablation requires a V9.13+ "
+                "phase-memory checkpoint."
             )
         if str(getattr(model, "policy_guard_gate_mode", "")) != "base":
             raise ValueError(
@@ -1632,6 +1664,12 @@ def run_single_task(
             "observer_only": True,
             "executed_policy": "immutable_base",
             "privileged_labels": "evaluation_only",
+            "policy_state_mode": (
+                "reset_each_replan"
+                if stateless_replan_ablation
+                else "recurrent"
+            ),
+            "stateless_replan_ablation": stateless_replan_ablation,
             "records": [],
         }
     if intervention_record is not None:

@@ -498,6 +498,44 @@ bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
 规定的状态、retry、post-grasp scheduler、几何零漂移和 Base action 完整性；后者还会
 重新施加历史离线 grounding gate，不能替代 PSCM 的独立闭环准入结论。
 
+### 5.6 V9.13 无状态 replan 消融
+
+当 recurrent PSCM 在闭环中塌缩为 `pending` 时，先进行纯评测消融，不重训也不修改
+checkpoint。每次 replan 都不向模型传入上一时刻 `policy_guard_state`，同时丢弃本次返回
+的状态；ERAF、clause scheduler 和全部权重保持不变，执行动作仍强制为 immutable Base。
+
+```bash
+cd /root/gpufree-data/LF-FastWAM
+
+V913_CKPT=/root/gpufree-data/LF-FastWAM/runs/libero_pgc_2cam224/pgc-v913-libero10-phase-safe-memory-1000-4gpu-seed42-v1/checkpoints/weights/step_007250.pt
+NATIVE_SIDECAR=/root/gpufree-data/pgc_libero_data_v1/v9/libero_10_seed42/sidecars/libero_10_native_eraf
+STATELESS_OUT=/root/gpufree-data/LF-FastWAM/evaluate_results/pgc_v913_libero10_correct_shadow_stateless_seed42_trials5
+STATELESS_SUMMARY=/root/gpufree-data/pgc_v913_libero10_shadow_stateless_summary.json
+
+PGC_CHECKPOINT="$V913_CKPT" \
+PGC_EVAL_SUITES='[libero_10]' \
+PGC_GATE_MODE=base \
+PGC_ERAF_SHADOW_AUDIT=true \
+PGC_ERAF_STATELESS_REPLAN_ABLATION=true \
+PGC_ERAF_SHADOW_SIDECAR_DIR="$NATIVE_SIDECAR" \
+PGC_MAX_POLICY_STEPS=600 \
+OUTPUT_ROOT="$STATELESS_OUT" \
+bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
+
+/opt/conda/bin/python scripts/summarize_pgc_v9_shadow_audit.py \
+  --results "$STATELESS_OUT" \
+  --output "$STATELESS_SUMMARY" \
+  --require-extended \
+  --require-stateless-replan
+```
+
+汇总中的 `policy_state_mode` 必须为 `reset_each_replan`，且
+`stateless_replan_ablation.state_input_channel_cut=true`、
+`previous_state_invalid_rate=1.0`。独立准入要求 Base action exact rate 为 100%、geometry
+max-abs 为 0、post-grasp scheduler accuracy 至少 90%；PSCM 自己输出的四状态准确率只作为
+诊断，不再作为无状态消融的准入条件。若 post-grasp scheduler 与 recurrent V9.13 的
+96.8% 基本持平，就停止部署四状态 memory，进入 stateless ERAF→Proposal 联合阶段。
+
 ## 6. 评测顺序
 
 ### 6.1 Base mode 与 Correct gate

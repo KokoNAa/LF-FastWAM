@@ -222,6 +222,26 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("--require-phase-safe-memory", source)
         self.assertIn("phase_safe_memory_admission_passed", source)
 
+    def test_v913_evaluation_supports_stateless_replan_ablation(self):
+        source = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PGC_ERAF_STATELESS_REPLAN_ABLATION", source)
+        self.assertIn(
+            "EVALUATION.entity_relation_stateless_replan_ablation=", source
+        )
+        self.assertIn("PGC_GATE_MODE=base", source)
+
+        summary_source = (
+            REPO_ROOT / "scripts/summarize_pgc_v9_shadow_audit.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--require-stateless-replan", summary_source)
+        stateless_audit_source = (
+            REPO_ROOT
+            / "experiments/libero/stateless_replan_audit.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("previous_state_invalid_rate", stateless_audit_source)
+
 
 if __name__ == "__main__":
     unittest.main()

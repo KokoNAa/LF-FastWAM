@@ -534,6 +534,11 @@ def _extended_clause_diagnostics(
                     and bool(memory_previous_valid[index])
                     else None
                 ),
+                "phase_safe_memory_previous_state_valid": (
+                    bool(memory_previous_valid[index])
+                    if phase_safe_memory_available
+                    else None
+                ),
                 "phase_safe_memory_next_state": (
                     int(memory_next_ids[index])
                     if phase_safe_memory_available and bool(memory_next_valid[index])

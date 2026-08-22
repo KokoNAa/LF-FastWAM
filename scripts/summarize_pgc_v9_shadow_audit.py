@@ -15,6 +15,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiments.libero.eraf_shadow_audit import summarize_eraf_shadow_records
+from experiments.libero.stateless_replan_audit import (
+    build_stateless_replan_report,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -42,6 +45,15 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Exit 2 unless the V9.13 phase-safe memory admission passes. "
             "This gate is independent of the legacy offline grounding gate."
+        ),
+    )
+    parser.add_argument(
+        "--require-stateless-replan",
+        action="store_true",
+        help=(
+            "Exit 2 unless the reset-each-replan ablation is declared, every "
+            "audited clause receives no previous PSCM state, Base actions stay "
+            "exact, geometry stays frozen, and post-grasp scheduling is >=90%."
         ),
     )
     return parser.parse_args()
@@ -94,11 +106,26 @@ def build_summary(
     records: list[dict[str, Any]] = []
     action_integrity: list[dict[str, Any]] = []
     tasks: list[dict[str, Any]] = []
+    policy_state_modes: set[str] = set()
     for path in result_files:
         payload = json.loads(path.read_text(encoding="utf-8"))
         audit = payload.get("eraf_shadow_audit")
         if not isinstance(audit, Mapping) or not audit.get("enabled"):
             raise ValueError(f"Result lacks an ERAF shadow audit: {path}")
+        policy_state_mode = str(audit.get("policy_state_mode", "recurrent"))
+        if policy_state_mode not in {"recurrent", "reset_each_replan"}:
+            raise ValueError(
+                f"Unknown ERAF policy-state mode {policy_state_mode!r}: {path}"
+            )
+        declared_stateless = bool(
+            audit.get(
+                "stateless_replan_ablation",
+                policy_state_mode == "reset_each_replan",
+            )
+        )
+        if declared_stateless != (policy_state_mode == "reset_each_replan"):
+            raise ValueError(f"Inconsistent stateless ablation metadata: {path}")
+        policy_state_modes.add(policy_state_mode)
         task_records = audit.get("records")
         if not isinstance(task_records, list) or not task_records:
             raise ValueError(f"Result has no ERAF shadow records: {path}")
@@ -134,11 +161,25 @@ def build_summary(
         records,
         action_integrity=action_integrity,
     )
+    if len(policy_state_modes) != 1:
+        raise ValueError(
+            "Cannot mix recurrent and reset-each-replan shadow results: "
+            f"{sorted(policy_state_modes)}."
+        )
+    policy_state_mode = next(iter(policy_state_modes))
+    stateless_report = build_stateless_replan_report(
+        records,
+        enabled=policy_state_mode == "reset_each_replan",
+        phase_safe_memory=summary["phase_safe_clause_memory"],
+        action_integrity=summary["action_integrity"],
+    )
     summary.update(
         {
             "result_files": len(result_files),
             "episodes": sum(item["episodes"] for item in tasks),
             "tasks": sorted(tasks, key=lambda item: item["task_id"]),
+            "policy_state_mode": policy_state_mode,
+            "stateless_replan_ablation": stateless_report,
         }
     )
     if offline_report is not None:
@@ -181,6 +222,10 @@ def main() -> None:
     if args.require_phase_safe_memory and not summary.get(
         "phase_safe_memory_admission_passed", False
     ):
+        raise SystemExit(2)
+    if args.require_stateless_replan and not summary.get(
+        "stateless_replan_ablation", {}
+    ).get("passed", False):
         raise SystemExit(2)
 
 

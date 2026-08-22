@@ -61,6 +61,9 @@ EVALUATION:
   # online labels are generated from the current MuJoCo state.
   entity_relation_shadow_audit: false
   entity_relation_shadow_sidecar_dir: null
+  # Evaluation-only V9.13 ablation. Every replan receives no previous PSCM
+  # state and the returned state is discarded; model weights remain unchanged.
+  entity_relation_stateless_replan_ablation: false
 
   # Optional external inputs
   dataset_stats_path: null
