@@ -11946,49 +11946,50 @@ class FastWAM(torch.nn.Module):
                                         f"model={expected_value}."
                                     )
                         if saved_grounding_objective >= 4 and not objective_upgrade:
-                            expected_scope = (
-                                (
-                                    (
-                                        (
-                                            "audited_hard_clause_tuple_balanced_"
-                                            "visual_role_binding_adapter_only"
-                                            if saved_grounding_objective >= 12
-                                            else (
-                                                "exclusive_all_entity_balanced_"
-                                                "visual_role_binding_adapter_only"
-                                            )
-                                        )
-                                        if saved_grounding_objective >= 11
-                                        else (
-                                            "clause_activation_plus_balanced_role_plus_"
-                                            "visibility_gated_view_fusion_plus_unfinished_"
-                                            "clause_scheduler"
-                                        )
-                                    )
-                                    if saved_grounding_objective >= 10
-                                    else "clause_activation_calibration_adapter_only"
+                            if saved_grounding_objective >= 13:
+                                expected_scope = (
+                                    "closed_loop_phase_rebinding_adapter_only"
                                 )
-                                if saved_grounding_objective >= 9
-                                else (
-                                    (
-                                        "exclusive_evidence_global_hard_curriculum_"
-                                        "balanced_visual_role_binding_adapter_only"
-                                        if saved_grounding_objective >= 8
-                                        else (
-                                            "global_hard_curriculum_balanced_visual_"
-                                            "role_binding_adapter_only"
-                                        )
-                                    )
-                                    if saved_grounding_objective >= 7
-                                    else "balanced_visual_role_binding_adapter_only"
+                            elif saved_grounding_objective >= 12:
+                                expected_scope = (
+                                    "audited_hard_clause_tuple_balanced_"
+                                    "visual_role_binding_adapter_only"
                                 )
-                                if saved_grounding_objective >= 6
-                                else (
+                            elif saved_grounding_objective >= 11:
+                                expected_scope = (
+                                    "exclusive_all_entity_balanced_"
+                                    "visual_role_binding_adapter_only"
+                                )
+                            elif saved_grounding_objective >= 10:
+                                expected_scope = (
+                                    "clause_activation_plus_balanced_role_plus_"
+                                    "visibility_gated_view_fusion_plus_unfinished_"
+                                    "clause_scheduler"
+                                )
+                            elif saved_grounding_objective >= 9:
+                                expected_scope = (
+                                    "clause_activation_calibration_adapter_only"
+                                )
+                            elif saved_grounding_objective >= 8:
+                                expected_scope = (
+                                    "exclusive_evidence_global_hard_curriculum_"
+                                    "balanced_visual_role_binding_adapter_only"
+                                )
+                            elif saved_grounding_objective >= 7:
+                                expected_scope = (
+                                    "global_hard_curriculum_balanced_visual_"
+                                    "role_binding_adapter_only"
+                                )
+                            elif saved_grounding_objective >= 6:
+                                expected_scope = (
+                                    "balanced_visual_role_binding_adapter_only"
+                                )
+                            elif saved_grounding_objective >= 5:
+                                expected_scope = (
                                     "structured_role_assignment_adapter_only"
-                                    if saved_grounding_objective >= 5
-                                    else "role_assignment_adapter_only"
                                 )
-                            )
+                            else:
+                                expected_scope = "role_assignment_adapter_only"
                             if (
                                 metadata.get("eraf_role_adapter_trainable_scope")
                                 != expected_scope
