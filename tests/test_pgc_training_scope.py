@@ -227,6 +227,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("PGC_ERAF_STATELESS_REPLAN_ABLATION", source)
+        self.assertIn("PGC_ERAF_COMPLETION_ONLY_MEMORY_ABLATION", source)
         self.assertIn(
             "EVALUATION.entity_relation_stateless_replan_ablation=", source
         )
@@ -236,6 +237,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             REPO_ROOT / "scripts/summarize_pgc_v9_shadow_audit.py"
         ).read_text(encoding="utf-8")
         self.assertIn("--require-stateless-replan", summary_source)
+        self.assertIn("--require-completion-only-memory", summary_source)
         stateless_audit_source = (
             REPO_ROOT
             / "experiments/libero/stateless_replan_audit.py"

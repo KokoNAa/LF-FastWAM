@@ -15,6 +15,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiments.libero.eraf_shadow_audit import summarize_eraf_shadow_records
+from experiments.libero.completion_only_memory_audit import (
+    build_completion_only_memory_report,
+)
 from experiments.libero.stateless_replan_audit import (
     build_stateless_replan_report,
 )
@@ -54,6 +57,15 @@ def _parse_args() -> argparse.Namespace:
             "Exit 2 unless the reset-each-replan ablation is declared, every "
             "audited clause receives no previous PSCM state, Base actions stay "
             "exact, geometry stays frozen, and post-grasp scheduling is >=90%."
+        ),
+    )
+    parser.add_argument(
+        "--require-completion-only-memory",
+        action="store_true",
+        help=(
+            "Exit 2 unless only completed states cross replans, completed "
+            "memory is exercised and sticky, Base actions stay exact, geometry "
+            "stays frozen, and post-grasp scheduling is >=90%."
         ),
     )
     return parser.parse_args()
@@ -113,7 +125,11 @@ def build_summary(
         if not isinstance(audit, Mapping) or not audit.get("enabled"):
             raise ValueError(f"Result lacks an ERAF shadow audit: {path}")
         policy_state_mode = str(audit.get("policy_state_mode", "recurrent"))
-        if policy_state_mode not in {"recurrent", "reset_each_replan"}:
+        if policy_state_mode not in {
+            "recurrent",
+            "reset_each_replan",
+            "completion_only",
+        }:
             raise ValueError(
                 f"Unknown ERAF policy-state mode {policy_state_mode!r}: {path}"
             )
@@ -125,6 +141,16 @@ def build_summary(
         )
         if declared_stateless != (policy_state_mode == "reset_each_replan"):
             raise ValueError(f"Inconsistent stateless ablation metadata: {path}")
+        declared_completion_only = bool(
+            audit.get(
+                "completion_only_memory_ablation",
+                policy_state_mode == "completion_only",
+            )
+        )
+        if declared_completion_only != (policy_state_mode == "completion_only"):
+            raise ValueError(
+                f"Inconsistent completion-only ablation metadata: {path}"
+            )
         policy_state_modes.add(policy_state_mode)
         task_records = audit.get("records")
         if not isinstance(task_records, list) or not task_records:
@@ -163,13 +189,19 @@ def build_summary(
     )
     if len(policy_state_modes) != 1:
         raise ValueError(
-            "Cannot mix recurrent and reset-each-replan shadow results: "
+            "Cannot mix policy-state modes in one shadow summary: "
             f"{sorted(policy_state_modes)}."
         )
     policy_state_mode = next(iter(policy_state_modes))
     stateless_report = build_stateless_replan_report(
         records,
         enabled=policy_state_mode == "reset_each_replan",
+        phase_safe_memory=summary["phase_safe_clause_memory"],
+        action_integrity=summary["action_integrity"],
+    )
+    completion_only_report = build_completion_only_memory_report(
+        records,
+        enabled=policy_state_mode == "completion_only",
         phase_safe_memory=summary["phase_safe_clause_memory"],
         action_integrity=summary["action_integrity"],
     )
@@ -180,6 +212,7 @@ def build_summary(
             "tasks": sorted(tasks, key=lambda item: item["task_id"]),
             "policy_state_mode": policy_state_mode,
             "stateless_replan_ablation": stateless_report,
+            "completion_only_memory_ablation": completion_only_report,
         }
     )
     if offline_report is not None:
@@ -225,6 +258,10 @@ def main() -> None:
         raise SystemExit(2)
     if args.require_stateless_replan and not summary.get(
         "stateless_replan_ablation", {}
+    ).get("passed", False):
+        raise SystemExit(2)
+    if args.require_completion_only_memory and not summary.get(
+        "completion_only_memory_ablation", {}
     ).get("passed", False):
         raise SystemExit(2)
 

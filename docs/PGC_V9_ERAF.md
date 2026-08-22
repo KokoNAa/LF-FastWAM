@@ -536,6 +536,45 @@ max-abs 为 0、post-grasp scheduler accuracy 至少 90%；PSCM 自己输出的�
 诊断，不再作为无状态消融的准入条件。若 post-grasp scheduler 与 recurrent V9.13 的
 96.8% 基本持平，就停止部署四状态 memory，进入 stateless ERAF→Proposal 联合阶段。
 
+### 5.7 V9.13 completion-only memory 消融
+
+该消融继续使用同一个 V9.13 checkpoint，但只允许 `COMPLETED=3` 跨 replan 传递。
+completed bit 采用 episode 内单调集合并；`PENDING/HOLDING/RETRY` 全部在每次模型调用后
+清除为 pending+invalid。它用于判断 recurrent PSCM 的收益是否主要来自“不要重新执行已
+完成 clause”，而不是来自失败的 holding/retry 状态分类。
+
+```bash
+cd /root/gpufree-data/LF-FastWAM
+
+V913_CKPT=/root/gpufree-data/LF-FastWAM/runs/libero_pgc_2cam224/pgc-v913-libero10-phase-safe-memory-1000-4gpu-seed42-v1/checkpoints/weights/step_007250.pt
+NATIVE_SIDECAR=/root/gpufree-data/pgc_libero_data_v1/v9/libero_10_seed42/sidecars/libero_10_native_eraf
+COMPLETION_OUT=/root/gpufree-data/LF-FastWAM/evaluate_results/pgc_v913_libero10_correct_shadow_completion_only_seed42_trials5
+COMPLETION_SUMMARY=/root/gpufree-data/pgc_v913_libero10_shadow_completion_only_summary.json
+
+PGC_CHECKPOINT="$V913_CKPT" \
+PGC_EVAL_SUITES='[libero_10]' \
+PGC_GATE_MODE=base \
+PGC_ERAF_SHADOW_AUDIT=true \
+PGC_ERAF_COMPLETION_ONLY_MEMORY_ABLATION=true \
+PGC_ERAF_SHADOW_SIDECAR_DIR="$NATIVE_SIDECAR" \
+PGC_MAX_POLICY_STEPS=600 \
+OUTPUT_ROOT="$COMPLETION_OUT" \
+bash scripts/eval_pgc_libero.sh 4 5 correct 42 10
+
+/opt/conda/bin/python scripts/summarize_pgc_v9_shadow_audit.py \
+  --results "$COMPLETION_OUT" \
+  --output "$COMPLETION_SUMMARY" \
+  --require-extended \
+  --require-completion-only-memory
+```
+
+准入要求：至少一次 completed history 被真实传回；所有有效历史状态必须为3，非 completed
+泄漏率为0；completed history precision 至少90%；completed sticky violation 为0；Base
+action exact rate 为100%；geometry max-abs 为0；post-grasp scheduler 至少90%。若恢复到
+recurrent V9.13 的96.8%附近，则
+后续部署只保留 completed bitset；若仍接近 stateless 的66.4%，再测试一个最小的
+current-clause latch，而不是恢复完整四状态 FSM。
+
 ## 6. 评测顺序
 
 ### 6.1 Base mode 与 Correct gate

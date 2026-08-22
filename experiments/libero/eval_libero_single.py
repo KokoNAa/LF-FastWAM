@@ -1178,16 +1178,21 @@ def run_single_episode(
     inference_latencies_ms: list[float] = []
     policy_guard_decisions: list[dict[str, Any]] = []
     # Explicit per-episode state: never retained on the model, shared between
-    # environments, or carried across LIBERO trials.  The stateless ablation
-    # makes every invocation look like the first replan and discards the
-    # returned state, cutting the recurrent PSCM channel without changing the
-    # checkpoint or ERAF/scheduler weights.
+    # environments, or carried across LIBERO trials.  Evaluation can either
+    # cut the recurrent PSCM channel completely or preserve only a monotonic
+    # completed-clause bitset; neither mode changes checkpoint weights or the
+    # ERAF/scheduler forward path.
     policy_guard_state = PolicyGuardStateController(
         reset_each_replan=bool(
             cfg.EVALUATION.get(
                 "entity_relation_stateless_replan_ablation", False
             )
-        )
+        ),
+        completion_only=bool(
+            cfg.EVALUATION.get(
+                "entity_relation_completion_only_memory_ablation", False
+            )
+        ),
     )
     closed_loop_capture_enabled = cfg.EVALUATION.get("closed_loop_capture_dir") not in (
         None,
@@ -1534,9 +1539,21 @@ def run_single_task(
             "entity_relation_stateless_replan_ablation", False
         )
     )
-    if stateless_replan_ablation and not eraf_shadow_enabled:
+    completion_only_ablation = bool(
+        cfg.EVALUATION.get(
+            "entity_relation_completion_only_memory_ablation", False
+        )
+    )
+    if stateless_replan_ablation and completion_only_ablation:
         raise ValueError(
-            "The stateless replan ablation requires the passive ERAF shadow "
+            "Stateless and completion-only policy-state ablations are mutually "
+            "exclusive."
+        )
+    if (stateless_replan_ablation or completion_only_ablation) and not (
+        eraf_shadow_enabled
+    ):
+        raise ValueError(
+            "Policy-state ablations require the passive ERAF shadow "
             "audit so the cut state channel and immutable Base action are "
             "independently verified."
         )
@@ -1580,7 +1597,7 @@ def run_single_task(
                 "ERAF shadow audit requires model.eval() so dropout cannot "
                 "perturb the Base rollout."
             )
-        if stateless_replan_ablation and int(
+        if (stateless_replan_ablation or completion_only_ablation) and int(
             getattr(
                 model,
                 "policy_guard_eraf_grounding_objective_version",
@@ -1588,7 +1605,7 @@ def run_single_task(
             )
         ) < 14:
             raise ValueError(
-                "The stateless replan ablation requires a V9.13+ "
+                "Policy-state ablations require a V9.13+ "
                 "phase-memory checkpoint."
             )
         if str(getattr(model, "policy_guard_gate_mode", "")) != "base":
@@ -1667,9 +1684,14 @@ def run_single_task(
             "policy_state_mode": (
                 "reset_each_replan"
                 if stateless_replan_ablation
-                else "recurrent"
+                else (
+                    "completion_only"
+                    if completion_only_ablation
+                    else "recurrent"
+                )
             ),
             "stateless_replan_ablation": stateless_replan_ablation,
+            "completion_only_memory_ablation": completion_only_ablation,
             "records": [],
         }
     if intervention_record is not None:

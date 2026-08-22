@@ -28,6 +28,7 @@ V9_ABLATION="${PGC_V9_ABLATION:-full}"
 ERAF_SHADOW_AUDIT="${PGC_ERAF_SHADOW_AUDIT:-false}"
 ERAF_SHADOW_SIDECAR_DIR="${PGC_ERAF_SHADOW_SIDECAR_DIR:-}"
 ERAF_STATELESS_REPLAN_ABLATION="${PGC_ERAF_STATELESS_REPLAN_ABLATION:-false}"
+ERAF_COMPLETION_ONLY_MEMORY_ABLATION="${PGC_ERAF_COMPLETION_ONLY_MEMORY_ABLATION:-false}"
 ERAF_DIAGNOSTICS_DEFAULT=true
 if [[ "${ERAF_SHADOW_AUDIT}" == "true" ]]; then
   # A shadow audit scores every replan directly in JSON. Avoid writing several
@@ -83,6 +84,17 @@ case "${ERAF_STATELESS_REPLAN_ABLATION}" in
     exit 1
     ;;
 esac
+case "${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}" in
+  true|false) ;;
+  *)
+    echo "PGC_ERAF_COMPLETION_ONLY_MEMORY_ABLATION must be true or false." >&2
+    exit 1
+    ;;
+esac
+if [[ "${ERAF_STATELESS_REPLAN_ABLATION}" == "true" && "${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}" == "true" ]]; then
+  echo "Stateless and completion-only policy-state ablations are mutually exclusive." >&2
+  exit 1
+fi
 if [[ ! -f "${PGC_CHECKPOINT}" ]]; then
   echo "PGC checkpoint not found: ${PGC_CHECKPOINT}" >&2
   exit 1
@@ -301,13 +313,13 @@ if [[ "${ERAF_SHADOW_AUDIT}" == "true" && "${PGC_CHECKPOINT_VERSION}" != "9" ]];
   echo "PGC ERAF shadow audit requires a PGC v9 checkpoint." >&2
   exit 1
 fi
-if [[ "${ERAF_STATELESS_REPLAN_ABLATION}" == "true" ]]; then
+if [[ "${ERAF_STATELESS_REPLAN_ABLATION}" == "true" || "${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}" == "true" ]]; then
   if [[ "${PGC_CHECKPOINT_VERSION}" != "9" || "${PGC_V9_GROUNDING_OBJECTIVE_VERSION}" -lt 14 ]]; then
-    echo "Stateless replan ablation requires a PGC V9.13+ phase-memory checkpoint." >&2
+    echo "Policy-state ablations require a PGC V9.13+ phase-memory checkpoint." >&2
     exit 1
   fi
   if [[ "${ERAF_SHADOW_AUDIT}" != "true" || "${GATE_MODE}" != "base" ]]; then
-    echo "Stateless replan ablation requires passive ERAF shadow audit with PGC_GATE_MODE=base." >&2
+    echo "Policy-state ablations require passive ERAF shadow audit with PGC_GATE_MODE=base." >&2
     exit 1
   fi
 fi
@@ -377,6 +389,7 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
     "EVALUATION.entity_relation_diagnostics=${ERAF_DIAGNOSTICS}"
     "EVALUATION.entity_relation_shadow_audit=${ERAF_SHADOW_AUDIT}"
     "EVALUATION.entity_relation_stateless_replan_ablation=${ERAF_STATELESS_REPLAN_ABLATION}"
+    "EVALUATION.entity_relation_completion_only_memory_ablation=${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}"
   )
   # Reconstruct ERAF with the exact checkpoint architecture/loss contract.
   # These values are not merely training diagnostics: the strict V9 loader
@@ -565,7 +578,14 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
   echo "  eraf_overlay_dir=${ERAF_OVERLAY_DIR}"
   echo "  eraf_shadow_audit=${ERAF_SHADOW_AUDIT}"
   echo "  eraf_shadow_sidecar=${ERAF_SHADOW_SIDECAR_DIR:-disabled}"
-  echo "  eraf_policy_state_mode=$([[ "${ERAF_STATELESS_REPLAN_ABLATION}" == "true" ]] && echo reset_each_replan || echo recurrent)"
+  if [[ "${ERAF_STATELESS_REPLAN_ABLATION}" == "true" ]]; then
+    ERAF_POLICY_STATE_MODE=reset_each_replan
+  elif [[ "${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}" == "true" ]]; then
+    ERAF_POLICY_STATE_MODE=completion_only
+  else
+    ERAF_POLICY_STATE_MODE=recurrent
+  fi
+  echo "  eraf_policy_state_mode=${ERAF_POLICY_STATE_MODE}"
 fi
 
 EXP_NAME="pgc-${CONDITION}" "${PYTHON_BIN}" \

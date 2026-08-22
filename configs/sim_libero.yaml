@@ -64,6 +64,9 @@ EVALUATION:
   # Evaluation-only V9.13 ablation. Every replan receives no previous PSCM
   # state and the returned state is discarded; model weights remain unchanged.
   entity_relation_stateless_replan_ablation: false
+  # Evaluation-only V9.13 ablation. Preserve only a monotonic per-clause
+  # completed bit; pending/holding/retry never cross a replan boundary.
+  entity_relation_completion_only_memory_ablation: false
 
   # Optional external inputs
   dataset_stats_path: null
