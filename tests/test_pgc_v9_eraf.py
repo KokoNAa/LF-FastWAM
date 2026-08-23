@@ -3903,6 +3903,35 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             torch.equal(bypass_residual, torch.zeros_like(bypass_residual))
         )
 
+    def test_v917_geometry_action_adapter_accepts_bfloat16_sidecar_inputs(self):
+        adapter = PhaseConditionedERAFGeometryActionAdapter(
+            action_dim=7,
+            proprio_dim=8,
+            hidden_dim=16,
+            max_clauses=4,
+            max_abs=0.25,
+        )
+        action = torch.randn(2, 6, 7, dtype=torch.bfloat16)
+        proprio = torch.randn(2, 8, dtype=torch.bfloat16)
+        outputs = {
+            name: value.to(dtype=torch.bfloat16)
+            if value.is_floating_point()
+            else value
+            for name, value in self._v915_bridge_outputs().items()
+        }
+        deployed, residual, metrics = adapter(
+            candidate_action=action,
+            eraf_outputs=outputs,
+            proprio=proprio,
+        )
+        self.assertEqual(deployed.dtype, torch.bfloat16)
+        self.assertEqual(residual.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(deployed, action))
+        self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
+        self.assertTrue(
+            torch.isfinite(metrics["pgc_v917_geometry_route_confidence"])
+        )
+
     def test_v915_action_grounding_is_zero_init_and_anchor_connected(self):
         bridge = PhaseConditionedERAFActionBridge(
             goal_dim=8,

@@ -1556,14 +1556,23 @@ class PhaseConditionedERAFGeometryActionAdapter(nn.Module):
             raise ValueError("V9.17 ERAF anchor/position tensors must be [B,C,3].")
 
         module_dtype = self.action_projection[1].weight.dtype
+        # Newly introduced trainable sidecars remain FP32 under the ZeRO2
+        # bf16 training path while frozen ERAF outputs arrive as bf16.  Keep
+        # every normalization/projection in the adapter parameter dtype and
+        # cast only the bounded residual back to the deployed action dtype.
+        # In particular, nn.LayerNorm requires its input and affine
+        # parameters to agree outside autocast.
+        subject_position = subject_position.to(dtype=module_dtype)
+        reference_position = reference_position.to(dtype=module_dtype)
+        grasp_anchor = grasp_anchor.to(dtype=module_dtype)
+        goal_anchor = goal_anchor.to(dtype=module_dtype)
+        interaction_anchor = interaction_anchor.to(dtype=module_dtype)
         eef_position = self.eef_position_projection(
             proprio.to(dtype=module_dtype)
-        ).to(
-            subject_position.dtype
         )
         eef_position = eef_position.unsqueeze(1).expand(-1, self.max_clauses, -1)
         phase = torch.softmax(eraf_outputs["phase_logits"].float(), dim=-1).to(
-            subject_position.dtype
+            module_dtype
         )
         if phase.shape != (*clause_shape, 3):
             raise ValueError("V9.17 phase probabilities must be [B,C,3].")
@@ -1581,13 +1590,13 @@ class PhaseConditionedERAFGeometryActionAdapter(nn.Module):
         relation_relative = reference_position - subject_position
         truth = torch.sigmoid(
             eraf_outputs["predicate_truth_logits"].float()
-        ).to(subject_position.dtype).unsqueeze(-1)
+        ).to(module_dtype).unsqueeze(-1)
         subject_visibility = torch.sigmoid(
             eraf_outputs["subject_visibility_logits"].float()
-        ).to(subject_position.dtype).unsqueeze(-1)
+        ).to(module_dtype).unsqueeze(-1)
         reference_visibility = torch.sigmoid(
             eraf_outputs["reference_visibility_logits"].float()
-        ).to(subject_position.dtype).unsqueeze(-1)
+        ).to(module_dtype).unsqueeze(-1)
         geometry = torch.cat(
             (
                 self._coordinate_features(grasp_relative),
@@ -1617,7 +1626,7 @@ class PhaseConditionedERAFGeometryActionAdapter(nn.Module):
         geometry_context = (
             clause_tokens * normalized_routing.to(clause_tokens.dtype).unsqueeze(-1)
         ).sum(dim=1)
-        route_confidence = routing_sum.clamp(0.0, 1.0).to(candidate_action.dtype)
+        route_confidence = routing_sum.clamp(0.0, 1.0).to(module_dtype)
 
         action_hidden = self.action_projection(
             candidate_action.detach().to(dtype=module_dtype)
@@ -1631,13 +1640,12 @@ class PhaseConditionedERAFGeometryActionAdapter(nn.Module):
         conditioned = self.output_norm(
             action_hidden + geometry_context.to(action_hidden.dtype).unsqueeze(1)
         )
-        cap = self.max_abs.to(
-            device=candidate_action.device, dtype=candidate_action.dtype
-        )
+        cap = self.max_abs.to(device=candidate_action.device, dtype=module_dtype)
         residual = torch.tanh(self.output_projection(conditioned)) * cap
         residual = residual * route_confidence.unsqueeze(-1)
         if action_is_pad is not None:
             residual = residual.masked_fill(action_is_pad.bool().unsqueeze(-1), 0.0)
+        residual = residual.to(dtype=candidate_action.dtype)
         action = candidate_action + residual
         metrics = {
             "pgc_v917_geometry_action_residual_rms": (
