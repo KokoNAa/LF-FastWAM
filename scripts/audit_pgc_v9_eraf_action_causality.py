@@ -149,6 +149,17 @@ def build_causal_variants(
             reference_subject_fallback
         ]
         wrong_reference[name] = value
+    # Keep the intervention geometrically coherent for V9.19's direct servo:
+    # a different reference frame must move the absolute placement anchor too.
+    reference_delta = (
+        _as_numpy(wrong_reference["reference_positions"])
+        - _as_numpy(target["reference_positions"])
+    )
+    wrong_reference["goal_anchors"] = np.clip(
+        _as_numpy(target["goal_anchors"]) + reference_delta,
+        -1.0,
+        1.0,
+    )
     wrong_goal_anchor = {
         name: _copy_value(value) for name, value in target.items()
     }
@@ -183,7 +194,18 @@ def build_causal_variants(
     clause_swap_eligible = bool(active.size >= 2)
     if clause_swap_eligible:
         first, second = map(int, active[:2])
+        route_fields = {
+            "clause_valid",
+            "predicate_truth",
+            "phase_ids",
+            "phase_valid",
+        }
         for name, value in clause_swap.items():
+            # Hold the currently selected unfinished slot fixed and swap only
+            # its entity/relation/anchor semantics.  Swapping route state too
+            # is a pure clause permutation and is necessarily action-invariant.
+            if name in route_fields:
+                continue
             if hasattr(value, "clone"):
                 original = value.clone()
                 value[first] = original[second]
@@ -389,6 +411,29 @@ def compute_causal_report(
     anchor_connected = bool(
         anchor_effect is not None and anchor_effect >= minimum_action_effect_rms
     )
+    anchor_directional = effects["wrong_goal_anchor_vs_oracle"][
+        "right_is_better_rate"
+    ]
+    anchor_ordering = bool(
+        anchor_directional is not None
+        and anchor_directional >= minimum_directional_rate
+    )
+    clause_effect = effects["clause_swap_vs_oracle"]["action_delta_rms"][
+        "mean"
+    ]
+    clause_connected = bool(
+        effects["clause_swap_vs_oracle"]["eligible_samples"] > 0
+        and clause_effect is not None
+        and clause_effect >= minimum_action_effect_rms
+    )
+    clause_directional = effects["clause_swap_vs_oracle"][
+        "right_is_better_rate"
+    ]
+    clause_ordering = bool(
+        clause_connected
+        and clause_directional is not None
+        and clause_directional >= minimum_directional_rate
+    )
     if not finite_bridge_response:
         diagnosis = "eraf_action_bridge_bypassed_or_insensitive"
         recommendation = (
@@ -401,6 +446,24 @@ def compute_causal_report(
             "Inject normalized grasp/goal/interaction anchors directly into "
             "phase-conditioned Proposal tokens and train anchor-only causal "
             "negatives."
+        )
+    elif not anchor_ordering:
+        diagnosis = "eraf_goal_anchor_active_but_directionally_misaligned"
+        recommendation = (
+            "Fit the phase-specific positive Cartesian gain against expert "
+            "prefixes; do not increase the unconstrained semantic bridge."
+        )
+    elif not clause_connected:
+        diagnosis = "eraf_selected_clause_not_connected_to_action"
+        recommendation = (
+            "Use one hard unfinished-clause route and hold route state fixed "
+            "while swapping clause semantics in the causal audit."
+        )
+    elif not clause_ordering:
+        diagnosis = "eraf_clause_route_active_but_expert_misaligned"
+        recommendation = (
+            "Balance multi-clause expert prefixes and train wrong-clause "
+            "ranking at the final action output."
         )
     elif not locally_connected:
         diagnosis = "eraf_action_proposal_locally_saturated"
@@ -434,7 +497,7 @@ def compute_causal_report(
         )
 
     return {
-        "format": "pgc_v9_eraf_action_causal_audit_v2",
+        "format": "pgc_v9_eraf_action_causal_audit_v3",
         "samples": len(records),
         "action_integrity": {
             "single_base_diffusion_per_sample": True,
@@ -444,6 +507,9 @@ def compute_causal_report(
         "passed": bool(
             bridge_response
             and anchor_connected
+            and anchor_ordering
+            and clause_connected
+            and clause_ordering
             and semantic_ordering
             and oracle_alignment
         ),
@@ -451,6 +517,9 @@ def compute_causal_report(
             "oracle_changes_action_vs_bypass": finite_bridge_response,
             "oracle_expert_loss_has_nonzero_query_gradient": locally_connected,
             "goal_anchor_changes_action": anchor_connected,
+            "wrong_goal_anchor_is_worse_than_oracle": anchor_ordering,
+            "clause_swap_changes_action": clause_connected,
+            "wrong_clause_is_worse_than_oracle": clause_ordering,
             "oracle_improves_expert_alignment": oracle_alignment,
             "semantic_intervention_coverage": semantic_coverage,
             "wrong_semantics_are_worse_than_oracle": semantic_ordering,

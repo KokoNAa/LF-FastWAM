@@ -1663,6 +1663,351 @@ class PhaseConditionedERAFGeometryActionAdapter(nn.Module):
         return action, residual, metrics
 
 
+class HardRoutedERAFPhaseServo(nn.Module):
+    """Convert one unfinished ERAF clause into a phase-specific action servo.
+
+    The V9.17 adapter softly averages every active clause and then mixes the
+    resulting geometry with the candidate action through a LayerNorm.  That
+    path is connected, but it does not preserve which clause or Cartesian
+    direction caused an action.  V9.19 instead selects exactly one clause,
+    keeps the desired Cartesian direction explicit, and learns only a positive
+    temporal gain plus bounded rotation/gripper corrections.
+
+    ``legacy_suppression_raw`` and both output heads are zero initialized.  A
+    newly-created servo is therefore bitwise equivalent to V9.18: the complete
+    legacy geometry residual is retained and the new servo contributes zero.
+    Training can subsequently suppress the legacy path per phase while the
+    direction-preserving path takes over.
+    """
+
+    ARTICULATED_PREDICATE_IDS = (7, 8, 9, 10)
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        proprio_dim: int,
+        hidden_dim: int = 256,
+        max_clauses: int = 4,
+        max_abs: float | Sequence[float] = 0.25,
+        eef_scale: Sequence[float] = (1.0, 1.0, 1.0),
+        eef_bias: Sequence[float] = (0.0, 0.0, 0.0),
+    ) -> None:
+        super().__init__()
+        if min(action_dim, proprio_dim, hidden_dim, max_clauses) <= 0:
+            raise ValueError("V9.19 phase-servo dimensions must be positive.")
+        if action_dim < 3 or proprio_dim < 3:
+            raise ValueError(
+                "V9.19 phase servo requires three action and proprio xyz dims."
+            )
+        if isinstance(max_abs, Sequence) and not isinstance(max_abs, (str, bytes)):
+            cap_values = [float(value) for value in max_abs]
+            if len(cap_values) != int(action_dim):
+                raise ValueError(
+                    "V9.19 per-dimension residual caps must match action_dim."
+                )
+        else:
+            cap_values = [float(max_abs)] * int(action_dim)
+        if any(value <= 0 for value in cap_values):
+            raise ValueError("V9.19 phase-servo residual caps must be positive.")
+        eef_scale_values = [float(value) for value in eef_scale]
+        eef_bias_values = [float(value) for value in eef_bias]
+        if len(eef_scale_values) != 3 or len(eef_bias_values) != 3:
+            raise ValueError("V9.19 EEF affine scale/bias must each have 3 values.")
+        if not all(
+            math.isfinite(value) and value > 0 for value in eef_scale_values
+        ) or not all(math.isfinite(value) for value in eef_bias_values):
+            raise ValueError("V9.19 EEF affine calibration must be finite and positive.")
+
+        self.action_dim = int(action_dim)
+        self.proprio_dim = int(proprio_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.max_clauses = int(max_clauses)
+        # FastWAM proprio stores dataset-normalized EEF xyz in the first three
+        # channels.  This affine maps it to ERAF's canonical workspace frame
+        # and stays inspectable instead of relearning xyz through an opaque MLP.
+        self.eef_scale = nn.Parameter(torch.tensor(eef_scale_values))
+        self.eef_bias = nn.Parameter(torch.tensor(eef_bias_values))
+        self.register_buffer(
+            "initial_eef_scale", torch.tensor(eef_scale_values), persistent=True
+        )
+        self.register_buffer(
+            "initial_eef_bias", torch.tensor(eef_bias_values), persistent=True
+        )
+        # The matrix is robot/action-frame calibration, not a task-specific
+        # policy.  Identity is correct for LIBERO's Cartesian delta convention
+        # and remains trainable for another robot frame.
+        self.workspace_to_action = nn.Parameter(torch.eye(3))
+        gain_input_dim = self.action_dim + 1 + 3 + 1
+        self.translation_gain = nn.Sequential(
+            nn.LayerNorm(gain_input_dim),
+            nn.Linear(gain_input_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim, 1),
+        )
+        nn.init.zeros_(self.translation_gain[-1].weight)
+        nn.init.zeros_(self.translation_gain[-1].bias)
+        aux_input_dim = self.action_dim + 3 + 3 + 1
+        self.auxiliary_residual = nn.Sequential(
+            nn.LayerNorm(aux_input_dim),
+            nn.Linear(aux_input_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim, self.action_dim),
+        )
+        nn.init.zeros_(self.auxiliary_residual[-1].weight)
+        nn.init.zeros_(self.auxiliary_residual[-1].bias)
+        self.legacy_suppression_raw = nn.Parameter(torch.zeros(3))
+        self.register_buffer(
+            "max_abs",
+            torch.tensor(cap_values, dtype=torch.float32).view(1, 1, -1),
+            persistent=True,
+        )
+
+    @staticmethod
+    def _gather_clause(value: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
+        if value.ndim < 2 or value.shape[0] != selected.shape[0]:
+            raise ValueError("V9.19 clause tensor and selection batch mismatch.")
+        gather_shape = (selected.shape[0], 1) + (1,) * (value.ndim - 2)
+        index = selected.view(gather_shape).expand(
+            selected.shape[0], 1, *value.shape[2:]
+        )
+        return value.gather(1, index).squeeze(1)
+
+    def forward(
+        self,
+        *,
+        candidate_action: torch.Tensor,
+        legacy_residual: torch.Tensor,
+        eraf_outputs: Mapping[str, torch.Tensor],
+        proprio: torch.Tensor,
+        eef_position: torch.Tensor | None = None,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        required = {
+            "active_logits",
+            "predicate_logits",
+            "grasp_anchor",
+            "goal_anchor",
+            "interaction_anchor",
+            "phase_logits",
+            "predicate_truth_logits",
+            "clause_execution_probability",
+        }
+        missing = sorted(required - set(eraf_outputs))
+        if missing:
+            raise ValueError(f"V9.19 phase servo is missing ERAF outputs: {missing}.")
+        if candidate_action.shape != legacy_residual.shape or (
+            candidate_action.ndim != 3
+            or candidate_action.shape[-1] != self.action_dim
+        ):
+            raise ValueError(
+                "V9.19 candidate and legacy residual must share [B,T,A]."
+            )
+        if proprio.shape != (candidate_action.shape[0], self.proprio_dim):
+            raise ValueError("V9.19 proprio must be [B,proprio_dim].")
+        if action_is_pad is not None and action_is_pad.shape != candidate_action.shape[:2]:
+            raise ValueError("V9.19 action padding mask must be [B,T].")
+
+        module_dtype = self.translation_gain[1].weight.dtype
+        active = torch.sigmoid(eraf_outputs["active_logits"].float())
+        execution = eraf_outputs["clause_execution_probability"].float()
+        if active.shape != execution.shape or active.shape != (
+            candidate_action.shape[0],
+            self.max_clauses,
+        ):
+            raise ValueError("V9.19 active/execution routing must be [B,C].")
+        route_score = execution.clamp_min(0.0) * active
+        fallback = torch.softmax(eraf_outputs["active_logits"].float(), dim=-1)
+        route_score = torch.where(
+            (route_score.sum(dim=-1, keepdim=True) > 1.0e-6),
+            route_score,
+            fallback,
+        )
+        selected_clause = route_score.argmax(dim=-1)
+        selected_confidence = self._gather_clause(
+            route_score, selected_clause
+        ).clamp(0.0, 1.0)
+
+        phase_probability = torch.softmax(
+            eraf_outputs["phase_logits"].float(), dim=-1
+        )
+        selected_phase_probability = self._gather_clause(
+            phase_probability, selected_clause
+        ).to(module_dtype)
+        selected_phase = selected_phase_probability.argmax(dim=-1)
+        selected_truth = torch.sigmoid(
+            self._gather_clause(
+                eraf_outputs["predicate_truth_logits"].float(), selected_clause
+            )
+        )
+        # A true predicate while holding is release-ready, matching V9.18's
+        # audited phase convention.
+        control_phase = torch.where(
+            (selected_phase == 1) & (selected_truth >= 0.5),
+            torch.full_like(selected_phase, 2),
+            selected_phase,
+        )
+        predicate_id = self._gather_clause(
+            eraf_outputs["predicate_logits"].argmax(dim=-1), selected_clause
+        )
+        articulated = torch.zeros_like(predicate_id, dtype=torch.bool)
+        for value in self.ARTICULATED_PREDICATE_IDS:
+            articulated |= predicate_id == value
+
+        if eef_position is None:
+            effective_eef_scale = self.eef_scale.to(module_dtype).clamp_min(
+                1.0e-4
+            )
+            calibrated_eef = (
+                proprio[:, :3].to(dtype=module_dtype)
+                * effective_eef_scale
+                + self.eef_bias.to(module_dtype)
+            ).clamp(-1.0, 1.0)
+            calibrated_from_state = calibrated_eef.new_zeros(())
+        else:
+            if eef_position.shape != (candidate_action.shape[0], 3):
+                raise ValueError("V9.19 canonical EEF position must be [B,3].")
+            calibrated_eef = eef_position.to(dtype=module_dtype)
+            calibrated_from_state = calibrated_eef.new_ones(())
+
+        grasp = self._gather_clause(
+            eraf_outputs["grasp_anchor"].to(module_dtype), selected_clause
+        )
+        goal = self._gather_clause(
+            eraf_outputs["goal_anchor"].to(module_dtype), selected_clause
+        )
+        interaction = self._gather_clause(
+            eraf_outputs["interaction_anchor"].to(module_dtype), selected_clause
+        )
+        approach_vector = grasp - calibrated_eef
+        transport_vector = goal - calibrated_eef
+        release_vector = torch.where(
+            articulated.unsqueeze(-1),
+            interaction - calibrated_eef,
+            transport_vector,
+        )
+        desired = torch.where(
+            (control_phase == 0).unsqueeze(-1),
+            approach_vector,
+            torch.where(
+                (control_phase == 1).unsqueeze(-1),
+                transport_vector,
+                release_vector,
+            ),
+        )
+        desired_norm = desired.norm(dim=-1, keepdim=True)
+        workspace_direction = desired / desired_norm.clamp_min(1.0e-6)
+        action_direction = torch.matmul(
+            workspace_direction, self.workspace_to_action.to(module_dtype).T
+        )
+        action_direction = F.normalize(action_direction, dim=-1, eps=1.0e-6)
+
+        batch, horizon, _ = candidate_action.shape
+        phase_features = F.one_hot(control_phase.clamp(0, 2), 3).to(module_dtype)
+        candidate = candidate_action.detach().to(module_dtype)
+        gain_features = torch.cat(
+            (
+                candidate,
+                desired_norm.unsqueeze(1).expand(-1, horizon, -1),
+                phase_features.unsqueeze(1).expand(-1, horizon, -1),
+                selected_truth.to(module_dtype).view(batch, 1, 1).expand(
+                    -1, horizon, -1
+                ),
+            ),
+            dim=-1,
+        )
+        # The forward value is non-negative and bounded, so the servo cannot
+        # reverse the desired direction.  A straight-through term guarantees
+        # a nonzero first-step gradient at the exact zero-init boundary across
+        # PyTorch versions (whose clamp boundary subgradient may differ).
+        translation_cap = float(self.max_abs[..., :3].min().item())
+        raw_gain = self.translation_gain(gain_features)
+        bounded_gain = raw_gain.clamp(
+            min=0.0, max=translation_cap
+        )
+        gain = bounded_gain + raw_gain - raw_gain.detach()
+        gain = gain * selected_confidence.to(module_dtype).view(batch, 1, 1)
+        translation = action_direction.unsqueeze(1) * gain
+
+        aux_features = torch.cat(
+            (
+                candidate,
+                desired.unsqueeze(1).expand(-1, horizon, -1),
+                phase_features.unsqueeze(1).expand(-1, horizon, -1),
+                selected_truth.to(module_dtype).view(batch, 1, 1).expand(
+                    -1, horizon, -1
+                ),
+            ),
+            dim=-1,
+        )
+        cap = self.max_abs.to(device=candidate.device, dtype=module_dtype)
+        auxiliary = torch.tanh(self.auxiliary_residual(aux_features)) * cap
+        auxiliary = auxiliary.clone()
+        auxiliary[..., :3] = 0.0
+        servo_residual = auxiliary
+        servo_residual[..., :3] = translation
+
+        bounded_suppression = self.legacy_suppression_raw.clamp(0.0, 1.0)
+        straight_through_suppression = (
+            bounded_suppression
+            + self.legacy_suppression_raw
+            - self.legacy_suppression_raw.detach()
+        )
+        suppression = straight_through_suppression[control_phase].to(
+            module_dtype
+        )
+        retained_legacy = legacy_residual.to(module_dtype) * (
+            1.0 - suppression.view(batch, 1, 1)
+        )
+        total_residual = (retained_legacy + servo_residual).clamp(
+            min=-cap, max=cap
+        )
+        if action_is_pad is not None:
+            total_residual = total_residual.masked_fill(
+                action_is_pad.bool().unsqueeze(-1), 0.0
+            )
+            servo_residual = servo_residual.masked_fill(
+                action_is_pad.bool().unsqueeze(-1), 0.0
+            )
+        total_residual = total_residual.to(candidate_action.dtype)
+        action = candidate_action + total_residual
+        hard_route = F.one_hot(selected_clause, self.max_clauses).float()
+        return action, total_residual, {
+            "pgc_v919_hard_clause_route_max": hard_route.max(dim=-1).values.mean(),
+            "pgc_v919_selected_clause_mean": selected_clause.float().mean(),
+            "pgc_v919_selected_phase_mean": control_phase.float().mean(),
+            "pgc_v919_route_confidence": selected_confidence.float().mean(),
+            "pgc_v919_canonical_eef_from_state": calibrated_from_state,
+            "pgc_v919_eef_scale_min": self.eef_scale.float().min(),
+            "pgc_v919_eef_bias_max_abs": self.eef_bias.float().abs().max(),
+            "pgc_v919_desired_distance": desired_norm.float().mean(),
+            "pgc_v919_translation_gain": gain.float().mean(),
+            "pgc_v919_servo_residual_rms": (
+                servo_residual.float().square().mean().sqrt()
+            ),
+            "pgc_v919_total_residual_rms": (
+                total_residual.float().square().mean().sqrt()
+            ),
+            "pgc_v919_legacy_suppression": suppression.float().mean(),
+            "pgc_v919_workspace_to_action_orthogonality_error": (
+                (
+                    self.workspace_to_action.float().T
+                    @ self.workspace_to_action.float()
+                    - torch.eye(3, device=self.workspace_to_action.device)
+                )
+                .square()
+                .mean()
+                .sqrt()
+            ),
+            "pgc_v919_workspace_to_action_determinant": torch.linalg.det(
+                self.workspace_to_action.float()
+            ),
+            "pgc_v919_selected_clause": selected_clause,
+            "pgc_v919_selected_control_phase": control_phase,
+            "pgc_v919_desired_direction": action_direction,
+        }
+
+
 class PairwiseActionAdvantageVerifier(nn.Module):
     """FP32 temporal verifier that predicts CF advantage over Base directly."""
 

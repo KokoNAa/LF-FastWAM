@@ -52,6 +52,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
 )
 from fastwam.models.wan22.fastwam import FastWAM
 from fastwam.models.wan22.policy_guard import (
+    HardRoutedERAFPhaseServo,
     PhaseConditionedERAFActionBridge,
     PhaseConditionedERAFGeometryActionAdapter,
     infer_spatial_patch_grid,
@@ -947,6 +948,70 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
 
 
 class PGCERAFModuleTest(unittest.TestCase):
+    def test_v919_hard_route_is_zero_init_exact_and_clause_directional(self):
+        servo = HardRoutedERAFPhaseServo(
+            action_dim=7,
+            proprio_dim=8,
+            hidden_dim=8,
+            max_clauses=2,
+            max_abs=0.25,
+        )
+        candidate = torch.zeros(1, 3, 7)
+        legacy = torch.randn_like(candidate) * 0.01
+        outputs = {
+            "active_logits": torch.full((1, 2), 10.0),
+            "predicate_logits": torch.nn.functional.one_hot(
+                torch.tensor([[1, 1]]), num_classes=11
+            ).float(),
+            "grasp_anchor": torch.zeros(1, 2, 3),
+            "goal_anchor": torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]),
+            "interaction_anchor": torch.zeros(1, 2, 3),
+            "phase_logits": torch.tensor(
+                [[[-10.0, 10.0, -10.0], [-10.0, 10.0, -10.0]]]
+            ),
+            "predicate_truth_logits": torch.full((1, 2), -10.0),
+            "clause_execution_probability": torch.tensor([[0.1, 0.9]]),
+        }
+        action, residual, metrics = servo(
+            candidate_action=candidate,
+            legacy_residual=legacy,
+            eraf_outputs=outputs,
+            proprio=torch.zeros(1, 8),
+        )
+        self.assertTrue(torch.equal(residual, legacy))
+        self.assertTrue(torch.equal(action, candidate + legacy))
+        self.assertEqual(int(metrics["pgc_v919_selected_clause"].item()), 1)
+        target = torch.zeros_like(action)
+        target[..., 1] = 0.1
+        (action - target).square().mean().backward()
+        self.assertGreater(
+            float(servo.translation_gain[-1].bias.grad.abs().item()), 0.0
+        )
+        servo.zero_grad(set_to_none=True)
+
+        with torch.no_grad():
+            servo.translation_gain[-1].bias.fill_(0.1)
+        _, routed_y, _ = servo(
+            candidate_action=candidate,
+            legacy_residual=torch.zeros_like(legacy),
+            eraf_outputs=outputs,
+            proprio=torch.zeros(1, 8),
+        )
+        self.assertGreater(float(routed_y[..., 1].mean()), 0.05)
+        self.assertAlmostEqual(float(routed_y[..., 0].abs().max()), 0.0)
+
+        outputs_x = dict(outputs)
+        outputs_x["clause_execution_probability"] = torch.tensor([[0.9, 0.1]])
+        _, routed_x, metrics_x = servo(
+            candidate_action=candidate,
+            legacy_residual=torch.zeros_like(legacy),
+            eraf_outputs=outputs_x,
+            proprio=torch.zeros(1, 8),
+        )
+        self.assertGreater(float(routed_x[..., 0].mean()), 0.05)
+        self.assertAlmostEqual(float(routed_x[..., 1].abs().max()), 0.0)
+        self.assertEqual(int(metrics_x["pgc_v919_selected_clause"].item()), 0)
+
     def test_v918_phase_residual_imitation_prefers_expert_correction(self):
         model = tiny_pgc_fastwam(
             version=9,
@@ -4518,6 +4583,76 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 "phase_conditioned_geometry_adapter_only_with_phase_"
                 "balanced_residual_imitation",
             )
+
+    def test_v918_to_v919_hard_phase_servo_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v918_path = root / "v918.pt"
+            v919_path = root / "v919.pt"
+            v918 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=18,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v918.mot.state_dict()},
+                base_path,
+            )
+            v918.load_checkpoint(base_path)
+            v918.save_checkpoint(v918_path, step=15250)
+            old_state = {
+                name: value.clone()
+                for name, value in v918.policy_guard_modules.state_dict().items()
+            }
+
+            v919 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=19,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v919.load_checkpoint(v918_path)
+            new_state = v919.policy_guard_modules.state_dict()
+            for name, value in old_state.items():
+                self.assertTrue(torch.equal(value, new_state[name]), name)
+            added = set(new_state) - set(old_state)
+            self.assertTrue(added)
+            self.assertTrue(
+                all(name.startswith("eraf_hard_routed_phase_servo.") for name in added)
+            )
+            v919.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v919.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules.eraf_hard_routed_phase_servo."
+                    )
+                    for name in trainable
+                )
+            )
+            v919.save_checkpoint(v919_path, step=16250)
+            metadata = torch.load(
+                v919_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(
+                metadata["eraf_action_phase_servo_contract"],
+                "hard_single_clause_explicit_affine_eef_phase_specific_"
+                "positive_cartesian_gain_with_legacy_suppression",
+            )
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "hard_routed_phase_servo_only",
+            )
+
 
     def test_v913_to_v914_checkpoint_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:

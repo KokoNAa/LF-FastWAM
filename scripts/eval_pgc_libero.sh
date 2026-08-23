@@ -255,7 +255,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 19)):
+    if objective not in set(range(1, 20)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -324,7 +324,9 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_eraf_v917_stack_plus_phase_balanced_direct_geometry_"
+            "frozen_v918_stack_plus_hard_clause_phase_direction_preserving_servo"
+            if objective >= 19
+            else "frozen_eraf_v917_stack_plus_phase_balanced_direct_geometry_"
             "residual_imitation"
             if objective >= 18
             else "frozen_eraf_v916_bridge_and_proposal_plus_direct_eef_"
@@ -345,7 +347,9 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
-            "phase_conditioned_geometry_adapter_only_with_phase_balanced_"
+            "hard_routed_phase_servo_only"
+            if objective >= 19
+            else "phase_conditioned_geometry_adapter_only_with_phase_balanced_"
             "residual_imitation"
             if objective >= 18
             else "phase_conditioned_relative_geometry_action_adapter_only"
@@ -365,7 +369,9 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
-            "phase_conditioned_geometry_adapter_only_with_phase_balanced_"
+            "hard_routed_phase_servo_only"
+            if objective >= 19
+            else "phase_conditioned_geometry_adapter_only_with_phase_balanced_"
             "residual_imitation"
             if objective >= 18
             else "phase_conditioned_relative_geometry_action_adapter_only"
@@ -392,6 +398,14 @@ if version == 9:
     ):
         raise SystemExit(
             "PGC v9.18 checkpoint lacks its phase-residual imitation contract"
+        )
+    if objective >= 19 and (
+        metadata.get("eraf_action_phase_servo_contract")
+        != "hard_single_clause_explicit_affine_eef_phase_specific_positive_"
+        "cartesian_gain_with_legacy_suppression"
+    ):
+        raise SystemExit(
+            "PGC v9.19 checkpoint lacks its hard-routed phase-servo contract"
         )
     if completion_only_memory and (
         training_stage != "action"
@@ -555,6 +569,9 @@ mapping = {
     "eraf_action_phase_transport_weight": "action_phase_transport_weight",
     "eraf_action_phase_release_weight": "action_phase_release_weight",
     "eraf_action_phase_direction_min_norm": "action_phase_direction_min_norm",
+    "eraf_action_servo_frame_weight": "action_servo_frame_weight",
+    "eraf_action_eef_initial_scale": "action_eef_scale",
+    "eraf_action_eef_initial_bias": "action_eef_bias",
     "eraf_action_causal_ranking_weight": "action_causal_ranking_weight",
     "eraf_action_causal_margin": "action_causal_margin",
     "eraf_attention_mask_weight": "attention_mask_weight",

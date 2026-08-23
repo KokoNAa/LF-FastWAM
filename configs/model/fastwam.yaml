@@ -306,6 +306,8 @@ policy_guard:
     # V9.18 keeps that route and explicitly imitates the bounded expert-minus-
     # frozen-candidate residual with approach/transport/release balancing and
     # translation-direction supervision.
+    # V9.19 freezes V9.18 and adds a hard single-clause, phase-specific
+    # direction-preserving Cartesian servo with an auditable EEF affine frame.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -333,6 +335,9 @@ policy_guard:
     action_phase_transport_weight: 2.0
     action_phase_release_weight: 3.0
     action_phase_direction_min_norm: 1.0e-3
+    action_servo_frame_weight: 0.01
+    action_eef_scale: [1.0, 1.0, 1.0]
+    action_eef_bias: [0.0, 0.0, 0.0]
     mask_weight: 1.0
     attention_mask_weight: 2.0
     entity_weight: 1.0

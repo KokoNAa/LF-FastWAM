@@ -31,6 +31,7 @@ from .policy_guard import (
     GoalActionAlignmentLoss,
     GoalGraphEncoder,
     GoalResidualAdapter,
+    HardRoutedERAFPhaseServo,
     LanguageVisualTargetBinder,
     PairwiseActionAdvantageVerifier,
     PhaseConditionedERAFActionBridge,
@@ -716,6 +717,17 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_action_phase_direction_min_norm = float(
             eraf_config.get("action_phase_direction_min_norm", 1.0e-3)
         )
+        self.policy_guard_eraf_action_servo_frame_weight = float(
+            eraf_config.get("action_servo_frame_weight", 0.01)
+        )
+        self.policy_guard_eraf_action_eef_scale = tuple(
+            float(value)
+            for value in eraf_config.get("action_eef_scale", (1.0, 1.0, 1.0))
+        )
+        self.policy_guard_eraf_action_eef_bias = tuple(
+            float(value)
+            for value in eraf_config.get("action_eef_bias", (0.0, 0.0, 0.0))
+        )
         self.policy_guard_eraf_grounding_objective_version = int(
             eraf_config.get("grounding_objective_version", 1)
         )
@@ -1353,10 +1365,11 @@ class FastWAM(torch.nn.Module):
                     16,
                     17,
                     18,
+                    19,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "between 1 and 18 inclusive."
+                        "between 1 and 19 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1491,6 +1504,11 @@ class FastWAM(torch.nn.Module):
                     raise ValueError(
                         "PGC V9.18 phase-residual weights and direction norm "
                         "threshold must be positive."
+                    )
+                if self.policy_guard_eraf_action_servo_frame_weight < 0:
+                    raise ValueError(
+                        "PGC V9.19 servo frame regularization must be "
+                        "non-negative."
                     )
                 if (
                     self.policy_guard_eraf_action_grounding_hidden_dim
@@ -1948,6 +1966,30 @@ class FastWAM(torch.nn.Module):
                                 max_abs=(
                                     self.policy_guard_eraf_action_geometry_residual_max_abs
                                 ),
+                            )
+                        if (
+                            self.policy_guard_eraf_grounding_objective_version
+                            >= 19
+                        ):
+                            if self.proprio_dim is None:
+                                raise ValueError(
+                                    "PGC V9.19 hard-routed phase servo requires "
+                                    "proprio_dim."
+                                )
+                            self.policy_guard_modules[
+                                "eraf_hard_routed_phase_servo"
+                            ] = HardRoutedERAFPhaseServo(
+                                action_dim=int(policy_action_expert.action_dim),
+                                proprio_dim=int(self.proprio_dim),
+                                hidden_dim=(
+                                    self.policy_guard_eraf_action_geometry_hidden_dim
+                                ),
+                                max_clauses=self.policy_guard_eraf_max_clauses,
+                                max_abs=(
+                                    self.policy_guard_eraf_action_geometry_residual_max_abs
+                                ),
+                                eef_scale=self.policy_guard_eraf_action_eef_scale,
+                                eef_bias=self.policy_guard_eraf_action_eef_bias,
                             )
                     if self.policy_guard_version in {6, 7}:
                         binder_kwargs = {
@@ -2408,6 +2450,19 @@ class FastWAM(torch.nn.Module):
                         elif self.policy_guard_eraf_training_stage == "action":
                             if (
                                 self.policy_guard_eraf_grounding_objective_version
+                                >= 19
+                            ):
+                                # V9.19 freezes the admitted V9.18 stack and
+                                # learns only the hard-clause, phase-specific
+                                # Cartesian servo that can suppress the legacy
+                                # soft geometry residual per phase.
+                                phase_servo = self.policy_guard_modules[
+                                    "eraf_hard_routed_phase_servo"
+                                ]
+                                phase_servo.train()
+                                phase_servo.requires_grad_(True)
+                            elif (
+                                self.policy_guard_eraf_grounding_objective_version
                                 >= 17
                             ):
                                 # V9.17 preserves the validated ERAF, Proposal,
@@ -2621,6 +2676,13 @@ class FastWAM(torch.nn.Module):
             optimizer_modules.append(
                 (
                     "eraf_geometry_action_adapter",
+                    self.policy_guard_eraf_action_geometry_learning_rate,
+                )
+            )
+        if "eraf_hard_routed_phase_servo" in self.policy_guard_modules:
+            optimizer_modules.append(
+                (
+                    "eraf_hard_routed_phase_servo",
                     self.policy_guard_eraf_action_geometry_learning_rate,
                 )
             )
@@ -5552,6 +5614,8 @@ class FastWAM(torch.nn.Module):
         source_labels: Optional[Mapping[str, torch.Tensor]] = None,
         reference_subject_fallback: bool = False,
         anchor_mirror_fallback: bool = False,
+        preserve_clause_route: bool = False,
+        propagate_reference_to_anchor: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Build one isolated same-state ERAF intervention for V9.15+.
 
@@ -5652,6 +5716,15 @@ class FastWAM(torch.nn.Module):
                     source_value,
                     torch.where(fallback_mask, subject_value, target_value),
                 )
+            if propagate_reference_to_anchor:
+                reference_delta = (
+                    negative["reference_position"]
+                    - target_outputs["reference_position"]
+                )
+                for name in ("goal_anchor", "interaction_anchor"):
+                    negative[name] = (
+                        target_outputs[name] + reference_delta
+                    ).clamp(-1.0, 1.0)
             return negative
         if kind in source_fields:
             for name in source_fields[kind]:
@@ -5699,6 +5772,12 @@ class FastWAM(torch.nn.Module):
             index = index.clone()
             index[0], index[1] = index[1].clone(), index[0].clone()
             negative[name] = value.index_select(1, index)
+        if preserve_clause_route:
+            # V9.19 audits the causal meaning of the selected slot.  Swapping
+            # both its semantics and its router score is a pure permutation
+            # and can never change any permutation-invariant action path.
+            for name in ("active_logits", "clause_execution_probability"):
+                negative[name] = target_outputs[name]
         return negative
 
     def _compute_policy_guard_v915_causal_action_loss(
@@ -6472,6 +6551,7 @@ class FastWAM(torch.nn.Module):
             )
         )
         pre_geometry_proposal_action = proposal_action
+        pre_geometry_source_proposal_action = source_proposal_action
         geometry_residual = proposal_action * 0.0
         if (
             self.policy_guard_version == 9
@@ -6505,6 +6585,38 @@ class FastWAM(torch.nn.Module):
                 proprio=proprio_current,
                 action_is_pad=action_is_pad,
             )
+            if self.policy_guard_eraf_grounding_objective_version >= 19:
+                phase_servo = self.policy_guard_modules[
+                    "eraf_hard_routed_phase_servo"
+                ]
+                (
+                    proposal_action,
+                    geometry_residual,
+                    phase_servo_metrics,
+                ) = phase_servo(
+                    candidate_action=pre_geometry_proposal_action,
+                    legacy_residual=geometry_residual,
+                    eraf_outputs=eraf_outputs,
+                    proprio=proprio_current,
+                    eef_position=inputs.get("eraf_eef_position_current"),
+                    action_is_pad=action_is_pad,
+                )
+                (
+                    source_proposal_action,
+                    source_geometry_residual,
+                    source_phase_servo_metrics,
+                ) = phase_servo(
+                    candidate_action=pre_geometry_source_proposal_action,
+                    legacy_residual=source_geometry_residual,
+                    eraf_outputs=source_eraf_outputs,
+                    proprio=proprio_current,
+                    eef_position=inputs.get("eraf_eef_position_current"),
+                    action_is_pad=action_is_pad,
+                )
+                geometry_metrics = dict(geometry_metrics)
+                geometry_metrics.update(phase_servo_metrics)
+                source_geometry_metrics = dict(source_geometry_metrics)
+                source_geometry_metrics.update(source_phase_servo_metrics)
             residual = residual + geometry_residual
             source_residual = source_residual + source_geometry_residual
             proposal_metrics = dict(proposal_metrics)
@@ -6550,6 +6662,14 @@ class FastWAM(torch.nn.Module):
                             self.policy_guard_eraf_grounding_objective_version
                             >= 17
                         ),
+                        preserve_clause_route=(
+                            self.policy_guard_eraf_grounding_objective_version
+                            >= 19
+                        ),
+                        propagate_reference_to_anchor=(
+                            self.policy_guard_eraf_grounding_objective_version
+                            >= 19
+                        ),
                     )
                 )
                 negative_queries, _ = action_grounding_bridge(
@@ -6562,7 +6682,8 @@ class FastWAM(torch.nn.Module):
                     action_is_pad=action_is_pad,
                 )
                 if self.policy_guard_eraf_grounding_objective_version >= 17:
-                    negative_action, _, _ = self.policy_guard_modules[
+                    pre_geometry_negative_action = negative_action
+                    negative_action, negative_geometry_residual, _ = self.policy_guard_modules[
                         "eraf_geometry_action_adapter"
                     ](
                         candidate_action=negative_action,
@@ -6570,6 +6691,17 @@ class FastWAM(torch.nn.Module):
                         proprio=inputs["proprio_current"],
                         action_is_pad=action_is_pad,
                     )
+                    if self.policy_guard_eraf_grounding_objective_version >= 19:
+                        negative_action, _, _ = self.policy_guard_modules[
+                            "eraf_hard_routed_phase_servo"
+                        ](
+                            candidate_action=pre_geometry_negative_action,
+                            legacy_residual=negative_geometry_residual,
+                            eraf_outputs=negative_eraf_outputs,
+                            proprio=inputs["proprio_current"],
+                            eef_position=inputs.get("eraf_eef_position_current"),
+                            action_is_pad=action_is_pad,
+                        )
                 v915_negative_actions[negative_kind] = negative_action
         wrong_entity_candidate_action = None
         wrong_relation_candidate_action = None
@@ -6710,6 +6842,40 @@ class FastWAM(torch.nn.Module):
                 paired_language_valid=paired_language_valid,
             )
             action_objective = action_objective + v918_phase_residual_loss
+        v919_frame_loss = action_objective.sum() * 0.0
+        if (
+            self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 19
+        ):
+            frame = self.policy_guard_modules[
+                "eraf_hard_routed_phase_servo"
+            ]
+            workspace_to_action = frame.workspace_to_action.float()
+            identity = torch.eye(
+                3,
+                device=workspace_to_action.device,
+                dtype=workspace_to_action.dtype,
+            )
+            v919_frame_loss = (
+                (
+                    workspace_to_action.T @ workspace_to_action
+                    - identity
+                ).square().mean()
+                + (torch.linalg.det(workspace_to_action) - 1.0).square()
+                + (
+                    frame.eef_scale.float()
+                    - frame.initial_eef_scale.float()
+                ).square().mean()
+                + (
+                    frame.eef_bias.float()
+                    - frame.initial_eef_bias.float()
+                ).square().mean()
+            )
+            action_objective = (
+                action_objective
+                + self.policy_guard_eraf_action_servo_frame_weight
+                * v919_frame_loss
+            )
         v915_causal_loss = action_objective.sum() * 0.0
         v915_causal_metrics: dict[str, torch.Tensor] = {}
         if v915_negative_actions:
@@ -6837,6 +7003,9 @@ class FastWAM(torch.nn.Module):
             "loss_pgc_v918_phase_residual": float(
                 v918_phase_residual_loss.detach().item()
             ),
+            "loss_pgc_v919_servo_frame": float(
+                v919_frame_loss.detach().item()
+            ),
             "loss_pgc_verifier": float(verifier_loss.detach().item()),
             "loss_pgc_goal_action_alignment": float(
                 alignment_loss.detach().item()
@@ -6884,6 +7053,13 @@ class FastWAM(torch.nn.Module):
                 action_training_scale
                 if self.policy_guard_version == 9
                 and self.policy_guard_eraf_grounding_objective_version >= 18
+                else 0.0
+            ),
+            "pgc_v919_servo_frame_effective_weight": (
+                action_training_scale
+                * self.policy_guard_eraf_action_servo_frame_weight
+                if self.policy_guard_version == 9
+                and self.policy_guard_eraf_grounding_objective_version >= 19
                 else 0.0
             ),
             "pgc_v6_target_interaction_effective_weight": (
@@ -10591,6 +10767,7 @@ class FastWAM(torch.nn.Module):
                 goal_queries=policy_guard_goal_queries,
                 action_is_pad=None,
             )
+            pre_geometry_policy_guard_action = policy_guard_latents_action
             if (
                 self.policy_guard_version == 9
                 and self.policy_guard_eraf_grounding_objective_version >= 17
@@ -10611,6 +10788,22 @@ class FastWAM(torch.nn.Module):
                     proprio=proprio,
                     action_is_pad=None,
                 )
+                if self.policy_guard_eraf_grounding_objective_version >= 19:
+                    (
+                        policy_guard_latents_action,
+                        geometry_residual,
+                        phase_servo_metrics,
+                    ) = self.policy_guard_modules[
+                        "eraf_hard_routed_phase_servo"
+                    ](
+                        candidate_action=pre_geometry_policy_guard_action,
+                        legacy_residual=geometry_residual,
+                        eraf_outputs=self._policy_guard_last_eraf_outputs,
+                        proprio=proprio,
+                        action_is_pad=None,
+                    )
+                    geometry_metrics = dict(geometry_metrics)
+                    geometry_metrics.update(phase_servo_metrics)
                 action_residual = action_residual + geometry_residual
                 policy_guard_proposal_metrics = dict(
                     policy_guard_proposal_metrics
@@ -10708,6 +10901,20 @@ class FastWAM(torch.nn.Module):
                 "pgc_v917_geometry_route_confidence",
                 "pgc_v917_geometry_eef_position_norm",
                 "pgc_v917_geometry_goal_relative_norm",
+                "pgc_v919_hard_clause_route_max",
+                "pgc_v919_selected_clause_mean",
+                "pgc_v919_selected_phase_mean",
+                "pgc_v919_route_confidence",
+                "pgc_v919_canonical_eef_from_state",
+                "pgc_v919_eef_scale_min",
+                "pgc_v919_eef_bias_max_abs",
+                "pgc_v919_desired_distance",
+                "pgc_v919_translation_gain",
+                "pgc_v919_servo_residual_rms",
+                "pgc_v919_total_residual_rms",
+                "pgc_v919_legacy_suppression",
+                "pgc_v919_workspace_to_action_orthogonality_error",
+                "pgc_v919_workspace_to_action_determinant",
             ):
                 metric_value = policy_guard_proposal_metrics.get(metric_name)
                 if metric_value is not None:
@@ -10743,6 +10950,7 @@ class FastWAM(torch.nn.Module):
                             goal_queries=variant_queries,
                             action_is_pad=None,
                         )
+                        pre_geometry_variant_action = variant_action
                         if (
                             self.policy_guard_version == 9
                             and self.policy_guard_eraf_grounding_objective_version
@@ -10765,6 +10973,29 @@ class FastWAM(torch.nn.Module):
                                 proprio=proprio,
                                 action_is_pad=None,
                             )
+                            if (
+                                self.policy_guard_eraf_grounding_objective_version
+                                >= 19
+                            ):
+                                (
+                                    variant_action,
+                                    variant_geometry_residual,
+                                    variant_phase_servo_metrics,
+                                ) = self.policy_guard_modules[
+                                    "eraf_hard_routed_phase_servo"
+                                ](
+                                    candidate_action=pre_geometry_variant_action,
+                                    legacy_residual=variant_geometry_residual,
+                                    eraf_outputs=variant_eraf_outputs,
+                                    proprio=proprio,
+                                    action_is_pad=None,
+                                )
+                                variant_geometry_metrics = dict(
+                                    variant_geometry_metrics
+                                )
+                                variant_geometry_metrics.update(
+                                    variant_phase_servo_metrics
+                                )
                             variant_residual = (
                                 variant_residual + variant_geometry_residual
                             )
@@ -10817,6 +11048,29 @@ class FastWAM(torch.nn.Module):
                                 ]
                                 .detach()
                                 .float()
+                                .item()
+                            )
+                        ),
+                        "v919_selected_clause": (
+                            None
+                            if "pgc_v919_selected_clause" not in variant_metrics
+                            else int(
+                                variant_metrics["pgc_v919_selected_clause"]
+                                .detach()
+                                .reshape(-1)[0]
+                                .item()
+                            )
+                        ),
+                        "v919_selected_control_phase": (
+                            None
+                            if "pgc_v919_selected_control_phase"
+                            not in variant_metrics
+                            else int(
+                                variant_metrics[
+                                    "pgc_v919_selected_control_phase"
+                                ]
+                                .detach()
+                                .reshape(-1)[0]
                                 .item()
                             )
                         ),
@@ -11133,8 +11387,12 @@ class FastWAM(torch.nn.Module):
                 eraf_role_adapter_trainable_scope = (
                     (
                         (
-                            "phase_conditioned_geometry_adapter_only_with_"
-                            "phase_balanced_residual_imitation"
+                            "hard_routed_phase_servo_only"
+                            if objective_version >= 19
+                            else (
+                                "phase_conditioned_geometry_adapter_only_with_"
+                                "phase_balanced_residual_imitation"
+                            )
                             if objective_version >= 18
                             else "phase_conditioned_relative_geometry_action_"
                             "adapter_only"
@@ -11769,8 +12027,13 @@ class FastWAM(torch.nn.Module):
             "eraf_action_joint_contract": (
                 (
                     (
-                        "frozen_eraf_v917_stack_plus_phase_balanced_direct_"
-                        "geometry_residual_imitation"
+                        "frozen_v918_stack_plus_hard_clause_phase_"
+                        "direction_preserving_servo"
+                        if self.policy_guard_eraf_grounding_objective_version >= 19
+                        else (
+                            "frozen_eraf_v917_stack_plus_phase_balanced_direct_"
+                            "geometry_residual_imitation"
+                        )
                         if self.policy_guard_eraf_grounding_objective_version >= 18
                         else "frozen_eraf_v916_bridge_and_proposal_plus_direct_"
                         "eef_relative_geometry_action_adapter"
@@ -11794,8 +12057,12 @@ class FastWAM(torch.nn.Module):
             "eraf_action_trainable_scope": (
                 (
                     (
-                        "phase_conditioned_geometry_adapter_only_with_phase_"
-                        "balanced_residual_imitation"
+                        "hard_routed_phase_servo_only"
+                        if self.policy_guard_eraf_grounding_objective_version >= 19
+                        else (
+                            "phase_conditioned_geometry_adapter_only_with_phase_"
+                            "balanced_residual_imitation"
+                        )
                         if self.policy_guard_eraf_grounding_objective_version >= 18
                         else "phase_conditioned_relative_geometry_action_adapter_only"
                     )
@@ -11895,6 +12162,31 @@ class FastWAM(torch.nn.Module):
                 "prefix_residual_imitation"
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 18
+                else None
+            ),
+            "eraf_action_phase_servo_contract": (
+                "hard_single_clause_explicit_affine_eef_phase_specific_positive_"
+                "cartesian_gain_with_legacy_suppression"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 19
+                else None
+            ),
+            "eraf_action_servo_frame_weight": (
+                self.policy_guard_eraf_action_servo_frame_weight
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 19
+                else None
+            ),
+            "eraf_action_eef_initial_scale": (
+                list(self.policy_guard_eraf_action_eef_scale)
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 19
+                else None
+            ),
+            "eraf_action_eef_initial_bias": (
+                list(self.policy_guard_eraf_action_eef_bias)
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 19
                 else None
             ),
             "eraf_action_phase_residual_imitation_weight": (
@@ -12928,6 +13220,18 @@ class FastWAM(torch.nn.Module):
             and bool(metadata.get("eraf_action_joint_training", False))
             and self.policy_guard_eraf_action_joint_training
         )
+        migrate_v918_to_v919_phase_servo = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 18
+            and self.policy_guard_eraf_grounding_objective_version == 19
+            and self.policy_guard_eraf_training_stage == "action"
+            and metadata.get("eraf_training_stage") == "action"
+            and saved_eraf_completion_only_memory
+            and self.policy_guard_eraf_completion_only_memory
+            and bool(metadata.get("eraf_action_joint_training", False))
+            and self.policy_guard_eraf_action_joint_training
+        )
         if migrate_v914_to_v915_action_grounding:
             expected_v914_warm_start = {
                 "eraf_action_joint_contract": (
@@ -13026,6 +13330,36 @@ class FastWAM(torch.nn.Module):
                 if metadata.get(name) != expected:
                     raise ValueError(
                         "PGC V9.18 requires an exact completed V9.17 action "
+                        f"checkpoint: {name}={metadata.get(name)!r}, "
+                        f"expected={expected!r}."
+                    )
+        if migrate_v918_to_v919_phase_servo:
+            expected_v918_warm_start = {
+                "eraf_action_joint_contract": (
+                    "frozen_eraf_v917_stack_plus_phase_balanced_direct_"
+                    "geometry_residual_imitation"
+                ),
+                "eraf_action_trainable_scope": (
+                    "phase_conditioned_geometry_adapter_only_with_phase_"
+                    "balanced_residual_imitation"
+                ),
+                "eraf_role_adapter_trainable_scope": (
+                    "phase_conditioned_geometry_adapter_only_with_phase_"
+                    "balanced_residual_imitation"
+                ),
+                "eraf_action_phase_residual_contract": (
+                    "phase_balanced_bounded_expert_minus_frozen_v9_17_candidate_"
+                    "prefix_residual_imitation"
+                ),
+                "eraf_policy_state_contract": (
+                    "monotonic_completed_bitset_no_pending_holding_retry_"
+                    "recurrence"
+                ),
+            }
+            for name, expected in expected_v918_warm_start.items():
+                if metadata.get(name) != expected:
+                    raise ValueError(
+                        "PGC V9.19 requires an exact completed V9.18 action "
                         f"checkpoint: {name}={metadata.get(name)!r}, "
                         f"expected={expected!r}."
                     )
@@ -13839,6 +14173,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 18
                             )
+                            or (
+                                saved_grounding_objective == 18
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 19
+                            )
                         )
                         objective_upgrade = objective_upgrade and (
                             (
@@ -13850,6 +14189,7 @@ class FastWAM(torch.nn.Module):
                             or migrate_v915_to_v916_semantic_causal
                             or migrate_v916_to_v917_direct_geometry
                             or migrate_v917_to_v918_phase_residual
+                            or migrate_v918_to_v919_phase_servo
                         )
                         if (
                             saved_grounding_objective
@@ -13992,6 +14332,60 @@ class FastWAM(torch.nn.Module):
                                         raise ValueError(
                                             "PGC V9.18 phase-weight contract mismatch."
                                         )
+                                if saved_grounding_objective >= 19:
+                                    expected_v919 = {
+                                        "eraf_action_phase_servo_contract": (
+                                            "hard_single_clause_explicit_affine_eef_"
+                                            "phase_specific_positive_cartesian_gain_"
+                                            "with_legacy_suppression"
+                                        ),
+                                        "eraf_action_servo_frame_weight": (
+                                            self.policy_guard_eraf_action_servo_frame_weight
+                                        ),
+                                    }
+                                    for name, expected in expected_v919.items():
+                                        value = metadata.get(name)
+                                        matches = (
+                                            value == expected
+                                            if isinstance(expected, str)
+                                            else math.isclose(
+                                                float(value), float(expected),
+                                                rel_tol=0.0, abs_tol=1.0e-9,
+                                            )
+                                        )
+                                        if not matches:
+                                            raise ValueError(
+                                                "PGC V9.19 phase-servo checkpoint "
+                                                f"mismatch: {name}={value!r}, "
+                                                f"expected={expected!r}."
+                                            )
+                                    for name, expected in {
+                                        "eraf_action_eef_initial_scale": (
+                                            self.policy_guard_eraf_action_eef_scale
+                                        ),
+                                        "eraf_action_eef_initial_bias": (
+                                            self.policy_guard_eraf_action_eef_bias
+                                        ),
+                                    }.items():
+                                        saved = metadata.get(name)
+                                        if (
+                                            not isinstance(saved, list)
+                                            or len(saved) != 3
+                                            or any(
+                                                not math.isclose(
+                                                    float(left), float(right),
+                                                    rel_tol=0.0, abs_tol=1.0e-9,
+                                                )
+                                                for left, right in zip(
+                                                    saved, expected
+                                                )
+                                            )
+                                        ):
+                                            raise ValueError(
+                                                "PGC V9.19 EEF affine checkpoint "
+                                                f"mismatch: {name}={saved!r}, "
+                                                f"expected={list(expected)!r}."
+                                            )
                         # V9.13 intentionally freezes the complete V9.11 ERAF
                         # geometry and disables every legacy grounding loss.
                         # Those loss weights are training-time hyperparameters,
@@ -14080,8 +14474,12 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_scope = (
                                     (
-                                        "phase_conditioned_geometry_adapter_only_"
-                                        "with_phase_balanced_residual_imitation"
+                                        "hard_routed_phase_servo_only"
+                                        if saved_grounding_objective >= 19
+                                        else (
+                                            "phase_conditioned_geometry_adapter_only_"
+                                            "with_phase_balanced_residual_imitation"
+                                        )
                                         if saved_grounding_objective >= 18
                                         else "phase_conditioned_relative_geometry_"
                                         "action_adapter_only"
@@ -14655,8 +15053,13 @@ class FastWAM(torch.nn.Module):
                                     )
                                 expected_action_joint_contract = (
                                     (
-                                        "frozen_eraf_v917_stack_plus_phase_balanced_"
-                                        "direct_geometry_residual_imitation"
+                                        "frozen_v918_stack_plus_hard_clause_phase_"
+                                        "direction_preserving_servo"
+                                        if saved_grounding_objective >= 19
+                                        else (
+                                            "frozen_eraf_v917_stack_plus_phase_balanced_"
+                                            "direct_geometry_residual_imitation"
+                                        )
                                         if saved_grounding_objective >= 18
                                         else "frozen_eraf_v916_bridge_and_proposal_"
                                         "plus_direct_eef_relative_geometry_action_"
@@ -14680,8 +15083,12 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_action_trainable_scope = (
                                     (
-                                        "phase_conditioned_geometry_adapter_only_"
-                                        "with_phase_balanced_residual_imitation"
+                                        "hard_routed_phase_servo_only"
+                                        if saved_grounding_objective >= 19
+                                        else (
+                                            "phase_conditioned_geometry_adapter_only_"
+                                            "with_phase_balanced_residual_imitation"
+                                        )
                                         if saved_grounding_objective >= 18
                                         else "phase_conditioned_relative_geometry_"
                                         "action_adapter_only"
@@ -14712,9 +15119,13 @@ class FastWAM(torch.nn.Module):
                                     ),
                                     "eraf_role_adapter_trainable_scope": (
                                         (
-                                            "phase_conditioned_geometry_adapter_"
-                                            "only_with_phase_balanced_residual_"
-                                            "imitation"
+                                            "hard_routed_phase_servo_only"
+                                            if saved_grounding_objective >= 19
+                                            else (
+                                                "phase_conditioned_geometry_adapter_"
+                                                "only_with_phase_balanced_residual_"
+                                                "imitation"
+                                            )
                                             if saved_grounding_objective >= 18
                                             else "phase_conditioned_relative_"
                                             "geometry_action_adapter_only"
@@ -14861,6 +15272,7 @@ class FastWAM(torch.nn.Module):
                 or migrate_v914_to_v915_action_grounding
                 or migrate_v916_to_v917_direct_geometry
                 or migrate_v917_to_v918_phase_residual
+                or migrate_v918_to_v919_phase_servo
             )
             incompatible = self.policy_guard_modules.load_state_dict(
                 guard_state, strict=not migrate_with_new_modules
@@ -15043,6 +15455,19 @@ class FastWAM(torch.nn.Module):
                         "restore every existing tensor exactly: "
                         f"missing={missing}, unexpected={unexpected}."
                     )
+            elif migrate_v918_to_v919_phase_servo:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                allowed_prefix = "eraf_hard_routed_phase_servo."
+                disallowed_missing = [
+                    key for key in missing if not key.startswith(allowed_prefix)
+                ]
+                if disallowed_missing or unexpected or not missing:
+                    raise ValueError(
+                        "PGC V9.18 -> V9.19 hard-routed phase-servo warm start "
+                        f"has incompatible sidecars: missing={missing}, "
+                        f"unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -15068,6 +15493,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v915_to_v916_semantic_causal
                 and not migrate_v916_to_v917_direct_geometry
                 and not migrate_v917_to_v918_phase_residual
+                and not migrate_v918_to_v919_phase_servo
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -15213,6 +15639,16 @@ class FastWAM(torch.nn.Module):
                     path,
                     resolved_base,
                     len(guard_state),
+                )
+            elif migrate_v918_to_v919_phase_servo:
+                logger.info(
+                    "Warm-started PGC v9.19 hard-routed phase servo from "
+                    "exact V9.18 action sidecars at %s (base=%s restored=%d "
+                    "new_servo_tensors=%d).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
+                    len(incompatible.missing_keys),
                 )
             else:
                 logger.info(
