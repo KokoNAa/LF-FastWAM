@@ -53,6 +53,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
 from fastwam.models.wan22.fastwam import FastWAM
 from fastwam.models.wan22.policy_guard import (
     PhaseConditionedERAFActionBridge,
+    PhaseConditionedERAFGeometryActionAdapter,
     infer_spatial_patch_grid,
 )
 import scripts.build_pgc_libero_entity_relations as eraf_builder
@@ -3846,7 +3847,61 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             "clause_execution_probability": torch.softmax(
                 torch.randn(batch_size, clauses), dim=-1
             ),
+            "subject_visibility_logits": torch.full(
+                (batch_size, clauses), 4.0
+            ),
+            "reference_visibility_logits": torch.full(
+                (batch_size, clauses), 4.0
+            ),
         }
+
+    def test_v917_geometry_action_adapter_is_zero_init_and_anchor_causal(self):
+        adapter = PhaseConditionedERAFGeometryActionAdapter(
+            action_dim=7,
+            proprio_dim=8,
+            hidden_dim=16,
+            max_clauses=4,
+            max_abs=0.25,
+        )
+        action = torch.randn(2, 6, 7)
+        proprio = torch.randn(2, 8)
+        outputs = self._v915_bridge_outputs()
+        initial, residual, metrics = adapter(
+            candidate_action=action,
+            eraf_outputs=outputs,
+            proprio=proprio,
+        )
+        self.assertTrue(torch.equal(initial, action))
+        self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
+        self.assertEqual(
+            float(metrics["pgc_v917_geometry_action_residual_rms"]), 0.0
+        )
+
+        adapter.output_projection.weight.data.normal_(std=0.1)
+        learned, _, _ = adapter(
+            candidate_action=action,
+            eraf_outputs=outputs,
+            proprio=proprio,
+        )
+        changed_outputs = dict(outputs)
+        changed_outputs["goal_anchor"] = outputs["goal_anchor"] + 0.4
+        changed, _, _ = adapter(
+            candidate_action=action,
+            eraf_outputs=changed_outputs,
+            proprio=proprio,
+        )
+        self.assertFalse(torch.equal(learned, changed))
+        bypass_outputs = dict(changed_outputs)
+        bypass_outputs["audit_bypass_bridge"] = torch.tensor(True)
+        bypass, bypass_residual, _ = adapter(
+            candidate_action=action,
+            eraf_outputs=bypass_outputs,
+            proprio=proprio,
+        )
+        self.assertTrue(torch.equal(bypass, action))
+        self.assertTrue(
+            torch.equal(bypass_residual, torch.zeros_like(bypass_residual))
+        )
 
     def test_v915_action_grounding_is_zero_init_and_anchor_connected(self):
         bridge = PhaseConditionedERAFActionBridge(
@@ -4201,6 +4256,91 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             for name, value in v916.policy_guard_modules.state_dict().items():
                 self.assertTrue(
                     torch.equal(value, restored.policy_guard_modules.state_dict()[name]),
+                    name,
+                )
+
+    def test_v916_to_v917_direct_geometry_action_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v916_path = root / "v916.pt"
+            v917_path = root / "v917.pt"
+            v916 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=16,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v916.mot.state_dict()},
+                base_path,
+            )
+            v916.load_checkpoint(base_path)
+            v916.save_checkpoint(v916_path, step=13750)
+
+            v917 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=17,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v917.load_checkpoint(v916_path)
+            old_state = v916.policy_guard_modules.state_dict()
+            new_state = v917.policy_guard_modules.state_dict()
+            for name, value in old_state.items():
+                self.assertTrue(torch.equal(value, new_state[name]), name)
+            adapter = v917.policy_guard_modules[
+                "eraf_geometry_action_adapter"
+            ]
+            self.assertTrue(
+                torch.equal(
+                    adapter.output_projection.weight,
+                    torch.zeros_like(adapter.output_projection.weight),
+                )
+            )
+            v917.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v917.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules.eraf_geometry_action_adapter."
+                    )
+                    for name in trainable
+                )
+            )
+            groups = v917.policy_guard_optimizer_groups(2.0e-5)
+            self.assertEqual(
+                [group["pgc_v9_group"] for group in groups],
+                ["eraf_geometry_action_adapter"],
+            )
+            v917.save_checkpoint(v917_path, step=14250)
+            metadata = torch.load(
+                v917_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "phase_conditioned_relative_geometry_action_adapter_only",
+            )
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=17,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            restored.load_checkpoint(v917_path)
+            for name, value in new_state.items():
+                self.assertTrue(
+                    torch.equal(
+                        value, restored.policy_guard_modules.state_dict()[name]
+                    ),
                     name,
                 )
 

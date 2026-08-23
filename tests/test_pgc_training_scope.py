@@ -284,6 +284,21 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             'PGC_V9_ACTION_CAUSAL_RANKING_WEIGHT:-2.0', source
         )
 
+    def test_v917_launcher_trains_direct_geometry_action_adapter(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("action-direct-geometry", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=17", source)
+        self.assertIn("START_STEP=13750", source)
+        self.assertIn("V9.17 must warm-start from the completed V9.16", source)
+        self.assertIn(
+            "entity_relation_grounding.action_geometry_learning_rate=", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_geometry_residual_max_abs=", source
+        )
+
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (
             REPO_ROOT / "scripts/summarize_pgc_v9_shadow_audit.py"

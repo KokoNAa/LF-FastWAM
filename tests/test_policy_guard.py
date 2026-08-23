@@ -89,6 +89,7 @@ def tiny_pgc_fastwam(
         text_dim=10,
         device="cpu",
         torch_dtype=torch.float32,
+        proprio_dim=(8 if v9_grounding_objective_version >= 17 else None),
         langforce_mvp_config={"enabled": False},
         transition_contract_config={"enabled": False},
         policy_guard_config={
@@ -192,6 +193,9 @@ def tiny_pgc_fastwam(
                 "action_grounding_learning_rate": 1.0e-4,
                 "action_causal_ranking_weight": 1.0,
                 "action_causal_margin": 0.01,
+                "action_geometry_hidden_dim": 8,
+                "action_geometry_learning_rate": 2.0e-5,
+                "action_geometry_residual_max_abs": 0.25,
                 "mask_weight": 1.0,
                 "attention_mask_weight": 2.0,
                 "entity_weight": 1.0,

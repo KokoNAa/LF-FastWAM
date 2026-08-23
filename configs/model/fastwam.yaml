@@ -300,6 +300,9 @@ policy_guard:
     # stage, only the ERAF-to-query bridge and ActionChunkProposal are trained.
     # V9.15 adds a zero-init phase-conditioned geometry path and action-level
     # causal ranking against wrong subject/reference/anchor/clause candidates.
+    # V9.16 calibrates the final semantic action bridge with stronger same-state
+    # negatives. V9.17 adds a short, zero-init route from phase-selected,
+    # EEF-relative ERAF geometry directly to the deployed action residual.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -318,6 +321,9 @@ policy_guard:
     action_grounding_learning_rate: 1.0e-4
     action_causal_ranking_weight: 1.0
     action_causal_margin: 0.01
+    action_geometry_hidden_dim: 256
+    action_geometry_learning_rate: 2.0e-5
+    action_geometry_residual_max_abs: 0.25
     mask_weight: 1.0
     attention_mask_weight: 2.0
     entity_weight: 1.0

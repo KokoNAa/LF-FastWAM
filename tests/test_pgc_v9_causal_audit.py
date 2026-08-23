@@ -90,6 +90,22 @@ class PGCV9CausalAuditTest(unittest.TestCase):
             sample["pgc_eraf_subject_entity_ids"][:2],
         )
 
+    def test_v917_anchor_audit_uses_same_state_mirror_fallback(self):
+        sample = _sample()
+        sample["pgc_eraf_source_goal_anchors"] = sample[
+            "pgc_eraf_goal_anchors"
+        ].copy()
+        variants, eligible = build_causal_variants(
+            sample, anchor_mirror_fallback=True
+        )
+        self.assertTrue(eligible["wrong_goal_anchor"])
+        self.assertFalse(
+            np.array_equal(
+                variants["wrong_goal_anchor"]["goal_anchors"][:2],
+                sample["pgc_eraf_goal_anchors"][:2],
+            )
+        )
+
     def test_report_distinguishes_bridge_response_and_alignment(self):
         records = []
         for _ in range(4):

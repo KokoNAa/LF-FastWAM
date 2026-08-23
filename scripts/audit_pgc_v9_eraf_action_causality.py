@@ -87,6 +87,8 @@ def oracle_from_sample(
 
 def build_causal_variants(
     sample: Mapping[str, Any],
+    *,
+    anchor_mirror_fallback: bool = False,
 ) -> tuple[dict[str, Mapping[str, Any] | None], dict[str, bool]]:
     target = oracle_from_sample(sample)
     source = oracle_from_sample(sample, source=True)
@@ -152,6 +154,29 @@ def build_causal_variants(
     }
     for name in GOAL_ANCHOR_FIELDS:
         wrong_goal_anchor[name] = _copy_value(source[name])
+    if anchor_mirror_fallback:
+        target_anchor = _as_numpy(target["goal_anchors"]).copy()
+        source_anchor = _as_numpy(source["goal_anchors"])
+        reference_position = _as_numpy(target["reference_positions"])
+        anchor_valid = _as_numpy(target["goal_anchor_valid"]).astype(bool)
+        source_changed = np.linalg.norm(
+            source_anchor - target_anchor, axis=-1
+        ) > 1.0e-4
+        fallback_mask = target_clause_valid & anchor_valid & ~source_changed
+        mirrored = 2.0 * reference_position - target_anchor
+        mirror_changed = np.linalg.norm(
+            mirrored - target_anchor, axis=-1
+        ) > 1.0e-4
+        offset = np.asarray((0.15, -0.15, 0.08), dtype=target_anchor.dtype)
+        fallback = np.where(
+            mirror_changed[..., None], mirrored, target_anchor + offset
+        )
+        wrong_anchor = source_anchor.copy()
+        wrong_anchor[fallback_mask] = fallback[fallback_mask]
+        wrong_goal_anchor["goal_anchors"] = wrong_anchor
+        wrong_goal_anchor["goal_anchor_valid"] = _copy_value(
+            target["goal_anchor_valid"]
+        )
 
     clause_swap = {name: _copy_value(value) for name, value in target.items()}
     active = np.flatnonzero(_as_numpy(target["clause_valid"]).astype(bool))
@@ -479,6 +504,23 @@ def _bridge_parameter_norms(model: Any) -> dict[str, float]:
         for parameter in getattr(module, name).parameters():
             squared += float(parameter.detach().float().square().sum().item())
         result[name] = float(squared**0.5)
+    geometry_adapter = (
+        model.policy_guard_modules["eraf_geometry_action_adapter"]
+        if "eraf_geometry_action_adapter" in model.policy_guard_modules
+        else None
+    )
+    if geometry_adapter is not None:
+        for name in (
+            "eef_position_projection",
+            "geometry_projection",
+            "action_projection",
+            "output_projection",
+        ):
+            squared = sum(
+                float(parameter.detach().float().square().sum().item())
+                for parameter in getattr(geometry_adapter, name).parameters()
+            )
+            result[f"v917_{name}"] = float(squared**0.5)
     return result
 
 
@@ -576,7 +618,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     records = []
     for ordinal, (position, sample) in enumerate(selected):
-        variants, eligibility = build_causal_variants(sample)
+        variants, eligibility = build_causal_variants(
+            sample,
+            anchor_mirror_fallback=(
+                int(metadata.get("eraf_grounding_objective_version", 0)) >= 17
+            ),
+        )
         prediction = model.infer_action(
             prompt=None,
             input_image=sample["video"][:, 0],

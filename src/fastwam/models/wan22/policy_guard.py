@@ -1397,6 +1397,264 @@ class PhaseConditionedERAFActionBridge(nn.Module):
         return routed_queries, metrics
 
 
+class PhaseConditionedERAFGeometryActionAdapter(nn.Module):
+    """Apply ERAF geometry directly to a deployed action chunk.
+
+    V9.15/V9.16 route geometry through goal queries and two attention
+    bottlenecks before it reaches the Proposal.  This adapter provides a short
+    causal path from phase-selected, EEF-relative anchors to every action
+    timestep.  Its final projection is zero initialized, so a fresh V9.17
+    module is exactly equivalent to V9.16.
+
+    LIBERO proprio is normalized independently from ERAF's canonical workspace.
+    A small learned calibration maps the current proprio vector into the same
+    bounded coordinate frame before relative vectors are formed.  This keeps
+    the interface deployment-only (RGB, language, proprio) and also supports
+    benchmarks with a different proprio dimension.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        proprio_dim: int,
+        hidden_dim: int = 256,
+        max_clauses: int = 4,
+        max_abs: float | Sequence[float] = 0.25,
+    ) -> None:
+        super().__init__()
+        if min(action_dim, proprio_dim, hidden_dim, max_clauses) <= 0:
+            raise ValueError("V9.17 geometry-action dimensions must be positive.")
+        if isinstance(max_abs, Sequence) and not isinstance(max_abs, (str, bytes)):
+            cap_values = [float(value) for value in max_abs]
+            if len(cap_values) != int(action_dim):
+                raise ValueError(
+                    "V9.17 per-dimension residual caps must match action_dim."
+                )
+        else:
+            cap_values = [float(max_abs)] * int(action_dim)
+        if any(value <= 0 for value in cap_values):
+            raise ValueError("V9.17 geometry residual caps must be positive.")
+
+        self.action_dim = int(action_dim)
+        self.proprio_dim = int(proprio_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.max_clauses = int(max_clauses)
+        self.eef_position_projection = nn.Sequential(
+            nn.LayerNorm(self.proprio_dim),
+            nn.Linear(self.proprio_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim, 3),
+            nn.Tanh(),
+        )
+        # Four three-dimensional relative vectors, each expanded to
+        # [x, sin(pi*x), cos(pi*x), sin(2*pi*x), cos(2*pi*x)].  Phase, truth,
+        # and two predicted visibility confidences remain explicit scalars.
+        geometry_dim = 4 * 3 * 5 + 3 + 1 + 2
+        self.geometry_projection = nn.Sequential(
+            nn.LayerNorm(geometry_dim),
+            nn.Linear(geometry_dim, self.hidden_dim * 2),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+        )
+        self.clause_embedding = nn.Parameter(
+            torch.empty(self.max_clauses, self.hidden_dim)
+        )
+        nn.init.normal_(self.clause_embedding, std=self.hidden_dim**-0.5)
+        self.action_projection = nn.Sequential(
+            nn.LayerNorm(self.action_dim),
+            nn.Linear(self.action_dim, self.hidden_dim),
+        )
+        self.output_norm = nn.LayerNorm(self.hidden_dim)
+        self.output_projection = nn.Linear(self.hidden_dim, self.action_dim)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+        self.register_buffer(
+            "max_abs",
+            torch.tensor(cap_values, dtype=torch.float32).view(1, 1, -1),
+            persistent=True,
+        )
+
+    @staticmethod
+    def _coordinate_features(coordinates: torch.Tensor) -> torch.Tensor:
+        value = coordinates.float().clamp(-2.0, 2.0)
+        features = [value]
+        for frequency in (1.0, 2.0):
+            angle = math.pi * frequency * value
+            features.extend((angle.sin(), angle.cos()))
+        return torch.cat(features, dim=-1).to(coordinates.dtype)
+
+    def forward(
+        self,
+        *,
+        candidate_action: torch.Tensor,
+        eraf_outputs: Mapping[str, torch.Tensor],
+        proprio: torch.Tensor,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        required = {
+            "active_logits",
+            "subject_position",
+            "reference_position",
+            "grasp_anchor",
+            "goal_anchor",
+            "interaction_anchor",
+            "phase_logits",
+            "predicate_truth_logits",
+            "clause_execution_probability",
+            "subject_visibility_logits",
+            "reference_visibility_logits",
+        }
+        missing = sorted(required - set(eraf_outputs))
+        if missing:
+            raise ValueError(
+                f"V9.17 geometry-action adapter is missing ERAF outputs: {missing}."
+            )
+        if candidate_action.ndim != 3 or candidate_action.shape[-1] != self.action_dim:
+            raise ValueError("V9.17 candidate action must be [B,T,action_dim].")
+        if proprio.ndim != 2 or proprio.shape != (
+            candidate_action.shape[0],
+            self.proprio_dim,
+        ):
+            raise ValueError(
+                "V9.17 proprio must be [B,proprio_dim] and match the action batch."
+            )
+        if action_is_pad is not None and action_is_pad.shape != candidate_action.shape[:2]:
+            raise ValueError("V9.17 action padding mask must be [B,T].")
+        bypass = eraf_outputs.get("audit_bypass_bridge")
+        if bypass is not None and bool(torch.as_tensor(bypass).all()):
+            residual = torch.zeros_like(candidate_action)
+            zero = residual.float().sum()
+            return candidate_action, residual, {
+                "pgc_v917_geometry_action_residual_rms": zero,
+                "pgc_v917_geometry_action_residual_max_abs": zero,
+                "pgc_v917_geometry_route_confidence": zero,
+                "pgc_v917_geometry_eef_position_norm": zero,
+                "pgc_v917_geometry_goal_relative_norm": zero,
+            }
+
+        subject_position = eraf_outputs["subject_position"]
+        reference_position = eraf_outputs["reference_position"]
+        grasp_anchor = eraf_outputs["grasp_anchor"]
+        goal_anchor = eraf_outputs["goal_anchor"]
+        interaction_anchor = eraf_outputs["interaction_anchor"]
+        clause_shape = subject_position.shape[:2]
+        expected_position_shape = (*clause_shape, 3)
+        if clause_shape != (candidate_action.shape[0], self.max_clauses):
+            raise ValueError("V9.17 ERAF clause shape is invalid.")
+        if any(
+            value.shape != expected_position_shape
+            for value in (
+                subject_position,
+                reference_position,
+                grasp_anchor,
+                goal_anchor,
+                interaction_anchor,
+            )
+        ):
+            raise ValueError("V9.17 ERAF anchor/position tensors must be [B,C,3].")
+
+        module_dtype = self.action_projection[1].weight.dtype
+        eef_position = self.eef_position_projection(
+            proprio.to(dtype=module_dtype)
+        ).to(
+            subject_position.dtype
+        )
+        eef_position = eef_position.unsqueeze(1).expand(-1, self.max_clauses, -1)
+        phase = torch.softmax(eraf_outputs["phase_logits"].float(), dim=-1).to(
+            subject_position.dtype
+        )
+        if phase.shape != (*clause_shape, 3):
+            raise ValueError("V9.17 phase probabilities must be [B,C,3].")
+        # Preserve a small cross-phase signal while emphasizing the geometry
+        # relevant to approach, transport, and release respectively.
+        approach_scale = 0.1 + 0.9 * phase[..., 0:1]
+        transport_scale = 0.1 + 0.9 * phase[..., 1:2]
+        release_scale = 0.1 + 0.9 * phase[..., 2:3]
+        grasp_relative = (grasp_anchor - eef_position) * approach_scale
+        # Once grasped, the controlled object follows the end effector and may
+        # be visually occluded.  Use the EEF as the transport origin so the
+        # placement vector remains meaningful after pickup.
+        goal_relative = (goal_anchor - eef_position) * transport_scale
+        interaction_relative = (interaction_anchor - eef_position) * release_scale
+        relation_relative = reference_position - subject_position
+        truth = torch.sigmoid(
+            eraf_outputs["predicate_truth_logits"].float()
+        ).to(subject_position.dtype).unsqueeze(-1)
+        subject_visibility = torch.sigmoid(
+            eraf_outputs["subject_visibility_logits"].float()
+        ).to(subject_position.dtype).unsqueeze(-1)
+        reference_visibility = torch.sigmoid(
+            eraf_outputs["reference_visibility_logits"].float()
+        ).to(subject_position.dtype).unsqueeze(-1)
+        geometry = torch.cat(
+            (
+                self._coordinate_features(grasp_relative),
+                self._coordinate_features(goal_relative),
+                self._coordinate_features(interaction_relative),
+                self._coordinate_features(relation_relative),
+                phase,
+                truth,
+                subject_visibility,
+                reference_visibility,
+            ),
+            dim=-1,
+        )
+        clause_tokens = self.geometry_projection(geometry) + self.clause_embedding
+
+        active = torch.sigmoid(eraf_outputs["active_logits"].float())
+        execution = eraf_outputs["clause_execution_probability"].float()
+        if active.shape != clause_shape or execution.shape != clause_shape:
+            raise ValueError("V9.17 active/execution routing must be [B,C].")
+        # Predicted visibility is a soft confidence, never a hard occlusion cut.
+        visibility = 0.25 + 0.375 * (
+            subject_visibility.squeeze(-1) + reference_visibility.squeeze(-1)
+        )
+        routing = execution.clamp_min(0.0) * active * visibility
+        routing_sum = routing.sum(dim=-1, keepdim=True)
+        normalized_routing = routing / routing_sum.clamp_min(1.0e-6)
+        geometry_context = (
+            clause_tokens * normalized_routing.to(clause_tokens.dtype).unsqueeze(-1)
+        ).sum(dim=1)
+        route_confidence = routing_sum.clamp(0.0, 1.0).to(candidate_action.dtype)
+
+        action_hidden = self.action_projection(
+            candidate_action.detach().to(dtype=module_dtype)
+        )
+        action_hidden = action_hidden + _sinusoidal_positions(
+            int(action_hidden.shape[1]),
+            int(action_hidden.shape[2]),
+            device=action_hidden.device,
+            dtype=action_hidden.dtype,
+        )
+        conditioned = self.output_norm(
+            action_hidden + geometry_context.to(action_hidden.dtype).unsqueeze(1)
+        )
+        cap = self.max_abs.to(
+            device=candidate_action.device, dtype=candidate_action.dtype
+        )
+        residual = torch.tanh(self.output_projection(conditioned)) * cap
+        residual = residual * route_confidence.unsqueeze(-1)
+        if action_is_pad is not None:
+            residual = residual.masked_fill(action_is_pad.bool().unsqueeze(-1), 0.0)
+        action = candidate_action + residual
+        metrics = {
+            "pgc_v917_geometry_action_residual_rms": (
+                residual.float().square().mean().sqrt()
+            ),
+            "pgc_v917_geometry_action_residual_max_abs": residual.float().abs().max(),
+            "pgc_v917_geometry_route_confidence": route_confidence.float().mean(),
+            "pgc_v917_geometry_eef_position_norm": (
+                eef_position[:, 0].float().norm(dim=-1).mean()
+            ),
+            "pgc_v917_geometry_goal_relative_norm": (
+                goal_relative.float().norm(dim=-1).mean()
+            ),
+        }
+        return action, residual, metrics
+
+
 class PairwiseActionAdvantageVerifier(nn.Module):
     """FP32 temporal verifier that predicts CF advantage over Base directly."""
 

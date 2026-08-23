@@ -34,6 +34,7 @@ from .policy_guard import (
     LanguageVisualTargetBinder,
     PairwiseActionAdvantageVerifier,
     PhaseConditionedERAFActionBridge,
+    PhaseConditionedERAFGeometryActionAdapter,
     RolloutAlignedActionProposal,
     SpatialObjectTokenTargetBinder,
     detached_policy_guard_metrics,
@@ -688,6 +689,15 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_action_causal_margin = float(
             eraf_config.get("action_causal_margin", 0.01)
         )
+        self.policy_guard_eraf_action_geometry_hidden_dim = int(
+            eraf_config.get("action_geometry_hidden_dim", 256)
+        )
+        self.policy_guard_eraf_action_geometry_learning_rate = float(
+            eraf_config.get("action_geometry_learning_rate", 2.0e-5)
+        )
+        self.policy_guard_eraf_action_geometry_residual_max_abs = float(
+            eraf_config.get("action_geometry_residual_max_abs", 0.25)
+        )
         self.policy_guard_eraf_grounding_objective_version = int(
             eraf_config.get("grounding_objective_version", 1)
         )
@@ -1206,6 +1216,12 @@ class FastWAM(torch.nn.Module):
         self._policy_guard_last_eraf_diagnostics: Optional[
             dict[str, torch.Tensor]
         ] = None
+        # Ephemeral inference-only tensors used by the V9.17 direct geometry
+        # route and causal audit. They are never serialized or returned by the
+        # ordinary rollout API.
+        self._policy_guard_last_eraf_outputs: Optional[
+            dict[str, torch.Tensor]
+        ] = None
 
         if self.policy_guard_enabled:
             if self.policy_guard_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
@@ -1317,10 +1333,11 @@ class FastWAM(torch.nn.Module):
                     14,
                     15,
                     16,
+                    17,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "between 1 and 16 inclusive."
+                        "between 1 and 17 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1435,9 +1452,14 @@ class FastWAM(torch.nn.Module):
                 if min(
                     self.policy_guard_eraf_action_grounding_hidden_dim,
                     self.policy_guard_eraf_action_grounding_num_heads,
+                    self.policy_guard_eraf_action_geometry_hidden_dim,
                 ) <= 0:
                     raise ValueError(
                         "PGC V9.15 action-grounding dimensions must be positive."
+                    )
+                if self.policy_guard_eraf_action_geometry_residual_max_abs <= 0:
+                    raise ValueError(
+                        "PGC V9.17 geometry-action residual bound must be positive."
                     )
                 if (
                     self.policy_guard_eraf_action_grounding_hidden_dim
@@ -1873,6 +1895,28 @@ class FastWAM(torch.nn.Module):
                                     self.policy_guard_eraf_action_grounding_num_heads
                                 ),
                                 max_clauses=self.policy_guard_eraf_max_clauses,
+                            )
+                        if (
+                            self.policy_guard_eraf_grounding_objective_version
+                            >= 17
+                        ):
+                            if self.proprio_dim is None:
+                                raise ValueError(
+                                    "PGC V9.17 direct geometry-action routing "
+                                    "requires proprio_dim."
+                                )
+                            self.policy_guard_modules[
+                                "eraf_geometry_action_adapter"
+                            ] = PhaseConditionedERAFGeometryActionAdapter(
+                                action_dim=int(policy_action_expert.action_dim),
+                                proprio_dim=int(self.proprio_dim),
+                                hidden_dim=(
+                                    self.policy_guard_eraf_action_geometry_hidden_dim
+                                ),
+                                max_clauses=self.policy_guard_eraf_max_clauses,
+                                max_abs=(
+                                    self.policy_guard_eraf_action_geometry_residual_max_abs
+                                ),
                             )
                     if self.policy_guard_version in {6, 7}:
                         binder_kwargs = {
@@ -2333,6 +2377,18 @@ class FastWAM(torch.nn.Module):
                         elif self.policy_guard_eraf_training_stage == "action":
                             if (
                                 self.policy_guard_eraf_grounding_objective_version
+                                >= 17
+                            ):
+                                # V9.17 preserves the validated ERAF, Proposal,
+                                # and V9.16 semantic bridge and trains only the
+                                # short EEF-relative geometry-to-action path.
+                                geometry_adapter = self.policy_guard_modules[
+                                    "eraf_geometry_action_adapter"
+                                ]
+                                geometry_adapter.train()
+                                geometry_adapter.requires_grad_(True)
+                            elif (
+                                self.policy_guard_eraf_grounding_objective_version
                                 >= 16
                             ):
                                 # V9.16 is a narrowly scoped semantic calibration:
@@ -2528,6 +2584,13 @@ class FastWAM(torch.nn.Module):
                 (
                     "eraf_action_grounding_bridge",
                     self.policy_guard_eraf_action_grounding_learning_rate,
+                )
+            )
+        if "eraf_geometry_action_adapter" in self.policy_guard_modules:
+            optimizer_modules.append(
+                (
+                    "eraf_geometry_action_adapter",
+                    self.policy_guard_eraf_action_geometry_learning_rate,
                 )
             )
         for module_name, learning_rate in optimizer_modules:
@@ -3142,6 +3205,7 @@ class FastWAM(torch.nn.Module):
             }
         )
         if not torch.is_grad_enabled():
+            self._policy_guard_last_eraf_outputs = dict(eraf_outputs)
             diagnostic_names = (
                 "active_logits",
                 "predicate_logits",
@@ -5456,6 +5520,7 @@ class FastWAM(torch.nn.Module):
         target_labels: Optional[Mapping[str, torch.Tensor]] = None,
         source_labels: Optional[Mapping[str, torch.Tensor]] = None,
         reference_subject_fallback: bool = False,
+        anchor_mirror_fallback: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Build one isolated same-state ERAF intervention for V9.15+.
 
@@ -5469,6 +5534,42 @@ class FastWAM(torch.nn.Module):
             "reference": ("reference_token", "reference_position"),
             "anchor": ("goal_anchor", "interaction_anchor"),
         }
+        if kind == "anchor" and anchor_mirror_fallback:
+            reference_position = target_outputs.get("reference_position")
+            if reference_position is None:
+                raise ValueError(
+                    "V9.17 anchor intervention requires reference_position."
+                )
+            for name in source_fields["anchor"]:
+                target_value = target_outputs[name]
+                source_value = source_outputs[name]
+                if not (
+                    target_value.shape
+                    == source_value.shape
+                    == reference_position.shape
+                ):
+                    raise ValueError(
+                        f"V9.17 anchor intervention shape mismatch for {name}."
+                    )
+                source_changed = (
+                    source_value.float() - target_value.float()
+                ).norm(dim=-1, keepdim=True) > 1.0e-4
+                mirrored = 2.0 * reference_position - target_value
+                mirror_changed = (
+                    mirrored.float() - target_value.float()
+                ).norm(dim=-1, keepdim=True) > 1.0e-4
+                offset = target_value.new_tensor((0.25, -0.25, 0.125))
+                fallback = torch.where(
+                    mirror_changed,
+                    mirrored,
+                    target_value + offset,
+                ).clamp(-1.0, 1.0)
+                negative[name] = torch.where(
+                    source_changed,
+                    source_value,
+                    fallback,
+                )
+            return negative
         if kind == "reference" and reference_subject_fallback:
             if target_labels is None or source_labels is None:
                 raise ValueError(
@@ -5549,6 +5650,8 @@ class FastWAM(torch.nn.Module):
             "predicate_truth_logits",
             "phase_logits",
             "clause_execution_probability",
+            "subject_visibility_logits",
+            "reference_visibility_logits",
         )
         for name in clause_fields:
             value = target_outputs.get(name)
@@ -5644,10 +5747,14 @@ class FastWAM(torch.nn.Module):
             reference_eligible = reference_changed.any(dim=-1)
         anchor_valid = (
             target_labels["goal_anchor_valid"].bool()
-            & source_labels["goal_anchor_valid"].bool()
             & clause_valid
-            & source_labels["clause_valid"].bool()
         )
+        if self.policy_guard_eraf_grounding_objective_version < 17:
+            anchor_valid = (
+                anchor_valid
+                & source_labels["goal_anchor_valid"].bool()
+                & source_labels["clause_valid"].bool()
+            )
         anchor_changed = (
             target_labels["goal_anchors"].float()
             - source_labels["goal_anchors"].float()
@@ -5655,7 +5762,12 @@ class FastWAM(torch.nn.Module):
         eligibility = {
             "subject": shared_valid & subject_changed.any(dim=-1),
             "reference": shared_valid & reference_eligible,
-            "anchor": shared_valid & (anchor_valid & anchor_changed).any(dim=-1),
+            "anchor": shared_valid
+            & (
+                anchor_valid.any(dim=-1)
+                if self.policy_guard_eraf_grounding_objective_version >= 17
+                else (anchor_valid & anchor_changed).any(dim=-1)
+            ),
             "clause": shared_valid & (clause_valid.sum(dim=-1) > 1),
         }
 
@@ -6136,6 +6248,46 @@ class FastWAM(torch.nn.Module):
                 action_is_pad=action_is_pad,
             )
         )
+        if (
+            self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 17
+        ):
+            proprio_current = inputs.get("proprio_current")
+            if proprio_current is None:
+                raise ValueError(
+                    "PGC V9.17 action training requires proprio_current."
+                )
+            geometry_adapter = self.policy_guard_modules[
+                "eraf_geometry_action_adapter"
+            ]
+            (
+                proposal_action,
+                geometry_residual,
+                geometry_metrics,
+            ) = geometry_adapter(
+                candidate_action=proposal_action,
+                eraf_outputs=eraf_outputs,
+                proprio=proprio_current,
+                action_is_pad=action_is_pad,
+            )
+            (
+                source_proposal_action,
+                source_geometry_residual,
+                source_geometry_metrics,
+            ) = geometry_adapter(
+                candidate_action=source_proposal_action,
+                eraf_outputs=source_eraf_outputs,
+                proprio=proprio_current,
+                action_is_pad=action_is_pad,
+            )
+            residual = residual + geometry_residual
+            source_residual = source_residual + source_geometry_residual
+            proposal_metrics = dict(proposal_metrics)
+            proposal_metrics.update(geometry_metrics)
+            for metric_name, metric_value in source_geometry_metrics.items():
+                source_proposal_metrics[
+                    f"source_{metric_name}"
+                ] = metric_value
         v915_negative_actions: dict[str, torch.Tensor] = {}
         if (
             self.policy_guard_version == 9
@@ -6169,6 +6321,10 @@ class FastWAM(torch.nn.Module):
                             self.policy_guard_eraf_grounding_objective_version
                             >= 16
                         ),
+                        anchor_mirror_fallback=(
+                            self.policy_guard_eraf_grounding_objective_version
+                            >= 17
+                        ),
                     )
                 )
                 negative_queries, _ = action_grounding_bridge(
@@ -6180,6 +6336,15 @@ class FastWAM(torch.nn.Module):
                     goal_queries=negative_queries,
                     action_is_pad=action_is_pad,
                 )
+                if self.policy_guard_eraf_grounding_objective_version >= 17:
+                    negative_action, _, _ = self.policy_guard_modules[
+                        "eraf_geometry_action_adapter"
+                    ](
+                        candidate_action=negative_action,
+                        eraf_outputs=negative_eraf_outputs,
+                        proprio=inputs["proprio_current"],
+                        action_is_pad=action_is_pad,
+                    )
                 v915_negative_actions[negative_kind] = negative_action
         wrong_entity_candidate_action = None
         wrong_relation_candidate_action = None
@@ -10016,10 +10181,12 @@ class FastWAM(torch.nn.Module):
                 torch.Tensor,
                 torch.Tensor,
                 Optional[dict[str, torch.Tensor]],
+                Optional[dict[str, torch.Tensor]],
             ],
         ] = {}
         if self.policy_guard_enabled and self.policy_guard_version == 9:
             self._policy_guard_last_eraf_diagnostics = None
+            self._policy_guard_last_eraf_outputs = None
         if self.policy_guard_enabled:
             if final_video_hidden is None:
                 raise RuntimeError("PGC inference requires final Video hidden tokens.")
@@ -10045,6 +10212,7 @@ class FastWAM(torch.nn.Module):
             )].detach()
             if policy_guard_eraf_audit_variants is not None:
                 learned_diagnostics = self._policy_guard_last_eraf_diagnostics
+                learned_eraf_outputs = self._policy_guard_last_eraf_outputs
                 for raw_name, oracle_variant in (
                     policy_guard_eraf_audit_variants.items()
                 ):
@@ -10057,6 +10225,7 @@ class FastWAM(torch.nn.Module):
                         variant_queries = policy_guard_goal_queries
                         variant_embedding = policy_guard_goal_embedding
                         variant_diagnostics = learned_diagnostics
+                        variant_eraf_outputs = learned_eraf_outputs
                     else:
                         (
                             variant_queries,
@@ -10078,14 +10247,17 @@ class FastWAM(torch.nn.Module):
                         variant_diagnostics = (
                             self._policy_guard_last_eraf_diagnostics
                         )
+                        variant_eraf_outputs = self._policy_guard_last_eraf_outputs
                     policy_guard_eraf_audit_goals[name] = (
                         variant_queries,
                         variant_embedding,
                         variant_diagnostics,
+                        variant_eraf_outputs,
                     )
                 # The deployed result and recurrent completion state must remain
                 # those of the learned ERAF path, independent of audit order.
                 self._policy_guard_last_eraf_diagnostics = learned_diagnostics
+                self._policy_guard_last_eraf_outputs = learned_eraf_outputs
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -10161,6 +10333,31 @@ class FastWAM(torch.nn.Module):
                 goal_queries=policy_guard_goal_queries,
                 action_is_pad=None,
             )
+            if (
+                self.policy_guard_version == 9
+                and self.policy_guard_eraf_grounding_objective_version >= 17
+            ):
+                if self._policy_guard_last_eraf_outputs is None or proprio is None:
+                    raise RuntimeError(
+                        "PGC V9.17 inference requires live ERAF outputs and proprio."
+                    )
+                (
+                    policy_guard_latents_action,
+                    geometry_residual,
+                    geometry_metrics,
+                ) = self.policy_guard_modules[
+                    "eraf_geometry_action_adapter"
+                ](
+                    candidate_action=policy_guard_latents_action,
+                    eraf_outputs=self._policy_guard_last_eraf_outputs,
+                    proprio=proprio,
+                    action_is_pad=None,
+                )
+                action_residual = action_residual + geometry_residual
+                policy_guard_proposal_metrics = dict(
+                    policy_guard_proposal_metrics
+                )
+                policy_guard_proposal_metrics.update(geometry_metrics)
             verifier = self.policy_guard_modules["verifier"]
             verifier_horizon = (
                 min(
@@ -10247,6 +10444,18 @@ class FastWAM(torch.nn.Module):
                     .to(device="cpu", dtype=torch.float32)
                 ),
             }
+            for metric_name in (
+                "pgc_v917_geometry_action_residual_rms",
+                "pgc_v917_geometry_action_residual_max_abs",
+                "pgc_v917_geometry_route_confidence",
+                "pgc_v917_geometry_eef_position_norm",
+                "pgc_v917_geometry_goal_relative_norm",
+            ):
+                metric_value = policy_guard_proposal_metrics.get(metric_name)
+                if metric_value is not None:
+                    result[metric_name] = float(
+                        metric_value.detach().float().item()
+                    )
             if policy_guard_eraf_audit_goals:
                 learned_queries = policy_guard_goal_queries
                 learned_embedding = policy_guard_goal_embedding
@@ -10255,6 +10464,7 @@ class FastWAM(torch.nn.Module):
                     variant_queries,
                     variant_embedding,
                     _,
+                    variant_eraf_outputs,
                 ) in policy_guard_eraf_audit_goals.items():
                     if (
                         name == "learned"
@@ -10275,6 +10485,33 @@ class FastWAM(torch.nn.Module):
                             goal_queries=variant_queries,
                             action_is_pad=None,
                         )
+                        if (
+                            self.policy_guard_version == 9
+                            and self.policy_guard_eraf_grounding_objective_version
+                            >= 17
+                        ):
+                            if variant_eraf_outputs is None or proprio is None:
+                                raise RuntimeError(
+                                    "PGC V9.17 causal variants require ERAF outputs "
+                                    "and proprio."
+                                )
+                            (
+                                variant_action,
+                                variant_geometry_residual,
+                                variant_geometry_metrics,
+                            ) = self.policy_guard_modules[
+                                "eraf_geometry_action_adapter"
+                            ](
+                                candidate_action=variant_action,
+                                eraf_outputs=variant_eraf_outputs,
+                                proprio=proprio,
+                                action_is_pad=None,
+                            )
+                            variant_residual = (
+                                variant_residual + variant_geometry_residual
+                            )
+                            variant_metrics = dict(variant_metrics)
+                            variant_metrics.update(variant_geometry_metrics)
                     causal_variants[name] = {
                         # Retained only for the explicit causal-audit API.  The
                         # standalone audit replays the small Proposal with this
@@ -10637,9 +10874,13 @@ class FastWAM(torch.nn.Module):
             if objective_version >= 14:
                 eraf_role_adapter_trainable_scope = (
                     (
-                        "semantic_causal_action_grounding_bridge_only"
-                        if objective_version >= 16
-                        else "frozen_eraf_perception_action_bridge_plus_proposal"
+                        "phase_conditioned_relative_geometry_action_adapter_only"
+                        if objective_version >= 17
+                        else (
+                            "semantic_causal_action_grounding_bridge_only"
+                            if objective_version >= 16
+                            else "frozen_eraf_perception_action_bridge_plus_proposal"
+                        )
                     )
                     if self.policy_guard_eraf_action_joint_training
                     else "phase_safe_temporal_clause_memory_only"
@@ -11263,14 +11504,19 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_action_joint_contract": (
                 (
-                    "frozen_eraf_perception_proposal_and_legacy_bridge_plus_"
-                    "semantic_causal_action_grounding_bridge"
-                    if self.policy_guard_eraf_grounding_objective_version >= 16
+                    "frozen_eraf_v916_bridge_and_proposal_plus_direct_"
+                    "eef_relative_geometry_action_adapter"
+                    if self.policy_guard_eraf_grounding_objective_version >= 17
                     else (
-                        "frozen_eraf_perception_plus_phase_conditioned_geometry_"
-                        "bridge_legacy_bridge_and_proposal"
-                        if self.policy_guard_eraf_grounding_objective_version >= 15
-                        else "frozen_eraf_perception_plus_action_bridge_and_proposal"
+                        "frozen_eraf_perception_proposal_and_legacy_bridge_plus_"
+                        "semantic_causal_action_grounding_bridge"
+                        if self.policy_guard_eraf_grounding_objective_version >= 16
+                        else (
+                            "frozen_eraf_perception_plus_phase_conditioned_geometry_"
+                            "bridge_legacy_bridge_and_proposal"
+                            if self.policy_guard_eraf_grounding_objective_version >= 15
+                            else "frozen_eraf_perception_plus_action_bridge_and_proposal"
+                        )
                     )
                 )
                 if is_v9 and self.policy_guard_eraf_action_joint_training
@@ -11278,14 +11524,18 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_action_trainable_scope": (
                 (
-                    "semantic_causal_action_grounding_bridge_only"
-                    if self.policy_guard_eraf_grounding_objective_version >= 16
+                    "phase_conditioned_relative_geometry_action_adapter_only"
+                    if self.policy_guard_eraf_grounding_objective_version >= 17
                     else (
-                        "phase_conditioned_subject_reference_anchor_action_bridge_"
-                        "plus_legacy_bridge_and_action_chunk_proposal"
-                        if self.policy_guard_eraf_grounding_objective_version >= 15
-                        else "base_query_projection_relation_attention_query_"
-                        "embedding_delta_plus_action_chunk_proposal"
+                        "semantic_causal_action_grounding_bridge_only"
+                        if self.policy_guard_eraf_grounding_objective_version >= 16
+                        else (
+                            "phase_conditioned_subject_reference_anchor_action_bridge_"
+                            "plus_legacy_bridge_and_action_chunk_proposal"
+                            if self.policy_guard_eraf_grounding_objective_version >= 15
+                            else "base_query_projection_relation_attention_query_"
+                            "embedding_delta_plus_action_chunk_proposal"
+                        )
                     )
                 )
                 if is_v9 and self.policy_guard_eraf_action_joint_training
@@ -11333,6 +11583,37 @@ class FastWAM(torch.nn.Module):
                 "reference_fallback_plus_clause_swap"
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 16
+                else None
+            ),
+            "eraf_action_geometry_contract": (
+                "phase_selected_eef_relative_grasp_goal_interaction_relation_"
+                "direct_bounded_action_residual_zero_init_v9_16_exact"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 17
+                else None
+            ),
+            "eraf_action_geometry_hidden_dim": (
+                self.policy_guard_eraf_action_geometry_hidden_dim
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 17
+                else None
+            ),
+            "eraf_action_geometry_learning_rate": (
+                self.policy_guard_eraf_action_geometry_learning_rate
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 17
+                else None
+            ),
+            "eraf_action_geometry_residual_max_abs": (
+                self.policy_guard_eraf_action_geometry_residual_max_abs
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 17
+                else None
+            ),
+            "eraf_action_anchor_negative_contract": (
+                "same_state_source_anchor_or_reference_mirror_with_offset_fallback"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 17
                 else None
             ),
             "eraf_hard_role_curriculum": (
@@ -12296,6 +12577,18 @@ class FastWAM(torch.nn.Module):
             and bool(metadata.get("eraf_action_joint_training", False))
             and self.policy_guard_eraf_action_joint_training
         )
+        migrate_v916_to_v917_direct_geometry = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 16
+            and self.policy_guard_eraf_grounding_objective_version == 17
+            and self.policy_guard_eraf_training_stage == "action"
+            and metadata.get("eraf_training_stage") == "action"
+            and saved_eraf_completion_only_memory
+            and self.policy_guard_eraf_completion_only_memory
+            and bool(metadata.get("eraf_action_joint_training", False))
+            and self.policy_guard_eraf_action_joint_training
+        )
         if migrate_v914_to_v915_action_grounding:
             expected_v914_warm_start = {
                 "eraf_action_joint_contract": (
@@ -12342,6 +12635,30 @@ class FastWAM(torch.nn.Module):
                 if metadata.get(name) != expected:
                     raise ValueError(
                         "PGC V9.16 requires an exact completed V9.15 action "
+                        f"checkpoint: {name}={metadata.get(name)!r}, "
+                        f"expected={expected!r}."
+                    )
+        if migrate_v916_to_v917_direct_geometry:
+            expected_v916_warm_start = {
+                "eraf_action_joint_contract": (
+                    "frozen_eraf_perception_proposal_and_legacy_bridge_plus_"
+                    "semantic_causal_action_grounding_bridge"
+                ),
+                "eraf_action_trainable_scope": (
+                    "semantic_causal_action_grounding_bridge_only"
+                ),
+                "eraf_role_adapter_trainable_scope": (
+                    "semantic_causal_action_grounding_bridge_only"
+                ),
+                "eraf_policy_state_contract": (
+                    "monotonic_completed_bitset_no_pending_holding_retry_"
+                    "recurrence"
+                ),
+            }
+            for name, expected in expected_v916_warm_start.items():
+                if metadata.get(name) != expected:
+                    raise ValueError(
+                        "PGC V9.17 requires an exact completed V9.16 action "
                         f"checkpoint: {name}={metadata.get(name)!r}, "
                         f"expected={expected!r}."
                     )
@@ -13145,6 +13462,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 16
                             )
+                            or (
+                                saved_grounding_objective == 16
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 17
+                            )
                         )
                         objective_upgrade = objective_upgrade and (
                             (
@@ -13154,6 +13476,7 @@ class FastWAM(torch.nn.Module):
                             )
                             or migrate_v914_to_v915_action_grounding
                             or migrate_v915_to_v916_semantic_causal
+                            or migrate_v916_to_v917_direct_geometry
                         )
                         if (
                             saved_grounding_objective
@@ -13202,6 +13525,40 @@ class FastWAM(torch.nn.Module):
                                     "PGC V9.16 checkpoint lacks its audited "
                                     "semantic-negative contract."
                                 )
+                            if saved_grounding_objective >= 17:
+                                expected_v917 = {
+                                    "eraf_action_geometry_contract": (
+                                        "phase_selected_eef_relative_grasp_goal_"
+                                        "interaction_relation_direct_bounded_action_"
+                                        "residual_zero_init_v9_16_exact"
+                                    ),
+                                    "eraf_action_geometry_hidden_dim": (
+                                        self.policy_guard_eraf_action_geometry_hidden_dim
+                                    ),
+                                    "eraf_action_geometry_residual_max_abs": (
+                                        self.policy_guard_eraf_action_geometry_residual_max_abs
+                                    ),
+                                    "eraf_action_anchor_negative_contract": (
+                                        "same_state_source_anchor_or_reference_mirror_"
+                                        "with_offset_fallback"
+                                    ),
+                                }
+                                for name, expected in expected_v917.items():
+                                    value = metadata.get(name)
+                                    if isinstance(expected, float):
+                                        matches = math.isclose(
+                                            float(value), expected,
+                                            rel_tol=0.0,
+                                            abs_tol=1.0e-9,
+                                        )
+                                    else:
+                                        matches = value == expected
+                                    if not matches:
+                                        raise ValueError(
+                                            "PGC V9.17 geometry-action checkpoint "
+                                            f"mismatch: {name}={value!r}, "
+                                            f"expected={expected!r}."
+                                        )
                         # V9.13 intentionally freezes the complete V9.11 ERAF
                         # geometry and disables every legacy grounding loss.
                         # Those loss weights are training-time hyperparameters,
@@ -13289,21 +13646,30 @@ class FastWAM(torch.nn.Module):
                                     metadata.get("eraf_training_stage") == "action"
                                 )
                                 expected_scope = (
-                                    "semantic_causal_action_grounding_bridge_only"
+                                    "phase_conditioned_relative_geometry_action_"
+                                    "adapter_only"
                                     if (
-                                        saved_grounding_objective >= 16
+                                        saved_grounding_objective >= 17
                                         and saved_action_joint_training
                                         and saved_action_stage
                                     )
                                     else (
-                                        "frozen_eraf_perception_action_bridge_"
-                                        "plus_proposal"
+                                        "semantic_causal_action_grounding_bridge_only"
                                         if (
-                                            saved_action_joint_training
+                                            saved_grounding_objective >= 16
+                                            and saved_action_joint_training
                                             and saved_action_stage
                                         )
                                         else (
-                                            "phase_safe_temporal_clause_memory_only"
+                                            "frozen_eraf_perception_action_bridge_"
+                                            "plus_proposal"
+                                            if (
+                                                saved_action_joint_training
+                                                and saved_action_stage
+                                            )
+                                            else (
+                                                "phase_safe_temporal_clause_memory_only"
+                                            )
                                         )
                                     )
                                 )
@@ -13850,30 +14216,40 @@ class FastWAM(torch.nn.Module):
                                         "completion-only memory contract."
                                     )
                                 expected_action_joint_contract = (
-                                    "frozen_eraf_perception_proposal_and_legacy_"
-                                    "bridge_plus_semantic_causal_action_"
-                                    "grounding_bridge"
-                                    if saved_grounding_objective >= 16
+                                    "frozen_eraf_v916_bridge_and_proposal_plus_"
+                                    "direct_eef_relative_geometry_action_adapter"
+                                    if saved_grounding_objective >= 17
                                     else (
-                                        "frozen_eraf_perception_plus_phase_"
-                                        "conditioned_geometry_bridge_legacy_bridge_"
-                                        "and_proposal"
-                                        if saved_grounding_objective >= 15
-                                        else "frozen_eraf_perception_plus_action_"
-                                        "bridge_and_proposal"
+                                        "frozen_eraf_perception_proposal_and_legacy_"
+                                        "bridge_plus_semantic_causal_action_"
+                                        "grounding_bridge"
+                                        if saved_grounding_objective >= 16
+                                        else (
+                                            "frozen_eraf_perception_plus_phase_"
+                                            "conditioned_geometry_bridge_legacy_bridge_"
+                                            "and_proposal"
+                                            if saved_grounding_objective >= 15
+                                            else "frozen_eraf_perception_plus_action_"
+                                            "bridge_and_proposal"
+                                        )
                                     )
                                 )
                                 expected_action_trainable_scope = (
-                                    "semantic_causal_action_grounding_bridge_only"
-                                    if saved_grounding_objective >= 16
+                                    "phase_conditioned_relative_geometry_action_"
+                                    "adapter_only"
+                                    if saved_grounding_objective >= 17
                                     else (
-                                        "phase_conditioned_subject_reference_anchor_"
-                                        "action_bridge_plus_legacy_bridge_and_action_"
-                                        "chunk_proposal"
-                                        if saved_grounding_objective >= 15
-                                        else "base_query_projection_relation_"
-                                        "attention_query_embedding_delta_plus_action_"
-                                        "chunk_proposal"
+                                        "semantic_causal_action_grounding_bridge_only"
+                                        if saved_grounding_objective >= 16
+                                        else (
+                                            "phase_conditioned_subject_reference_anchor_"
+                                            "action_bridge_plus_legacy_bridge_and_action_"
+                                            "chunk_proposal"
+                                            if saved_grounding_objective >= 15
+                                            else "base_query_projection_relation_"
+                                            "attention_query_embedding_delta_plus_action_"
+                                            "chunk_proposal"
+                                        )
                                     )
                                 )
                                 expected_v914_contract = {
@@ -13886,10 +14262,15 @@ class FastWAM(torch.nn.Module):
                                         expected_action_trainable_scope
                                     ),
                                     "eraf_role_adapter_trainable_scope": (
-                                        "semantic_causal_action_grounding_bridge_only"
-                                        if saved_grounding_objective >= 16
-                                        else "frozen_eraf_perception_action_bridge_"
-                                        "plus_proposal"
+                                        "phase_conditioned_relative_geometry_action_"
+                                        "adapter_only"
+                                        if saved_grounding_objective >= 17
+                                        else (
+                                            "semantic_causal_action_grounding_bridge_only"
+                                            if saved_grounding_objective >= 16
+                                            else "frozen_eraf_perception_action_bridge_"
+                                            "plus_proposal"
+                                        )
                                     ),
                                 }
                                 for name, expected in expected_v914_contract.items():
@@ -14023,6 +14404,7 @@ class FastWAM(torch.nn.Module):
                 or migrate_v9_to_phase_rebinding
                 or migrate_v9_to_phase_safe_memory
                 or migrate_v914_to_v915_action_grounding
+                or migrate_v916_to_v917_direct_geometry
             )
             incompatible = self.policy_guard_modules.load_state_dict(
                 guard_state, strict=not migrate_with_new_modules
@@ -14183,6 +14565,19 @@ class FastWAM(torch.nn.Module):
                         f"incompatible sidecars: missing={missing}, "
                         f"unexpected={unexpected}."
                     )
+            elif migrate_v916_to_v917_direct_geometry:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                allowed_prefix = "eraf_geometry_action_adapter."
+                disallowed_missing = [
+                    key for key in missing if not key.startswith(allowed_prefix)
+                ]
+                if disallowed_missing or unexpected or not missing:
+                    raise ValueError(
+                        "PGC V9.16 -> V9.17 direct geometry-action warm start "
+                        f"has incompatible sidecars: missing={missing}, "
+                        f"unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -14206,6 +14601,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v9_to_phase_safe_memory
                 and not migrate_v914_to_v915_action_grounding
                 and not migrate_v915_to_v916_semantic_causal
+                and not migrate_v916_to_v917_direct_geometry
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -14332,6 +14728,16 @@ class FastWAM(torch.nn.Module):
                     path,
                     resolved_base,
                     len(guard_state),
+                )
+            elif migrate_v916_to_v917_direct_geometry:
+                logger.info(
+                    "Warm-started PGC v9.17 direct geometry-action adapter from "
+                    "exact V9.16 action sidecars at %s (base=%s restored=%d "
+                    "new_geometry_tensors=%d).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
+                    len(incompatible.missing_keys),
                 )
             else:
                 logger.info(
