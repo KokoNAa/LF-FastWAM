@@ -323,6 +323,26 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             "entity_relation_grounding.action_phase_direction_weight=", source
         )
 
+    def test_v920_launcher_inherits_frozen_grounding_and_v919_eef_contract(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("action-waypoint", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=20", source)
+        self.assertIn("START_STEP=16250", source)
+        self.assertIn(
+            '"${GROUNDING_OBJECTIVE_VERSION}" == "19" || '
+            '"${GROUNDING_OBJECTIVE_VERSION}" == "20"',
+            source,
+        )
+        frozen_contract = source[
+            source.index('if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14"') :
+            source.index("if ! [[ \"${NPROC_PER_NODE}\"")
+        ]
+        self.assertIn('"${GROUNDING_OBJECTIVE_VERSION}" == "20"', frozen_contract)
+        self.assertIn("ATTENTION_MASK_WEIGHT=0.0", frozen_contract)
+        self.assertIn("ROLE_SWAP_WEIGHT=0.0", frozen_contract)
+
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (
             REPO_ROOT / "scripts/summarize_pgc_v9_shadow_audit.py"

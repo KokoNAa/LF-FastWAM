@@ -640,8 +640,8 @@ case "${ABLATION}" in
     exit 1
     ;;
 esac
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14" || "${GROUNDING_OBJECTIVE_VERSION}" == "15" || "${GROUNDING_OBJECTIVE_VERSION}" == "16" || "${GROUNDING_OBJECTIVE_VERSION}" == "17" || "${GROUNDING_OBJECTIVE_VERSION}" == "18" || "${GROUNDING_OBJECTIVE_VERSION}" == "19" ]]; then
-  # V9.13+ freeze the validated V9.11 perception/grounding losses. V9.15-19
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14" || "${GROUNDING_OBJECTIVE_VERSION}" == "15" || "${GROUNDING_OBJECTIVE_VERSION}" == "16" || "${GROUNDING_OBJECTIVE_VERSION}" == "17" || "${GROUNDING_OBJECTIVE_VERSION}" == "18" || "${GROUNDING_OBJECTIVE_VERSION}" == "19" || "${GROUNDING_OBJECTIVE_VERSION}" == "20" ]]; then
+  # V9.13+ freeze the validated V9.11 perception/grounding losses. V9.15-20
   # inherit V9.14's exact zero-loss contract while calibrating action paths.
   MASK_WEIGHT=0.0
   ATTENTION_MASK_WEIGHT=0.0
@@ -716,7 +716,7 @@ fi
 
 ACTION_EEF_SCALE="[1.0,1.0,1.0]"
 ACTION_EEF_BIAS="[0.0,0.0,0.0]"
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "19" ]]; then
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "19" || "${GROUNDING_OBJECTIVE_VERSION}" == "20" ]]; then
   EEF_AFFINE="$(${PYTHON_BIN} - "${STATS_PATH}" "${NATIVE_SIDECAR}/index.json" <<'PY'
 import json
 import sys
@@ -728,7 +728,7 @@ field = state_stats.get("default")
 if field is None:
     if len(state_stats) != 1:
         raise SystemExit(
-            "V9.19 cannot identify the canonical proprio state statistics."
+            "V9.19+ cannot identify the canonical proprio state statistics."
         )
     field = next(iter(state_stats.values()))
 state_min = [float(value) for value in field["global_min"][:3]]
