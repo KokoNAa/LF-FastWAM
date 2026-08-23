@@ -3954,6 +3954,90 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 1.0,
             )
 
+    def test_v916_reference_negative_uses_same_state_subject_fallback(self):
+        target_outputs = self._v915_bridge_outputs(batch_size=1)
+        source_outputs = self._v915_bridge_outputs(batch_size=1)
+        target_outputs["reference_token"].fill_(1.0)
+        target_outputs["reference_position"].fill_(1.0)
+        target_outputs["subject_token"].fill_(2.0)
+        target_outputs["subject_position"].fill_(2.0)
+        source_outputs["reference_token"].fill_(3.0)
+        source_outputs["reference_position"].fill_(3.0)
+        clause_valid = torch.tensor([[True, True, False, False]])
+        target_labels = {
+            "clause_valid": clause_valid,
+            "subject_entity_ids": torch.tensor([[1, 2, -1, -1]]),
+            "reference_entity_ids": torch.tensor([[9, 9, -1, -1]]),
+        }
+        source_labels = {
+            "clause_valid": clause_valid,
+            "subject_entity_ids": torch.tensor([[4, 5, -1, -1]]),
+            # The source shares the same container, so using its mask/pose is
+            # not a genuine wrong-reference intervention.
+            "reference_entity_ids": torch.tensor([[9, 9, -1, -1]]),
+        }
+        negative = FastWAM._policy_guard_v915_negative_eraf_outputs(
+            target_outputs=target_outputs,
+            source_outputs=source_outputs,
+            kind="reference",
+            target_labels=target_labels,
+            source_labels=source_labels,
+            reference_subject_fallback=True,
+        )
+        torch.testing.assert_close(
+            negative["reference_token"][:, :2],
+            target_outputs["subject_token"][:, :2],
+        )
+        torch.testing.assert_close(
+            negative["reference_position"][:, :2],
+            target_outputs["subject_position"][:, :2],
+        )
+        torch.testing.assert_close(
+            negative["reference_token"][:, 2:],
+            target_outputs["reference_token"][:, 2:],
+        )
+
+    def test_v916_reference_fallback_is_causally_eligible(self):
+        model = tiny_pgc_fastwam(
+            version=9,
+            v9_stage="action",
+            v9_grounding_objective_version=16,
+            v9_completion_only_memory=True,
+            v9_action_joint_training=True,
+        )
+        clause_valid = torch.tensor([[True, False, False, False]])
+        target_labels = {
+            "clause_valid": clause_valid,
+            "subject_entity_ids": torch.tensor([[1, -1, -1, -1]]),
+            "reference_entity_ids": torch.tensor([[9, -1, -1, -1]]),
+            "goal_anchor_valid": clause_valid,
+            "goal_anchors": torch.zeros(1, 4, 3),
+        }
+        source_labels = {
+            "clause_valid": clause_valid,
+            "subject_entity_ids": torch.tensor([[2, -1, -1, -1]]),
+            "reference_entity_ids": torch.tensor([[9, -1, -1, -1]]),
+            "goal_anchor_valid": clause_valid,
+            "goal_anchors": torch.zeros(1, 4, 3),
+        }
+        correct = torch.zeros(1, 4, 7)
+        loss, metrics = model._compute_policy_guard_v915_causal_action_loss(
+            correct_action=correct,
+            negative_actions={"reference": torch.ones_like(correct)},
+            target_action=correct,
+            action_is_pad=None,
+            target_labels=target_labels,
+            source_labels=source_labels,
+            is_counterfactual=torch.ones(1, dtype=torch.bool),
+            direct_action_valid=torch.ones(1, dtype=torch.bool),
+            paired_language_valid=torch.ones(1, dtype=torch.bool),
+        )
+        self.assertEqual(float(loss), 0.0)
+        self.assertEqual(float(metrics["pgc_v915_reference_eligible_rate"]), 1.0)
+        self.assertEqual(
+            float(metrics["pgc_v916_reference_subject_fallback_rate"]), 1.0
+        )
+
     def test_v914_to_v915_action_grounding_upgrade_contract(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -4034,6 +4118,88 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                     torch.equal(
                         value, restored.policy_guard_modules.state_dict()[name]
                     ),
+                    name,
+                )
+
+    def test_v915_to_v916_semantic_causal_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v915_path = root / "v915.pt"
+            v916_path = root / "v916.pt"
+            v915 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=15,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v915.mot.state_dict()},
+                base_path,
+            )
+            v915.load_checkpoint(base_path)
+            v915.policy_guard_modules[
+                "eraf_action_grounding_bridge"
+            ].query_delta_projection.weight.data.normal_(std=0.01)
+            v915.save_checkpoint(v915_path, step=13250)
+
+            v916 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=16,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v916.load_checkpoint(v915_path)
+            for name, value in v915.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(value, v916.policy_guard_modules.state_dict()[name]),
+                    name,
+                )
+            v916.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v916.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules.eraf_action_grounding_bridge."
+                    )
+                    for name in trainable
+                )
+            )
+            groups = v916.policy_guard_optimizer_groups(2.0e-5)
+            self.assertEqual(
+                [group["pgc_v9_group"] for group in groups],
+                ["eraf_action_grounding_bridge"],
+            )
+            v916.save_checkpoint(v916_path, step=13750)
+            payload = torch.load(v916_path, map_location="cpu", weights_only=False)
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "semantic_causal_action_grounding_bridge_only",
+            )
+            self.assertEqual(
+                metadata["eraf_action_semantic_negative_contract"],
+                "joint_valid_entity_id_swap_with_same_state_subject_as_"
+                "reference_fallback_plus_clause_swap",
+            )
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=16,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            restored.load_checkpoint(v916_path)
+            for name, value in v916.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(value, restored.policy_guard_modules.state_dict()[name]),
                     name,
                 )
 

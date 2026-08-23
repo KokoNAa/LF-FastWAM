@@ -27,6 +27,8 @@ if str(PROJECT_ROOT) not in sys.path:
 ORACLE_FIELDS = (
     "clause_valid",
     "predicate_ids",
+    "subject_entity_ids",
+    "reference_entity_ids",
     "subject_masks",
     "reference_masks",
     "subject_mask_valid",
@@ -42,12 +44,14 @@ ORACLE_FIELDS = (
     "phase_valid",
 )
 SUBJECT_FIELDS = (
+    "subject_entity_ids",
     "subject_masks",
     "subject_mask_valid",
     "subject_positions",
     "subject_position_valid",
 )
 REFERENCE_FIELDS = (
+    "reference_entity_ids",
     "reference_masks",
     "reference_mask_valid",
     "reference_positions",
@@ -86,14 +90,63 @@ def build_causal_variants(
 ) -> tuple[dict[str, Mapping[str, Any] | None], dict[str, bool]]:
     target = oracle_from_sample(sample)
     source = oracle_from_sample(sample, source=True)
+    target_clause_valid = _as_numpy(target["clause_valid"]).astype(bool)
+    source_clause_valid = _as_numpy(source["clause_valid"]).astype(bool)
+    jointly_valid = target_clause_valid & source_clause_valid
+    target_subject_ids = _as_numpy(target["subject_entity_ids"]).astype(np.int64)
+    target_reference_ids = _as_numpy(target["reference_entity_ids"]).astype(np.int64)
+    source_subject_ids = _as_numpy(source["subject_entity_ids"]).astype(np.int64)
+    source_reference_ids = _as_numpy(source["reference_entity_ids"]).astype(np.int64)
+    genuine_subject_swap = (
+        jointly_valid
+        & (target_subject_ids >= 0)
+        & (source_subject_ids >= 0)
+        & (target_subject_ids != source_subject_ids)
+    )
+    genuine_reference_swap = (
+        jointly_valid
+        & (target_reference_ids >= 0)
+        & (source_reference_ids >= 0)
+        & (target_reference_ids != source_reference_ids)
+    )
+    # Strict-conflict pairs often share one container/fixture, so there is no
+    # source reference to swap.  In that case the target subject is a
+    # same-state, visually present, semantically invalid reference.  This is
+    # the exact fallback used by V9.16 training and avoids treating ordinary
+    # mask/pose drift as an entity intervention.
+    reference_subject_fallback = (
+        target_clause_valid
+        & ~genuine_reference_swap
+        & (target_subject_ids >= 0)
+        & (target_reference_ids >= 0)
+        & (target_subject_ids != target_reference_ids)
+    )
+
     wrong_subject = {name: _copy_value(value) for name, value in target.items()}
     for name in SUBJECT_FIELDS:
-        wrong_subject[name] = _copy_value(source[name])
+        value = _as_numpy(target[name]).copy()
+        source_value = _as_numpy(source[name])
+        value[genuine_subject_swap] = source_value[genuine_subject_swap]
+        wrong_subject[name] = value
     wrong_reference = {
         name: _copy_value(value) for name, value in target.items()
     }
+    subject_to_reference = {
+        "reference_entity_ids": "subject_entity_ids",
+        "reference_masks": "subject_masks",
+        "reference_mask_valid": "subject_mask_valid",
+        "reference_positions": "subject_positions",
+        "reference_position_valid": "subject_position_valid",
+    }
     for name in REFERENCE_FIELDS:
-        wrong_reference[name] = _copy_value(source[name])
+        value = _as_numpy(target[name]).copy()
+        source_value = _as_numpy(source[name])
+        subject_value = _as_numpy(target[subject_to_reference[name]])
+        value[genuine_reference_swap] = source_value[genuine_reference_swap]
+        value[reference_subject_fallback] = subject_value[
+            reference_subject_fallback
+        ]
+        wrong_reference[name] = value
     wrong_goal_anchor = {
         name: _copy_value(value) for name, value in target.items()
     }
@@ -122,8 +175,10 @@ def build_causal_variants(
         )
 
     eligibility = {
-        "wrong_subject": changed(SUBJECT_FIELDS, wrong_subject),
-        "wrong_reference": changed(REFERENCE_FIELDS, wrong_reference),
+        "wrong_subject": bool(genuine_subject_swap.any()),
+        "wrong_reference": bool(
+            genuine_reference_swap.any() or reference_subject_fallback.any()
+        ),
         "wrong_goal_anchor": changed(GOAL_ANCHOR_FIELDS, wrong_goal_anchor),
         "clause_swap": clause_swap_eligible,
     }
@@ -292,8 +347,13 @@ def compute_causal_report(
     reference_directional = effects["wrong_reference_vs_oracle"][
         "right_is_better_rate"
     ]
+    semantic_coverage = bool(
+        effects["wrong_subject_vs_oracle"]["eligible_samples"] > 0
+        and effects["wrong_reference_vs_oracle"]["eligible_samples"] > 0
+    )
     semantic_ordering = bool(
-        subject_directional is not None
+        semantic_coverage
+        and subject_directional is not None
         and reference_directional is not None
         and subject_directional >= minimum_directional_rate
         and reference_directional >= minimum_directional_rate
@@ -323,6 +383,12 @@ def compute_causal_report(
             "Reduce Proposal saturation and restore a nonzero expert-loss "
             "Jacobian with respect to ERAF-routed goal queries."
         )
+    elif not semantic_coverage:
+        diagnosis = "eraf_semantic_intervention_coverage_missing"
+        recommendation = (
+            "Audit true entity-ID swaps or the documented same-state subject-as-"
+            "reference fallback before judging Proposal semantic directionality."
+        )
     elif not semantic_ordering:
         diagnosis = "eraf_semantics_not_directionally_used_by_proposal"
         recommendation = (
@@ -343,7 +409,7 @@ def compute_causal_report(
         )
 
     return {
-        "format": "pgc_v9_eraf_action_causal_audit_v1",
+        "format": "pgc_v9_eraf_action_causal_audit_v2",
         "samples": len(records),
         "action_integrity": {
             "single_base_diffusion_per_sample": True,
@@ -361,6 +427,7 @@ def compute_causal_report(
             "oracle_expert_loss_has_nonzero_query_gradient": locally_connected,
             "goal_anchor_changes_action": anchor_connected,
             "oracle_improves_expert_alignment": oracle_alignment,
+            "semantic_intervention_coverage": semantic_coverage,
             "wrong_semantics_are_worse_than_oracle": semantic_ordering,
         },
         "thresholds": {

@@ -18,6 +18,8 @@ def _sample():
         values = {
             "clause_valid": clause_valid,
             "predicate_ids": np.array([1 + offset, 2, 0, 0]),
+            "subject_entity_ids": np.array([10 + offset, 11 + offset, -1, -1]),
+            "reference_entity_ids": np.array([20 + offset, 21 + offset, -1, -1]),
             "subject_masks": np.full((4, 8, 16), offset, dtype=np.float32),
             "reference_masks": np.full((4, 8, 16), offset + 1, dtype=np.float32),
             "subject_mask_valid": clause_valid,
@@ -55,8 +57,8 @@ class PGCV9CausalAuditTest(unittest.TestCase):
         )
         self.assertTrue(all(eligible.values()))
         np.testing.assert_array_equal(
-            variants["wrong_subject"]["subject_positions"],
-            sample["pgc_eraf_source_subject_positions"],
+            variants["wrong_subject"]["subject_positions"][:2],
+            sample["pgc_eraf_source_subject_positions"][:2],
         )
         np.testing.assert_array_equal(
             variants["wrong_subject"]["reference_positions"],
@@ -65,6 +67,28 @@ class PGCV9CausalAuditTest(unittest.TestCase):
         self.assertEqual(variants["clause_swap"]["predicate_ids"][:2].tolist(), [2, 1])
         self.assertIsNone(variants["learned"])
         self.assertTrue(variants["bypass"]["_audit_bypass_bridge"])
+
+    def test_entity_ids_not_mask_drift_define_semantic_eligibility(self):
+        sample = _sample()
+        sample["pgc_eraf_source_subject_entity_ids"] = sample[
+            "pgc_eraf_subject_entity_ids"
+        ].copy()
+        sample["pgc_eraf_source_reference_entity_ids"] = sample[
+            "pgc_eraf_reference_entity_ids"
+        ].copy()
+        variants, eligible = build_causal_variants(sample)
+        self.assertFalse(eligible["wrong_subject"])
+        # Shared-reference tasks still receive the documented same-state
+        # subject-as-reference negative, never a mask-drift pseudo swap.
+        self.assertTrue(eligible["wrong_reference"])
+        np.testing.assert_array_equal(
+            variants["wrong_subject"]["subject_masks"],
+            sample["pgc_eraf_subject_masks"],
+        )
+        np.testing.assert_array_equal(
+            variants["wrong_reference"]["reference_entity_ids"][:2],
+            sample["pgc_eraf_subject_entity_ids"][:2],
+        )
 
     def test_report_distinguishes_bridge_response_and_alignment(self):
         records = []

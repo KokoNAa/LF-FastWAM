@@ -266,6 +266,24 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         )
         self.assertIn("migrate_pgc_eraf_workspace.py", source)
 
+    def test_v916_launcher_calibrates_only_semantic_causal_bridge(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("action-semantic-causal", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=16", source)
+        self.assertIn("START_STEP=13250", source)
+        self.assertIn("DEFAULT_STAGE_STEPS=500", source)
+        self.assertIn(
+            "V9.16 must warm-start from the completed V9.15", source
+        )
+        self.assertIn(
+            'PGC_V9_ACTION_GROUNDING_LEARNING_RATE:-2.0e-5', source
+        )
+        self.assertIn(
+            'PGC_V9_ACTION_CAUSAL_RANKING_WEIGHT:-2.0', source
+        )
+
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (
             REPO_ROOT / "scripts/summarize_pgc_v9_shadow_audit.py"
