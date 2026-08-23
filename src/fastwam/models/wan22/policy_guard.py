@@ -2129,11 +2129,11 @@ class PhaseCompatibleERAFWaypointAdapter(nn.Module):
         tangent = raw_tangent - (
             raw_tangent * anchor_step
         ).sum(dim=-1, keepdim=True) * anchor_step
-        tangent_norm = tangent.norm(dim=-1, keepdim=True)
-        tangent = tangent * (
-            self.tangent_max_ratio
-            * torch.tanh(tangent_norm)
-            / tangent_norm.clamp_min(1.0e-6)
+        # Smooth vector-norm saturation. Unlike tanh(||t||) * t / ||t|| with
+        # an epsilon clamp, this map has Jacobian tangent_max_ratio * I at the
+        # zero-init point, so the local-waypoint head can actually leave zero.
+        tangent = self.tangent_max_ratio * tangent / torch.sqrt(
+            1.0 + tangent.square().sum(dim=-1, keepdim=True)
         )
         local_direction = F.normalize(
             anchor_step + tangent, dim=-1, eps=1.0e-6

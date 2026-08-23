@@ -1052,6 +1052,27 @@ class PGCERAFModuleTest(unittest.TestCase):
         (action - target).square().mean().backward()
         self.assertGreater(float(adapter.gain_head.bias.grad.abs().item()), 0.0)
 
+        adapter.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            adapter.compatibility_head.bias.fill_(20.0)
+            adapter.gain_head.bias.fill_(0.1)
+            adapter.tangent_head.bias.zero_()
+        tangent_action, _, _ = adapter(
+            candidate_action=torch.zeros_like(candidate),
+            legacy_residual=torch.zeros_like(legacy),
+            inherited_servo_residual=torch.zeros_like(legacy),
+            desired_direction=direction,
+            control_phase=torch.tensor([0, 1]),
+            route_confidence=torch.tensor([0.9, 0.8]),
+        )
+        orthogonal_target = torch.zeros_like(tangent_action)
+        orthogonal_target[0, :, 1] = 0.1
+        orthogonal_target[1, :, 0] = 0.1
+        (tangent_action - orthogonal_target).square().mean().backward()
+        self.assertGreater(
+            float(adapter.tangent_head.bias.grad.norm().item()), 0.0
+        )
+
         with torch.no_grad():
             adapter.gain_head.bias.fill_(0.1)
             adapter.tangent_head.bias.copy_(torch.tensor([0.0, 0.2, 0.1]))
