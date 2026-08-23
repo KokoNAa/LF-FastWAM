@@ -2435,11 +2435,20 @@ class GoalActionAlignmentLoss(nn.Module):
 def detached_policy_guard_metrics(
     metrics: dict[str, Any]
 ) -> dict[str, float]:
-    return {
-        name: (
-            float(value.detach().float().cpu().item())
-            if isinstance(value, torch.Tensor)
-            else float(value)
-        )
-        for name, value in metrics.items()
-    }
+    """Detach scalar training metrics without consuming audit tensors.
+
+    Proposal modules may return per-sample routing decisions alongside scalar
+    summaries.  Those tensors are useful to causal audits and rollout traces,
+    but they are not valid trainer log values.  Keep them in the proposal
+    output while omitting them from the scalar loss dictionary.
+    """
+
+    detached: dict[str, float] = {}
+    for name, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                continue
+            detached[name] = float(value.detach().float().cpu().item())
+        else:
+            detached[name] = float(value)
+    return detached

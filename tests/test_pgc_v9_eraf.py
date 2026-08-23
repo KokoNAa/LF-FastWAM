@@ -55,6 +55,7 @@ from fastwam.models.wan22.policy_guard import (
     HardRoutedERAFPhaseServo,
     PhaseConditionedERAFActionBridge,
     PhaseConditionedERAFGeometryActionAdapter,
+    detached_policy_guard_metrics,
     infer_spatial_patch_grid,
 )
 import scripts.build_pgc_libero_entity_relations as eraf_builder
@@ -948,6 +949,17 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
 
 
 class PGCERAFModuleTest(unittest.TestCase):
+    def test_training_metric_detach_preserves_only_scalar_diagnostics(self):
+        metrics = detached_policy_guard_metrics(
+            {
+                "scalar_tensor": torch.tensor(2.5),
+                "python_scalar": 3,
+                "selected_clause": torch.tensor([0, 1, 2]),
+                "desired_direction": torch.zeros(3, 3),
+            }
+        )
+        self.assertEqual(metrics, {"scalar_tensor": 2.5, "python_scalar": 3.0})
+
     def test_v919_hard_route_is_zero_init_exact_and_clause_directional(self):
         servo = HardRoutedERAFPhaseServo(
             action_dim=7,
