@@ -3880,6 +3880,27 @@ class PGCERAFIntegrationTest(unittest.TestCase):
         )
         self.assertFalse(torch.equal(learned, swapped))
 
+    def test_v915_action_grounding_accepts_fp32_geometry_with_bfloat16_model(self):
+        bridge = PhaseConditionedERAFActionBridge(
+            goal_dim=8,
+            eraf_hidden_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            max_clauses=4,
+        ).to(dtype=torch.bfloat16)
+        queries = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+        outputs = self._v915_bridge_outputs()
+        for name in ("subject_token", "reference_token", "relation_hidden"):
+            outputs[name] = outputs[name].to(torch.bfloat16)
+        routed, metrics = bridge(goal_queries=queries, eraf_outputs=outputs)
+        self.assertEqual(routed.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(routed, queries))
+        self.assertTrue(
+            torch.isfinite(
+                metrics["pgc_v915_action_grounding_goal_anchor_norm"]
+            )
+        )
+
     def test_v915_causal_ranking_prefers_correct_action(self):
         model = tiny_pgc_fastwam(
             version=9,

@@ -1307,21 +1307,21 @@ class PhaseConditionedERAFActionBridge(nn.Module):
                 self._coordinate_features(grasp_anchor),
             ),
             dim=-1,
-        )
+        ).to(subject.dtype)
         reference_geometry = torch.cat(
             (
                 self._coordinate_features(reference_position),
                 self._coordinate_features(goal_anchor),
             ),
             dim=-1,
-        )
+        ).to(subject.dtype)
         relation_geometry = torch.cat(
             (
                 self._coordinate_features(interaction_anchor),
                 self._coordinate_features(displacement),
             ),
             dim=-1,
-        )
+        ).to(subject.dtype)
         phase_probability = torch.softmax(
             eraf_outputs["phase_logits"].float(), dim=-1
         ).to(subject.dtype)
