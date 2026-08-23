@@ -565,9 +565,10 @@ case "${ABLATION}" in
     exit 1
     ;;
 esac
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14" ]]; then
-  # V9.13 learns temporal clause state/routing only. Every V9.11 geometry and
-  # semantic head remains frozen and receives no auxiliary optimization loss.
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14" || "${GROUNDING_OBJECTIVE_VERSION}" == "15" ]]; then
+  # V9.13+ freeze the validated V9.11 perception/grounding losses. V9.15
+  # inherits V9.14's exact zero-loss contract while training only its action
+  # bridges and Proposal.
   MASK_WEIGHT=0.0
   ATTENTION_MASK_WEIGHT=0.0
   ENTITY_WEIGHT=0.0

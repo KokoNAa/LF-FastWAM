@@ -243,6 +243,11 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=15", source)
         self.assertIn("START_STEP=11250", source)
         self.assertIn(
+            'GROUNDING_OBJECTIVE_VERSION}" == "14" || '
+            '"${GROUNDING_OBJECTIVE_VERSION}" == "15"',
+            source,
+        )
+        self.assertIn(
             "V9.15 must warm-start from the completed V9.14", source
         )
         self.assertIn(
