@@ -234,6 +234,26 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             "action_joint_training=",
             source,
         )
+
+    def test_v915_launcher_warm_starts_v914_and_enables_causal_geometry(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("action-geometry-causal", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=15", source)
+        self.assertIn("START_STEP=11250", source)
+        self.assertIn(
+            "V9.15 must warm-start from the completed V9.14", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_grounding_learning_rate=", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_causal_ranking_weight=", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_causal_margin=", source
+        )
         self.assertIn("grounding_aux:${GROUNDING_AUX_WEIGHT}", source)
         self.assertIn(
             "ERAF workspace mismatch detected before distributed launch",

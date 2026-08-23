@@ -50,7 +50,10 @@ from fastwam.models.wan22.entity_relation_affordance import (
     _structured_all_entity_assignment_loss,
     entity_relation_affordance_loss,
 )
-from fastwam.models.wan22.policy_guard import infer_spatial_patch_grid
+from fastwam.models.wan22.policy_guard import (
+    PhaseConditionedERAFActionBridge,
+    infer_spatial_patch_grid,
+)
 import scripts.build_pgc_libero_entity_relations as eraf_builder
 import scripts.build_pgc_v912_closed_loop_grounding_data as v912_builder
 from scripts.build_pgc_libero_entity_relations import (
@@ -3822,6 +3825,196 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 v9_grounding_objective_version=14,
                 v9_action_joint_training=True,
             )
+
+    @staticmethod
+    def _v915_bridge_outputs(batch_size=2, clauses=4, hidden_dim=8):
+        return {
+            "active_logits": torch.tensor(
+                [[4.0, 4.0, -4.0, -4.0]]
+            ).expand(batch_size, -1).clone(),
+            "subject_token": torch.randn(batch_size, clauses, hidden_dim),
+            "reference_token": torch.randn(batch_size, clauses, hidden_dim),
+            "relation_hidden": torch.randn(batch_size, clauses, hidden_dim),
+            "subject_position": torch.randn(batch_size, clauses, 3) * 0.1,
+            "reference_position": torch.randn(batch_size, clauses, 3) * 0.1,
+            "grasp_anchor": torch.randn(batch_size, clauses, 3) * 0.1,
+            "goal_anchor": torch.randn(batch_size, clauses, 3) * 0.1,
+            "interaction_anchor": torch.randn(batch_size, clauses, 3) * 0.1,
+            "predicate_truth_logits": torch.randn(batch_size, clauses),
+            "phase_logits": torch.randn(batch_size, clauses, 3),
+            "clause_execution_probability": torch.softmax(
+                torch.randn(batch_size, clauses), dim=-1
+            ),
+        }
+
+    def test_v915_action_grounding_is_zero_init_and_anchor_connected(self):
+        bridge = PhaseConditionedERAFActionBridge(
+            goal_dim=8,
+            eraf_hidden_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            max_clauses=4,
+        )
+        queries = torch.randn(2, 3, 8)
+        outputs = self._v915_bridge_outputs()
+        initial, metrics = bridge(goal_queries=queries, eraf_outputs=outputs)
+        self.assertTrue(torch.equal(initial, queries))
+        self.assertEqual(
+            float(metrics["pgc_v915_action_grounding_query_delta_rms"]), 0.0
+        )
+        bridge.query_delta_projection.weight.data.normal_(std=0.1)
+        learned, _ = bridge(goal_queries=queries, eraf_outputs=outputs)
+        changed_outputs = dict(outputs)
+        changed_outputs["goal_anchor"] = outputs["goal_anchor"] + 0.25
+        changed, _ = bridge(
+            goal_queries=queries, eraf_outputs=changed_outputs
+        )
+        self.assertFalse(torch.equal(learned, changed))
+        swapped_outputs = dict(outputs)
+        swap = torch.tensor([1, 0, 2, 3])
+        for name, value in outputs.items():
+            if value.ndim >= 2 and value.shape[1] == 4:
+                swapped_outputs[name] = value.index_select(1, swap)
+        swapped, _ = bridge(
+            goal_queries=queries, eraf_outputs=swapped_outputs
+        )
+        self.assertFalse(torch.equal(learned, swapped))
+
+    def test_v915_causal_ranking_prefers_correct_action(self):
+        model = tiny_pgc_fastwam(
+            version=9,
+            v9_stage="action",
+            v9_grounding_objective_version=15,
+            v9_completion_only_memory=True,
+            v9_action_joint_training=True,
+        )
+        batch = 2
+        correct = torch.zeros(batch, 4, 7)
+        target = torch.zeros_like(correct)
+        negative = torch.full_like(correct, 0.5)
+        clause_valid = torch.tensor(
+            [[True, True, False, False], [True, True, False, False]]
+        )
+        target_labels = {
+            "clause_valid": clause_valid,
+            "subject_entity_ids": torch.tensor([[1, 2, -1, -1]] * batch),
+            "reference_entity_ids": torch.tensor([[3, 4, -1, -1]] * batch),
+            "goal_anchor_valid": clause_valid,
+            "goal_anchor": torch.zeros(batch, 4, 3),
+        }
+        source_labels = {
+            "clause_valid": clause_valid,
+            "subject_entity_ids": torch.tensor([[5, 6, -1, -1]] * batch),
+            "reference_entity_ids": torch.tensor([[7, 8, -1, -1]] * batch),
+            "goal_anchor_valid": clause_valid,
+            "goal_anchor": torch.ones(batch, 4, 3),
+        }
+        loss, metrics = model._compute_policy_guard_v915_causal_action_loss(
+            correct_action=correct,
+            negative_actions={
+                kind: negative
+                for kind in ("subject", "reference", "anchor", "clause")
+            },
+            target_action=target,
+            action_is_pad=None,
+            target_labels=target_labels,
+            source_labels=source_labels,
+            is_counterfactual=torch.ones(batch, dtype=torch.bool),
+            direct_action_valid=torch.ones(batch, dtype=torch.bool),
+            paired_language_valid=torch.ones(batch, dtype=torch.bool),
+        )
+        self.assertEqual(float(loss), 0.0)
+        self.assertEqual(
+            float(metrics["pgc_v915_action_causal_active_kinds"]), 4.0
+        )
+        for kind in ("subject", "reference", "anchor", "clause"):
+            self.assertEqual(
+                float(metrics[f"pgc_v915_{kind}_correct_action_win_rate"]),
+                1.0,
+            )
+
+    def test_v914_to_v915_action_grounding_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v914_path = root / "v914.pt"
+            v915_path = root / "v915.pt"
+            v914 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=14,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v914.mot.state_dict()},
+                base_path,
+            )
+            v914.load_checkpoint(base_path)
+            v914.save_checkpoint(v914_path, step=11250)
+
+            v915 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=15,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v915.load_checkpoint(v914_path)
+            bridge = v915.policy_guard_modules["eraf_action_grounding_bridge"]
+            self.assertTrue(
+                torch.equal(
+                    bridge.query_delta_projection.weight,
+                    torch.zeros_like(bridge.query_delta_projection.weight),
+                )
+            )
+            for name, value in v914.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(value, v915.policy_guard_modules.state_dict()[name]),
+                    name,
+                )
+            v915.prepare_trainable_parameters()
+            trainable_modules = {
+                name.split(".")[1]
+                for name, parameter in v915.named_parameters()
+                if parameter.requires_grad
+                and name.startswith("policy_guard_modules.")
+            }
+            self.assertEqual(
+                trainable_modules,
+                {
+                    "entity_relation_affordance",
+                    "action_chunk_proposal",
+                    "eraf_action_grounding_bridge",
+                },
+            )
+            rates = {
+                group["pgc_v9_group"]: group["lr"]
+                for group in v915.policy_guard_optimizer_groups(5.0e-5)
+            }
+            self.assertEqual(rates["eraf_action_grounding_bridge"], 1.0e-4)
+            v915.save_checkpoint(v915_path, step=13250)
+            payload = torch.load(v915_path, map_location="cpu", weights_only=False)
+            self.assertEqual(
+                payload["architecture_metadata"]["eraf_action_grounding_contract"],
+                "separate_subject_reference_relation_grasp_goal_interaction_"
+                "displacement_tokens_zero_init_v9_14_exact",
+            )
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=15,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            restored.load_checkpoint(v915_path)
+            for name, value in v915.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(
+                        value, restored.policy_guard_modules.state_dict()[name]
+                    ),
+                    name,
+                )
 
     def test_v913_to_v914_checkpoint_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -272,7 +272,7 @@ class Wan22Trainer:
                         "PGC V9.13 grounding requires the audited four-way "
                         "phase-safe memory curriculum."
                     )
-                valid_phase_safe_stage = objective_version == 14 and (
+                valid_phase_safe_stage = objective_version >= 14 and (
                     training_stage == "grounding"
                     or (
                         training_stage == "action"
@@ -283,17 +283,17 @@ class Wan22Trainer:
                 if phase_safe_memory and not valid_phase_safe_stage:
                     raise ValueError(
                         "PGC phase-memory data is valid only for objective-v14 "
-                        "V9.13 grounding or V9.14 completion-only joint action "
-                        "training."
+                        "V9.13 grounding or objective-v14+ completion-only "
+                        "joint action training."
                     )
                 if (
-                    objective_version == 14
+                    objective_version >= 14
                     and training_stage == "action"
                     and action_joint_training
                     and not phase_safe_memory
                 ):
                     raise ValueError(
-                        "PGC V9.14 joint action training requires the audited "
+                        "PGC V9.14+ joint action training requires the audited "
                         "four-way phase-memory curriculum."
                     )
 

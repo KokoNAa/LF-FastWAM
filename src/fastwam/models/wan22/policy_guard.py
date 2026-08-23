@@ -12,7 +12,7 @@ pairwise advantage verifier before any override of the exact Base candidate.
 from __future__ import annotations
 
 import math
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -1167,6 +1167,234 @@ class RolloutAlignedActionProposal(nn.Module):
             "pgc_v4_action_residual_cap_mean": cap.float().mean(),
         }
         return proposal, residual, metrics
+
+
+class PhaseConditionedERAFActionBridge(nn.Module):
+    """Route explicit, phase-conditioned ERAF geometry into Proposal queries.
+
+    Subject, reference, and relation evidence remain distinct, and grasp,
+    goal, interaction, and displacement geometry have direct paths.  The final
+    projection is zero initialized, making a new V9.15 bridge exactly V9.14.
+    """
+
+    ROLE_COUNT = 3
+
+    def __init__(
+        self,
+        *,
+        goal_dim: int,
+        eraf_hidden_dim: int,
+        hidden_dim: int = 256,
+        num_heads: int = 8,
+        max_clauses: int = 4,
+    ):
+        super().__init__()
+        if min(
+            goal_dim, eraf_hidden_dim, hidden_dim, num_heads, max_clauses
+        ) <= 0:
+            raise ValueError("V9.15 action-grounding dimensions must be positive.")
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                "V9.15 action-grounding hidden_dim must be divisible by "
+                "num_heads."
+            )
+        self.goal_dim = int(goal_dim)
+        self.eraf_hidden_dim = int(eraf_hidden_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.max_clauses = int(max_clauses)
+        coordinate_dim = 3 * 5
+        self.subject_projection = nn.Sequential(
+            nn.LayerNorm(eraf_hidden_dim),
+            nn.Linear(eraf_hidden_dim, hidden_dim),
+        )
+        self.reference_projection = nn.Sequential(
+            nn.LayerNorm(eraf_hidden_dim),
+            nn.Linear(eraf_hidden_dim, hidden_dim),
+        )
+        self.relation_projection = nn.Sequential(
+            nn.LayerNorm(eraf_hidden_dim),
+            nn.Linear(eraf_hidden_dim, hidden_dim),
+        )
+        self.grasp_geometry_projection = nn.Linear(
+            coordinate_dim * 2, hidden_dim
+        )
+        self.goal_geometry_projection = nn.Linear(
+            coordinate_dim * 2, hidden_dim
+        )
+        self.relation_geometry_projection = nn.Linear(
+            coordinate_dim * 2, hidden_dim
+        )
+        self.phase_projection = nn.Linear(3, hidden_dim, bias=False)
+        self.truth_projection = nn.Linear(1, hidden_dim, bias=False)
+        self.role_embedding = nn.Parameter(
+            torch.empty(self.ROLE_COUNT, hidden_dim)
+        )
+        nn.init.normal_(self.role_embedding, std=hidden_dim**-0.5)
+        self.clause_embedding = nn.Parameter(
+            torch.empty(max_clauses, hidden_dim)
+        )
+        nn.init.normal_(self.clause_embedding, std=hidden_dim**-0.5)
+        self.query_projection = nn.Sequential(
+            nn.LayerNorm(goal_dim),
+            nn.Linear(goal_dim, hidden_dim),
+        )
+        self.role_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True
+        )
+        self.query_delta_projection = nn.Linear(hidden_dim, goal_dim)
+        nn.init.zeros_(self.query_delta_projection.weight)
+        nn.init.zeros_(self.query_delta_projection.bias)
+
+    @staticmethod
+    def _coordinate_features(coordinates: torch.Tensor) -> torch.Tensor:
+        value = coordinates.float().clamp(-2.0, 2.0)
+        features = [value]
+        for frequency in (1.0, 2.0):
+            angle = math.pi * frequency * value
+            features.extend((angle.sin(), angle.cos()))
+        return torch.cat(features, dim=-1).to(coordinates.dtype)
+
+    def forward(
+        self,
+        *,
+        goal_queries: torch.Tensor,
+        eraf_outputs: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        required = {
+            "active_logits",
+            "subject_token",
+            "reference_token",
+            "subject_position",
+            "reference_position",
+            "grasp_anchor",
+            "goal_anchor",
+            "interaction_anchor",
+            "relation_hidden",
+            "predicate_truth_logits",
+            "phase_logits",
+            "clause_execution_probability",
+        }
+        missing = sorted(required - set(eraf_outputs))
+        if missing:
+            raise ValueError(
+                f"V9.15 action grounding is missing ERAF outputs: {missing}."
+            )
+        if goal_queries.ndim != 3 or goal_queries.shape[-1] != self.goal_dim:
+            raise ValueError("V9.15 goal queries must be [B,K,goal_dim].")
+        subject = eraf_outputs["subject_token"]
+        reference = eraf_outputs["reference_token"]
+        relation = eraf_outputs["relation_hidden"]
+        if subject.shape != reference.shape or subject.shape != relation.shape:
+            raise ValueError("V9.15 ERAF role tokens must have identical shapes.")
+        if subject.ndim != 3 or subject.shape[-1] != self.eraf_hidden_dim:
+            raise ValueError("V9.15 ERAF role token dimensions are invalid.")
+        if subject.shape[1] != self.max_clauses:
+            raise ValueError(
+                "V9.15 ERAF clause count does not match the configured maximum."
+            )
+        if subject.shape[0] != goal_queries.shape[0]:
+            raise ValueError("V9.15 ERAF and goal-query batches must match.")
+
+        subject_position = eraf_outputs["subject_position"]
+        reference_position = eraf_outputs["reference_position"]
+        grasp_anchor = eraf_outputs["grasp_anchor"]
+        goal_anchor = eraf_outputs["goal_anchor"]
+        interaction_anchor = eraf_outputs["interaction_anchor"]
+        displacement = goal_anchor.float() - grasp_anchor.float()
+        subject_geometry = torch.cat(
+            (
+                self._coordinate_features(subject_position),
+                self._coordinate_features(grasp_anchor),
+            ),
+            dim=-1,
+        )
+        reference_geometry = torch.cat(
+            (
+                self._coordinate_features(reference_position),
+                self._coordinate_features(goal_anchor),
+            ),
+            dim=-1,
+        )
+        relation_geometry = torch.cat(
+            (
+                self._coordinate_features(interaction_anchor),
+                self._coordinate_features(displacement),
+            ),
+            dim=-1,
+        )
+        phase_probability = torch.softmax(
+            eraf_outputs["phase_logits"].float(), dim=-1
+        ).to(subject.dtype)
+        phase = self.phase_projection(phase_probability)
+        truth = self.truth_projection(
+            torch.sigmoid(eraf_outputs["predicate_truth_logits"].float())
+            .to(subject.dtype)
+            .unsqueeze(-1)
+        )
+        tokens = torch.stack(
+            (
+                self.subject_projection(subject)
+                + self.grasp_geometry_projection(subject_geometry)
+                + self.role_embedding[0],
+                self.reference_projection(reference)
+                + self.goal_geometry_projection(reference_geometry)
+                + self.role_embedding[1],
+                self.relation_projection(relation)
+                + self.relation_geometry_projection(relation_geometry)
+                + truth
+                + self.role_embedding[2],
+            ),
+            dim=2,
+        )
+        tokens = (
+            tokens
+            + phase.unsqueeze(2)
+            + self.clause_embedding[None, :, None, :]
+        )
+        routing = eraf_outputs["clause_execution_probability"].float()
+        if routing.shape != subject.shape[:2]:
+            raise ValueError("V9.15 clause routing shape is invalid.")
+        active = torch.sigmoid(eraf_outputs["active_logits"].float())
+        routing = routing * active
+        no_route = routing.sum(dim=-1, keepdim=True) <= 1.0e-6
+        fallback = torch.softmax(eraf_outputs["active_logits"].float(), dim=-1)
+        routing = torch.where(no_route, fallback, routing)
+        tokens = tokens * routing.to(tokens.dtype).unsqueeze(-1).unsqueeze(-1)
+        tokens = tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])
+        valid_clause = active > 0.5
+        valid_token = valid_clause.unsqueeze(-1).expand(
+            -1, -1, self.ROLE_COUNT
+        ).reshape(valid_clause.shape[0], -1)
+        safe_tokens, key_padding_mask = _safe_key_padding_mask(
+            tokens, valid_token
+        )
+        query_delta, attention = self.role_attention(
+            query=self.query_projection(goal_queries),
+            key=safe_tokens,
+            value=safe_tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=True,
+        )
+        projected_delta = self.query_delta_projection(query_delta).to(
+            goal_queries.dtype
+        )
+        routed_queries = goal_queries + projected_delta
+        probabilities = attention.float().clamp_min(1.0e-8)
+        entropy = -(probabilities * probabilities.log()).sum(dim=-1)
+        entropy = entropy / math.log(max(2, probabilities.shape[-1]))
+        metrics = {
+            "pgc_v915_action_grounding_query_delta_rms": (
+                projected_delta.float().square().mean().sqrt()
+            ),
+            "pgc_v915_action_grounding_attention_entropy": entropy.mean(),
+            "pgc_v915_action_grounding_goal_anchor_norm": (
+                goal_anchor.float().norm(dim=-1).mean()
+            ),
+            "pgc_v915_action_grounding_displacement_norm": (
+                displacement.float().norm(dim=-1).mean()
+            ),
+        }
+        return routed_queries, metrics
 
 
 class PairwiseActionAdvantageVerifier(nn.Module):

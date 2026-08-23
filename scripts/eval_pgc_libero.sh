@@ -255,7 +255,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 15)):
+    if objective not in set(range(1, 16)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -322,17 +322,38 @@ if version == 9:
         != "exact_v9_11_geometry"
     ):
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
+    expected_action_joint_contract = (
+        "frozen_eraf_perception_plus_phase_conditioned_geometry_bridge_"
+        "legacy_bridge_and_proposal"
+        if objective >= 15
+        else "frozen_eraf_perception_plus_action_bridge_and_proposal"
+    )
+    expected_action_trainable_scope = (
+        "phase_conditioned_subject_reference_anchor_action_bridge_plus_"
+        "legacy_bridge_and_action_chunk_proposal"
+        if objective >= 15
+        else "base_query_projection_relation_attention_query_embedding_"
+        "delta_plus_action_chunk_proposal"
+    )
+    if objective >= 15 and (
+        metadata.get("eraf_action_grounding_contract")
+        != "separate_subject_reference_relation_grasp_goal_interaction_"
+        "displacement_tokens_zero_init_v9_14_exact"
+    ):
+        raise SystemExit(
+            "PGC v9.15 checkpoint lacks its explicit action-grounding contract"
+        )
     if completion_only_memory and (
         training_stage != "action"
         or metadata.get("eraf_action_joint_training") is not True
         or metadata.get("eraf_action_joint_contract")
-        != "frozen_eraf_perception_plus_action_bridge_and_proposal"
+        != expected_action_joint_contract
         or metadata.get("eraf_action_trainable_scope")
-        != "base_query_projection_relation_attention_query_embedding_delta_plus_action_chunk_proposal"
+        != expected_action_trainable_scope
         or metadata.get("eraf_role_adapter_trainable_scope")
         != "frozen_eraf_perception_action_bridge_plus_proposal"
     ):
-        raise SystemExit("PGC v9.14 checkpoint lacks its joint-action contract")
+        raise SystemExit("PGC v9.14+ checkpoint lacks its joint-action contract")
 else:
     objective = 0
     training_stage = "grounding"
@@ -470,6 +491,11 @@ mapping = {
     "eraf_grounding_aux_weight": "grounding_aux_weight",
     "eraf_completion_only_memory": "completion_only_memory",
     "eraf_action_joint_training": "action_joint_training",
+    "eraf_action_grounding_hidden_dim": "action_grounding_hidden_dim",
+    "eraf_action_grounding_num_heads": "action_grounding_num_heads",
+    "eraf_action_grounding_learning_rate": "action_grounding_learning_rate",
+    "eraf_action_causal_ranking_weight": "action_causal_ranking_weight",
+    "eraf_action_causal_margin": "action_causal_margin",
     "eraf_attention_mask_weight": "attention_mask_weight",
     "eraf_role_swap_weight": "role_swap_weight",
     "eraf_role_overlap_weight": "role_overlap_weight",
