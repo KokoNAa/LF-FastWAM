@@ -595,8 +595,8 @@ case "${ABLATION}" in
     exit 1
     ;;
 esac
-if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14" || "${GROUNDING_OBJECTIVE_VERSION}" == "15" || "${GROUNDING_OBJECTIVE_VERSION}" == "16" ]]; then
-  # V9.13+ freeze the validated V9.11 perception/grounding losses. V9.15/16
+if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14" || "${GROUNDING_OBJECTIVE_VERSION}" == "15" || "${GROUNDING_OBJECTIVE_VERSION}" == "16" || "${GROUNDING_OBJECTIVE_VERSION}" == "17" ]]; then
+  # V9.13+ freeze the validated V9.11 perception/grounding losses. V9.15-17
   # inherit V9.14's exact zero-loss contract while calibrating action paths.
   MASK_WEIGHT=0.0
   ATTENTION_MASK_WEIGHT=0.0

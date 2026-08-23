@@ -293,6 +293,11 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("START_STEP=13750", source)
         self.assertIn("V9.17 must warm-start from the completed V9.16", source)
         self.assertIn(
+            '"${GROUNDING_OBJECTIVE_VERSION}" == "16" || '
+            '"${GROUNDING_OBJECTIVE_VERSION}" == "17"',
+            source,
+        )
+        self.assertIn(
             "entity_relation_grounding.action_geometry_learning_rate=", source
         )
         self.assertIn(
