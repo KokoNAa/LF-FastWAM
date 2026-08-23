@@ -255,7 +255,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 20)):
+    if objective not in set(range(1, 21)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -324,7 +324,9 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_v918_stack_plus_hard_clause_phase_direction_preserving_servo"
+            "frozen_v919_stack_plus_phase_compatible_local_waypoint_vector_field"
+            if objective >= 20
+            else "frozen_v918_stack_plus_hard_clause_phase_direction_preserving_servo"
             if objective >= 19
             else "frozen_eraf_v917_stack_plus_phase_balanced_direct_geometry_"
             "residual_imitation"
@@ -347,7 +349,9 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
-            "hard_routed_phase_servo_only"
+            "phase_compatible_local_waypoint_adapter_only"
+            if objective >= 20
+            else "hard_routed_phase_servo_only"
             if objective >= 19
             else "phase_conditioned_geometry_adapter_only_with_phase_balanced_"
             "residual_imitation"
@@ -369,7 +373,9 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
-            "hard_routed_phase_servo_only"
+            "phase_compatible_local_waypoint_adapter_only"
+            if objective >= 20
+            else "hard_routed_phase_servo_only"
             if objective >= 19
             else "phase_conditioned_geometry_adapter_only_with_phase_balanced_"
             "residual_imitation"
@@ -406,6 +412,14 @@ if version == 9:
     ):
         raise SystemExit(
             "PGC v9.19 checkpoint lacks its hard-routed phase-servo contract"
+        )
+    if objective >= 20 and (
+        metadata.get("eraf_action_waypoint_contract")
+        != "hard_clause_phase_compatible_positive_progress_local_tangent_"
+        "waypoint_with_privileged_training_only_compatibility_labels"
+    ):
+        raise SystemExit(
+            "PGC v9.20 checkpoint lacks its phase-compatible waypoint contract"
         )
     if completion_only_memory and (
         training_stage != "action"
@@ -570,6 +584,8 @@ mapping = {
     "eraf_action_phase_release_weight": "action_phase_release_weight",
     "eraf_action_phase_direction_min_norm": "action_phase_direction_min_norm",
     "eraf_action_servo_frame_weight": "action_servo_frame_weight",
+    "eraf_action_waypoint_min_cosine": "action_waypoint_min_cosine",
+    "eraf_action_waypoint_tangent_max_ratio": "action_waypoint_tangent_max_ratio",
     "eraf_action_eef_initial_scale": "action_eef_scale",
     "eraf_action_eef_initial_bias": "action_eef_bias",
     "eraf_action_causal_ranking_weight": "action_causal_ranking_weight",

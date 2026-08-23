@@ -53,6 +53,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
 from fastwam.models.wan22.fastwam import FastWAM
 from fastwam.models.wan22.policy_guard import (
     HardRoutedERAFPhaseServo,
+    PhaseCompatibleERAFWaypointAdapter,
     PhaseConditionedERAFActionBridge,
     PhaseConditionedERAFGeometryActionAdapter,
     detached_policy_guard_metrics,
@@ -1023,6 +1024,70 @@ class PGCERAFModuleTest(unittest.TestCase):
         self.assertGreater(float(routed_x[..., 0].mean()), 0.05)
         self.assertAlmostEqual(float(routed_x[..., 1].abs().max()), 0.0)
         self.assertEqual(int(metrics_x["pgc_v919_selected_clause"].item()), 0)
+
+    def test_v920_waypoint_is_zero_init_exact_and_preserves_anchor_progress(self):
+        adapter = PhaseCompatibleERAFWaypointAdapter(
+            action_dim=7,
+            hidden_dim=16,
+            max_abs=0.25,
+            tangent_max_ratio=0.75,
+        )
+        candidate = torch.randn(2, 3, 7) * 0.01
+        legacy = torch.randn_like(candidate) * 0.01
+        direction = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        action, residual, metrics = adapter(
+            candidate_action=candidate,
+            legacy_residual=legacy,
+            inherited_servo_residual=torch.zeros_like(legacy),
+            desired_direction=direction,
+            control_phase=torch.tensor([0, 1]),
+            route_confidence=torch.tensor([0.9, 0.8]),
+        )
+        self.assertTrue(torch.equal(residual, legacy))
+        self.assertTrue(torch.equal(action, candidate + legacy))
+        self.assertEqual(float(metrics["pgc_v920_translation_gain"]), 0.0)
+
+        target = action.detach().clone()
+        target[..., :3] += direction[:, None, :] * 0.1
+        (action - target).square().mean().backward()
+        self.assertGreater(float(adapter.gain_head.bias.grad.abs().item()), 0.0)
+
+        with torch.no_grad():
+            adapter.gain_head.bias.fill_(0.1)
+            adapter.tangent_head.bias.copy_(torch.tensor([0.0, 0.2, 0.1]))
+        _, _, routed = adapter(
+            candidate_action=candidate,
+            legacy_residual=torch.zeros_like(legacy),
+            inherited_servo_residual=torch.zeros_like(legacy),
+            desired_direction=direction,
+            control_phase=torch.tensor([0, 1]),
+            route_confidence=torch.tensor([0.9, 0.8]),
+        )
+        local = routed["pgc_v920_local_direction"]
+        progress = (local * direction[:, None, :]).sum(dim=-1)
+        self.assertTrue(torch.all(progress > 0.0))
+        tangent = local - progress.unsqueeze(-1) * direction[:, None, :]
+        self.assertTrue(torch.all(tangent.norm(dim=-1) <= 0.75 + 1.0e-5))
+
+        inherited = torch.zeros_like(legacy)
+        inherited[..., 0] = 0.1
+        with torch.no_grad():
+            adapter.compatibility_head.bias.fill_(-20.0)
+            adapter.gain_head.bias.zero_()
+            adapter.tangent_head.bias.zero_()
+        _, suppressed, suppressed_metrics = adapter(
+            candidate_action=candidate,
+            legacy_residual=torch.zeros_like(legacy),
+            inherited_servo_residual=inherited,
+            desired_direction=direction,
+            control_phase=torch.tensor([0, 1]),
+            route_confidence=torch.tensor([0.9, 0.8]),
+        )
+        self.assertLess(float(suppressed.abs().max()), 1.0e-6)
+        self.assertLess(
+            float(suppressed_metrics["pgc_v920_inherited_servo_retention"]),
+            1.0e-6,
+        )
 
     def test_v918_phase_residual_imitation_prefers_expert_correction(self):
         model = tiny_pgc_fastwam(
@@ -4663,6 +4728,79 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 metadata["eraf_action_trainable_scope"],
                 "hard_routed_phase_servo_only",
+            )
+
+    def test_v919_to_v920_phase_compatible_waypoint_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v919_path = root / "v919.pt"
+            v920_path = root / "v920.pt"
+            v919 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=19,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v919.mot.state_dict()},
+                base_path,
+            )
+            v919.load_checkpoint(base_path)
+            v919.save_checkpoint(v919_path, step=16250)
+            old_state = {
+                name: value.clone()
+                for name, value in v919.policy_guard_modules.state_dict().items()
+            }
+
+            v920 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=20,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v920.load_checkpoint(v919_path)
+            new_state = v920.policy_guard_modules.state_dict()
+            for name, value in old_state.items():
+                self.assertTrue(torch.equal(value, new_state[name]), name)
+            added = set(new_state) - set(old_state)
+            self.assertTrue(added)
+            self.assertTrue(
+                all(
+                    name.startswith("eraf_phase_compatible_waypoint_adapter.")
+                    for name in added
+                )
+            )
+            v920.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v920.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules."
+                        "eraf_phase_compatible_waypoint_adapter."
+                    )
+                    for name in trainable
+                )
+            )
+            v920.save_checkpoint(v920_path, step=17250)
+            metadata = torch.load(
+                v920_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(
+                metadata["eraf_action_waypoint_contract"],
+                "hard_clause_phase_compatible_positive_progress_local_tangent_"
+                "waypoint_with_privileged_training_only_compatibility_labels",
+            )
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "phase_compatible_local_waypoint_adapter_only",
             )
 
 

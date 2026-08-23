@@ -2004,7 +2004,190 @@ class HardRoutedERAFPhaseServo(nn.Module):
             ),
             "pgc_v919_selected_clause": selected_clause,
             "pgc_v919_selected_control_phase": control_phase,
+            "pgc_v919_route_confidence_per_sample": selected_confidence,
             "pgc_v919_desired_direction": action_direction,
+            "pgc_v919_retained_legacy_residual": retained_legacy,
+            "pgc_v919_servo_residual": servo_residual,
+        }
+
+
+class PhaseCompatibleERAFWaypointAdapter(nn.Module):
+    """Learn a local action vector only where ERAF geometry is executable.
+
+    A terminal anchor is not necessarily the next collision-free Cartesian
+    direction.  This adapter keeps positive progress toward the hard-routed
+    ERAF anchor, while learning a bounded tangent component that represents a
+    local waypoint.  A separate compatibility predictor decides whether the
+    current phase should use this geometric route at all.  The gain and tangent
+    heads are zero initialized, so adding V9.20 is exactly V9.19 at warm start.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        hidden_dim: int = 256,
+        max_abs: float | Sequence[float] = 0.25,
+        tangent_max_ratio: float = 0.75,
+    ) -> None:
+        super().__init__()
+        if action_dim < 3 or hidden_dim <= 0:
+            raise ValueError("V9.20 waypoint adapter requires xyz actions.")
+        if not 0 < tangent_max_ratio <= 1:
+            raise ValueError("V9.20 tangent_max_ratio must be in (0,1].")
+        if isinstance(max_abs, Sequence) and not isinstance(max_abs, (str, bytes)):
+            caps = [float(value) for value in max_abs]
+            if len(caps) != int(action_dim):
+                raise ValueError("V9.20 residual caps must match action_dim.")
+        else:
+            caps = [float(max_abs)] * int(action_dim)
+        if any(value <= 0 for value in caps):
+            raise ValueError("V9.20 residual caps must be positive.")
+
+        self.action_dim = int(action_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.tangent_max_ratio = float(tangent_max_ratio)
+        feature_dim = self.action_dim + 3 + 3 + 1
+        self.feature_norm = nn.LayerNorm(feature_dim)
+        self.feature_projection = nn.Sequential(
+            nn.Linear(feature_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+        )
+        self.compatibility_head = nn.Linear(self.hidden_dim, 1)
+        self.tangent_head = nn.Linear(self.hidden_dim, 3)
+        self.gain_head = nn.Linear(self.hidden_dim, 1)
+        nn.init.zeros_(self.compatibility_head.weight)
+        nn.init.zeros_(self.compatibility_head.bias)
+        nn.init.zeros_(self.tangent_head.weight)
+        nn.init.zeros_(self.tangent_head.bias)
+        nn.init.zeros_(self.gain_head.weight)
+        nn.init.zeros_(self.gain_head.bias)
+        self.register_buffer(
+            "max_abs",
+            torch.tensor(caps, dtype=torch.float32).view(1, 1, -1),
+            persistent=True,
+        )
+
+    def forward(
+        self,
+        *,
+        candidate_action: torch.Tensor,
+        legacy_residual: torch.Tensor,
+        inherited_servo_residual: torch.Tensor,
+        desired_direction: torch.Tensor,
+        control_phase: torch.Tensor,
+        route_confidence: torch.Tensor,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if (
+            candidate_action.shape != legacy_residual.shape
+            or candidate_action.shape != inherited_servo_residual.shape
+            or (
+            candidate_action.ndim != 3
+            or candidate_action.shape[-1] != self.action_dim
+            )
+        ):
+            raise ValueError(
+                "V9.20 candidate/legacy/inherited actions must share [B,T,A]."
+            )
+        batch, horizon, _ = candidate_action.shape
+        if desired_direction.shape != (batch, 3):
+            raise ValueError("V9.20 desired_direction must be [B,3].")
+        if control_phase.shape != (batch,) or route_confidence.shape != (batch,):
+            raise ValueError("V9.20 phase/confidence must be [B].")
+        if action_is_pad is not None and action_is_pad.shape != (batch, horizon):
+            raise ValueError("V9.20 action padding mask must be [B,T].")
+
+        module_dtype = self.feature_projection[0].weight.dtype
+        candidate = candidate_action.to(module_dtype)
+        anchor_direction = F.normalize(
+            desired_direction.to(module_dtype), dim=-1, eps=1.0e-6
+        )
+        phase = F.one_hot(control_phase.long().clamp(0, 2), 3).to(module_dtype)
+        features = torch.cat(
+            (
+                candidate,
+                anchor_direction.unsqueeze(1).expand(-1, horizon, -1),
+                phase.unsqueeze(1).expand(-1, horizon, -1),
+                route_confidence.to(module_dtype)
+                .view(batch, 1, 1)
+                .expand(-1, horizon, -1),
+            ),
+            dim=-1,
+        )
+        hidden = self.feature_projection(self.feature_norm(features))
+        compatibility_logits = self.compatibility_head(hidden).squeeze(-1)
+        compatibility = torch.sigmoid(compatibility_logits)
+        raw_retention = compatibility * 2.0
+        bounded_retention = raw_retention.clamp(max=1.0)
+        inherited_retention = (
+            bounded_retention.detach() + raw_retention - raw_retention.detach()
+        )
+
+        raw_tangent = self.tangent_head(hidden)
+        anchor_step = anchor_direction.unsqueeze(1)
+        tangent = raw_tangent - (
+            raw_tangent * anchor_step
+        ).sum(dim=-1, keepdim=True) * anchor_step
+        tangent_norm = tangent.norm(dim=-1, keepdim=True)
+        tangent = tangent * (
+            self.tangent_max_ratio
+            * torch.tanh(tangent_norm)
+            / tangent_norm.clamp_min(1.0e-6)
+        )
+        local_direction = F.normalize(
+            anchor_step + tangent, dim=-1, eps=1.0e-6
+        )
+
+        translation_cap = self.max_abs[..., :3].to(
+            device=candidate.device, dtype=module_dtype
+        ).min()
+        raw_gain = self.gain_head(hidden)
+        bounded_gain = raw_gain.clamp(min=0.0, max=translation_cap)
+        gain = bounded_gain.detach() + raw_gain - raw_gain.detach()
+        translation = local_direction * gain * compatibility.unsqueeze(-1)
+        servo_residual = torch.zeros_like(candidate)
+        servo_residual[..., :3] = translation
+        if action_is_pad is not None:
+            servo_residual = servo_residual.masked_fill(
+                action_is_pad.bool().unsqueeze(-1), 0.0
+            )
+        cap = self.max_abs.to(device=candidate.device, dtype=module_dtype)
+        retained_inherited_servo = inherited_servo_residual.to(module_dtype) * (
+            inherited_retention.unsqueeze(-1)
+        )
+        effective_servo_residual = retained_inherited_servo + servo_residual
+        total_residual = (
+            legacy_residual.to(module_dtype)
+            + effective_servo_residual
+        ).clamp(min=-cap, max=cap)
+        if action_is_pad is not None:
+            pad = action_is_pad.bool().unsqueeze(-1)
+            effective_servo_residual = effective_servo_residual.masked_fill(
+                pad, 0.0
+            )
+            total_residual = total_residual.masked_fill(pad, 0.0)
+        action = candidate + total_residual
+        return action.to(candidate_action.dtype), total_residual.to(
+            candidate_action.dtype
+        ), {
+            "pgc_v920_compatibility_probability": compatibility.float().mean(),
+            "pgc_v920_inherited_servo_retention": (
+                bounded_retention.float().mean()
+            ),
+            "pgc_v920_waypoint_tangent_rms": tangent.float().square().mean().sqrt(),
+            "pgc_v920_translation_gain": bounded_gain.float().mean(),
+            "pgc_v920_servo_residual_rms": (
+                servo_residual.float().square().mean().sqrt()
+            ),
+            "pgc_v920_total_residual_rms": (
+                total_residual.float().square().mean().sqrt()
+            ),
+            "pgc_v920_compatibility_logits": compatibility_logits,
+            "pgc_v920_compatibility_probability_per_step": compatibility,
+            "pgc_v920_local_direction": local_direction,
+            "pgc_v920_servo_translation": translation,
+            "pgc_v920_effective_servo_residual": effective_servo_residual,
         }
 
 
