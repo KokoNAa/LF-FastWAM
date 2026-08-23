@@ -5547,8 +5547,8 @@ class FastWAM(torch.nn.Module):
             & source_labels["clause_valid"].bool()
         )
         anchor_changed = (
-            target_labels["goal_anchor"].float()
-            - source_labels["goal_anchor"].float()
+            target_labels["goal_anchors"].float()
+            - source_labels["goal_anchors"].float()
         ).norm(dim=-1) > 1.0e-4
         eligibility = {
             "subject": shared_valid & subject_changed.any(dim=-1),

@@ -3921,14 +3921,14 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             "subject_entity_ids": torch.tensor([[1, 2, -1, -1]] * batch),
             "reference_entity_ids": torch.tensor([[3, 4, -1, -1]] * batch),
             "goal_anchor_valid": clause_valid,
-            "goal_anchor": torch.zeros(batch, 4, 3),
+            "goal_anchors": torch.zeros(batch, 4, 3),
         }
         source_labels = {
             "clause_valid": clause_valid,
             "subject_entity_ids": torch.tensor([[5, 6, -1, -1]] * batch),
             "reference_entity_ids": torch.tensor([[7, 8, -1, -1]] * batch),
             "goal_anchor_valid": clause_valid,
-            "goal_anchor": torch.ones(batch, 4, 3),
+            "goal_anchors": torch.ones(batch, 4, 3),
         }
         loss, metrics = model._compute_policy_guard_v915_causal_action_loss(
             correct_action=correct,
