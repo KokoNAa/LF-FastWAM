@@ -255,7 +255,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 18)):
+    if objective not in set(range(1, 19)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -323,8 +323,13 @@ if version == 9:
     ):
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
-        "frozen_eraf_v916_bridge_and_proposal_plus_direct_eef_relative_"
-        "geometry_action_adapter"
+        (
+            "frozen_eraf_v917_stack_plus_phase_balanced_direct_geometry_"
+            "residual_imitation"
+            if objective >= 18
+            else "frozen_eraf_v916_bridge_and_proposal_plus_direct_eef_"
+            "relative_geometry_action_adapter"
+        )
         if objective >= 17
         else (
             "frozen_eraf_perception_proposal_and_legacy_bridge_plus_"
@@ -339,7 +344,12 @@ if version == 9:
         )
     )
     expected_action_trainable_scope = (
-        "phase_conditioned_relative_geometry_action_adapter_only"
+        (
+            "phase_conditioned_geometry_adapter_only_with_phase_balanced_"
+            "residual_imitation"
+            if objective >= 18
+            else "phase_conditioned_relative_geometry_action_adapter_only"
+        )
         if objective >= 17
         else (
             "semantic_causal_action_grounding_bridge_only"
@@ -354,7 +364,12 @@ if version == 9:
         )
     )
     expected_role_trainable_scope = (
-        "phase_conditioned_relative_geometry_action_adapter_only"
+        (
+            "phase_conditioned_geometry_adapter_only_with_phase_balanced_"
+            "residual_imitation"
+            if objective >= 18
+            else "phase_conditioned_relative_geometry_action_adapter_only"
+        )
         if objective >= 17
         else (
             "semantic_causal_action_grounding_bridge_only"
@@ -369,6 +384,14 @@ if version == 9:
     ):
         raise SystemExit(
             "PGC v9.15 checkpoint lacks its explicit action-grounding contract"
+        )
+    if objective >= 18 and (
+        metadata.get("eraf_action_phase_residual_contract")
+        != "phase_balanced_bounded_expert_minus_frozen_v9_17_candidate_"
+        "prefix_residual_imitation"
+    ):
+        raise SystemExit(
+            "PGC v9.18 checkpoint lacks its phase-residual imitation contract"
         )
     if completion_only_memory and (
         training_stage != "action"
@@ -524,6 +547,14 @@ mapping = {
     "eraf_action_geometry_hidden_dim": "action_geometry_hidden_dim",
     "eraf_action_geometry_learning_rate": "action_geometry_learning_rate",
     "eraf_action_geometry_residual_max_abs": "action_geometry_residual_max_abs",
+    "eraf_action_phase_residual_imitation_weight": (
+        "action_phase_residual_imitation_weight"
+    ),
+    "eraf_action_phase_direction_weight": "action_phase_direction_weight",
+    "eraf_action_phase_approach_weight": "action_phase_approach_weight",
+    "eraf_action_phase_transport_weight": "action_phase_transport_weight",
+    "eraf_action_phase_release_weight": "action_phase_release_weight",
+    "eraf_action_phase_direction_min_norm": "action_phase_direction_min_norm",
     "eraf_action_causal_ranking_weight": "action_causal_ranking_weight",
     "eraf_action_causal_margin": "action_causal_margin",
     "eraf_attention_mask_weight": "attention_mask_weight",

@@ -304,6 +304,25 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             "entity_relation_grounding.action_geometry_residual_max_abs=", source
         )
 
+    def test_v918_launcher_trains_phase_balanced_expert_residual(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("action-phase-residual", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=18", source)
+        self.assertIn("START_STEP=14250", source)
+        self.assertIn("DEFAULT_STAGE_STEPS=1000", source)
+        self.assertIn(
+            "V9.18 must warm-start from the completed V9.17", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_phase_residual_imitation_weight=",
+            source,
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_phase_direction_weight=", source
+        )
+
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (
             REPO_ROOT / "scripts/summarize_pgc_v9_shadow_audit.py"

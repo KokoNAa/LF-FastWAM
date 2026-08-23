@@ -303,6 +303,9 @@ policy_guard:
     # V9.16 calibrates the final semantic action bridge with stronger same-state
     # negatives. V9.17 adds a short, zero-init route from phase-selected,
     # EEF-relative ERAF geometry directly to the deployed action residual.
+    # V9.18 keeps that route and explicitly imitates the bounded expert-minus-
+    # frozen-candidate residual with approach/transport/release balancing and
+    # translation-direction supervision.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -324,6 +327,12 @@ policy_guard:
     action_geometry_hidden_dim: 256
     action_geometry_learning_rate: 2.0e-5
     action_geometry_residual_max_abs: 0.25
+    action_phase_residual_imitation_weight: 2.0
+    action_phase_direction_weight: 0.5
+    action_phase_approach_weight: 1.0
+    action_phase_transport_weight: 2.0
+    action_phase_release_weight: 3.0
+    action_phase_direction_min_norm: 1.0e-3
     mask_weight: 1.0
     attention_mask_weight: 2.0
     entity_weight: 1.0

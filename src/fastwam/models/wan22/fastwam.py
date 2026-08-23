@@ -698,6 +698,24 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_action_geometry_residual_max_abs = float(
             eraf_config.get("action_geometry_residual_max_abs", 0.25)
         )
+        self.policy_guard_eraf_action_phase_residual_imitation_weight = float(
+            eraf_config.get("action_phase_residual_imitation_weight", 2.0)
+        )
+        self.policy_guard_eraf_action_phase_direction_weight = float(
+            eraf_config.get("action_phase_direction_weight", 0.5)
+        )
+        self.policy_guard_eraf_action_phase_approach_weight = float(
+            eraf_config.get("action_phase_approach_weight", 1.0)
+        )
+        self.policy_guard_eraf_action_phase_transport_weight = float(
+            eraf_config.get("action_phase_transport_weight", 2.0)
+        )
+        self.policy_guard_eraf_action_phase_release_weight = float(
+            eraf_config.get("action_phase_release_weight", 3.0)
+        )
+        self.policy_guard_eraf_action_phase_direction_min_norm = float(
+            eraf_config.get("action_phase_direction_min_norm", 1.0e-3)
+        )
         self.policy_guard_eraf_grounding_objective_version = int(
             eraf_config.get("grounding_objective_version", 1)
         )
@@ -1334,10 +1352,11 @@ class FastWAM(torch.nn.Module):
                     15,
                     16,
                     17,
+                    18,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "between 1 and 17 inclusive."
+                        "between 1 and 18 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1460,6 +1479,18 @@ class FastWAM(torch.nn.Module):
                 if self.policy_guard_eraf_action_geometry_residual_max_abs <= 0:
                     raise ValueError(
                         "PGC V9.17 geometry-action residual bound must be positive."
+                    )
+                if min(
+                    self.policy_guard_eraf_action_phase_residual_imitation_weight,
+                    self.policy_guard_eraf_action_phase_direction_weight,
+                    self.policy_guard_eraf_action_phase_approach_weight,
+                    self.policy_guard_eraf_action_phase_transport_weight,
+                    self.policy_guard_eraf_action_phase_release_weight,
+                    self.policy_guard_eraf_action_phase_direction_min_norm,
+                ) <= 0:
+                    raise ValueError(
+                        "PGC V9.18 phase-residual weights and direction norm "
+                        "threshold must be positive."
                     )
                 if (
                     self.policy_guard_eraf_action_grounding_hidden_dim
@@ -5818,6 +5849,198 @@ class FastWAM(torch.nn.Module):
             )
         return total, metrics
 
+    def _compute_policy_guard_v918_phase_residual_loss(
+        self,
+        *,
+        geometry_residual: torch.Tensor,
+        pre_geometry_action: torch.Tensor,
+        target_action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+        target_labels: Mapping[str, torch.Tensor],
+        eraf_outputs: Mapping[str, torch.Tensor],
+        is_counterfactual: torch.Tensor,
+        direct_action_valid: torch.Tensor,
+        paired_language_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Fit the bounded V9.17 residual to phase-specific expert corrections.
+
+        The upstream Proposal is deliberately detached when constructing the
+        target.  V9.18 therefore learns only the missing geometry-to-control
+        correction instead of allowing the loss to be satisfied by changing
+        the already audited ERAF, semantic bridge, or Proposal.
+        """
+        if geometry_residual.shape != pre_geometry_action.shape or (
+            target_action.shape != pre_geometry_action.shape
+        ):
+            raise ValueError(
+                "PGC V9.18 residual, candidate, and expert actions must share "
+                "the same [B,T,A] shape."
+            )
+        clause_valid = target_labels["clause_valid"].bool()
+        phase_valid = target_labels["phase_valid"].bool() & clause_valid
+        phase_ids = target_labels["phase_ids"].long()
+        execution_probability = eraf_outputs[
+            "clause_execution_probability"
+        ].float()
+        if execution_probability.shape != clause_valid.shape:
+            raise ValueError(
+                "PGC V9.18 clause execution probabilities do not match labels."
+            )
+        selected_clause = execution_probability.detach().masked_fill(
+            ~phase_valid, -1.0
+        ).argmax(dim=-1)
+        selected_phase = phase_ids.gather(
+            1, selected_clause.unsqueeze(-1)
+        ).squeeze(-1)
+        selected_valid = phase_valid.gather(
+            1, selected_clause.unsqueeze(-1)
+        ).squeeze(-1)
+        predicate_truth = target_labels["predicate_truth"].float().gather(
+            1, selected_clause.unsqueeze(-1)
+        ).squeeze(-1)
+        predicate_truth_valid = target_labels[
+            "predicate_truth_valid"
+        ].bool().gather(1, selected_clause.unsqueeze(-1)).squeeze(-1)
+        # The observation immediately before a successful release can still
+        # carry phase=1 (holding).  If the spatial predicate is already true
+        # while held, treat that frame as release-ready rather than generic
+        # transport.  Phase=2 remains the post-release/completed case.
+        control_phase = torch.where(
+            (selected_phase == 1)
+            & predicate_truth_valid
+            & (predicate_truth >= 0.5),
+            torch.full_like(selected_phase, 2),
+            selected_phase,
+        )
+        sample_valid = (
+            is_counterfactual.bool()
+            & direct_action_valid.bool()
+            & paired_language_valid.bool()
+            & selected_valid
+        )
+
+        max_abs = float(self.policy_guard_eraf_action_geometry_residual_max_abs)
+        target_residual = (
+            target_action.float() - pre_geometry_action.detach().float()
+        ).clamp(min=-max_abs, max=max_abs)
+        predicted_residual = geometry_residual.float()
+        batch, horizon, _ = predicted_residual.shape
+        prefix = min(self.policy_guard_execution_prefix_steps, horizon)
+        temporal_weight = predicted_residual.new_full(
+            (batch, horizon), float(self.policy_guard_suffix_loss_weight)
+        )
+        temporal_weight[:, :prefix] = 1.0
+        if action_is_pad is not None:
+            temporal_weight = temporal_weight * (~action_is_pad.bool()).float()
+
+        phase_weight_values = predicted_residual.new_tensor(
+            (
+                self.policy_guard_eraf_action_phase_approach_weight,
+                self.policy_guard_eraf_action_phase_transport_weight,
+                self.policy_guard_eraf_action_phase_release_weight,
+            )
+        )
+        phase_weight = phase_weight_values[control_phase.clamp(0, 2)]
+        sample_weight = sample_valid.float() * phase_weight
+        weighted_step = temporal_weight * sample_weight.unsqueeze(-1)
+        weighted_count = weighted_step.sum().clamp_min(1.0)
+
+        regression_per_step = F.smooth_l1_loss(
+            predicted_residual,
+            target_residual,
+            reduction="none",
+            beta=0.01,
+        ).mean(dim=-1)
+        imitation_loss = (
+            regression_per_step * weighted_step
+        ).sum() / weighted_count
+
+        translation_dim = min(3, int(predicted_residual.shape[-1]))
+        predicted_translation = predicted_residual[..., :translation_dim]
+        target_translation = target_residual[..., :translation_dim]
+        target_translation_norm = target_translation.norm(dim=-1)
+        direction_valid = (
+            target_translation_norm
+            >= self.policy_guard_eraf_action_phase_direction_min_norm
+        )
+        direction_weight = weighted_step * direction_valid.float()
+        direction_count = direction_weight.sum().clamp_min(1.0)
+        direction_cosine = F.cosine_similarity(
+            predicted_translation,
+            target_translation,
+            dim=-1,
+            eps=1.0e-6,
+        )
+        direction_loss = (
+            (1.0 - direction_cosine) * direction_weight
+        ).sum() / direction_count
+        total = (
+            self.policy_guard_eraf_action_phase_residual_imitation_weight
+            * imitation_loss
+            + self.policy_guard_eraf_action_phase_direction_weight
+            * direction_loss
+        )
+
+        prefix_valid = temporal_weight[:, :prefix] > 0
+        prefix_valid_float = prefix_valid.float()
+        prefix_count = prefix_valid_float.sum(dim=-1).clamp_min(1.0)
+        pre_error = (
+            (
+                pre_geometry_action[:, :prefix].float()
+                - target_action[:, :prefix].float()
+            )
+            .square()
+            .mean(dim=-1)
+            * prefix_valid_float
+        ).sum(dim=-1) / prefix_count
+        post_error = (
+            (
+                pre_geometry_action[:, :prefix].float()
+                + predicted_residual[:, :prefix]
+                - target_action[:, :prefix].float()
+            )
+            .square()
+            .mean(dim=-1)
+            * prefix_valid_float
+        ).sum(dim=-1) / prefix_count
+        valid_count = sample_valid.float().sum().clamp_min(1.0)
+        metrics: dict[str, torch.Tensor] = {
+            "loss_pgc_v918_phase_residual_imitation": imitation_loss.detach(),
+            "loss_pgc_v918_translation_direction": direction_loss.detach(),
+            "pgc_v918_phase_valid_fraction": sample_valid.float().mean().detach(),
+            "pgc_v918_target_residual_rms": (
+                (
+                    target_residual.square().mean(dim=(1, 2)).sqrt()
+                    * sample_valid.float()
+                ).sum()
+                / valid_count
+            ).detach(),
+            "pgc_v918_prefix_mse_improvement": (
+                ((pre_error - post_error) * sample_valid.float()).sum()
+                / valid_count
+            ).detach(),
+            "pgc_v918_translation_direction_cosine": (
+                (direction_cosine * direction_weight).sum() / direction_count
+            ).detach(),
+            "pgc_v918_translation_direction_positive_rate": (
+                ((direction_cosine > 0).float() * direction_weight).sum()
+                / direction_count
+            ).detach(),
+        }
+        for phase_id, phase_name in enumerate(
+            ("approach", "transport", "release")
+        ):
+            phase_sample = sample_valid & (control_phase == phase_id)
+            phase_count = phase_sample.float().sum().clamp_min(1.0)
+            metrics[f"pgc_v918_{phase_name}_sample_fraction"] = (
+                phase_sample.float().mean().detach()
+            )
+            metrics[f"pgc_v918_{phase_name}_prefix_mse_improvement"] = (
+                ((pre_error - post_error) * phase_sample.float()).sum()
+                / phase_count
+            ).detach()
+        return total, metrics
+
     def _training_loss_policy_guard_v5(
         self,
         *,
@@ -6248,6 +6471,8 @@ class FastWAM(torch.nn.Module):
                 action_is_pad=action_is_pad,
             )
         )
+        pre_geometry_proposal_action = proposal_action
+        geometry_residual = proposal_action * 0.0
         if (
             self.policy_guard_version == 9
             and self.policy_guard_eraf_grounding_objective_version >= 17
@@ -6464,6 +6689,27 @@ class FastWAM(torch.nn.Module):
             + self.policy_guard_residual_smoothness_weight
             * residual_smoothness_loss
         )
+        v918_phase_residual_loss = action_objective.sum() * 0.0
+        v918_phase_residual_metrics: dict[str, torch.Tensor] = {}
+        if (
+            self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 18
+        ):
+            (
+                v918_phase_residual_loss,
+                v918_phase_residual_metrics,
+            ) = self._compute_policy_guard_v918_phase_residual_loss(
+                geometry_residual=geometry_residual,
+                pre_geometry_action=pre_geometry_proposal_action,
+                target_action=action,
+                action_is_pad=action_is_pad,
+                target_labels=target_labels,
+                eraf_outputs=eraf_outputs,
+                is_counterfactual=is_counterfactual,
+                direct_action_valid=direct_action_valid,
+                paired_language_valid=paired_language_valid,
+            )
+            action_objective = action_objective + v918_phase_residual_loss
         v915_causal_loss = action_objective.sum() * 0.0
         v915_causal_metrics: dict[str, torch.Tensor] = {}
         if v915_negative_actions:
@@ -6588,6 +6834,9 @@ class FastWAM(torch.nn.Module):
             "loss_pgc_v915_action_causal_ranking": float(
                 v915_causal_loss.detach().item()
             ),
+            "loss_pgc_v918_phase_residual": float(
+                v918_phase_residual_loss.detach().item()
+            ),
             "loss_pgc_verifier": float(verifier_loss.detach().item()),
             "loss_pgc_goal_action_alignment": float(
                 alignment_loss.detach().item()
@@ -6629,6 +6878,12 @@ class FastWAM(torch.nn.Module):
                 * self.policy_guard_eraf_action_causal_ranking_weight
                 if self.policy_guard_version == 9
                 and self.policy_guard_eraf_grounding_objective_version >= 15
+                else 0.0
+            ),
+            "pgc_v918_phase_residual_effective_weight": (
+                action_training_scale
+                if self.policy_guard_version == 9
+                and self.policy_guard_eraf_grounding_objective_version >= 18
                 else 0.0
             ),
             "pgc_v6_target_interaction_effective_weight": (
@@ -6813,6 +7068,9 @@ class FastWAM(torch.nn.Module):
         loss_dict.update(detached_policy_guard_metrics(prototype_metrics))
         loss_dict.update(detached_policy_guard_metrics(eraf_loss_metrics))
         loss_dict.update(detached_policy_guard_metrics(v915_causal_metrics))
+        loss_dict.update(
+            detached_policy_guard_metrics(v918_phase_residual_metrics)
+        )
         for name, value in detached_policy_guard_metrics(
             source_goal_metrics
         ).items():
@@ -10874,7 +11132,13 @@ class FastWAM(torch.nn.Module):
             if objective_version >= 14:
                 eraf_role_adapter_trainable_scope = (
                     (
-                        "phase_conditioned_relative_geometry_action_adapter_only"
+                        (
+                            "phase_conditioned_geometry_adapter_only_with_"
+                            "phase_balanced_residual_imitation"
+                            if objective_version >= 18
+                            else "phase_conditioned_relative_geometry_action_"
+                            "adapter_only"
+                        )
                         if objective_version >= 17
                         else (
                             "semantic_causal_action_grounding_bridge_only"
@@ -11504,8 +11768,13 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_action_joint_contract": (
                 (
-                    "frozen_eraf_v916_bridge_and_proposal_plus_direct_"
-                    "eef_relative_geometry_action_adapter"
+                    (
+                        "frozen_eraf_v917_stack_plus_phase_balanced_direct_"
+                        "geometry_residual_imitation"
+                        if self.policy_guard_eraf_grounding_objective_version >= 18
+                        else "frozen_eraf_v916_bridge_and_proposal_plus_direct_"
+                        "eef_relative_geometry_action_adapter"
+                    )
                     if self.policy_guard_eraf_grounding_objective_version >= 17
                     else (
                         "frozen_eraf_perception_proposal_and_legacy_bridge_plus_"
@@ -11524,7 +11793,12 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_action_trainable_scope": (
                 (
-                    "phase_conditioned_relative_geometry_action_adapter_only"
+                    (
+                        "phase_conditioned_geometry_adapter_only_with_phase_"
+                        "balanced_residual_imitation"
+                        if self.policy_guard_eraf_grounding_objective_version >= 18
+                        else "phase_conditioned_relative_geometry_action_adapter_only"
+                    )
                     if self.policy_guard_eraf_grounding_objective_version >= 17
                     else (
                         "semantic_causal_action_grounding_bridge_only"
@@ -11614,6 +11888,59 @@ class FastWAM(torch.nn.Module):
                 "same_state_source_anchor_or_reference_mirror_with_offset_fallback"
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 17
+                else None
+            ),
+            "eraf_action_phase_residual_contract": (
+                "phase_balanced_bounded_expert_minus_frozen_v9_17_candidate_"
+                "prefix_residual_imitation"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 18
+                else None
+            ),
+            "eraf_action_phase_residual_imitation_weight": (
+                self.policy_guard_eraf_action_phase_residual_imitation_weight
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 18
+                else None
+            ),
+            "eraf_action_phase_direction_weight": (
+                self.policy_guard_eraf_action_phase_direction_weight
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 18
+                else None
+            ),
+            "eraf_action_phase_weights": (
+                [
+                    self.policy_guard_eraf_action_phase_approach_weight,
+                    self.policy_guard_eraf_action_phase_transport_weight,
+                    self.policy_guard_eraf_action_phase_release_weight,
+                ]
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 18
+                else None
+            ),
+            "eraf_action_phase_approach_weight": (
+                self.policy_guard_eraf_action_phase_approach_weight
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 18
+                else None
+            ),
+            "eraf_action_phase_transport_weight": (
+                self.policy_guard_eraf_action_phase_transport_weight
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 18
+                else None
+            ),
+            "eraf_action_phase_release_weight": (
+                self.policy_guard_eraf_action_phase_release_weight
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 18
+                else None
+            ),
+            "eraf_action_phase_direction_min_norm": (
+                self.policy_guard_eraf_action_phase_direction_min_norm
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 18
                 else None
             ),
             "eraf_hard_role_curriculum": (
@@ -12589,6 +12916,18 @@ class FastWAM(torch.nn.Module):
             and bool(metadata.get("eraf_action_joint_training", False))
             and self.policy_guard_eraf_action_joint_training
         )
+        migrate_v917_to_v918_phase_residual = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 17
+            and self.policy_guard_eraf_grounding_objective_version == 18
+            and self.policy_guard_eraf_training_stage == "action"
+            and metadata.get("eraf_training_stage") == "action"
+            and saved_eraf_completion_only_memory
+            and self.policy_guard_eraf_completion_only_memory
+            and bool(metadata.get("eraf_action_joint_training", False))
+            and self.policy_guard_eraf_action_joint_training
+        )
         if migrate_v914_to_v915_action_grounding:
             expected_v914_warm_start = {
                 "eraf_action_joint_contract": (
@@ -12659,6 +12998,34 @@ class FastWAM(torch.nn.Module):
                 if metadata.get(name) != expected:
                     raise ValueError(
                         "PGC V9.17 requires an exact completed V9.16 action "
+                        f"checkpoint: {name}={metadata.get(name)!r}, "
+                        f"expected={expected!r}."
+                    )
+        if migrate_v917_to_v918_phase_residual:
+            expected_v917_warm_start = {
+                "eraf_action_joint_contract": (
+                    "frozen_eraf_v916_bridge_and_proposal_plus_direct_"
+                    "eef_relative_geometry_action_adapter"
+                ),
+                "eraf_action_trainable_scope": (
+                    "phase_conditioned_relative_geometry_action_adapter_only"
+                ),
+                "eraf_role_adapter_trainable_scope": (
+                    "phase_conditioned_relative_geometry_action_adapter_only"
+                ),
+                "eraf_action_geometry_contract": (
+                    "phase_selected_eef_relative_grasp_goal_interaction_"
+                    "relation_direct_bounded_action_residual_zero_init_v9_16_exact"
+                ),
+                "eraf_policy_state_contract": (
+                    "monotonic_completed_bitset_no_pending_holding_retry_"
+                    "recurrence"
+                ),
+            }
+            for name, expected in expected_v917_warm_start.items():
+                if metadata.get(name) != expected:
+                    raise ValueError(
+                        "PGC V9.18 requires an exact completed V9.17 action "
                         f"checkpoint: {name}={metadata.get(name)!r}, "
                         f"expected={expected!r}."
                     )
@@ -13467,6 +13834,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 17
                             )
+                            or (
+                                saved_grounding_objective == 17
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 18
+                            )
                         )
                         objective_upgrade = objective_upgrade and (
                             (
@@ -13477,6 +13849,7 @@ class FastWAM(torch.nn.Module):
                             or migrate_v914_to_v915_action_grounding
                             or migrate_v915_to_v916_semantic_causal
                             or migrate_v916_to_v917_direct_geometry
+                            or migrate_v917_to_v918_phase_residual
                         )
                         if (
                             saved_grounding_objective
@@ -13558,6 +13931,66 @@ class FastWAM(torch.nn.Module):
                                             "PGC V9.17 geometry-action checkpoint "
                                             f"mismatch: {name}={value!r}, "
                                             f"expected={expected!r}."
+                                        )
+                                if saved_grounding_objective >= 18:
+                                    expected_v918 = {
+                                        "eraf_action_phase_residual_contract": (
+                                            "phase_balanced_bounded_expert_minus_"
+                                            "frozen_v9_17_candidate_prefix_residual_"
+                                            "imitation"
+                                        ),
+                                        "eraf_action_phase_residual_imitation_weight": (
+                                            self.policy_guard_eraf_action_phase_residual_imitation_weight
+                                        ),
+                                        "eraf_action_phase_direction_weight": (
+                                            self.policy_guard_eraf_action_phase_direction_weight
+                                        ),
+                                        "eraf_action_phase_direction_min_norm": (
+                                            self.policy_guard_eraf_action_phase_direction_min_norm
+                                        ),
+                                    }
+                                    for name, expected in expected_v918.items():
+                                        value = metadata.get(name)
+                                        matches = (
+                                            value == expected
+                                            if isinstance(expected, str)
+                                            else math.isclose(
+                                                float(value),
+                                                float(expected),
+                                                rel_tol=0.0,
+                                                abs_tol=1.0e-9,
+                                            )
+                                        )
+                                        if not matches:
+                                            raise ValueError(
+                                                "PGC V9.18 phase-residual checkpoint "
+                                                f"mismatch: {name}={value!r}, "
+                                                f"expected={expected!r}."
+                                            )
+                                    saved_phase_weights = metadata.get(
+                                        "eraf_action_phase_weights"
+                                    )
+                                    expected_phase_weights = [
+                                        self.policy_guard_eraf_action_phase_approach_weight,
+                                        self.policy_guard_eraf_action_phase_transport_weight,
+                                        self.policy_guard_eraf_action_phase_release_weight,
+                                    ]
+                                    if not isinstance(saved_phase_weights, list) or (
+                                        len(saved_phase_weights) != 3
+                                    ) or any(
+                                        not math.isclose(
+                                            float(saved),
+                                            float(expected),
+                                            rel_tol=0.0,
+                                            abs_tol=1.0e-9,
+                                        )
+                                        for saved, expected in zip(
+                                            saved_phase_weights,
+                                            expected_phase_weights,
+                                        )
+                                    ):
+                                        raise ValueError(
+                                            "PGC V9.18 phase-weight contract mismatch."
                                         )
                         # V9.13 intentionally freezes the complete V9.11 ERAF
                         # geometry and disables every legacy grounding loss.
@@ -13646,8 +14079,13 @@ class FastWAM(torch.nn.Module):
                                     metadata.get("eraf_training_stage") == "action"
                                 )
                                 expected_scope = (
-                                    "phase_conditioned_relative_geometry_action_"
-                                    "adapter_only"
+                                    (
+                                        "phase_conditioned_geometry_adapter_only_"
+                                        "with_phase_balanced_residual_imitation"
+                                        if saved_grounding_objective >= 18
+                                        else "phase_conditioned_relative_geometry_"
+                                        "action_adapter_only"
+                                    )
                                     if (
                                         saved_grounding_objective >= 17
                                         and saved_action_joint_training
@@ -14216,8 +14654,14 @@ class FastWAM(torch.nn.Module):
                                         "completion-only memory contract."
                                     )
                                 expected_action_joint_contract = (
-                                    "frozen_eraf_v916_bridge_and_proposal_plus_"
-                                    "direct_eef_relative_geometry_action_adapter"
+                                    (
+                                        "frozen_eraf_v917_stack_plus_phase_balanced_"
+                                        "direct_geometry_residual_imitation"
+                                        if saved_grounding_objective >= 18
+                                        else "frozen_eraf_v916_bridge_and_proposal_"
+                                        "plus_direct_eef_relative_geometry_action_"
+                                        "adapter"
+                                    )
                                     if saved_grounding_objective >= 17
                                     else (
                                         "frozen_eraf_perception_proposal_and_legacy_"
@@ -14235,8 +14679,13 @@ class FastWAM(torch.nn.Module):
                                     )
                                 )
                                 expected_action_trainable_scope = (
-                                    "phase_conditioned_relative_geometry_action_"
-                                    "adapter_only"
+                                    (
+                                        "phase_conditioned_geometry_adapter_only_"
+                                        "with_phase_balanced_residual_imitation"
+                                        if saved_grounding_objective >= 18
+                                        else "phase_conditioned_relative_geometry_"
+                                        "action_adapter_only"
+                                    )
                                     if saved_grounding_objective >= 17
                                     else (
                                         "semantic_causal_action_grounding_bridge_only"
@@ -14262,8 +14711,14 @@ class FastWAM(torch.nn.Module):
                                         expected_action_trainable_scope
                                     ),
                                     "eraf_role_adapter_trainable_scope": (
-                                        "phase_conditioned_relative_geometry_action_"
-                                        "adapter_only"
+                                        (
+                                            "phase_conditioned_geometry_adapter_"
+                                            "only_with_phase_balanced_residual_"
+                                            "imitation"
+                                            if saved_grounding_objective >= 18
+                                            else "phase_conditioned_relative_"
+                                            "geometry_action_adapter_only"
+                                        )
                                         if saved_grounding_objective >= 17
                                         else (
                                             "semantic_causal_action_grounding_bridge_only"
@@ -14405,6 +14860,7 @@ class FastWAM(torch.nn.Module):
                 or migrate_v9_to_phase_safe_memory
                 or migrate_v914_to_v915_action_grounding
                 or migrate_v916_to_v917_direct_geometry
+                or migrate_v917_to_v918_phase_residual
             )
             incompatible = self.policy_guard_modules.load_state_dict(
                 guard_state, strict=not migrate_with_new_modules
@@ -14578,6 +15034,15 @@ class FastWAM(torch.nn.Module):
                         f"has incompatible sidecars: missing={missing}, "
                         f"unexpected={unexpected}."
                     )
+            elif migrate_v917_to_v918_phase_residual:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                if missing or unexpected:
+                    raise ValueError(
+                        "PGC V9.17 -> V9.18 phase-residual warm start must "
+                        "restore every existing tensor exactly: "
+                        f"missing={missing}, unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -14602,6 +15067,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v914_to_v915_action_grounding
                 and not migrate_v915_to_v916_semantic_causal
                 and not migrate_v916_to_v917_direct_geometry
+                and not migrate_v917_to_v918_phase_residual
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -14738,6 +15204,15 @@ class FastWAM(torch.nn.Module):
                     resolved_base,
                     len(guard_state),
                     len(incompatible.missing_keys),
+                )
+            elif migrate_v917_to_v918_phase_residual:
+                logger.info(
+                    "Warm-started PGC v9.18 phase-residual calibration from "
+                    "exact V9.17 action sidecars at %s (base=%s restored=%d "
+                    "new_tensors=0).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
                 )
             else:
                 logger.info(

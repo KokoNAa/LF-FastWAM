@@ -947,6 +947,86 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
 
 
 class PGCERAFModuleTest(unittest.TestCase):
+    def test_v918_phase_residual_imitation_prefers_expert_correction(self):
+        model = tiny_pgc_fastwam(
+            version=9,
+            v9_stage="action",
+            v9_grounding_objective_version=18,
+            v9_completion_only_memory=True,
+            v9_action_joint_training=True,
+        )
+        candidate = torch.zeros(3, 2, 3)
+        expert = torch.tensor(
+            [
+                [[0.10, 0.00, 0.00], [0.08, 0.00, 0.00]],
+                [[0.00, 0.12, 0.00], [0.00, 0.10, 0.00]],
+                [[0.00, 0.00, 0.14], [0.00, 0.00, 0.12]],
+            ]
+        )
+        labels = {
+            "clause_valid": torch.tensor(
+                [[True, False, False, False]] * 3
+            ),
+            "phase_valid": torch.tensor(
+                [[True, False, False, False]] * 3
+            ),
+            "phase_ids": torch.tensor(
+                [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]]
+            ),
+            "predicate_truth": torch.zeros(3, 4),
+            "predicate_truth_valid": torch.ones(3, 4, dtype=torch.bool),
+        }
+        eraf_outputs = {
+            "clause_execution_probability": torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]] * 3
+            )
+        }
+        common = {
+            "pre_geometry_action": candidate,
+            "target_action": expert,
+            "action_is_pad": torch.zeros(3, 2, dtype=torch.bool),
+            "target_labels": labels,
+            "eraf_outputs": eraf_outputs,
+            "is_counterfactual": torch.ones(3, dtype=torch.bool),
+            "direct_action_valid": torch.ones(3, dtype=torch.bool),
+            "paired_language_valid": torch.ones(3, dtype=torch.bool),
+        }
+        correct = expert.clone().requires_grad_(True)
+        correct_loss, metrics = (
+            model._compute_policy_guard_v918_phase_residual_loss(
+                geometry_residual=correct,
+                **common,
+            )
+        )
+        zero_loss, _ = model._compute_policy_guard_v918_phase_residual_loss(
+            geometry_residual=torch.zeros_like(expert),
+            **common,
+        )
+        wrong_loss, _ = model._compute_policy_guard_v918_phase_residual_loss(
+            geometry_residual=-expert,
+            **common,
+        )
+        self.assertLess(float(correct_loss), float(zero_loss))
+        self.assertLess(float(zero_loss), float(wrong_loss))
+        self.assertAlmostEqual(
+            float(metrics["pgc_v918_prefix_mse_improvement"]),
+            float(expert.square().mean()),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(metrics["pgc_v918_translation_direction_positive_rate"]),
+            1.0,
+            places=6,
+        )
+        for phase_name in ("approach", "transport", "release"):
+            self.assertAlmostEqual(
+                float(metrics[f"pgc_v918_{phase_name}_sample_fraction"]),
+                1.0 / 3.0,
+                places=6,
+            )
+        correct_loss.backward()
+        self.assertIsNotNone(correct.grad)
+
     def setUp(self):
         torch.manual_seed(91)
         self.module = EntityRelationAffordanceField(
@@ -4372,6 +4452,72 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                     ),
                     name,
                 )
+
+    def test_v917_to_v918_phase_residual_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v917_path = root / "v917.pt"
+            v918_path = root / "v918.pt"
+            v917 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=17,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v917.mot.state_dict()},
+                base_path,
+            )
+            v917.load_checkpoint(base_path)
+            v917.save_checkpoint(v917_path, step=14250)
+            old_state = {
+                name: value.clone()
+                for name, value in v917.policy_guard_modules.state_dict().items()
+            }
+
+            v918 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=18,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v918.load_checkpoint(v917_path)
+            new_state = v918.policy_guard_modules.state_dict()
+            self.assertEqual(set(old_state), set(new_state))
+            for name, value in old_state.items():
+                self.assertTrue(torch.equal(value, new_state[name]), name)
+            v918.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v918.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules.eraf_geometry_action_adapter."
+                    )
+                    for name in trainable
+                )
+            )
+            v918.save_checkpoint(v918_path, step=15250)
+            metadata = torch.load(
+                v918_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(
+                metadata["eraf_action_phase_residual_contract"],
+                "phase_balanced_bounded_expert_minus_frozen_v9_17_"
+                "candidate_prefix_residual_imitation",
+            )
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "phase_conditioned_geometry_adapter_only_with_phase_"
+                "balanced_residual_imitation",
+            )
 
     def test_v913_to_v914_checkpoint_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
