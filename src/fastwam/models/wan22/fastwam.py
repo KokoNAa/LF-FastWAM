@@ -1315,10 +1315,11 @@ class FastWAM(torch.nn.Module):
                     12,
                     13,
                     14,
+                    15,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, or 14."
+                        "between 1 and 15 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
