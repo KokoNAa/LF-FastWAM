@@ -13289,14 +13289,22 @@ class FastWAM(torch.nn.Module):
                                     metadata.get("eraf_training_stage") == "action"
                                 )
                                 expected_scope = (
-                                    "frozen_eraf_perception_action_bridge_"
-                                    "plus_proposal"
+                                    "semantic_causal_action_grounding_bridge_only"
                                     if (
-                                        saved_action_joint_training
+                                        saved_grounding_objective >= 16
+                                        and saved_action_joint_training
                                         and saved_action_stage
                                     )
                                     else (
-                                        "phase_safe_temporal_clause_memory_only"
+                                        "frozen_eraf_perception_action_bridge_"
+                                        "plus_proposal"
+                                        if (
+                                            saved_action_joint_training
+                                            and saved_action_stage
+                                        )
+                                        else (
+                                            "phase_safe_temporal_clause_memory_only"
+                                        )
                                     )
                                 )
                             elif saved_grounding_objective == 13:

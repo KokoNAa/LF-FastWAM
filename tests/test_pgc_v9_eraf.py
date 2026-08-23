@@ -50,6 +50,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
     _structured_all_entity_assignment_loss,
     entity_relation_affordance_loss,
 )
+from fastwam.models.wan22.fastwam import FastWAM
 from fastwam.models.wan22.policy_guard import (
     PhaseConditionedERAFActionBridge,
     infer_spatial_patch_grid,
