@@ -1119,6 +1119,21 @@ class PGCERAFModuleTest(unittest.TestCase):
                 oracle=oracle,
             )
 
+    def test_causal_audit_bypass_is_exact_v5_goalgraph(self):
+        base_queries, base_embedding, (_, _, outputs, _) = self._forward()
+        with torch.no_grad():
+            routed_queries, routed_embedding, routed = self.module.route_oracle(
+                base_goal_queries=base_queries,
+                base_goal_embedding=base_embedding,
+                outputs=outputs,
+                oracle={"_audit_bypass_bridge": True},
+            )
+        self.assertTrue(torch.equal(routed_queries, base_queries))
+        self.assertTrue(torch.equal(routed_embedding, base_embedding))
+        self.assertTrue(routed["oracle_eraf_enabled"].all())
+        self.assertTrue(routed["audit_bypass_bridge"].all())
+        self.assertEqual(routed["oracle_selected_clause"].tolist(), [-1, -1])
+
     def test_v99_view_fusion_and_scheduler_are_zero_init_and_trainable(self):
         torch.manual_seed(919)
         module = EntityRelationAffordanceField(

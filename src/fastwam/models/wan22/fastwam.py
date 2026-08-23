@@ -9345,12 +9345,27 @@ class FastWAM(torch.nn.Module):
         mask_language: bool = False,
         policy_guard_state: Optional[Mapping[str, torch.Tensor]] = None,
         policy_guard_eraf_oracle: Optional[Mapping[str, torch.Tensor]] = None,
+        policy_guard_eraf_audit_variants: Optional[
+            Mapping[str, Optional[Mapping[str, Any]]]
+        ] = None,
     ) -> dict[str, Any]:
         self.eval()
         if policy_guard_eraf_oracle is not None and not (
             self.policy_guard_enabled and self.policy_guard_version == 9
         ):
             raise ValueError("Oracle ERAF input requires PGC v9.")
+        if policy_guard_eraf_audit_variants is not None and not (
+            self.policy_guard_enabled and self.policy_guard_version == 9
+        ):
+            raise ValueError("ERAF causal variants require PGC v9.")
+        if (
+            policy_guard_eraf_audit_variants is not None
+            and policy_guard_eraf_oracle is not None
+        ):
+            raise ValueError(
+                "Ordinary Oracle ERAF routing and causal variants are mutually "
+                "exclusive."
+            )
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError(
                 "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
@@ -9530,6 +9545,14 @@ class FastWAM(torch.nn.Module):
         policy_guard_goal_embedding = None
         policy_guard_current_video_hidden = None
         policy_guard_goal_metrics: dict[str, torch.Tensor] = {}
+        policy_guard_eraf_audit_goals: dict[
+            str,
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                Optional[dict[str, torch.Tensor]],
+            ],
+        ] = {}
         if self.policy_guard_enabled and self.policy_guard_version == 9:
             self._policy_guard_last_eraf_diagnostics = None
         if self.policy_guard_enabled:
@@ -9555,6 +9578,49 @@ class FastWAM(torch.nn.Module):
             policy_guard_current_video_hidden = final_video_hidden[:, : int(
                 video_pre["meta"]["tokens_per_frame"]
             )].detach()
+            if policy_guard_eraf_audit_variants is not None:
+                learned_diagnostics = self._policy_guard_last_eraf_diagnostics
+                for raw_name, oracle_variant in (
+                    policy_guard_eraf_audit_variants.items()
+                ):
+                    name = str(raw_name).strip()
+                    if not name:
+                        raise ValueError("ERAF causal variant names must be non-empty.")
+                    if name in policy_guard_eraf_audit_goals:
+                        raise ValueError(f"Duplicate ERAF causal variant {name!r}.")
+                    if oracle_variant is None:
+                        variant_queries = policy_guard_goal_queries
+                        variant_embedding = policy_guard_goal_embedding
+                        variant_diagnostics = learned_diagnostics
+                    else:
+                        (
+                            variant_queries,
+                            variant_embedding,
+                            _,
+                        ) = self._encode_policy_guard_goal(
+                            final_video_hidden=final_video_hidden,
+                            video_tokens_per_frame=int(
+                                video_pre["meta"]["tokens_per_frame"]
+                            ),
+                            context=context,
+                            context_mask=context_mask,
+                            language_context_len=language_context_len,
+                            current_visual_hidden=video_pre["tokens"],
+                            policy_guard_state=policy_guard_state,
+                            policy_guard_eraf_oracle=oracle_variant,
+                            proprio=proprio,
+                        )
+                        variant_diagnostics = (
+                            self._policy_guard_last_eraf_diagnostics
+                        )
+                    policy_guard_eraf_audit_goals[name] = (
+                        variant_queries,
+                        variant_embedding,
+                        variant_diagnostics,
+                    )
+                # The deployed result and recurrent completion state must remain
+                # those of the learned ERAF path, independent of audit order.
+                self._policy_guard_last_eraf_diagnostics = learned_diagnostics
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -9624,7 +9690,7 @@ class FastWAM(torch.nn.Module):
             (
                 policy_guard_latents_action,
                 action_residual,
-                _,
+                policy_guard_proposal_metrics,
             ) = self.policy_guard_modules["action_chunk_proposal"](
                 base_action=latents_action,
                 goal_queries=policy_guard_goal_queries,
@@ -9716,6 +9782,86 @@ class FastWAM(torch.nn.Module):
                     .to(device="cpu", dtype=torch.float32)
                 ),
             }
+            if policy_guard_eraf_audit_goals:
+                learned_queries = policy_guard_goal_queries
+                learned_embedding = policy_guard_goal_embedding
+                causal_variants: dict[str, dict[str, Any]] = {}
+                for name, (
+                    variant_queries,
+                    variant_embedding,
+                    _,
+                ) in policy_guard_eraf_audit_goals.items():
+                    if (
+                        name == "learned"
+                        and variant_queries is policy_guard_goal_queries
+                    ):
+                        variant_action = policy_guard_latents_action
+                        variant_residual = action_residual
+                        variant_metrics: Mapping[str, torch.Tensor] = (
+                            policy_guard_proposal_metrics
+                        )
+                    else:
+                        (
+                            variant_action,
+                            variant_residual,
+                            variant_metrics,
+                        ) = self.policy_guard_modules["action_chunk_proposal"](
+                            base_action=latents_action,
+                            goal_queries=variant_queries,
+                            action_is_pad=None,
+                        )
+                    causal_variants[name] = {
+                        # Retained only for the explicit causal-audit API.  The
+                        # standalone audit replays the small Proposal with this
+                        # tensor to measure the expert-loss gradient with
+                        # respect to ERAF-routed queries; ordinary rollout
+                        # results never expose it.
+                        "goal_queries": variant_queries.detach().to(
+                            device="cpu", dtype=torch.float32
+                        ),
+                        "action": variant_action[0].detach().to(
+                            device="cpu", dtype=torch.float32
+                        ),
+                        "residual": variant_residual[0].detach().to(
+                            device="cpu", dtype=torch.float32
+                        ),
+                        "residual_rms": float(
+                            variant_residual.float().square().mean().sqrt().item()
+                        ),
+                        "goal_query_rms": float(
+                            variant_queries.float().square().mean().sqrt().item()
+                        ),
+                        "goal_query_delta_from_learned_rms": float(
+                            (variant_queries - learned_queries)
+                            .float()
+                            .square()
+                            .mean()
+                            .sqrt()
+                            .item()
+                        ),
+                        "goal_embedding_delta_from_learned_rms": float(
+                            (variant_embedding - learned_embedding)
+                            .float()
+                            .square()
+                            .mean()
+                            .sqrt()
+                            .item()
+                        ),
+                        "proposal_attention_entropy": (
+                            None
+                            if "pgc_v4_action_residual_attention_entropy"
+                            not in variant_metrics
+                            else float(
+                                variant_metrics[
+                                    "pgc_v4_action_residual_attention_entropy"
+                                ]
+                                .detach()
+                                .float()
+                                .item()
+                            )
+                        ),
+                    }
+                result["policy_guard_eraf_causal_variants"] = causal_variants
             if self.policy_guard_version in {6, 7}:
                 metric_prefix = (
                     "pgc_v7" if self.policy_guard_version == 7 else "pgc_v6"

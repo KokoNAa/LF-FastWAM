@@ -1875,6 +1875,40 @@ class EntityRelationAffordanceField(nn.Module):
         """
         if torch.is_grad_enabled():
             raise RuntimeError("Oracle ERAF routing is evaluation-only.")
+        # The causal audit needs a true no-ERAF control.  Feeding zero relation
+        # tokens through the learned projections is not such a control because
+        # LayerNorm and linear biases can still perturb the frozen GoalGraph.
+        # This evaluation-only intervention bypasses the complete ERAF bridge
+        # and therefore returns the V5 GoalGraph representation bit-for-bit.
+        if bool(oracle.get("_audit_bypass_bridge", False)):
+            batch_size, clause_count, _ = outputs["clause_hidden"].shape
+            bypass_outputs = dict(outputs)
+            bypass_outputs.update(
+                {
+                    "oracle_eraf_enabled": torch.ones(
+                        batch_size,
+                        device=base_goal_queries.device,
+                        dtype=torch.bool,
+                    ),
+                    "oracle_selected_clause": torch.full(
+                        (batch_size,),
+                        -1,
+                        device=base_goal_queries.device,
+                        dtype=torch.long,
+                    ),
+                    "oracle_clause_valid": torch.zeros(
+                        (batch_size, clause_count),
+                        device=base_goal_queries.device,
+                        dtype=torch.bool,
+                    ),
+                    "audit_bypass_bridge": torch.ones(
+                        batch_size,
+                        device=base_goal_queries.device,
+                        dtype=torch.bool,
+                    ),
+                }
+            )
+            return base_goal_queries, base_goal_embedding, bypass_outputs
         required = {
             "clause_valid",
             "predicate_ids",

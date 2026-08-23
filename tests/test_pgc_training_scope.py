@@ -279,6 +279,26 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("EVALUATION.entity_relation_oracle=", source)
         self.assertIn("Oracle ERAF requires PGC_GATE_MODE=counterfactual", source)
 
+    def test_v914_has_same_state_eraf_action_causal_audit(self):
+        audit = (
+            REPO_ROOT / "scripts/audit_pgc_v9_eraf_action_causality.py"
+        ).read_text(encoding="utf-8")
+        model = (
+            REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"
+        ).read_text(encoding="utf-8")
+        for variant in (
+            "learned",
+            "oracle",
+            "bypass",
+            "wrong_subject",
+            "wrong_reference",
+            "wrong_goal_anchor",
+            "clause_swap",
+        ):
+            self.assertIn(f'"{variant}"', audit)
+        self.assertIn("expert_loss_goal_query_gradient_rms", audit)
+        self.assertIn("policy_guard_eraf_audit_variants", model)
+
 
 if __name__ == "__main__":
     unittest.main()
