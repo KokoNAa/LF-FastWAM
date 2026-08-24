@@ -995,6 +995,10 @@ class PGCERAFModuleTest(unittest.TestCase):
         self.assertTrue(torch.equal(residual, legacy))
         self.assertTrue(torch.equal(action, candidate + legacy))
         self.assertEqual(int(metrics["pgc_v919_selected_clause"].item()), 1)
+        torch.testing.assert_close(
+            metrics["pgc_v919_calibrated_eef_position"],
+            torch.zeros(1, 3),
+        )
         target = torch.zeros_like(action)
         target[..., 1] = 0.1
         (action - target).square().mean().backward()

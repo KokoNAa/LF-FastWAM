@@ -1978,6 +1978,11 @@ class HardRoutedERAFPhaseServo(nn.Module):
             "pgc_v919_selected_phase_mean": control_phase.float().mean(),
             "pgc_v919_route_confidence": selected_confidence.float().mean(),
             "pgc_v919_canonical_eef_from_state": calibrated_from_state,
+            # Preserve the exact canonical EEF used to construct the deployed
+            # servo directions.  Downstream privileged teachers must reuse
+            # this value instead of depending on an optional dataset field or
+            # reimplementing the audited proprio affine transform.
+            "pgc_v919_calibrated_eef_position": calibrated_eef,
             "pgc_v919_eef_scale_min": self.eef_scale.float().min(),
             "pgc_v919_eef_bias_max_abs": self.eef_bias.float().abs().max(),
             "pgc_v919_desired_distance": desired_norm.float().mean(),

@@ -6395,7 +6395,6 @@ class FastWAM(torch.nn.Module):
         waypoint_metrics: Mapping[str, torch.Tensor],
         target_labels: Mapping[str, torch.Tensor],
         target_action: torch.Tensor,
-        eef_position: Optional[torch.Tensor],
         action_is_pad: Optional[torch.Tensor],
         is_counterfactual: torch.Tensor,
         direct_action_valid: torch.Tensor,
@@ -6413,6 +6412,7 @@ class FastWAM(torch.nn.Module):
             "pgc_v919_selected_control_phase",
             "pgc_v919_route_confidence_per_sample",
             "pgc_v920_compatibility_probability_per_step",
+            "pgc_v919_calibrated_eef_position",
         }
         required_deployed = {"pgc_v921_effective_expert_correction"}
         missing = sorted(required_waypoint - set(waypoint_metrics))
@@ -6421,11 +6421,10 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"PGC V9.21 expert-alignment metrics are missing: {missing}."
             )
-        if eef_position is None:
-            raise ValueError(
-                "PGC V9.21 expert alignment requires canonical EEF positions."
-            )
         batch, horizon, _ = candidate_action.shape
+        eef_position = waypoint_metrics[
+            "pgc_v919_calibrated_eef_position"
+        ].float()
         if eef_position.shape != (batch, 3):
             raise ValueError("PGC V9.21 canonical EEF position must be [B,3].")
 
@@ -7638,7 +7637,6 @@ class FastWAM(torch.nn.Module):
                 waypoint_metrics=phase_servo_metrics,
                 target_labels=target_labels,
                 target_action=action,
-                eef_position=inputs.get("eraf_eef_position_current"),
                 action_is_pad=action_is_pad,
                 is_counterfactual=is_counterfactual,
                 direct_action_valid=direct_action_valid,
