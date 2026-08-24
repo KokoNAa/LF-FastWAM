@@ -409,6 +409,17 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn(
             'if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "22" ]]', source
         )
+        frozen_contract = source[
+            source.index('if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14"') :
+            source.index("if ! [[ \"${NPROC_PER_NODE}\"")
+        ]
+        self.assertIn('"${GROUNDING_OBJECTIVE_VERSION}" == "22"', frozen_contract)
+        self.assertIn("ATTENTION_MASK_WEIGHT=0.0", frozen_contract)
+        eef_contract = source[
+            source.index('ACTION_EEF_SCALE="[1.0,1.0,1.0]"') :
+            source.index("NATIVE_DATASET=", source.index("ACTION_EEF_SCALE="))
+        ]
+        self.assertIn('"${GROUNDING_OBJECTIVE_VERSION}" == "22"', eef_contract)
 
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (
