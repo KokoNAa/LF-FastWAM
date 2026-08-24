@@ -206,7 +206,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"action_expert_imitation_weight"',
             source,
         )
-        self.assertIn("set(range(1, 24))", source)
+        self.assertIn("set(range(1, 25))", source)
         self.assertNotIn("phase_rebinding_energy_weight=0.01", source)
 
     def test_v913_launcher_uses_v911_geometry_and_phase_safe_memory_only(self):
