@@ -206,7 +206,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"action_expert_imitation_weight"',
             source,
         )
-        self.assertIn("set(range(1, 23))", source)
+        self.assertIn("set(range(1, 24))", source)
         self.assertNotIn("phase_rebinding_energy_weight=0.01", source)
 
     def test_v913_launcher_uses_v911_geometry_and_phase_safe_memory_only(self):
@@ -409,6 +409,17 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn(
             'if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "22" ]]', source
         )
+        self.assertIn("action-alignment-preserving-clause", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=23", source)
+        self.assertIn(
+            "entity_relation_grounding.action_clause_teacher_weight=", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_clause_alignment_guard_weight=",
+            source,
+        )
+        self.assertIn("action_clause_teacher_weight: 4.0", config)
+        self.assertIn("action_clause_alignment_guard_weight: 8.0", config)
         frozen_contract = source[
             source.index('if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14"') :
             source.index("if ! [[ \"${NPROC_PER_NODE}\"")

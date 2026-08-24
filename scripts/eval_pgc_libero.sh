@@ -255,7 +255,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 23)):
+    if objective not in set(range(1, 24)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -324,7 +324,10 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_v920_stack_plus_phase_specific_expert_adapter_with_"
+            "frozen_v921_teacher_plus_alignment_preserving_negative_focused_"
+            "final_action_clause_ranking"
+            if objective >= 23
+            else "frozen_v920_stack_plus_phase_specific_expert_adapter_with_"
             "balanced_final_action_clause_ranking"
             if objective >= 22
             else "frozen_v920_stack_plus_phase_specific_privileged_expert_"
@@ -441,11 +444,25 @@ if version == 9:
         )
     if objective >= 22 and (
         metadata.get("eraf_action_clause_ranking_contract")
-        != "coherent_same_state_clause_swap_final_expert_prefix_mse_ranking_"
-        "balanced_over_approach_transport_release"
+        != (
+            "frozen_v921_teacher_correct_output_preservation_plus_expert_"
+            "nonregression_and_detached_correct_wrong_clause_ranking_"
+            "balanced_over_approach_transport_release"
+            if objective >= 23
+            else "coherent_same_state_clause_swap_final_expert_prefix_mse_"
+            "ranking_balanced_over_approach_transport_release"
+        )
     ):
         raise SystemExit(
             "PGC clause-ranking checkpoint lacks its balanced final-action contract"
+        )
+    if objective >= 23 and (
+        metadata.get("eraf_action_clause_teacher_contract")
+        != "training_only_frozen_exact_v921_expert_residual_adapter_excluded_"
+        "from_rollout_and_optimizer"
+    ):
+        raise SystemExit(
+            "PGC alignment-preserving clause checkpoint lacks its frozen teacher contract"
         )
     if completion_only_memory and (
         training_stage != "action"
@@ -621,6 +638,10 @@ mapping = {
     "eraf_action_expert_native_zero_weight": "action_expert_native_zero_weight",
     "eraf_action_clause_ranking_weight": "action_clause_ranking_weight",
     "eraf_action_clause_ranking_margin": "action_clause_ranking_margin",
+    "eraf_action_clause_teacher_weight": "action_clause_teacher_weight",
+    "eraf_action_clause_alignment_guard_weight": (
+        "action_clause_alignment_guard_weight"
+    ),
     "eraf_action_eef_initial_scale": "action_eef_scale",
     "eraf_action_eef_initial_bias": "action_eef_bias",
     "eraf_action_causal_ranking_weight": "action_causal_ranking_weight",
