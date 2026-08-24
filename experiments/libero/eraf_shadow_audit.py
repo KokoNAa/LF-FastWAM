@@ -1329,6 +1329,7 @@ class ERAFOracleProvider(ERAFShadowAuditor):
             "goal_anchors": goal_anchors,
             "goal_anchor_valid": goal_anchor_valid,
             "predicate_truth": predicate_truth,
+            "subject_grasped": subject_grasped,
             "phase_ids": phase_ids,
             "phase_valid": clause_valid.copy(),
         }

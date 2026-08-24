@@ -48,6 +48,11 @@ from experiments.libero.eraf_shadow_audit import (
     verify_shadow_action_integrity,
 )
 from experiments.libero.language_condition import normalize_instruction_condition
+from experiments.libero.oracle_phase_servo import (
+    OraclePhaseServoConfig,
+    apply_oracle_phase_servo,
+    summarize_oracle_phase_servo,
+)
 from experiments.libero.language_interventions import (
     load_language_intervention_manifest,
     select_language_intervention_record,
@@ -938,6 +943,55 @@ def _resolve_max_steps(cfg: DictConfig) -> int:
     return max_steps
 
 
+def _oracle_phase_servo_config(cfg: DictConfig) -> OraclePhaseServoConfig:
+    evaluation = cfg.EVALUATION
+    config = OraclePhaseServoConfig(
+        enabled=bool(evaluation.get("entity_relation_oracle_phase_servo", False)),
+        approach_gain=float(
+            evaluation.get("entity_relation_oracle_servo_approach_gain", 4.0)
+        ),
+        transport_gain=float(
+            evaluation.get("entity_relation_oracle_servo_transport_gain", 4.0)
+        ),
+        max_translation_action=float(
+            evaluation.get(
+                "entity_relation_oracle_servo_max_translation_action", 0.20
+            )
+        ),
+        approach_height_m=float(
+            evaluation.get("entity_relation_oracle_servo_approach_height_m", 0.08)
+        ),
+        transport_height_m=float(
+            evaluation.get("entity_relation_oracle_servo_transport_height_m", 0.10)
+        ),
+        grasp_offset_m=float(
+            evaluation.get("entity_relation_oracle_servo_grasp_offset_m", 0.01)
+        ),
+        release_height_m=float(
+            evaluation.get("entity_relation_oracle_servo_release_height_m", 0.04)
+        ),
+        horizontal_tolerance_m=float(
+            evaluation.get(
+                "entity_relation_oracle_servo_horizontal_tolerance_m", 0.035
+            )
+        ),
+        grasp_distance_m=float(
+            evaluation.get("entity_relation_oracle_servo_grasp_distance_m", 0.035)
+        ),
+        release_distance_m=float(
+            evaluation.get("entity_relation_oracle_servo_release_distance_m", 0.05)
+        ),
+        interaction_distance_m=float(
+            evaluation.get(
+                "entity_relation_oracle_servo_interaction_distance_m", 0.045
+            )
+        ),
+    )
+    if config.enabled:
+        config.validate()
+    return config
+
+
 def _capture_libero_sim_state(env: Any) -> np.ndarray:
     """Return the exact flattened simulator state used by LIBERO reset APIs."""
     inner = getattr(env, "env", None)
@@ -1155,6 +1209,11 @@ def run_single_episode(
     list[dict[str, Any]],
 ]:
     max_steps = _resolve_max_steps(cfg)
+    oracle_phase_servo = _oracle_phase_servo_config(cfg)
+    if oracle_phase_servo.enabled and eraf_oracle_provider is None:
+        raise ValueError(
+            "Oracle phase servo requires the live ERAF oracle provider."
+        )
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
@@ -1298,6 +1357,14 @@ def run_single_episode(
 
         if len(pending_actions) == 0:
             inference_replan_index += 1
+            oracle_policy_input = (
+                eraf_oracle_provider.policy_input(
+                    obs=obs,
+                    episode_idx=episode_idx,
+                )
+                if eraf_oracle_provider is not None
+                else None
+            )
             eraf_capture_candidate = None
             if (
                 eraf_capture_enabled
@@ -1351,15 +1418,30 @@ def run_single_episode(
                 input_h=input_h,
                 model_device=model_device,
                 policy_guard_state=policy_guard_state.state_for_replan(),
-                policy_guard_eraf_oracle=(
-                    eraf_oracle_provider.policy_input(
-                        obs=obs,
-                        episode_idx=episode_idx,
-                    )
-                    if eraf_oracle_provider is not None
-                    else None
-                ),
+                policy_guard_eraf_oracle=oracle_policy_input,
             )
+            if oracle_phase_servo.enabled:
+                if oracle_policy_input is None or eraf_oracle_provider is None:
+                    raise RuntimeError(
+                        "Oracle phase servo lost its live privileged input."
+                    )
+                action_chunk, servo_diagnostics = apply_oracle_phase_servo(
+                    action_chunk,
+                    obs=obs,
+                    oracle=oracle_policy_input,
+                    workspace_min=eraf_oracle_provider.contract.workspace_min,
+                    workspace_max=eraf_oracle_provider.contract.workspace_max,
+                    config=oracle_phase_servo,
+                )
+                if policy_guard_diagnostics is None:
+                    raise RuntimeError(
+                        "Oracle phase servo requires policy-guard diagnostics."
+                    )
+                servo_diagnostics["replan_index"] = inference_replan_index
+                servo_diagnostics["policy_step"] = policy_steps_executed
+                policy_guard_diagnostics["entity_relation_oracle_phase_servo"] = (
+                    servo_diagnostics
+                )
             policy_guard_state.accept_model_state(next_policy_guard_state)
             inference_latencies_ms.append(inference_latency_ms)
             if policy_guard_diagnostics is not None:
@@ -1593,6 +1675,12 @@ def run_single_task(
     eraf_oracle_enabled = bool(
         cfg.EVALUATION.get("entity_relation_oracle", False)
     )
+    oracle_phase_servo = _oracle_phase_servo_config(cfg)
+    if oracle_phase_servo.enabled and not eraf_oracle_enabled:
+        raise ValueError(
+            "EVALUATION.entity_relation_oracle_phase_servo requires "
+            "EVALUATION.entity_relation_oracle=true."
+        )
     stateless_replan_ablation = bool(
         cfg.EVALUATION.get(
             "entity_relation_stateless_replan_ablation", False
@@ -1822,6 +1910,20 @@ def run_single_task(
                 "eraf_relation_reasoner_bridge_and_action_proposal"
             ),
         }
+    if oracle_phase_servo.enabled:
+        results["eraf_oracle_phase_servo"] = {
+            "enabled": True,
+            "privileged_evaluation_only": True,
+            "deployment_eligible": False,
+            "translation": "live_subject_goal_phase_cartesian_servo",
+            "orientation": "learned_proposal_passthrough",
+            "placement_gripper": "explicit_phase_command",
+            "interaction_near_fixture": "learned_proposal_passthrough",
+            "config": {
+                name: getattr(oracle_phase_servo, name)
+                for name in oracle_phase_servo.__dataclass_fields__
+            },
+        }
     if intervention_record is not None:
         results["pair_id"] = intervention_record.get("pair_id")
     if counterfactual_metadata is not None:
@@ -1973,6 +2075,18 @@ def run_single_task(
     results["policy_guard_override_rate"] = float(
         results["policy_guard_override_count"]
     ) / max(1, results["policy_guard_decision_count"])
+    if oracle_phase_servo.enabled:
+        episode_servo_records = [
+            [
+                decision["entity_relation_oracle_phase_servo"]
+                for decision in episode["decisions"]
+                if "entity_relation_oracle_phase_servo" in decision
+            ]
+            for episode in results["policy_guard_episode_diagnostics"]
+        ]
+        results["eraf_oracle_phase_servo"]["summary"] = (
+            summarize_oracle_phase_servo(episode_servo_records)
+        )
     if policy_guard_decisions:
         results["policy_guard_base_score_mean"] = float(
             np.mean([item["base_score"] for item in policy_guard_decisions])

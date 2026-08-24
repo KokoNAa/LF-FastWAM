@@ -29,6 +29,19 @@ ERAF_SHADOW_AUDIT="${PGC_ERAF_SHADOW_AUDIT:-false}"
 ERAF_SHADOW_SIDECAR_DIR="${PGC_ERAF_SHADOW_SIDECAR_DIR:-}"
 ERAF_ORACLE="${PGC_ERAF_ORACLE:-false}"
 ERAF_ORACLE_SIDECAR_DIR="${PGC_ERAF_ORACLE_SIDECAR_DIR:-}"
+ERAF_ORACLE_PHASE_SERVO="${PGC_ERAF_ORACLE_PHASE_SERVO:-false}"
+ERAF_ORACLE_SERVO_APPROACH_GAIN="${PGC_ERAF_ORACLE_SERVO_APPROACH_GAIN:-4.0}"
+ERAF_ORACLE_SERVO_TRANSPORT_GAIN="${PGC_ERAF_ORACLE_SERVO_TRANSPORT_GAIN:-4.0}"
+ERAF_ORACLE_SERVO_MAX_TRANSLATION="${PGC_ERAF_ORACLE_SERVO_MAX_TRANSLATION_ACTION:-0.20}"
+ERAF_ORACLE_SERVO_REPLAN_STEPS="${PGC_ERAF_ORACLE_SERVO_REPLAN_STEPS:-5}"
+ERAF_ORACLE_SERVO_APPROACH_HEIGHT="${PGC_ERAF_ORACLE_SERVO_APPROACH_HEIGHT_M:-0.08}"
+ERAF_ORACLE_SERVO_TRANSPORT_HEIGHT="${PGC_ERAF_ORACLE_SERVO_TRANSPORT_HEIGHT_M:-0.10}"
+ERAF_ORACLE_SERVO_GRASP_OFFSET="${PGC_ERAF_ORACLE_SERVO_GRASP_OFFSET_M:-0.01}"
+ERAF_ORACLE_SERVO_RELEASE_HEIGHT="${PGC_ERAF_ORACLE_SERVO_RELEASE_HEIGHT_M:-0.04}"
+ERAF_ORACLE_SERVO_HORIZONTAL_TOLERANCE="${PGC_ERAF_ORACLE_SERVO_HORIZONTAL_TOLERANCE_M:-0.035}"
+ERAF_ORACLE_SERVO_GRASP_DISTANCE="${PGC_ERAF_ORACLE_SERVO_GRASP_DISTANCE_M:-0.035}"
+ERAF_ORACLE_SERVO_RELEASE_DISTANCE="${PGC_ERAF_ORACLE_SERVO_RELEASE_DISTANCE_M:-0.05}"
+ERAF_ORACLE_SERVO_INTERACTION_DISTANCE="${PGC_ERAF_ORACLE_SERVO_INTERACTION_DISTANCE_M:-0.045}"
 ERAF_STATELESS_REPLAN_ABLATION="${PGC_ERAF_STATELESS_REPLAN_ABLATION:-false}"
 ERAF_COMPLETION_ONLY_MEMORY_ABLATION="${PGC_ERAF_COMPLETION_ONLY_MEMORY_ABLATION:-false}"
 ERAF_DIAGNOSTICS_DEFAULT=true
@@ -86,6 +99,21 @@ case "${ERAF_ORACLE}" in
     exit 1
     ;;
 esac
+case "${ERAF_ORACLE_PHASE_SERVO}" in
+  true|false) ;;
+  *)
+    echo "PGC_ERAF_ORACLE_PHASE_SERVO must be true or false." >&2
+    exit 1
+    ;;
+esac
+if [[ "${ERAF_ORACLE_PHASE_SERVO}" == "true" && "${ERAF_ORACLE}" != "true" ]]; then
+  echo "Oracle phase servo requires PGC_ERAF_ORACLE=true." >&2
+  exit 1
+fi
+if ! [[ "${ERAF_ORACLE_SERVO_REPLAN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PGC_ERAF_ORACLE_SERVO_REPLAN_STEPS must be a positive integer." >&2
+  exit 1
+fi
 if [[ "${ERAF_ORACLE}" == "true" && "${ERAF_SHADOW_AUDIT}" == "true" ]]; then
   echo "Oracle ERAF and passive ERAF shadow audit are mutually exclusive." >&2
   exit 1
@@ -779,6 +807,23 @@ PY
       "EVALUATION.entity_relation_oracle_sidecar_dir=${ERAF_ORACLE_SIDECAR_DIR}"
     )
   fi
+  if [[ "${ERAF_ORACLE_PHASE_SERVO}" == "true" ]]; then
+    EXTRA_OVERRIDES+=(
+      "+EVALUATION.entity_relation_oracle_phase_servo=true"
+      "+EVALUATION.entity_relation_oracle_servo_approach_gain=${ERAF_ORACLE_SERVO_APPROACH_GAIN}"
+      "+EVALUATION.entity_relation_oracle_servo_transport_gain=${ERAF_ORACLE_SERVO_TRANSPORT_GAIN}"
+      "+EVALUATION.entity_relation_oracle_servo_max_translation_action=${ERAF_ORACLE_SERVO_MAX_TRANSLATION}"
+      "+EVALUATION.entity_relation_oracle_servo_approach_height_m=${ERAF_ORACLE_SERVO_APPROACH_HEIGHT}"
+      "+EVALUATION.entity_relation_oracle_servo_transport_height_m=${ERAF_ORACLE_SERVO_TRANSPORT_HEIGHT}"
+      "+EVALUATION.entity_relation_oracle_servo_grasp_offset_m=${ERAF_ORACLE_SERVO_GRASP_OFFSET}"
+      "+EVALUATION.entity_relation_oracle_servo_release_height_m=${ERAF_ORACLE_SERVO_RELEASE_HEIGHT}"
+      "+EVALUATION.entity_relation_oracle_servo_horizontal_tolerance_m=${ERAF_ORACLE_SERVO_HORIZONTAL_TOLERANCE}"
+      "+EVALUATION.entity_relation_oracle_servo_grasp_distance_m=${ERAF_ORACLE_SERVO_GRASP_DISTANCE}"
+      "+EVALUATION.entity_relation_oracle_servo_release_distance_m=${ERAF_ORACLE_SERVO_RELEASE_DISTANCE}"
+      "+EVALUATION.entity_relation_oracle_servo_interaction_distance_m=${ERAF_ORACLE_SERVO_INTERACTION_DISTANCE}"
+      "EVALUATION.replan_steps=${ERAF_ORACLE_SERVO_REPLAN_STEPS}"
+    )
+  fi
 fi
 if [[ -n "${MANIFEST_PATH}" ]]; then
   EXTRA_OVERRIDES+=("EVALUATION.language_intervention_manifest=${MANIFEST_PATH}")
@@ -840,6 +885,7 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
   echo "  eraf_shadow_sidecar=${ERAF_SHADOW_SIDECAR_DIR:-disabled}"
   echo "  eraf_oracle=${ERAF_ORACLE}"
   echo "  eraf_oracle_sidecar=${ERAF_ORACLE_SIDECAR_DIR:-disabled}"
+  echo "  eraf_oracle_phase_servo=${ERAF_ORACLE_PHASE_SERVO}"
   if [[ "${ERAF_STATELESS_REPLAN_ABLATION}" == "true" ]]; then
     ERAF_POLICY_STATE_MODE=reset_each_replan
   elif [[ "${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}" == "true" ]]; then

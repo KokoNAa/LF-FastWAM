@@ -6,6 +6,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PolicyGuardTrainingScopeTest(unittest.TestCase):
+    def test_oracle_phase_servo_is_explicit_privileged_eval_ablation(self):
+        launcher = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
+        evaluator = (
+            REPO_ROOT / "experiments/libero/eval_libero_single.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'ERAF_ORACLE_PHASE_SERVO="${PGC_ERAF_ORACLE_PHASE_SERVO:-false}"',
+            launcher,
+        )
+        self.assertIn(
+            "Oracle phase servo requires PGC_ERAF_ORACLE=true.", launcher
+        )
+        self.assertIn('"privileged_evaluation_only": True', evaluator)
+        self.assertIn('"deployment_eligible": False', evaluator)
+
     def test_joint_training_requires_explicit_unlock(self):
         source = (REPO_ROOT / "scripts/train_pgc_libero.sh").read_text(
             encoding="utf-8"
