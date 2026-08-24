@@ -16248,6 +16248,7 @@ class FastWAM(torch.nn.Module):
                         if (
                             saved_grounding_objective >= 2
                             and not migrate_v9_to_phase_safe_memory
+                            and not objective_upgrade
                         ):
                             for metadata_name, expected_value in {
                                 "eraf_attention_mask_weight": (
@@ -16284,6 +16285,7 @@ class FastWAM(torch.nn.Module):
                         if (
                             saved_grounding_objective >= 3
                             and not migrate_v9_to_phase_safe_memory
+                            and not objective_upgrade
                         ):
                             for metadata_name, expected_value in {
                                 "eraf_role_assignment_weight": (

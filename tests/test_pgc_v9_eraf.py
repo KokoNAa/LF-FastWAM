@@ -5198,6 +5198,17 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                     "eraf_phase_expert_residual_adapter"
                 ].phase_output.bias.fill_(0.125)
             v921.save_checkpoint(v921_path, step=18250)
+            # Action checkpoints freeze grounding; their disabled training
+            # weights are not an action-upgrade compatibility contract.
+            payload = torch.load(v921_path, map_location="cpu", weights_only=False)
+            payload["architecture_metadata"]["eraf_attention_mask_weight"] = 0.0
+            payload["architecture_metadata"]["eraf_role_swap_weight"] = 0.0
+            payload["architecture_metadata"]["eraf_role_overlap_weight"] = 0.0
+            payload["architecture_metadata"]["eraf_role_assignment_weight"] = 0.0
+            payload["architecture_metadata"][
+                "eraf_role_assignment_hard_weight"
+            ] = 0.0
+            torch.save(payload, v921_path)
 
             v923 = tiny_pgc_fastwam(
                 version=9,
