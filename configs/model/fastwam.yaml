@@ -345,6 +345,11 @@ policy_guard:
     action_waypoint_zero_weight: 1.0
     action_waypoint_min_cosine: 0.20
     action_waypoint_tangent_max_ratio: 0.75
+    action_expert_imitation_weight: 2.0
+    action_expert_direction_weight: 0.5
+    action_expert_deployed_weight: 1.0
+    action_expert_distillation_weight: 0.5
+    action_expert_native_zero_weight: 1.0
     action_eef_scale: [1.0, 1.0, 1.0]
     action_eef_bias: [0.0, 0.0, 0.0]
     mask_weight: 1.0

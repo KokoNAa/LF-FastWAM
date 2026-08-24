@@ -353,6 +353,9 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
             encoding="utf-8"
         )
+        config = (REPO_ROOT / "configs/model/fastwam.yaml").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("action-expert-alignment", source)
         self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=21", source)
         self.assertIn("START_STEP=17250", source)
@@ -369,6 +372,11 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn(
             "entity_relation_grounding.action_expert_native_zero_weight=", source
         )
+        self.assertIn("action_expert_imitation_weight: 2.0", config)
+        self.assertIn("action_expert_direction_weight: 0.5", config)
+        self.assertIn("action_expert_deployed_weight: 1.0", config)
+        self.assertIn("action_expert_distillation_weight: 0.5", config)
+        self.assertIn("action_expert_native_zero_weight: 1.0", config)
 
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (
