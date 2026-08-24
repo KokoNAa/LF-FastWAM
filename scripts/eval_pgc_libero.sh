@@ -255,7 +255,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 22)):
+    if objective not in set(range(1, 23)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -324,8 +324,11 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_v920_stack_plus_phase_specific_privileged_expert_prefix_"
-            "residual_alignment"
+            "frozen_v920_stack_plus_phase_specific_expert_adapter_with_"
+            "balanced_final_action_clause_ranking"
+            if objective >= 22
+            else "frozen_v920_stack_plus_phase_specific_privileged_expert_"
+            "prefix_residual_alignment"
             if objective >= 21
             else "frozen_v919_stack_plus_phase_compatible_local_waypoint_vector_field"
             if objective >= 20
@@ -435,6 +438,14 @@ if version == 9:
     ):
         raise SystemExit(
             "PGC expert-alignment checkpoint lacks its privileged prefix contract"
+        )
+    if objective >= 22 and (
+        metadata.get("eraf_action_clause_ranking_contract")
+        != "coherent_same_state_clause_swap_final_expert_prefix_mse_ranking_"
+        "balanced_over_approach_transport_release"
+    ):
+        raise SystemExit(
+            "PGC clause-ranking checkpoint lacks its balanced final-action contract"
         )
     if completion_only_memory and (
         training_stage != "action"
@@ -608,6 +619,8 @@ mapping = {
         "action_expert_distillation_weight"
     ),
     "eraf_action_expert_native_zero_weight": "action_expert_native_zero_weight",
+    "eraf_action_clause_ranking_weight": "action_clause_ranking_weight",
+    "eraf_action_clause_ranking_margin": "action_clause_ranking_margin",
     "eraf_action_eef_initial_scale": "action_eef_scale",
     "eraf_action_eef_initial_bias": "action_eef_bias",
     "eraf_action_causal_ranking_weight": "action_causal_ranking_weight",

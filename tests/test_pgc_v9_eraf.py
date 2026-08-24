@@ -1170,6 +1170,73 @@ class PGCERAFModuleTest(unittest.TestCase):
             (3, 4, 3, 7),
         )
 
+    def test_v922_clause_ranking_balances_final_actions_across_phases(self):
+        model = tiny_pgc_fastwam(
+            version=9,
+            v9_stage="action",
+            v9_grounding_objective_version=22,
+            v9_completion_only_memory=True,
+            v9_action_joint_training=True,
+        )
+        batch, horizon, action_dim = 3, 4, 3
+        target = torch.zeros(batch, horizon, action_dim)
+        correct = torch.zeros_like(target, requires_grad=True)
+        wrong = torch.full_like(target, 0.25)
+        labels = {
+            "clause_valid": torch.tensor(
+                [[True, True, False, False]] * batch
+            ),
+            "phase_valid": torch.tensor(
+                [[True, False, False, False]] * batch
+            ),
+            "phase_ids": torch.tensor(
+                [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]]
+            ),
+            "predicate_truth": torch.zeros(batch, 4),
+            "predicate_truth_valid": torch.ones(
+                batch, 4, dtype=torch.bool
+            ),
+        }
+        waypoint = {"pgc_v919_selected_clause": torch.zeros(batch, dtype=torch.long)}
+        loss, metrics = model._compute_policy_guard_v922_clause_action_ranking_loss(
+            correct_action=correct,
+            wrong_clause_action=wrong,
+            target_action=target,
+            action_is_pad=torch.zeros(batch, horizon, dtype=torch.bool),
+            target_labels=labels,
+            waypoint_metrics=waypoint,
+            is_counterfactual=torch.ones(batch, dtype=torch.bool),
+            direct_action_valid=torch.ones(batch, dtype=torch.bool),
+            paired_language_valid=torch.ones(batch, dtype=torch.bool),
+        )
+        self.assertEqual(float(loss), 0.0)
+        self.assertEqual(float(metrics["pgc_v922_active_phase_groups"]), 3.0)
+        self.assertEqual(
+            float(metrics["pgc_v922_clause_correct_action_win_rate"]), 1.0
+        )
+
+        bad_correct = torch.full_like(target, 0.2, requires_grad=True)
+        bad_wrong = torch.zeros_like(target)
+        bad_loss, bad_metrics = (
+            model._compute_policy_guard_v922_clause_action_ranking_loss(
+                correct_action=bad_correct,
+                wrong_clause_action=bad_wrong,
+                target_action=target,
+                action_is_pad=None,
+                target_labels=labels,
+                waypoint_metrics=waypoint,
+                is_counterfactual=torch.ones(batch, dtype=torch.bool),
+                direct_action_valid=torch.ones(batch, dtype=torch.bool),
+                paired_language_valid=torch.ones(batch, dtype=torch.bool),
+            )
+        )
+        self.assertGreater(float(bad_loss), 0.0)
+        self.assertEqual(
+            float(bad_metrics["pgc_v922_clause_correct_action_win_rate"]), 0.0
+        )
+        bad_loss.backward()
+        self.assertGreater(float(bad_correct.grad.abs().sum()), 0.0)
+
     def test_v918_phase_residual_imitation_prefers_expert_correction(self):
         model = tiny_pgc_fastwam(
             version=9,
@@ -4967,6 +5034,74 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                 metadata["eraf_action_expert_alignment_contract"],
                 "training_only_privileged_phase_anchor_teacher_plus_deployed_"
                 "full_action_prefix_residual_and_semantic_causal_ranking",
+            )
+
+    def test_v921_to_v922_clause_ranking_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v921_path = root / "v921.pt"
+            v922_path = root / "v922.pt"
+            v921 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=21,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v921.mot.state_dict()},
+                base_path,
+            )
+            v921.load_checkpoint(base_path)
+            v921.save_checkpoint(v921_path, step=18250)
+            old_state = {
+                name: value.clone()
+                for name, value in v921.policy_guard_modules.state_dict().items()
+            }
+
+            v922 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=22,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v922.load_checkpoint(v921_path)
+            new_state = v922.policy_guard_modules.state_dict()
+            self.assertEqual(set(old_state), set(new_state))
+            for name, value in old_state.items():
+                self.assertTrue(torch.equal(value, new_state[name]), name)
+
+            v922.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v922.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules."
+                        "eraf_phase_expert_residual_adapter."
+                    )
+                    for name in trainable
+                )
+            )
+            v922.save_checkpoint(v922_path, step=18750)
+            metadata = torch.load(
+                v922_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(
+                metadata["eraf_action_joint_contract"],
+                "frozen_v920_stack_plus_phase_specific_expert_adapter_with_"
+                "balanced_final_action_clause_ranking",
+            )
+            self.assertEqual(
+                metadata["eraf_action_clause_ranking_contract"],
+                "coherent_same_state_clause_swap_final_expert_prefix_mse_"
+                "ranking_balanced_over_approach_transport_release",
             )
 
 

@@ -350,6 +350,8 @@ policy_guard:
     action_expert_deployed_weight: 1.0
     action_expert_distillation_weight: 0.5
     action_expert_native_zero_weight: 1.0
+    action_clause_ranking_weight: 4.0
+    action_clause_ranking_margin: 0.02
     action_eef_scale: [1.0, 1.0, 1.0]
     action_eef_bias: [0.0, 0.0, 0.0]
     mask_weight: 1.0

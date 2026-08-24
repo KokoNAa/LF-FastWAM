@@ -763,6 +763,12 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_action_expert_native_zero_weight = float(
             eraf_config.get("action_expert_native_zero_weight", 1.0)
         )
+        self.policy_guard_eraf_action_clause_ranking_weight = float(
+            eraf_config.get("action_clause_ranking_weight", 4.0)
+        )
+        self.policy_guard_eraf_action_clause_ranking_margin = float(
+            eraf_config.get("action_clause_ranking_margin", 0.02)
+        )
         self.policy_guard_eraf_grounding_objective_version = int(
             eraf_config.get("grounding_objective_version", 1)
         )
@@ -1403,10 +1409,11 @@ class FastWAM(torch.nn.Module):
                     19,
                     20,
                     21,
+                    22,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "between 1 and 21 inclusive."
+                        "between 1 and 22 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1567,6 +1574,14 @@ class FastWAM(torch.nn.Module):
                 ) <= 0:
                     raise ValueError(
                         "PGC V9.21 expert-alignment loss weights must be positive."
+                    )
+                if min(
+                    self.policy_guard_eraf_action_clause_ranking_weight,
+                    self.policy_guard_eraf_action_clause_ranking_margin,
+                ) <= 0:
+                    raise ValueError(
+                        "PGC V9.22 clause-action ranking weight and margin "
+                        "must be positive."
                     )
                 if (
                     self.policy_guard_eraf_action_grounding_hidden_dim
@@ -6679,6 +6694,147 @@ class FastWAM(torch.nn.Module):
             ).detach()
         return total, metrics
 
+    def _compute_policy_guard_v922_clause_action_ranking_loss(
+        self,
+        *,
+        correct_action: torch.Tensor,
+        wrong_clause_action: torch.Tensor,
+        target_action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+        target_labels: Mapping[str, torch.Tensor],
+        waypoint_metrics: Mapping[str, torch.Tensor],
+        is_counterfactual: torch.Tensor,
+        direct_action_valid: torch.Tensor,
+        paired_language_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Rank coherent wrong-clause actions below the routed expert prefix.
+
+        Earlier causal training averages clause swaps with entity, reference,
+        and anchor interventions.  With small batches, multi-clause examples
+        therefore contribute too rarely to establish a directional ordering.
+        This objective operates only on valid multi-clause counterfactual
+        prefixes and averages active approach/transport/release groups equally.
+        The comparison is made at the final deployed action output.
+        """
+        if wrong_clause_action.shape != correct_action.shape or (
+            target_action.shape != correct_action.shape
+        ):
+            raise ValueError(
+                "PGC V9.22 correct, wrong-clause, and expert actions must "
+                "share [B,T,A]."
+            )
+        required = {
+            "pgc_v919_selected_clause",
+        }
+        missing = sorted(required - set(waypoint_metrics))
+        if missing:
+            raise ValueError(
+                f"PGC V9.22 clause ranking metrics are missing: {missing}."
+            )
+        batch, horizon, _ = correct_action.shape
+        prefix = min(self.policy_guard_execution_prefix_steps, horizon)
+        valid_step = correct_action.new_ones((batch, prefix), dtype=torch.float32)
+        if action_is_pad is not None:
+            valid_step = (~action_is_pad[:, :prefix].bool()).float()
+        step_count = valid_step.sum(dim=-1).clamp_min(1.0)
+
+        def prefix_error(candidate: torch.Tensor) -> torch.Tensor:
+            error = (
+                candidate[:, :prefix].float()
+                - target_action[:, :prefix].float()
+            ).square().mean(dim=-1)
+            return (error * valid_step).sum(dim=-1) / step_count
+
+        correct_error = prefix_error(correct_action)
+        wrong_error = prefix_error(wrong_clause_action)
+        clause_valid = target_labels["clause_valid"].bool()
+        selected_clause = waypoint_metrics["pgc_v919_selected_clause"].long()
+        if selected_clause.shape != (batch,):
+            raise ValueError("PGC V9.22 selected clause must be [B].")
+        selected_clause = selected_clause.clamp(0, clause_valid.shape[1] - 1)
+
+        def gather_clause(value: torch.Tensor) -> torch.Tensor:
+            index = selected_clause.view(batch, 1, *([1] * (value.ndim - 2)))
+            index = index.expand(batch, 1, *value.shape[2:])
+            return value.gather(1, index).squeeze(1)
+
+        selected_valid = gather_clause(clause_valid)
+        phase_valid = gather_clause(target_labels["phase_valid"].bool())
+        phase = gather_clause(target_labels["phase_ids"].long()).clamp(0, 2)
+        truth = gather_clause(target_labels["predicate_truth"].float())
+        truth_valid = gather_clause(
+            target_labels["predicate_truth_valid"].bool()
+        )
+        phase = torch.where(
+            (phase == 1) & truth_valid & (truth >= 0.5),
+            torch.full_like(phase, 2),
+            phase,
+        )
+        eligible = (
+            is_counterfactual.bool()
+            & direct_action_valid.bool()
+            & paired_language_valid.bool()
+            & (clause_valid.sum(dim=-1) > 1)
+            & selected_valid
+            & phase_valid
+            & (valid_step.sum(dim=-1) > 0)
+        )
+        margin = float(self.policy_guard_eraf_action_clause_ranking_margin)
+        ranking = torch.relu(margin + correct_error - wrong_error)
+        active_phase_count = ranking.sum() * 0.0
+        balanced_loss = ranking.sum() * 0.0
+        metrics: dict[str, torch.Tensor] = {}
+        for phase_id, phase_name in enumerate(("approach", "transport", "release")):
+            phase_mask = eligible & (phase == phase_id)
+            weight = phase_mask.float()
+            count = weight.sum().clamp_min(1.0)
+            phase_loss = (ranking * weight).sum() / count
+            phase_win = (
+                (correct_error < wrong_error).float() * weight
+            ).sum() / count
+            balanced_loss = balanced_loss + phase_loss
+            active_phase_count = active_phase_count + phase_mask.any().float()
+            metrics[f"loss_pgc_v922_{phase_name}_clause_ranking"] = (
+                phase_loss.detach()
+            )
+            metrics[f"pgc_v922_{phase_name}_clause_win_rate"] = (
+                phase_win.detach()
+            )
+            metrics[f"pgc_v922_{phase_name}_eligible_fraction"] = (
+                phase_mask.float().mean().detach()
+            )
+        balanced_loss = balanced_loss / active_phase_count.clamp_min(1.0)
+        weight = eligible.float()
+        count = weight.sum().clamp_min(1.0)
+        action_delta = (
+            wrong_clause_action[:, :prefix].float()
+            - correct_action[:, :prefix].float()
+        ).square().mean(dim=(1, 2)).sqrt()
+        metrics.update(
+            {
+                "loss_pgc_v922_clause_action_ranking": balanced_loss.detach(),
+                "pgc_v922_clause_eligible_fraction": (
+                    eligible.float().mean().detach()
+                ),
+                "pgc_v922_clause_correct_action_win_rate": (
+                    ((correct_error < wrong_error).float() * weight).sum()
+                    / count
+                ).detach(),
+                "pgc_v922_clause_margin_satisfied_rate": (
+                    ((wrong_error - correct_error >= margin).float() * weight).sum()
+                    / count
+                ).detach(),
+                "pgc_v922_clause_action_delta_rms": (
+                    (action_delta * weight).sum() / count
+                ).detach(),
+                "pgc_v922_active_phase_groups": active_phase_count.detach(),
+            }
+        )
+        return (
+            self.policy_guard_eraf_action_clause_ranking_weight * balanced_loss,
+            metrics,
+        )
+
     def _training_loss_policy_guard_v5(
         self,
         *,
@@ -7651,7 +7807,7 @@ class FastWAM(torch.nn.Module):
             v915_negative_actions
             and (
                 self.policy_guard_eraf_grounding_objective_version < 20
-                or self.policy_guard_eraf_grounding_objective_version >= 21
+                or self.policy_guard_eraf_grounding_objective_version == 21
             )
         ):
             v915_causal_loss, v915_causal_metrics = (
@@ -7672,6 +7828,32 @@ class FastWAM(torch.nn.Module):
                 + self.policy_guard_eraf_action_causal_ranking_weight
                 * v915_causal_loss
             )
+        v922_clause_ranking_loss = action_objective.sum() * 0.0
+        v922_clause_ranking_metrics: dict[str, torch.Tensor] = {}
+        if (
+            self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 22
+        ):
+            wrong_clause_action = v915_negative_actions.get("clause")
+            if wrong_clause_action is None:
+                raise RuntimeError(
+                    "PGC V9.22 requires the coherent final wrong-clause action."
+                )
+            (
+                v922_clause_ranking_loss,
+                v922_clause_ranking_metrics,
+            ) = self._compute_policy_guard_v922_clause_action_ranking_loss(
+                correct_action=proposal_action,
+                wrong_clause_action=wrong_clause_action,
+                target_action=action,
+                action_is_pad=action_is_pad,
+                target_labels=target_labels,
+                waypoint_metrics=phase_servo_metrics,
+                is_counterfactual=is_counterfactual,
+                direct_action_valid=direct_action_valid,
+                paired_language_valid=paired_language_valid,
+            )
+            action_objective = action_objective + v922_clause_ranking_loss
         if self.policy_guard_version == 9:
             grounding_scale = {
                 "grounding": 1.0,
@@ -7787,6 +7969,9 @@ class FastWAM(torch.nn.Module):
             "loss_pgc_v921_expert_alignment": float(
                 v921_expert_alignment_loss.detach().item()
             ),
+            "loss_pgc_v922_clause_action_ranking": float(
+                v922_clause_ranking_loss.detach().item()
+            ),
             "loss_pgc_verifier": float(verifier_loss.detach().item()),
             "loss_pgc_goal_action_alignment": float(
                 alignment_loss.detach().item()
@@ -7853,6 +8038,13 @@ class FastWAM(torch.nn.Module):
                 action_training_scale
                 if self.policy_guard_version == 9
                 and self.policy_guard_eraf_grounding_objective_version >= 21
+                else 0.0
+            ),
+            "pgc_v922_clause_ranking_effective_weight": (
+                action_training_scale
+                * self.policy_guard_eraf_action_clause_ranking_weight
+                if self.policy_guard_version == 9
+                and self.policy_guard_eraf_grounding_objective_version >= 22
                 else 0.0
             ),
             "pgc_v6_target_interaction_effective_weight": (
@@ -8043,6 +8235,9 @@ class FastWAM(torch.nn.Module):
         loss_dict.update(detached_policy_guard_metrics(v920_waypoint_metrics))
         loss_dict.update(
             detached_policy_guard_metrics(v921_expert_alignment_metrics)
+        )
+        loss_dict.update(
+            detached_policy_guard_metrics(v922_clause_ranking_metrics)
         )
         for name, value in detached_policy_guard_metrics(
             source_goal_metrics
@@ -12971,7 +13166,10 @@ class FastWAM(torch.nn.Module):
             "eraf_action_joint_contract": (
                 (
                     (
-                        "frozen_v920_stack_plus_phase_specific_privileged_"
+                        "frozen_v920_stack_plus_phase_specific_expert_adapter_"
+                        "with_balanced_final_action_clause_ranking"
+                        if self.policy_guard_eraf_grounding_objective_version >= 22
+                        else "frozen_v920_stack_plus_phase_specific_privileged_"
                         "expert_prefix_residual_alignment"
                         if self.policy_guard_eraf_grounding_objective_version >= 21
                         else "frozen_v919_stack_plus_phase_compatible_local_"
@@ -13202,6 +13400,25 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_eraf_action_expert_native_zero_weight
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 21
+                else None
+            ),
+            "eraf_action_clause_ranking_contract": (
+                "coherent_same_state_clause_swap_final_expert_prefix_mse_"
+                "ranking_balanced_over_approach_transport_release"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 22
+                else None
+            ),
+            "eraf_action_clause_ranking_weight": (
+                self.policy_guard_eraf_action_clause_ranking_weight
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 22
+                else None
+            ),
+            "eraf_action_clause_ranking_margin": (
+                self.policy_guard_eraf_action_clause_ranking_margin
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 22
                 else None
             ),
             "eraf_action_servo_frame_weight": (
@@ -14289,6 +14506,18 @@ class FastWAM(torch.nn.Module):
             and bool(metadata.get("eraf_action_joint_training", False))
             and self.policy_guard_eraf_action_joint_training
         )
+        migrate_v921_to_v922_clause_ranking = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 21
+            and self.policy_guard_eraf_grounding_objective_version == 22
+            and self.policy_guard_eraf_training_stage == "action"
+            and metadata.get("eraf_training_stage") == "action"
+            and saved_eraf_completion_only_memory
+            and self.policy_guard_eraf_completion_only_memory
+            and bool(metadata.get("eraf_action_joint_training", False))
+            and self.policy_guard_eraf_action_joint_training
+        )
         if migrate_v914_to_v915_action_grounding:
             expected_v914_warm_start = {
                 "eraf_action_joint_contract": (
@@ -14469,6 +14698,35 @@ class FastWAM(torch.nn.Module):
                 if metadata.get(name) != expected:
                     raise ValueError(
                         "PGC V9.21 requires an exact completed V9.20 action "
+                        f"checkpoint: {name}={metadata.get(name)!r}, "
+                        f"expected={expected!r}."
+                    )
+        if migrate_v921_to_v922_clause_ranking:
+            expected_v921_warm_start = {
+                "eraf_action_joint_contract": (
+                    "frozen_v920_stack_plus_phase_specific_privileged_"
+                    "expert_prefix_residual_alignment"
+                ),
+                "eraf_action_trainable_scope": (
+                    "phase_specific_privileged_expert_residual_adapter_only"
+                ),
+                "eraf_role_adapter_trainable_scope": (
+                    "phase_specific_privileged_expert_residual_adapter_only"
+                ),
+                "eraf_action_expert_alignment_contract": (
+                    "training_only_privileged_phase_anchor_teacher_plus_"
+                    "deployed_full_action_prefix_residual_and_semantic_"
+                    "causal_ranking"
+                ),
+                "eraf_policy_state_contract": (
+                    "monotonic_completed_bitset_no_pending_holding_retry_"
+                    "recurrence"
+                ),
+            }
+            for name, expected in expected_v921_warm_start.items():
+                if metadata.get(name) != expected:
+                    raise ValueError(
+                        "PGC V9.22 requires an exact completed V9.21 action "
                         f"checkpoint: {name}={metadata.get(name)!r}, "
                         f"expected={expected!r}."
                     )
@@ -15297,6 +15555,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 21
                             )
+                            or (
+                                saved_grounding_objective == 21
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 22
+                            )
                         )
                         objective_upgrade = objective_upgrade and (
                             (
@@ -15311,6 +15574,7 @@ class FastWAM(torch.nn.Module):
                             or migrate_v918_to_v919_phase_servo
                             or migrate_v919_to_v920_waypoint
                             or migrate_v920_to_v921_expert_alignment
+                            or migrate_v921_to_v922_clause_ranking
                         )
                         if (
                             saved_grounding_objective
@@ -15568,6 +15832,36 @@ class FastWAM(torch.nn.Module):
                                             "PGC V9.21 expert-alignment loss weights "
                                             "do not match the model configuration."
                                         )
+                                if saved_grounding_objective >= 22:
+                                    expected_clause_contract = (
+                                        "coherent_same_state_clause_swap_final_"
+                                        "expert_prefix_mse_ranking_balanced_over_"
+                                        "approach_transport_release"
+                                    )
+                                    if metadata.get(
+                                        "eraf_action_clause_ranking_contract"
+                                    ) != expected_clause_contract:
+                                        raise ValueError(
+                                            "PGC V9.22 checkpoint lacks its balanced "
+                                            "final-action clause-ranking contract."
+                                        )
+                                    for name, expected in {
+                                        "eraf_action_clause_ranking_weight": (
+                                            self.policy_guard_eraf_action_clause_ranking_weight
+                                        ),
+                                        "eraf_action_clause_ranking_margin": (
+                                            self.policy_guard_eraf_action_clause_ranking_margin
+                                        ),
+                                    }.items():
+                                        if not math.isclose(
+                                            float(metadata.get(name)),
+                                            float(expected),
+                                            rel_tol=0.0,
+                                            abs_tol=1.0e-9,
+                                        ):
+                                            raise ValueError(
+                                                f"PGC V9.22 clause-ranking mismatch: {name}."
+                                            )
                         # V9.13 intentionally freezes the complete V9.11 ERAF
                         # geometry and disables every legacy grounding loss.
                         # Those loss weights are training-time hyperparameters,
@@ -16240,6 +16534,10 @@ class FastWAM(torch.nn.Module):
                                 expected_action_joint_contract = (
                                     (
                                         "frozen_v920_stack_plus_phase_specific_"
+                                        "expert_adapter_with_balanced_final_action_"
+                                        "clause_ranking"
+                                        if saved_grounding_objective >= 22
+                                        else "frozen_v920_stack_plus_phase_specific_"
                                         "privileged_expert_prefix_residual_alignment"
                                         if saved_grounding_objective >= 21
                                         else "frozen_v919_stack_plus_phase_compatible_"
@@ -16724,6 +17022,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v918_to_v919_phase_servo
                 and not migrate_v919_to_v920_waypoint
                 and not migrate_v920_to_v921_expert_alignment
+                and not migrate_v921_to_v922_clause_ranking
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -16899,6 +17198,15 @@ class FastWAM(torch.nn.Module):
                     resolved_base,
                     len(guard_state),
                     len(incompatible.missing_keys),
+                )
+            elif migrate_v921_to_v922_clause_ranking:
+                logger.info(
+                    "Warm-started PGC v9.22 balanced final-action clause "
+                    "ranking from exact V9.21 action sidecars at %s "
+                    "(base=%s restored=%d new_tensors=0).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
                 )
             else:
                 logger.info(

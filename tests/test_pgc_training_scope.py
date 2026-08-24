@@ -206,7 +206,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"action_expert_imitation_weight"',
             source,
         )
-        self.assertIn("set(range(1, 22))", source)
+        self.assertIn("set(range(1, 23))", source)
         self.assertNotIn("phase_rebinding_energy_weight=0.01", source)
 
     def test_v913_launcher_uses_v911_geometry_and_phase_safe_memory_only(self):
@@ -382,6 +382,32 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"${GROUNDING_OBJECTIVE_VERSION}" == "20" || '
             '"${GROUNDING_OBJECTIVE_VERSION}" == "21"',
             source,
+        )
+
+    def test_clause_ranking_launcher_calibrates_final_multiclause_actions(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
+            encoding="utf-8"
+        )
+        config = (REPO_ROOT / "configs/model/fastwam.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("action-clause-ranking", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=22", source)
+        self.assertIn("START_STEP=18250", source)
+        self.assertIn("DEFAULT_STAGE_STEPS=500", source)
+        self.assertIn(
+            "expert-alignment checkpoint at step 18250", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_clause_ranking_weight=", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_clause_ranking_margin=", source
+        )
+        self.assertIn("action_clause_ranking_weight: 4.0", config)
+        self.assertIn("action_clause_ranking_margin: 0.02", config)
+        self.assertIn(
+            'if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "22" ]]', source
         )
 
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
