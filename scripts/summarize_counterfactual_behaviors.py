@@ -20,6 +20,7 @@ from experiments.libero.counterfactual_diagnostics import (
     COUNTERFACTUAL_BEHAVIOR_CATEGORIES,
     empty_behavior_counts,
 )
+from experiments.libero.oracle_phase_servo import summarize_oracle_phase_servo
 
 
 def _result_files(path: Path) -> list[Path]:
@@ -78,6 +79,7 @@ def summarize(path: Path, expected_episodes: int | None = None) -> dict[str, Any
 
     rows: list[dict[str, Any]] = []
     per_task: dict[int, Counter[str]] = defaultdict(Counter)
+    oracle_servo_episodes: list[list[dict[str, Any]]] = []
     for result_path in result_files:
         with result_path.open("r", encoding="utf-8") as handle:
             result = json.load(handle)
@@ -90,6 +92,14 @@ def summarize(path: Path, expected_episodes: int | None = None) -> dict[str, Any
             raise ValueError(
                 "Diagnostic episode count does not match total_episodes in "
                 f"{result_path}."
+            )
+        for policy_episode in result.get("policy_guard_episode_diagnostics", []):
+            oracle_servo_episodes.append(
+                [
+                    decision["entity_relation_oracle_phase_servo"]
+                    for decision in policy_episode.get("decisions", [])
+                    if "entity_relation_oracle_phase_servo" in decision
+                ]
             )
         for episode in episodes:
             row = _episode_row(result, episode, result_path)
@@ -123,7 +133,7 @@ def summarize(path: Path, expected_episodes: int | None = None) -> dict[str, Any
     event_counts = {
         field: sum(bool(row[field]) for row in rows) for field in event_fields
     }
-    return {
+    summary = {
         "result_files": len(result_files),
         "total_episodes": total,
         "behavior_counts": behavior_counts,
@@ -145,6 +155,11 @@ def summarize(path: Path, expected_episodes: int | None = None) -> dict[str, Any
         },
         "episodes": rows,
     }
+    if any(oracle_servo_episodes):
+        summary["oracle_phase_servo"] = summarize_oracle_phase_servo(
+            oracle_servo_episodes
+        )
+    return summary
 
 
 def main() -> None:

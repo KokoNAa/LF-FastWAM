@@ -165,6 +165,35 @@ class CounterfactualBehaviorSummaryTest(unittest.TestCase):
                     "horizon_timeout": True,
                 },
             ],
+            "policy_guard_episode_diagnostics": [
+                {
+                    "episode": 0,
+                    "decisions": [
+                        {
+                            "entity_relation_oracle_phase_servo": {
+                                "applied": True,
+                                "mode": "approach_hover",
+                                "selected_clause": 0,
+                                "effective_phase": 0,
+                                "subject_distance_m": 0.4,
+                                "goal_distance_m": 0.8,
+                                "action_delta_rms": 0.1,
+                            }
+                        },
+                        {
+                            "entity_relation_oracle_phase_servo": {
+                                "applied": True,
+                                "mode": "approach_hover",
+                                "selected_clause": 0,
+                                "effective_phase": 0,
+                                "subject_distance_m": 0.3,
+                                "goal_distance_m": 0.8,
+                                "action_delta_rms": 0.2,
+                            }
+                        },
+                    ],
+                }
+            ],
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "gpu0_task0_results.json"
@@ -178,6 +207,10 @@ class CounterfactualBehaviorSummaryTest(unittest.TestCase):
         )
         self.assertEqual(summary["event_counts"]["source_goal_achieved"], 1)
         self.assertEqual(summary["event_counts"]["other_object_grasped"], 1)
+        self.assertEqual(summary["oracle_phase_servo"]["decisions"], 2)
+        self.assertEqual(
+            summary["oracle_phase_servo"]["approach_progress_rate"], 1.0
+        )
         self.assertEqual(summary["event_counts"]["horizon_timeout"], 1)
 
 
