@@ -20,6 +20,12 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn(
             "Oracle phase servo requires PGC_ERAF_ORACLE=true.", launcher
         )
+        self.assertIn(
+            'ERAF_ORACLE_SERVO_SCOPE="${PGC_ERAF_ORACLE_SERVO_SCOPE:-full}"',
+            launcher,
+        )
+        self.assertIn("transport_proposal_release", launcher)
+        self.assertIn("transport_oracle_release", launcher)
         self.assertIn('"privileged_evaluation_only": True', evaluator)
         self.assertIn('"deployment_eligible": False', evaluator)
 

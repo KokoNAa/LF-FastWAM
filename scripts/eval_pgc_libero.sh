@@ -30,6 +30,7 @@ ERAF_SHADOW_SIDECAR_DIR="${PGC_ERAF_SHADOW_SIDECAR_DIR:-}"
 ERAF_ORACLE="${PGC_ERAF_ORACLE:-false}"
 ERAF_ORACLE_SIDECAR_DIR="${PGC_ERAF_ORACLE_SIDECAR_DIR:-}"
 ERAF_ORACLE_PHASE_SERVO="${PGC_ERAF_ORACLE_PHASE_SERVO:-false}"
+ERAF_ORACLE_SERVO_SCOPE="${PGC_ERAF_ORACLE_SERVO_SCOPE:-full}"
 ERAF_ORACLE_SERVO_APPROACH_GAIN="${PGC_ERAF_ORACLE_SERVO_APPROACH_GAIN:-4.0}"
 ERAF_ORACLE_SERVO_TRANSPORT_GAIN="${PGC_ERAF_ORACLE_SERVO_TRANSPORT_GAIN:-4.0}"
 ERAF_ORACLE_SERVO_MAX_TRANSLATION="${PGC_ERAF_ORACLE_SERVO_MAX_TRANSLATION_ACTION:-0.20}"
@@ -110,6 +111,13 @@ if [[ "${ERAF_ORACLE_PHASE_SERVO}" == "true" && "${ERAF_ORACLE}" != "true" ]]; t
   echo "Oracle phase servo requires PGC_ERAF_ORACLE=true." >&2
   exit 1
 fi
+case "${ERAF_ORACLE_SERVO_SCOPE}" in
+  full|transport_proposal_release|transport_oracle_release) ;;
+  *)
+    echo "PGC_ERAF_ORACLE_SERVO_SCOPE must be full, transport_proposal_release, or transport_oracle_release." >&2
+    exit 1
+    ;;
+esac
 if ! [[ "${ERAF_ORACLE_SERVO_REPLAN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "PGC_ERAF_ORACLE_SERVO_REPLAN_STEPS must be a positive integer." >&2
   exit 1
@@ -810,6 +818,7 @@ PY
   if [[ "${ERAF_ORACLE_PHASE_SERVO}" == "true" ]]; then
     EXTRA_OVERRIDES+=(
       "+EVALUATION.entity_relation_oracle_phase_servo=true"
+      "+EVALUATION.entity_relation_oracle_servo_scope=${ERAF_ORACLE_SERVO_SCOPE}"
       "+EVALUATION.entity_relation_oracle_servo_approach_gain=${ERAF_ORACLE_SERVO_APPROACH_GAIN}"
       "+EVALUATION.entity_relation_oracle_servo_transport_gain=${ERAF_ORACLE_SERVO_TRANSPORT_GAIN}"
       "+EVALUATION.entity_relation_oracle_servo_max_translation_action=${ERAF_ORACLE_SERVO_MAX_TRANSLATION}"
@@ -886,6 +895,7 @@ if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
   echo "  eraf_oracle=${ERAF_ORACLE}"
   echo "  eraf_oracle_sidecar=${ERAF_ORACLE_SIDECAR_DIR:-disabled}"
   echo "  eraf_oracle_phase_servo=${ERAF_ORACLE_PHASE_SERVO}"
+  echo "  eraf_oracle_servo_scope=${ERAF_ORACLE_SERVO_SCOPE}"
   if [[ "${ERAF_STATELESS_REPLAN_ABLATION}" == "true" ]]; then
     ERAF_POLICY_STATE_MODE=reset_each_replan
   elif [[ "${ERAF_COMPLETION_ONLY_MEMORY_ABLATION}" == "true" ]]; then

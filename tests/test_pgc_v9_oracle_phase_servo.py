@@ -108,6 +108,92 @@ class OraclePhaseServoTest(unittest.TestCase):
         self.assertEqual(diagnostics["mode"], "release_open")
         self.assertTrue(np.all(output[:, -1] == -1.0))
 
+    def test_transport_proposal_release_preserves_acquisition(self):
+        output, diagnostics = self.apply(
+            eef=[0.1, 0.1, 0.2],
+            payload=oracle(subject=[0.5, 0.5, 0.2], goal=[0.8, 0.8, 0.2]),
+            config=OraclePhaseServoConfig(
+                enabled=True, scope="transport_proposal_release"
+            ),
+        )
+        self.assertEqual(diagnostics["mode"], "proposal_acquisition")
+        self.assertFalse(diagnostics["applied"])
+        self.assertTrue(np.array_equal(output, self.actions))
+
+    def test_transport_proposal_release_holds_then_returns_release_to_proposal(self):
+        config = OraclePhaseServoConfig(
+            enabled=True, scope="transport_proposal_release"
+        )
+        goal = np.asarray([0.8, 0.8, 0.2])
+        output, diagnostics = self.apply(
+            eef=[0.2, 0.2, 0.3],
+            payload=oracle(
+                subject=[0.2, 0.2, 0.2], goal=goal, phase=1, grasped=True
+            ),
+            config=config,
+        )
+        self.assertEqual(diagnostics["mode"], "transport_hover")
+        self.assertTrue(np.all(output[:, -1] == 1.0))
+
+        output, diagnostics = self.apply(
+            eef=goal + np.asarray([0.0, 0.0, config.release_height_m]),
+            payload=oracle(
+                subject=[0.2, 0.2, 0.2], goal=goal, phase=1, grasped=True
+            ),
+            config=config,
+        )
+        self.assertEqual(diagnostics["mode"], "release_proposal")
+        self.assertFalse(diagnostics["applied"])
+        self.assertTrue(np.array_equal(output, self.actions))
+
+    def test_transport_oracle_release_preserves_acquisition_and_opens(self):
+        config = OraclePhaseServoConfig(
+            enabled=True, scope="transport_oracle_release"
+        )
+        subject = np.asarray([0.5, 0.5, 0.2])
+        goal = np.asarray([0.8, 0.8, 0.2])
+        output, diagnostics = self.apply(
+            eef=subject,
+            payload=oracle(subject=subject, goal=goal),
+            config=config,
+        )
+        self.assertEqual(diagnostics["mode"], "proposal_acquisition")
+        self.assertTrue(np.array_equal(output, self.actions))
+
+        output, diagnostics = self.apply(
+            eef=goal + np.asarray([0.0, 0.0, config.release_height_m]),
+            payload=oracle(
+                subject=subject, goal=goal, phase=1, grasped=True
+            ),
+            config=config,
+        )
+        self.assertEqual(diagnostics["mode"], "release_open")
+        self.assertTrue(np.all(output[:, -1] == -1.0))
+
+    def test_transport_scopes_leave_interactions_to_proposal(self):
+        output, diagnostics = self.apply(
+            eef=[0.1, 0.1, 0.2],
+            payload=oracle(
+                subject=[0.5, 0.5, 0.2], goal=[0.8, 0.8, 0.2], predicate=7
+            ),
+            config=OraclePhaseServoConfig(
+                enabled=True, scope="transport_oracle_release"
+            ),
+        )
+        self.assertEqual(diagnostics["mode"], "proposal_interaction")
+        self.assertFalse(diagnostics["applied"])
+        self.assertTrue(np.array_equal(output, self.actions))
+
+    def test_invalid_scope_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "scope must be one of"):
+            self.apply(
+                eef=[0.1, 0.1, 0.2],
+                payload=oracle(
+                    subject=[0.5, 0.5, 0.2], goal=[0.8, 0.8, 0.2]
+                ),
+                config=OraclePhaseServoConfig(enabled=True, scope="unknown"),
+            )
+
     def test_released_unfinished_retries_approach(self):
         subject = np.asarray([0.5, 0.5, 0.2])
         output, diagnostics = self.apply(
@@ -142,6 +228,7 @@ class OraclePhaseServoTest(unittest.TestCase):
                 {
                     "applied": True,
                     "mode": "approach_hover",
+                    "scope": "full",
                     "selected_clause": 0,
                     "effective_phase": 0,
                     "subject_distance_m": 0.4,
@@ -151,6 +238,7 @@ class OraclePhaseServoTest(unittest.TestCase):
                 {
                     "applied": True,
                     "mode": "approach_hover",
+                    "scope": "full",
                     "selected_clause": 0,
                     "effective_phase": 0,
                     "subject_distance_m": 0.3,
@@ -163,6 +251,7 @@ class OraclePhaseServoTest(unittest.TestCase):
         self.assertEqual(summary["approach_progress_samples"], 1)
         self.assertEqual(summary["approach_progress_rate"], 1.0)
         self.assertAlmostEqual(summary["action_delta_rms_mean"], 0.15)
+        self.assertEqual(summary["scope_counts"], {"full": 2})
 
 
 if __name__ == "__main__":

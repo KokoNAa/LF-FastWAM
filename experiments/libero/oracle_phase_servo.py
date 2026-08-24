@@ -18,11 +18,19 @@ import numpy as np
 
 PLACEMENT_PREDICATE_IDS = frozenset({1, 2, 3, 4, 5, 6})
 INTERACTION_PREDICATE_IDS = frozenset({7, 8, 9, 10})
+ORACLE_PHASE_SERVO_SCOPES = frozenset(
+    {
+        "full",
+        "transport_proposal_release",
+        "transport_oracle_release",
+    }
+)
 
 
 @dataclass(frozen=True)
 class OraclePhaseServoConfig:
     enabled: bool = False
+    scope: str = "full"
     approach_gain: float = 4.0
     transport_gain: float = 4.0
     max_translation_action: float = 0.20
@@ -36,6 +44,11 @@ class OraclePhaseServoConfig:
     interaction_distance_m: float = 0.045
 
     def validate(self) -> None:
+        if self.scope not in ORACLE_PHASE_SERVO_SCOPES:
+            raise ValueError(
+                "Oracle phase-servo scope must be one of "
+                f"{sorted(ORACLE_PHASE_SERVO_SCOPES)}, got {self.scope!r}."
+            )
         positive = {
             "approach_gain": self.approach_gain,
             "transport_gain": self.transport_gain,
@@ -107,7 +120,12 @@ def apply_oracle_phase_servo(
         raise ValueError("Oracle phase servo received non-finite actions.")
     output = actions.copy()
     if not config.enabled:
-        return output, {"enabled": False, "applied": False, "mode": "disabled"}
+        return output, {
+            "enabled": False,
+            "applied": False,
+            "mode": "disabled",
+            "scope": config.scope,
+        }
     config.validate()
 
     lower = np.asarray(workspace_min, dtype=np.float32).reshape(3)
@@ -121,6 +139,7 @@ def apply_oracle_phase_servo(
             "enabled": True,
             "applied": False,
             "mode": "all_clauses_complete",
+            "scope": config.scope,
             "selected_clause": -1,
         }
 
@@ -162,7 +181,23 @@ def apply_oracle_phase_servo(
     mode = "missing_anchor"
     gripper_command: float | None = None
 
-    if predicate_id in PLACEMENT_PREDICATE_IDS and effective_phase == 0 and subject is not None:
+    acquisition_servo_enabled = config.scope == "full"
+    interaction_servo_enabled = config.scope == "full"
+    oracle_release_enabled = config.scope in {
+        "full",
+        "transport_oracle_release",
+    }
+
+    if (
+        predicate_id in PLACEMENT_PREDICATE_IDS
+        and effective_phase == 0
+        and not acquisition_servo_enabled
+    ):
+        # The learned Proposal owns approach, orientation and grasp.  A body
+        # centre is not an executable grasp pose, so transport-only ablations
+        # must not overwrite acquisition actions.
+        mode = "proposal_acquisition"
+    elif predicate_id in PLACEMENT_PREDICATE_IDS and effective_phase == 0 and subject is not None:
         horizontal = float(np.linalg.norm(eef[:2] - subject[:2]))
         grasp_target = subject + np.asarray([0.0, 0.0, config.grasp_offset_m])
         grasp_distance = float(np.linalg.norm(eef - grasp_target))
@@ -182,10 +217,16 @@ def apply_oracle_phase_servo(
         horizontal = float(np.linalg.norm(eef[:2] - goal[:2]))
         release_target = goal + np.asarray([0.0, 0.0, config.release_height_m])
         release_distance = float(np.linalg.norm(eef - release_target))
-        if release_distance <= config.release_distance_m:
+        if release_distance <= config.release_distance_m and oracle_release_enabled:
             target = eef.copy()
             mode = "release_open"
             gripper_command = -1.0
+        elif release_distance <= config.release_distance_m:
+            # Keep the object closed during oracle transport, then return the
+            # complete chunk to Proposal at the release boundary.  In
+            # particular, do not zero translation while expecting Proposal to
+            # perform its own final placement correction.
+            mode = "release_proposal"
         elif horizontal > config.horizontal_tolerance_m:
             target = goal + np.asarray([0.0, 0.0, config.transport_height_m])
             mode = "transport_hover"
@@ -194,6 +235,8 @@ def apply_oracle_phase_servo(
             target = release_target
             mode = "transport_descend"
             gripper_command = 1.0
+    elif predicate_id in INTERACTION_PREDICATE_IDS and not interaction_servo_enabled:
+        mode = "proposal_interaction"
     elif predicate_id in INTERACTION_PREDICATE_IDS:
         interaction = goal if goal is not None else subject
         if interaction is not None:
@@ -228,6 +271,7 @@ def apply_oracle_phase_servo(
     action_delta_rms = float(np.sqrt(np.mean((output - actions) ** 2)))
     return output, {
         "enabled": True,
+        "scope": config.scope,
         "applied": bool(target is not None or gripper_command is not None),
         "mode": mode,
         "selected_clause": selected,
@@ -255,6 +299,7 @@ def summarize_oracle_phase_servo(
     records = [record for episode in episode_records for record in episode]
     applied = [record for record in records if bool(record.get("applied", False))]
     modes = Counter(str(record.get("mode", "unknown")) for record in records)
+    scopes = Counter(str(record.get("scope", "unknown")) for record in records)
     progress = {"approach": [], "transport": []}
     for episode in episode_records:
         previous: Mapping[str, Any] | None = None
@@ -280,6 +325,7 @@ def summarize_oracle_phase_servo(
         "applied_decisions": len(applied),
         "applied_rate": float(len(applied) / max(len(records), 1)),
         "mode_counts": dict(sorted(modes.items())),
+        "scope_counts": dict(sorted(scopes.items())),
         "action_delta_rms_mean": float(np.mean(delta)) if delta else None,
         "action_delta_rms_max": float(np.max(delta)) if delta else None,
         "approach_progress_samples": len(progress["approach"]),

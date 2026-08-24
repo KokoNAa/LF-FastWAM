@@ -947,6 +947,9 @@ def _oracle_phase_servo_config(cfg: DictConfig) -> OraclePhaseServoConfig:
     evaluation = cfg.EVALUATION
     config = OraclePhaseServoConfig(
         enabled=bool(evaluation.get("entity_relation_oracle_phase_servo", False)),
+        scope=str(
+            evaluation.get("entity_relation_oracle_servo_scope", "full")
+        ),
         approach_gain=float(
             evaluation.get("entity_relation_oracle_servo_approach_gain", 4.0)
         ),
