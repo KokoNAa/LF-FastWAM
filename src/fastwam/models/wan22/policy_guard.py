@@ -2382,6 +2382,171 @@ class PhaseSpecificERAFExpertResidualAdapter(nn.Module):
         }
 
 
+class ClauseSemanticRetentionResidual(nn.Module):
+    """Safely modulate an admitted expert-aligned action by clause semantics.
+
+    The V9.21 expert adapter is treated as an immutable positive policy.  This
+    module can only move its output toward the immutable Base action.  Its
+    suppression head is zero initialized, so a newly attached module is
+    exactly V9.21 at initialization.  Correct routes are trained to retain the
+    admitted action, while coherent same-state clause swaps may learn a safe
+    Base fallback without updating the positive action adapter.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        goal_dim: int,
+        max_clauses: int = 4,
+        hidden_dim: int = 256,
+    ) -> None:
+        super().__init__()
+        if min(action_dim, goal_dim, max_clauses, hidden_dim) <= 0:
+            raise ValueError(
+                "Clause semantic retention dimensions must be positive."
+            )
+        self.action_dim = int(action_dim)
+        self.goal_dim = int(goal_dim)
+        self.max_clauses = int(max_clauses)
+        self.hidden_dim = int(hidden_dim)
+        # Base/aligned/delta actions, pooled goal context, clause, phase,
+        # route confidence, and normalized horizon position.
+        feature_dim = (
+            3 * self.action_dim
+            + self.goal_dim
+            + self.max_clauses
+            + 3
+            + 2
+        )
+        self.feature_norm = nn.LayerNorm(feature_dim)
+        self.feature_projection = nn.Sequential(
+            nn.Linear(feature_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+        )
+        self.suppression_head = nn.Linear(self.hidden_dim, 1)
+        nn.init.zeros_(self.suppression_head.weight)
+        nn.init.zeros_(self.suppression_head.bias)
+
+    def forward(
+        self,
+        *,
+        base_action: torch.Tensor,
+        aligned_action: torch.Tensor,
+        goal_queries: torch.Tensor,
+        selected_clause: torch.Tensor,
+        control_phase: torch.Tensor,
+        route_confidence: torch.Tensor,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if (
+            base_action.ndim != 3
+            or base_action.shape != aligned_action.shape
+            or base_action.shape[-1] != self.action_dim
+        ):
+            raise ValueError(
+                "Clause retention Base/aligned actions must share [B,T,A]."
+            )
+        batch, horizon, _ = base_action.shape
+        if (
+            goal_queries.ndim != 3
+            or goal_queries.shape[0] != batch
+            or goal_queries.shape[-1] != self.goal_dim
+        ):
+            raise ValueError("Clause retention goal queries must be [B,Q,D].")
+        if (
+            selected_clause.shape != (batch,)
+            or control_phase.shape != (batch,)
+            or route_confidence.shape != (batch,)
+        ):
+            raise ValueError(
+                "Clause retention route tensors must each have shape [B]."
+            )
+        if action_is_pad is not None and action_is_pad.shape != (batch, horizon):
+            raise ValueError("Clause retention padding mask must be [B,T].")
+
+        module_dtype = self.feature_projection[0].weight.dtype
+        base = base_action.to(module_dtype)
+        aligned = aligned_action.to(module_dtype)
+        delta = aligned - base
+        # Preserve clause identity. Mean pooling would make a coherent clause
+        # swap nearly permutation invariant and recreate the exact failure
+        # this residual is intended to isolate.
+        selected_query = selected_clause.long().clamp(
+            0, goal_queries.shape[1] - 1
+        )
+        goal = goal_queries.to(module_dtype).gather(
+            1,
+            selected_query.view(batch, 1, 1).expand(
+                batch, 1, self.goal_dim
+            ),
+        ).squeeze(1)
+        goal = goal.unsqueeze(1).expand(-1, horizon, -1)
+        clause = F.one_hot(
+            selected_clause.long().clamp(0, self.max_clauses - 1),
+            self.max_clauses,
+        ).to(module_dtype)
+        clause = clause.unsqueeze(1).expand(-1, horizon, -1)
+        phase = F.one_hot(control_phase.long().clamp(0, 2), 3).to(module_dtype)
+        phase = phase.unsqueeze(1).expand(-1, horizon, -1)
+        route = route_confidence.to(module_dtype).reshape(batch, 1, 1).expand(
+            -1, horizon, -1
+        )
+        if horizon == 1:
+            progress = base.new_zeros((batch, 1, 1))
+        else:
+            progress = torch.linspace(
+                0.0,
+                1.0,
+                horizon,
+                device=base.device,
+                dtype=module_dtype,
+            ).view(1, horizon, 1).expand(batch, -1, -1)
+        features = torch.cat(
+            (base, aligned, delta, goal, clause, phase, route, progress),
+            dim=-1,
+        )
+        hidden = self.feature_projection(self.feature_norm(features))
+        suppression_logit = self.suppression_head(hidden).squeeze(-1)
+        bounded_suppression = suppression_logit.clamp(min=0.0, max=1.0)
+        # Straight-through clipping retains a useful gradient at the exact
+        # identity initialization while the deployed value stays in [0, 1].
+        suppression = (
+            bounded_suppression.detach()
+            + suppression_logit
+            - suppression_logit.detach()
+        )
+        if action_is_pad is not None:
+            suppression = suppression.masked_fill(action_is_pad.bool(), 0.0)
+            bounded_suppression = bounded_suppression.masked_fill(
+                action_is_pad.bool(), 0.0
+            )
+        semantic_residual = -delta * suppression.unsqueeze(-1)
+        action = aligned + semantic_residual
+        if action_is_pad is not None:
+            semantic_residual = semantic_residual.masked_fill(
+                action_is_pad.bool().unsqueeze(-1), 0.0
+            )
+        return action.to(aligned_action.dtype), semantic_residual.to(
+            aligned_action.dtype
+        ), {
+            "pgc_v924_clause_suppression_logit": suppression_logit,
+            "pgc_v924_clause_suppression_training": suppression,
+            "pgc_v924_clause_suppression_per_step": bounded_suppression,
+            "pgc_v924_clause_suppression_mean": (
+                bounded_suppression.float().mean()
+            ),
+            "pgc_v924_clause_retention_mean": (
+                1.0 - bounded_suppression.float().mean()
+            ),
+            "pgc_v924_clause_semantic_residual_rms": (
+                semantic_residual.float().square().mean().sqrt()
+            ),
+        }
+
+
 class PairwiseActionAdvantageVerifier(nn.Module):
     """FP32 temporal verifier that predicts CF advantage over Base directly."""
 

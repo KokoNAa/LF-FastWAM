@@ -420,6 +420,15 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         )
         self.assertIn("action_clause_teacher_weight: 4.0", config)
         self.assertIn("action_clause_alignment_guard_weight: 8.0", config)
+        self.assertIn("action-isolated-clause-residual", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=24", source)
+        self.assertIn(
+            "entity_relation_grounding.action_clause_wrong_suppression_weight=",
+            source,
+        )
+        self.assertIn(
+            "action_clause_wrong_suppression_weight: 4.0", config
+        )
         frozen_contract = source[
             source.index('if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14"') :
             source.index("if ! [[ \"${NPROC_PER_NODE}\"")

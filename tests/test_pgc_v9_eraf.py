@@ -52,6 +52,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
 )
 from fastwam.models.wan22.fastwam import FastWAM
 from fastwam.models.wan22.policy_guard import (
+    ClauseSemanticRetentionResidual,
     HardRoutedERAFPhaseServo,
     PhaseCompatibleERAFWaypointAdapter,
     PhaseConditionedERAFActionBridge,
@@ -1169,6 +1170,105 @@ class PGCERAFModuleTest(unittest.TestCase):
             tuple(routed_metrics["pgc_v921_phase_residual_candidates"].shape),
             (3, 4, 3, 7),
         )
+
+    def test_v924_clause_semantic_residual_is_identity_initialized_and_bounded(self):
+        module = ClauseSemanticRetentionResidual(
+            action_dim=7,
+            goal_dim=16,
+            max_clauses=4,
+            hidden_dim=32,
+        )
+        base = torch.randn(2, 5, 7)
+        aligned = base + torch.randn_like(base) * 0.1
+        kwargs = {
+            "base_action": base,
+            "aligned_action": aligned,
+            "goal_queries": torch.randn(2, 4, 16),
+            "selected_clause": torch.tensor([0, 2]),
+            "control_phase": torch.tensor([0, 2]),
+            "route_confidence": torch.tensor([0.8, 0.9]),
+        }
+        action, residual, metrics = module(**kwargs)
+        self.assertTrue(torch.equal(action, aligned))
+        self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
+        self.assertEqual(
+            float(metrics["pgc_v924_clause_suppression_mean"]), 0.0
+        )
+
+        with torch.no_grad():
+            module.suppression_head.bias.fill_(1.0)
+        fallback, residual, metrics = module(**kwargs)
+        torch.testing.assert_close(fallback, base)
+        torch.testing.assert_close(residual, base - aligned)
+        self.assertEqual(
+            float(metrics["pgc_v924_clause_suppression_mean"]), 1.0
+        )
+
+    def test_v924_loss_preserves_correct_route_and_trains_wrong_suppression(self):
+        model = tiny_pgc_fastwam(
+            version=9,
+            v9_stage="action",
+            v9_grounding_objective_version=24,
+            v9_completion_only_memory=True,
+            v9_action_joint_training=True,
+        )
+        batch, horizon, action_dim = 3, 4, 3
+        target = torch.zeros(batch, horizon, action_dim)
+        correct = torch.zeros_like(target, requires_grad=True)
+        teacher = torch.zeros_like(target)
+        base = torch.full_like(target, 0.25)
+        wrong = torch.full_like(target, 0.25, requires_grad=True)
+        correct_suppression = torch.zeros(
+            batch, horizon, requires_grad=True
+        )
+        wrong_suppression = torch.zeros(
+            batch, horizon, requires_grad=True
+        )
+        labels = {
+            "clause_valid": torch.tensor(
+                [[True, True, False, False]] * batch
+            ),
+            "phase_valid": torch.tensor(
+                [[True, False, False, False]] * batch
+            ),
+            "phase_ids": torch.tensor(
+                [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]]
+            ),
+            "predicate_truth": torch.zeros(batch, 4),
+            "predicate_truth_valid": torch.ones(
+                batch, 4, dtype=torch.bool
+            ),
+        }
+        loss, metrics = model._compute_policy_guard_v924_isolated_clause_residual_loss(
+            correct_action=correct,
+            wrong_clause_action=wrong,
+            teacher_action=teacher,
+            base_action=base,
+            target_action=target,
+            correct_route_metrics={
+                "pgc_v924_clause_suppression_training": correct_suppression
+            },
+            wrong_route_metrics={
+                "pgc_v924_clause_suppression_training": wrong_suppression
+            },
+            action_is_pad=None,
+            target_labels=labels,
+            waypoint_metrics={
+                "pgc_v919_selected_clause": torch.zeros(
+                    batch, dtype=torch.long
+                )
+            },
+            is_counterfactual=torch.ones(batch, dtype=torch.bool),
+            direct_action_valid=torch.ones(batch, dtype=torch.bool),
+            paired_language_valid=torch.ones(batch, dtype=torch.bool),
+        )
+        self.assertGreater(float(loss), 0.0)
+        self.assertEqual(
+            float(metrics["pgc_v924_alignment_nonregression_rate"]), 1.0
+        )
+        loss.backward()
+        self.assertEqual(float(correct.grad.abs().sum()), 0.0)
+        self.assertGreater(float(wrong_suppression.grad.abs().sum()), 0.0)
 
     def test_v922_clause_ranking_balances_final_actions_across_phases(self):
         model = tiny_pgc_fastwam(
@@ -5278,6 +5378,125 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             for name, value in v923.policy_guard_modules.state_dict().items():
                 self.assertTrue(
                     torch.equal(value, restored.policy_guard_modules.state_dict()[name]),
+                    name,
+                )
+
+    def test_v921_to_v924_isolated_clause_residual_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v921_path = root / "v921.pt"
+            v924_path = root / "v924.pt"
+            v921 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=21,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v921.mot.state_dict()},
+                base_path,
+            )
+            v921.load_checkpoint(base_path)
+            with torch.no_grad():
+                v921.policy_guard_modules[
+                    "eraf_phase_expert_residual_adapter"
+                ].phase_output.bias.fill_(0.125)
+            v921.save_checkpoint(v921_path, step=18250)
+
+            v924 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=24,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v924.load_checkpoint(v921_path)
+            self.assertTrue(
+                torch.equal(
+                    v924.policy_guard_modules[
+                        "eraf_phase_expert_residual_adapter"
+                    ].phase_output.bias,
+                    v921.policy_guard_modules[
+                        "eraf_phase_expert_residual_adapter"
+                    ].phase_output.bias,
+                )
+            )
+            residual = v924.policy_guard_modules[
+                "eraf_clause_semantic_retention_residual"
+            ]
+            self.assertTrue(
+                torch.equal(
+                    residual.suppression_head.weight,
+                    torch.zeros_like(residual.suppression_head.weight),
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    residual.suppression_head.bias,
+                    torch.zeros_like(residual.suppression_head.bias),
+                )
+            )
+
+            v924.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v924.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules."
+                        "eraf_clause_semantic_retention_residual."
+                    )
+                    for name in trainable
+                )
+            )
+            self.assertTrue(
+                all(
+                    not parameter.requires_grad
+                    for parameter in v924.policy_guard_modules[
+                        "eraf_phase_expert_residual_adapter"
+                    ].parameters()
+                )
+            )
+
+            v924.save_checkpoint(v924_path, step=18750)
+            metadata = torch.load(
+                v924_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(
+                metadata["eraf_action_joint_contract"],
+                "frozen_v921_expert_adapter_plus_isolated_clause_semantic_"
+                "retention_residual",
+            )
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "clause_semantic_retention_residual_only",
+            )
+            self.assertEqual(
+                metadata["eraf_action_clause_residual_contract"],
+                "frozen_v921_positive_action_plus_identity_initialized_"
+                "clause_conditioned_base_fallback",
+            )
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=24,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            restored.load_checkpoint(v924_path)
+            for name, value in v924.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(
+                        value,
+                        restored.policy_guard_modules.state_dict()[name],
+                    ),
                     name,
                 )
 
