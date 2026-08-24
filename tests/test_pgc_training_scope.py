@@ -346,6 +346,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             source.index("if ! [[ \"${NPROC_PER_NODE}\"")
         ]
         self.assertIn('"${GROUNDING_OBJECTIVE_VERSION}" == "20"', frozen_contract)
+        self.assertIn('"${GROUNDING_OBJECTIVE_VERSION}" == "21"', frozen_contract)
         self.assertIn("ATTENTION_MASK_WEIGHT=0.0", frozen_contract)
         self.assertIn("ROLE_SWAP_WEIGHT=0.0", frozen_contract)
 
@@ -377,6 +378,11 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn("action_expert_deployed_weight: 1.0", config)
         self.assertIn("action_expert_distillation_weight: 0.5", config)
         self.assertIn("action_expert_native_zero_weight: 1.0", config)
+        self.assertIn(
+            '"${GROUNDING_OBJECTIVE_VERSION}" == "20" || '
+            '"${GROUNDING_OBJECTIVE_VERSION}" == "21"',
+            source,
+        )
 
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (
