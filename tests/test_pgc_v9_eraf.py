@@ -56,6 +56,7 @@ from fastwam.models.wan22.policy_guard import (
     PhaseCompatibleERAFWaypointAdapter,
     PhaseConditionedERAFActionBridge,
     PhaseConditionedERAFGeometryActionAdapter,
+    PhaseSpecificERAFExpertResidualAdapter,
     detached_policy_guard_metrics,
     infer_spatial_patch_grid,
 )
@@ -1108,6 +1109,61 @@ class PGCERAFModuleTest(unittest.TestCase):
         self.assertLess(
             float(suppressed_metrics["pgc_v920_inherited_servo_retention"]),
             1.0e-6,
+        )
+
+    def test_v921_expert_residual_is_zero_init_exact_and_phase_specific(self):
+        adapter = PhaseSpecificERAFExpertResidualAdapter(
+            action_dim=7,
+            hidden_dim=16,
+            max_abs=0.25,
+        )
+        candidate = torch.randn(3, 4, 7) * 0.01
+        current = torch.randn_like(candidate) * 0.01
+        direction = torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        action, residual, metrics = adapter(
+            candidate_action=candidate,
+            current_residual=current,
+            desired_direction=direction,
+            desired_distance=torch.tensor([0.1, 0.2, 0.3]),
+            control_phase=torch.tensor([0, 1, 2]),
+            route_confidence=torch.ones(3),
+            waypoint_compatibility=torch.ones(3, 4),
+        )
+        self.assertTrue(torch.equal(residual, current))
+        self.assertTrue(torch.equal(action, candidate + current))
+        self.assertEqual(float(metrics["pgc_v921_expert_correction_rms"]), 0.0)
+
+        target = action.detach().clone()
+        target[..., 6] += 0.1
+        (action - target).square().mean().backward()
+        self.assertGreater(float(adapter.phase_output.bias.grad.norm()), 0.0)
+
+        adapter.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            adapter.phase_output.weight.zero_()
+            adapter.phase_output.bias.zero_()
+            adapter.phase_output.bias[0] = 0.4
+            adapter.phase_output.bias[7 + 3] = 0.4
+            adapter.phase_output.bias[14 + 6] = 0.4
+        routed_action, _, routed_metrics = adapter(
+            candidate_action=torch.zeros_like(candidate),
+            current_residual=torch.zeros_like(current),
+            desired_direction=direction,
+            desired_distance=torch.tensor([0.1, 0.2, 0.3]),
+            control_phase=torch.tensor([0, 1, 2]),
+            route_confidence=torch.ones(3),
+            waypoint_compatibility=torch.ones(3, 4),
+        )
+        self.assertGreater(float(routed_action[0, :, 0].mean()), 0.0)
+        self.assertAlmostEqual(float(routed_action[0, :, 3].abs().max()), 0.0)
+        self.assertGreater(float(routed_action[1, :, 3].mean()), 0.0)
+        self.assertAlmostEqual(float(routed_action[1, :, 6].abs().max()), 0.0)
+        self.assertGreater(float(routed_action[2, :, 6].mean()), 0.0)
+        self.assertEqual(
+            tuple(routed_metrics["pgc_v921_phase_residual_candidates"].shape),
+            (3, 4, 3, 7),
         )
 
     def test_v918_phase_residual_imitation_prefers_expert_correction(self):
@@ -4822,6 +4878,91 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 metadata["eraf_action_trainable_scope"],
                 "phase_compatible_local_waypoint_adapter_only",
+            )
+
+    def test_v920_to_v921_expert_alignment_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v920_path = root / "v920.pt"
+            v921_path = root / "v921.pt"
+            v920 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=20,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v920.mot.state_dict()},
+                base_path,
+            )
+            v920.load_checkpoint(base_path)
+            v920.save_checkpoint(v920_path, step=17250)
+            old_state = {
+                name: value.clone()
+                for name, value in v920.policy_guard_modules.state_dict().items()
+            }
+
+            v921 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=21,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v921.load_checkpoint(v920_path)
+            new_state = v921.policy_guard_modules.state_dict()
+            for name, value in old_state.items():
+                self.assertTrue(torch.equal(value, new_state[name]), name)
+            added = set(new_state) - set(old_state)
+            self.assertTrue(added)
+            self.assertTrue(
+                all(
+                    name.startswith("eraf_phase_expert_residual_adapter.")
+                    for name in added
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    v921.policy_guard_modules[
+                        "eraf_phase_expert_residual_adapter"
+                    ].phase_output.weight,
+                    torch.zeros_like(
+                        v921.policy_guard_modules[
+                            "eraf_phase_expert_residual_adapter"
+                        ].phase_output.weight
+                    ),
+                )
+            )
+            v921.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v921.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules."
+                        "eraf_phase_expert_residual_adapter."
+                    )
+                    for name in trainable
+                )
+            )
+            v921.save_checkpoint(v921_path, step=18250)
+            metadata = torch.load(
+                v921_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "phase_specific_privileged_expert_residual_adapter_only",
+            )
+            self.assertEqual(
+                metadata["eraf_action_expert_alignment_contract"],
+                "training_only_privileged_phase_anchor_teacher_plus_deployed_"
+                "full_action_prefix_residual_and_semantic_causal_ranking",
             )
 
 

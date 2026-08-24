@@ -1981,6 +1981,9 @@ class HardRoutedERAFPhaseServo(nn.Module):
             "pgc_v919_eef_scale_min": self.eef_scale.float().min(),
             "pgc_v919_eef_bias_max_abs": self.eef_bias.float().abs().max(),
             "pgc_v919_desired_distance": desired_norm.float().mean(),
+            "pgc_v919_desired_distance_per_sample": (
+                desired_norm.squeeze(-1)
+            ),
             "pgc_v919_translation_gain": gain.float().mean(),
             "pgc_v919_servo_residual_rms": (
                 servo_residual.float().square().mean().sqrt()
@@ -2188,6 +2191,189 @@ class PhaseCompatibleERAFWaypointAdapter(nn.Module):
             "pgc_v920_local_direction": local_direction,
             "pgc_v920_servo_translation": translation,
             "pgc_v920_effective_servo_residual": effective_servo_residual,
+        }
+
+
+class PhaseSpecificERAFExpertResidualAdapter(nn.Module):
+    """Map routed ERAF geometry to an expert-aligned local action residual.
+
+    A terminal grasp/goal/interaction anchor does not uniquely determine the
+    next action: transport may first lift or detour, and release also needs
+    rotation and gripper commands.  The preceding waypoint field can only add
+    a positive-progress xyz vector.  This adapter therefore predicts a bounded
+    full-action correction with a separate output head for approach,
+    transport, and release.  Its heads are zero initialized, making a newly
+    added adapter exactly equivalent to the frozen waypoint checkpoint.
+
+    Training may call the same module a second time with privileged anchors and
+    phase labels.  Those labels never enter the deployed call; they only teach
+    the shared geometry-to-action map and provide a distillation target for the
+    learned ERAF route.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        hidden_dim: int = 256,
+        max_abs: float | Sequence[float] = 0.25,
+    ) -> None:
+        super().__init__()
+        if action_dim < 3 or hidden_dim <= 0:
+            raise ValueError(
+                "ERAF expert residual adapter requires xyz actions and a "
+                "positive hidden dimension."
+            )
+        if isinstance(max_abs, Sequence) and not isinstance(max_abs, (str, bytes)):
+            caps = [float(value) for value in max_abs]
+            if len(caps) != int(action_dim):
+                raise ValueError(
+                    "ERAF expert residual caps must match action_dim."
+                )
+        else:
+            caps = [float(max_abs)] * int(action_dim)
+        if any(value <= 0 for value in caps):
+            raise ValueError("ERAF expert residual caps must be positive.")
+
+        self.action_dim = int(action_dim)
+        self.hidden_dim = int(hidden_dim)
+        # current action + current residual + direction + distance + route
+        # confidence + waypoint compatibility + normalized horizon position.
+        feature_dim = 2 * self.action_dim + 3 + 4
+        self.feature_norm = nn.LayerNorm(feature_dim)
+        self.feature_projection = nn.Sequential(
+            nn.Linear(feature_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+        )
+        self.phase_output = nn.Linear(self.hidden_dim, 3 * self.action_dim)
+        nn.init.zeros_(self.phase_output.weight)
+        nn.init.zeros_(self.phase_output.bias)
+        self.register_buffer(
+            "max_abs",
+            torch.tensor(caps, dtype=torch.float32).view(1, 1, 1, -1),
+            persistent=True,
+        )
+
+    def forward(
+        self,
+        *,
+        candidate_action: torch.Tensor,
+        current_residual: torch.Tensor,
+        desired_direction: torch.Tensor,
+        desired_distance: torch.Tensor,
+        control_phase: torch.Tensor,
+        route_confidence: torch.Tensor,
+        waypoint_compatibility: torch.Tensor,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if (
+            candidate_action.ndim != 3
+            or candidate_action.shape[-1] != self.action_dim
+            or current_residual.shape != candidate_action.shape
+        ):
+            raise ValueError(
+                "ERAF expert candidate/current residual must share [B,T,A]."
+            )
+        batch, horizon, _ = candidate_action.shape
+        if desired_direction.shape != (batch, 3):
+            raise ValueError("ERAF expert desired_direction must be [B,3].")
+        if desired_distance.shape not in {(batch,), (batch, 1)}:
+            raise ValueError("ERAF expert desired_distance must be [B] or [B,1].")
+        if control_phase.shape != (batch,) or route_confidence.shape != (batch,):
+            raise ValueError("ERAF expert phase/confidence must be [B].")
+        if waypoint_compatibility.shape not in {
+            (batch,),
+            (batch, horizon),
+        }:
+            raise ValueError(
+                "ERAF expert waypoint compatibility must be [B] or [B,T]."
+            )
+        if action_is_pad is not None and action_is_pad.shape != (batch, horizon):
+            raise ValueError("ERAF expert action padding mask must be [B,T].")
+
+        module_dtype = self.feature_projection[0].weight.dtype
+        candidate = candidate_action.to(module_dtype)
+        current = current_residual.to(module_dtype)
+        current_action = candidate + current
+        direction = F.normalize(
+            desired_direction.to(module_dtype), dim=-1, eps=1.0e-6
+        ).unsqueeze(1).expand(-1, horizon, -1)
+        distance = desired_distance.to(module_dtype).reshape(batch, 1, 1).expand(
+            -1, horizon, -1
+        )
+        route = route_confidence.to(module_dtype).reshape(batch, 1, 1).expand(
+            -1, horizon, -1
+        )
+        compatibility = waypoint_compatibility.to(module_dtype)
+        if compatibility.ndim == 1:
+            compatibility = compatibility[:, None].expand(-1, horizon)
+        compatibility = compatibility.unsqueeze(-1)
+        if horizon == 1:
+            progress = candidate.new_zeros((batch, 1, 1))
+        else:
+            progress = torch.linspace(
+                0.0,
+                1.0,
+                horizon,
+                device=candidate.device,
+                dtype=module_dtype,
+            ).view(1, horizon, 1).expand(batch, -1, -1)
+        features = torch.cat(
+            (
+                current_action,
+                current,
+                direction,
+                distance,
+                route,
+                compatibility,
+                progress,
+            ),
+            dim=-1,
+        )
+        hidden = self.feature_projection(self.feature_norm(features))
+        raw_candidates = self.phase_output(hidden).reshape(
+            batch, horizon, 3, self.action_dim
+        )
+        cap = self.max_abs.to(device=candidate.device, dtype=module_dtype)
+        phase_candidates = torch.tanh(raw_candidates) * cap
+        phase_index = control_phase.long().clamp(0, 2).view(
+            batch, 1, 1, 1
+        ).expand(-1, horizon, 1, self.action_dim)
+        selected_correction = phase_candidates.gather(2, phase_index).squeeze(2)
+        if action_is_pad is not None:
+            pad = action_is_pad.bool().unsqueeze(-1)
+            selected_correction = selected_correction.masked_fill(pad, 0.0)
+            phase_candidates = phase_candidates.masked_fill(
+                pad.unsqueeze(2), 0.0
+            )
+        total_cap = cap.squeeze(2)
+        total_residual = (current + selected_correction).clamp(
+            min=-total_cap, max=total_cap
+        )
+        if action_is_pad is not None:
+            total_residual = total_residual.masked_fill(pad, 0.0)
+        effective_correction = total_residual - current
+        if action_is_pad is not None:
+            effective_correction = effective_correction.masked_fill(pad, 0.0)
+        action = candidate + total_residual
+        return action.to(candidate_action.dtype), total_residual.to(
+            candidate_action.dtype
+        ), {
+            "pgc_v921_expert_correction_rms": (
+                effective_correction.float().square().mean().sqrt()
+            ),
+            "pgc_v921_raw_expert_correction_rms": (
+                selected_correction.float().square().mean().sqrt()
+            ),
+            "pgc_v921_total_residual_rms": (
+                total_residual.float().square().mean().sqrt()
+            ),
+            "pgc_v921_phase_residual_candidates": phase_candidates,
+            "pgc_v921_selected_expert_correction": selected_correction,
+            "pgc_v921_effective_expert_correction": effective_correction,
+            "pgc_v921_selected_control_phase": control_phase,
         }
 
 

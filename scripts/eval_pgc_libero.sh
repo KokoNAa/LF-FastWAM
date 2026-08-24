@@ -255,7 +255,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 21)):
+    if objective not in set(range(1, 22)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -324,7 +324,10 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_v919_stack_plus_phase_compatible_local_waypoint_vector_field"
+            "frozen_v920_stack_plus_phase_specific_privileged_expert_prefix_"
+            "residual_alignment"
+            if objective >= 21
+            else "frozen_v919_stack_plus_phase_compatible_local_waypoint_vector_field"
             if objective >= 20
             else "frozen_v918_stack_plus_hard_clause_phase_direction_preserving_servo"
             if objective >= 19
@@ -349,7 +352,9 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
-            "phase_compatible_local_waypoint_adapter_only"
+            "phase_specific_privileged_expert_residual_adapter_only"
+            if objective >= 21
+            else "phase_compatible_local_waypoint_adapter_only"
             if objective >= 20
             else "hard_routed_phase_servo_only"
             if objective >= 19
@@ -373,7 +378,9 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
-            "phase_compatible_local_waypoint_adapter_only"
+            "phase_specific_privileged_expert_residual_adapter_only"
+            if objective >= 21
+            else "phase_compatible_local_waypoint_adapter_only"
             if objective >= 20
             else "hard_routed_phase_servo_only"
             if objective >= 19
@@ -420,6 +427,14 @@ if version == 9:
     ):
         raise SystemExit(
             "PGC v9.20 checkpoint lacks its phase-compatible waypoint contract"
+        )
+    if objective >= 21 and (
+        metadata.get("eraf_action_expert_alignment_contract")
+        != "training_only_privileged_phase_anchor_teacher_plus_deployed_"
+        "full_action_prefix_residual_and_semantic_causal_ranking"
+    ):
+        raise SystemExit(
+            "PGC expert-alignment checkpoint lacks its privileged prefix contract"
         )
     if completion_only_memory and (
         training_stage != "action"
@@ -586,6 +601,13 @@ mapping = {
     "eraf_action_servo_frame_weight": "action_servo_frame_weight",
     "eraf_action_waypoint_min_cosine": "action_waypoint_min_cosine",
     "eraf_action_waypoint_tangent_max_ratio": "action_waypoint_tangent_max_ratio",
+    "eraf_action_expert_imitation_weight": "action_expert_imitation_weight",
+    "eraf_action_expert_direction_weight": "action_expert_direction_weight",
+    "eraf_action_expert_deployed_weight": "action_expert_deployed_weight",
+    "eraf_action_expert_distillation_weight": (
+        "action_expert_distillation_weight"
+    ),
+    "eraf_action_expert_native_zero_weight": "action_expert_native_zero_weight",
     "eraf_action_eef_initial_scale": "action_eef_scale",
     "eraf_action_eef_initial_bias": "action_eef_bias",
     "eraf_action_causal_ranking_weight": "action_causal_ranking_weight",

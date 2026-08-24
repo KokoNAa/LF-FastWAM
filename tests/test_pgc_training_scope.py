@@ -201,6 +201,12 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"eraf_completion_only_memory": "completion_only_memory"',
             source,
         )
+        self.assertIn(
+            '"eraf_action_expert_imitation_weight": '
+            '"action_expert_imitation_weight"',
+            source,
+        )
+        self.assertIn("set(range(1, 22))", source)
         self.assertNotIn("phase_rebinding_energy_weight=0.01", source)
 
     def test_v913_launcher_uses_v911_geometry_and_phase_safe_memory_only(self):
@@ -342,6 +348,27 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn('"${GROUNDING_OBJECTIVE_VERSION}" == "20"', frozen_contract)
         self.assertIn("ATTENTION_MASK_WEIGHT=0.0", frozen_contract)
         self.assertIn("ROLE_SWAP_WEIGHT=0.0", frozen_contract)
+
+    def test_expert_alignment_launcher_freezes_v920_and_trains_prefix_residual(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("action-expert-alignment", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=21", source)
+        self.assertIn("START_STEP=17250", source)
+        self.assertIn("DEFAULT_STAGE_STEPS=1000", source)
+        self.assertIn(
+            "phase-compatible waypoint checkpoint at step 17250", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_expert_imitation_weight=", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_expert_distillation_weight=", source
+        )
+        self.assertIn(
+            "entity_relation_grounding.action_expert_native_zero_weight=", source
+        )
 
     def test_v913_shadow_summary_has_an_independent_admission_gate(self):
         source = (
