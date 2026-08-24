@@ -207,6 +207,19 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             source,
         )
         self.assertIn("set(range(1, 25))", source)
+        self.assertIn(
+            '"frozen_v921_expert_adapter_plus_isolated_clause_semantic_"',
+            source,
+        )
+        self.assertIn('"clause_semantic_retention_residual_only"', source)
+        self.assertIn(
+            '"frozen_v921_correct_route_identity_plus_isolated_wrong_clause_"',
+            source,
+        )
+        self.assertIn(
+            '"frozen_v921_positive_action_plus_identity_initialized_clause_"',
+            source,
+        )
         self.assertNotIn("phase_rebinding_energy_weight=0.01", source)
 
     def test_v913_launcher_uses_v911_geometry_and_phase_safe_memory_only(self):

@@ -324,8 +324,11 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_v921_teacher_plus_alignment_preserving_negative_focused_"
-            "final_action_clause_ranking"
+            "frozen_v921_expert_adapter_plus_isolated_clause_semantic_"
+            "retention_residual"
+            if objective >= 24
+            else "frozen_v921_teacher_plus_alignment_preserving_negative_"
+            "focused_final_action_clause_ranking"
             if objective >= 23
             else "frozen_v920_stack_plus_phase_specific_expert_adapter_with_"
             "balanced_final_action_clause_ranking"
@@ -358,7 +361,9 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
-            "phase_specific_privileged_expert_residual_adapter_only"
+            "clause_semantic_retention_residual_only"
+            if objective >= 24
+            else "phase_specific_privileged_expert_residual_adapter_only"
             if objective >= 21
             else "phase_compatible_local_waypoint_adapter_only"
             if objective >= 20
@@ -384,7 +389,9 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
-            "phase_specific_privileged_expert_residual_adapter_only"
+            "clause_semantic_retention_residual_only"
+            if objective >= 24
+            else "phase_specific_privileged_expert_residual_adapter_only"
             if objective >= 21
             else "phase_compatible_local_waypoint_adapter_only"
             if objective >= 20
@@ -445,7 +452,10 @@ if version == 9:
     if objective >= 22 and (
         metadata.get("eraf_action_clause_ranking_contract")
         != (
-            "frozen_v921_teacher_correct_output_preservation_plus_expert_"
+            "frozen_v921_correct_route_identity_plus_isolated_wrong_clause_"
+            "base_fallback_ranking"
+            if objective >= 24
+            else "frozen_v921_teacher_correct_output_preservation_plus_expert_"
             "nonregression_and_detached_correct_wrong_clause_ranking_"
             "balanced_over_approach_transport_release"
             if objective >= 23
@@ -456,13 +466,21 @@ if version == 9:
         raise SystemExit(
             "PGC clause-ranking checkpoint lacks its balanced final-action contract"
         )
-    if objective >= 23 and (
+    if objective == 23 and (
         metadata.get("eraf_action_clause_teacher_contract")
         != "training_only_frozen_exact_v921_expert_residual_adapter_excluded_"
         "from_rollout_and_optimizer"
     ):
         raise SystemExit(
             "PGC alignment-preserving clause checkpoint lacks its frozen teacher contract"
+        )
+    if objective >= 24 and (
+        metadata.get("eraf_action_clause_residual_contract")
+        != "frozen_v921_positive_action_plus_identity_initialized_clause_"
+        "conditioned_base_fallback"
+    ):
+        raise SystemExit(
+            "PGC isolated-clause checkpoint lacks its semantic residual contract"
         )
     if completion_only_memory and (
         training_stage != "action"
