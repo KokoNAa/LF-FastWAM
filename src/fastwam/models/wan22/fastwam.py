@@ -18434,7 +18434,10 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_scope = (
                                     (
-                                        "eraf_action_context_injector_only"
+                                        "shared_video_action_lora_plus_eraf_action_"
+                                        "context_injector"
+                                        if saved_grounding_objective >= 26
+                                        else "eraf_action_context_injector_only"
                                         if saved_grounding_objective >= 25
                                         else "clause_semantic_retention_residual_only"
                                         if saved_grounding_objective >= 24
