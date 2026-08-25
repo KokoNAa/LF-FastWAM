@@ -17484,7 +17484,9 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_scope = (
                                     (
-                                        "clause_semantic_retention_residual_only"
+                                        "eraf_action_context_injector_only"
+                                        if saved_grounding_objective >= 25
+                                        else "clause_semantic_retention_residual_only"
                                         if saved_grounding_objective >= 24
                                         else "phase_specific_privileged_expert_residual_adapter_only"
                                         if saved_grounding_objective >= 21
