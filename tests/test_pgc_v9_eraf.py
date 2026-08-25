@@ -5799,6 +5799,24 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                     for name in trainable
                 )
             )
+            groups = v926.policy_guard_optimizer_groups(5.0e-6)
+            grouped_ids = {
+                id(parameter)
+                for group in groups
+                for parameter in group["params"]
+            }
+            trainable_ids = {
+                id(parameter)
+                for parameter in v926.parameters()
+                if parameter.requires_grad
+            }
+            self.assertEqual(grouped_ids, trainable_ids)
+            rates = {group["pgc_v9_group"]: group["lr"] for group in groups}
+            self.assertEqual(rates["shared_video_action_lora"], 5.0e-6)
+            self.assertEqual(
+                rates["eraf_action_context_injector"],
+                v926.policy_guard_eraf_action_geometry_learning_rate,
+            )
             with torch.no_grad():
                 next(iter(lora_b.values())).fill_(0.125)
             v926.save_checkpoint(v926_path, step=20750)

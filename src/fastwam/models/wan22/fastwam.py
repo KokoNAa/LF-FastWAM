@@ -3039,6 +3039,28 @@ class FastWAM(torch.nn.Module):
                         "pgc_v9_group": module_name,
                     }
                 )
+        if (
+            self.policy_guard_eraf_grounding_objective_version >= 26
+            and self.lora_enabled
+        ):
+            adapter_ids = self._adapter_parameter_ids()
+            adapter_parameters = [
+                parameter
+                for parameter in self.parameters()
+                if parameter.requires_grad and id(parameter) in adapter_ids
+            ]
+            if not adapter_parameters:
+                raise RuntimeError(
+                    "PGC V9.26 optimizer received no trainable shared Expert "
+                    "LoRA parameters."
+                )
+            groups.append(
+                {
+                    "params": adapter_parameters,
+                    "lr": default_learning_rate,
+                    "pgc_v9_group": "shared_video_action_lora",
+                }
+            )
         grouped_ids = {
             id(parameter)
             for group in groups
