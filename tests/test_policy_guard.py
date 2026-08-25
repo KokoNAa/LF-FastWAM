@@ -184,7 +184,9 @@ def tiny_pgc_fastwam(
                 "temperature": 0.07,
                 "learning_rate": 2.0e-5,
                 "grounding_aux_weight": (
-                    0.0 if v9_action_joint_training else 0.25
+                    0.25
+                    if v9_grounding_objective_version >= 26
+                    else (0.0 if v9_action_joint_training else 0.25)
                 ),
                 "completion_only_memory": v9_completion_only_memory,
                 "action_joint_training": v9_action_joint_training,
@@ -193,6 +195,11 @@ def tiny_pgc_fastwam(
                 "action_grounding_learning_rate": 1.0e-4,
                 "action_causal_ranking_weight": 1.0,
                 "action_causal_margin": 0.01,
+                "expert_lora_world_language_weight": 0.10,
+                "expert_lora_world_language_margin": 0.01,
+                "expert_lora_native_action_weight": 1.0,
+                "expert_lora_counterfactual_action_weight": 1.0,
+                "expert_lora_regularization_weight": 1.0e-6,
                 "action_geometry_hidden_dim": 8,
                 "action_geometry_learning_rate": 2.0e-5,
                 "action_geometry_residual_max_abs": 0.25,
@@ -343,6 +350,21 @@ def tiny_pgc_fastwam(
                 "alpha": 4,
                 "dropout": 0.0,
                 "experts": ["action"],
+                "extra_trainable_patterns": [],
+            }
+        )
+    elif (
+        configure_lora
+        and version == 9
+        and v9_grounding_objective_version >= 26
+    ):
+        model.configure_lora(
+            {
+                "enabled": True,
+                "rank": 2,
+                "alpha": 2,
+                "dropout": 0.0,
+                "experts": ["video", "action"],
                 "extra_trainable_patterns": [],
             }
         )

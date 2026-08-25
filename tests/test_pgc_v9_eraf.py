@@ -5727,6 +5727,109 @@ class PGCERAFIntegrationTest(unittest.TestCase):
                     name,
                 )
 
+    def test_v925_to_v926_shared_expert_lora_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v925_path = root / "v925.pt"
+            v926_path = root / "v926.pt"
+            v925 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=25,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v925.mot.state_dict()},
+                base_path,
+            )
+            v925.load_checkpoint(base_path)
+            v925.save_checkpoint(v925_path, step=19750)
+
+            v926 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=26,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v926.load_checkpoint(v925_path)
+            for name, value in v925.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(
+                        value,
+                        v926.policy_guard_modules.state_dict()[name],
+                    ),
+                    name,
+                )
+            lora_b = {
+                name: parameter
+                for name, parameter in v926.mot.named_parameters()
+                if name.endswith(".lora_B")
+            }
+            self.assertTrue(lora_b)
+            self.assertTrue(
+                all(torch.count_nonzero(value).item() == 0 for value in lora_b.values())
+            )
+
+            v926.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v926.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(
+                any(name.endswith((".lora_A", ".lora_B")) for name in trainable)
+            )
+            self.assertTrue(
+                any(
+                    name.startswith(
+                        "policy_guard_modules.eraf_action_context_injector."
+                    )
+                    for name in trainable
+                )
+            )
+            self.assertTrue(
+                all(
+                    name.endswith((".lora_A", ".lora_B"))
+                    or name.startswith(
+                        "policy_guard_modules.eraf_action_context_injector."
+                    )
+                    for name in trainable
+                )
+            )
+            with torch.no_grad():
+                next(iter(lora_b.values())).fill_(0.125)
+            v926.save_checkpoint(v926_path, step=20750)
+            payload = torch.load(
+                v926_path, map_location="cpu", weights_only=False
+            )
+            metadata = payload["architecture_metadata"]
+            self.assertEqual(
+                metadata["counterfactual_policy"],
+                "single_eraf_path_shared_video_action_expert_lora",
+            )
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "shared_video_action_lora_plus_eraf_action_context_injector",
+            )
+            self.assertIs(metadata["eraf_single_path"], True)
+            self.assertEqual(metadata["gate_mode"], "eraf_only")
+            self.assertTrue(payload["eraf_shared_expert_lora"])
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=26,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            restored.load_checkpoint(v926_path)
+            restored_lora = restored._lora_adapter_state_dict()
+            for name, value in payload["eraf_shared_expert_lora"].items():
+                self.assertTrue(torch.equal(value, restored_lora[name]), name)
+
 
     def test_v913_to_v914_checkpoint_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -311,6 +311,11 @@ policy_guard:
     # V9.20 freezes V9.19 and learns a phase-compatible local waypoint vector
     # field. Privileged expert actions label when anchor progress is compatible;
     # deployment predicts that compatibility from RGB/language/proprio only.
+    # Objective 26 keeps the mature ERAF and completion memory frozen, removes
+    # Base/candidate selection from deployment, and adapts the one shared Video
+    # and Action Expert with LoRA. Future-video flow, wrong-language world
+    # ranking, native/CF action flow, and frozen-ERAF preservation are optimized
+    # together; no post-sampler action residual is active.
     grounding_objective_version: 2
     hidden_dim: 256
     num_heads: 8
@@ -329,6 +334,11 @@ policy_guard:
     action_grounding_learning_rate: 1.0e-4
     action_causal_ranking_weight: 1.0
     action_causal_margin: 0.01
+    expert_lora_world_language_weight: 0.10
+    expert_lora_world_language_margin: 0.01
+    expert_lora_native_action_weight: 1.0
+    expert_lora_counterfactual_action_weight: 1.0
+    expert_lora_regularization_weight: 1.0e-6
     action_geometry_hidden_dim: 256
     action_geometry_learning_rate: 2.0e-5
     action_geometry_residual_max_abs: 0.25

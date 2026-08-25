@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|grounding-structured-role|grounding-balanced-role|grounding-hard-role|grounding-exclusive-role|grounding-clause-calibration|grounding-view-scheduler|grounding-all-entity-role|grounding-clause-tuple|grounding-phase-rebinding|grounding-phase-memory|action-completion-only|action-geometry-causal|action-semantic-causal|action-direct-geometry|action-phase-residual|action-phase-servo|action-waypoint|action-expert-alignment|action-clause-ranking|action-alignment-preserving-clause|action-isolated-clause-residual|action-context-injection|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
+SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|grounding-role|grounding-role-adapter|grounding-structured-role|grounding-balanced-role|grounding-hard-role|grounding-exclusive-role|grounding-clause-calibration|grounding-view-scheduler|grounding-all-entity-role|grounding-clause-tuple|grounding-phase-rebinding|grounding-phase-memory|action-completion-only|action-geometry-causal|action-semantic-causal|action-direct-geometry|action-phase-residual|action-phase-servo|action-waypoint|action-expert-alignment|action-clause-ranking|action-alignment-preserving-clause|action-isolated-clause-residual|action-context-injection|action-eraf-expert-lora|action|verifier> <gpus> <base_checkpoint> <init_checkpoint> <original_cf_dataset> <strict_cf_dataset> <native_sidecar> <original_cf_sidecar> <strict_cf_sidecar> [seed] [full|entity-only|without-anchor]}"
 STAGE="${2:?Missing V9 training stage}"
 NPROC_PER_NODE="${3:?Missing GPU count}"
 BASE_CHECKPOINT="${4:?Missing released FastWAM checkpoint}"
@@ -253,6 +253,17 @@ case "${STAGE}" in
     LEARNING_RATE="2.0e-5"
     CONFIG_STAGE="action"
     DEFAULT_GROUNDING_OBJECTIVE_VERSION=25
+    SAVE_EVERY=250
+    ;;
+  action-eraf-expert-lora)
+    # Keep the admitted ERAF/completion memory frozen. Adapt the one deployed
+    # Video/Action Expert path with LoRA plus the internal ERAF context injector.
+    START_STEP=19750
+    STAGE_START_STEP=19750
+    DEFAULT_STAGE_STEPS=1000
+    LEARNING_RATE="5.0e-6"
+    CONFIG_STAGE="action"
+    DEFAULT_GROUNDING_OBJECTIVE_VERSION=26
     SAVE_EVERY=250
     ;;
   action)
@@ -563,6 +574,12 @@ case "${STAGE}" in
       exit 1
     fi
     ;;
+  action-eraf-expert-lora)
+    if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "26" ]]; then
+      echo "Formal single-path ERAF shared Expert-LoRA training requires objective version 26." >&2
+      exit 1
+    fi
+    ;;
   grounding-role)
     if [[ "${GROUNDING_OBJECTIVE_VERSION}" != "3" ]]; then
       echo "Formal V9.2 role repair requires objective version 3." >&2
@@ -676,7 +693,7 @@ if [[ "${STAGE}" == "grounding-hard-role" || "${STAGE}" == "grounding-exclusive-
 fi
 CLOSED_LOOP_GROUNDING_DATASET="${PGC_V9_CLOSED_LOOP_GROUNDING_DATASET:-}"
 CLOSED_LOOP_GROUNDING_SIDECAR="${PGC_V9_CLOSED_LOOP_GROUNDING_SIDECAR:-}"
-if [[ "${STAGE}" == "grounding-phase-rebinding" || "${STAGE}" == "grounding-phase-memory" || "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" ]]; then
+if [[ "${STAGE}" == "grounding-phase-rebinding" || "${STAGE}" == "grounding-phase-memory" || "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" || "${STAGE}" == "action-eraf-expert-lora" ]]; then
   if [[ -z "${CLOSED_LOOP_GROUNDING_DATASET}" || ! -d "${CLOSED_LOOP_GROUNDING_DATASET}" ]]; then
     echo "Phase-aware V9 action stages require PGC_V9_CLOSED_LOOP_GROUNDING_DATASET." >&2
     exit 1
@@ -843,7 +860,7 @@ STRICT_CF_DATASET="$(cd -- "${STRICT_CF_DATASET}" && pwd -P)"
 NATIVE_SIDECAR="$(cd -- "${NATIVE_SIDECAR}" && pwd -P)"
 ORIGINAL_CF_SIDECAR="$(cd -- "${ORIGINAL_CF_SIDECAR}" && pwd -P)"
 STRICT_CF_SIDECAR="$(cd -- "${STRICT_CF_SIDECAR}" && pwd -P)"
-if [[ "${STAGE}" == "grounding-phase-rebinding" || "${STAGE}" == "grounding-phase-memory" || "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" ]]; then
+if [[ "${STAGE}" == "grounding-phase-rebinding" || "${STAGE}" == "grounding-phase-memory" || "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" || "${STAGE}" == "action-eraf-expert-lora" ]]; then
   CLOSED_LOOP_GROUNDING_DATASET="$(cd -- "${CLOSED_LOOP_GROUNDING_DATASET}" && pwd -P)"
   CLOSED_LOOP_GROUNDING_SIDECAR="$(cd -- "${CLOSED_LOOP_GROUNDING_SIDECAR}" && pwd -P)"
 fi
@@ -1094,6 +1111,11 @@ else:
             and grounding_objective_version == 24
             and int(requested_objective) == 25
         )
+        or (
+            stage == "action-eraf-expert-lora"
+            and grounding_objective_version == 25
+            and int(requested_objective) == 26
+        )
     )
     if grounding_objective_version != int(requested_objective) and not objective_upgrade:
         raise SystemExit(
@@ -1118,6 +1140,7 @@ else:
         "action-alignment-preserving-clause": "action",
         "action-isolated-clause-residual": "action",
         "action-context-injection": "action",
+        "action-eraf-expert-lora": "action",
         "verifier": "action",
     }[stage]
     saved_stage = str(
@@ -1371,6 +1394,29 @@ else:
                 "Internal ERAF Action-Expert context injection must warm-start "
                 "from the completed V9.24 checkpoint at step 18750."
             )
+    if stage == "action-eraf-expert-lora":
+        metadata = payload.get("architecture_metadata") or {}
+        if (
+            grounding_objective_version != 25
+            or metadata.get("eraf_training_stage") != "action"
+            or not bool(metadata.get("eraf_action_joint_training", False))
+            or metadata.get("eraf_action_joint_contract")
+            != "frozen_eraf_and_shared_action_expert_plus_internal_"
+            "context_injector_no_post_action_residual"
+            or metadata.get("eraf_action_trainable_scope")
+            != "eraf_action_context_injector_only"
+            or metadata.get("eraf_role_adapter_trainable_scope")
+            != "eraf_action_context_injector_only"
+            or metadata.get("eraf_action_context_injection_contract")
+            != "append_bounded_eraf_tokens_to_shared_action_expert_context_"
+            "at_every_denoising_step_no_post_action_residual"
+            or metadata.get("eraf_policy_state_contract")
+            != "monotonic_completed_bitset_no_pending_holding_retry_recurrence"
+        ):
+            raise SystemExit(
+                "Single-path ERAF shared Expert-LoRA training must warm-start "
+                "from the completed internal-context checkpoint at step 19750."
+            )
 saved_base = payload.get("base_checkpoint")
 if not saved_base:
     raise SystemExit(f"Initialization checkpoint has no protected base: {checkpoint}")
@@ -1403,6 +1449,7 @@ if stage in {
     "action-alignment-preserving-clause",
     "action-isolated-clause-residual",
     "action-context-injection",
+    "action-eraf-expert-lora",
 }:
     if closed_loop_dataset == "null" or closed_loop_sidecar == "null":
         raise SystemExit(
@@ -1490,7 +1537,7 @@ PY
 json_array() {
   "${PYTHON_BIN}" -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"
 }
-if [[ "${STAGE}" == "grounding-phase-rebinding" || "${STAGE}" == "grounding-phase-memory" || "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" ]]; then
+if [[ "${STAGE}" == "grounding-phase-rebinding" || "${STAGE}" == "grounding-phase-memory" || "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" || "${STAGE}" == "action-eraf-expert-lora" ]]; then
   NATIVE_JSON="$(json_array "${NATIVE_DATASET}" "${CLOSED_LOOP_GROUNDING_DATASET}")"
   SIDECAR_JSON="$(json_array "${NATIVE_SIDECAR}" "${CLOSED_LOOP_GROUNDING_SIDECAR}" "${ORIGINAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}")"
   CLOSED_LOOP_NATIVE_DATASET_COUNT=1
@@ -1504,20 +1551,37 @@ if [[ "${STAGE}" == "grounding-phase-rebinding" ]]; then
 else
   CLOSED_LOOP_REBINDING=false
 fi
-if [[ "${STAGE}" == "grounding-phase-memory" || "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" ]]; then
+if [[ "${STAGE}" == "grounding-phase-memory" || "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" || "${STAGE}" == "action-eraf-expert-lora" ]]; then
   PHASE_SAFE_MEMORY=true
 else
   PHASE_SAFE_MEMORY=false
 fi
-if [[ "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" ]]; then
+if [[ "${STAGE}" == "action-completion-only" || "${STAGE}" == "action-geometry-causal" || "${STAGE}" == "action-semantic-causal" || "${STAGE}" == "action-direct-geometry" || "${STAGE}" == "action-phase-residual" || "${STAGE}" == "action-phase-servo" || "${STAGE}" == "action-waypoint" || "${STAGE}" == "action-expert-alignment" || "${STAGE}" == "action-clause-ranking" || "${STAGE}" == "action-alignment-preserving-clause" || "${STAGE}" == "action-isolated-clause-residual" || "${STAGE}" == "action-context-injection" || "${STAGE}" == "action-eraf-expert-lora" ]]; then
   COMPLETION_ONLY_MEMORY=true
   ACTION_JOINT_TRAINING=true
-  GROUNDING_AUX_WEIGHT=0.0
+  if [[ "${STAGE}" == "action-eraf-expert-lora" ]]; then
+    GROUNDING_AUX_WEIGHT="${PGC_V9_GROUNDING_AUX_WEIGHT:-0.25}"
+  else
+    GROUNDING_AUX_WEIGHT=0.0
+  fi
 else
   COMPLETION_ONLY_MEMORY=false
   ACTION_JOINT_TRAINING=false
   GROUNDING_AUX_WEIGHT=0.25
 fi
+if [[ "${STAGE}" == "action-eraf-expert-lora" ]]; then
+  EXPERT_LORA_ENABLED=true
+else
+  EXPERT_LORA_ENABLED=false
+fi
+EXPERT_LORA_RANK="${PGC_V9_EXPERT_LORA_RANK:-16}"
+EXPERT_LORA_ALPHA="${PGC_V9_EXPERT_LORA_ALPHA:-16}"
+EXPERT_LORA_DROPOUT="${PGC_V9_EXPERT_LORA_DROPOUT:-0.05}"
+EXPERT_LORA_WORLD_LANGUAGE_WEIGHT="${PGC_V9_EXPERT_LORA_WORLD_LANGUAGE_WEIGHT:-0.10}"
+EXPERT_LORA_WORLD_LANGUAGE_MARGIN="${PGC_V9_EXPERT_LORA_WORLD_LANGUAGE_MARGIN:-0.01}"
+EXPERT_LORA_NATIVE_ACTION_WEIGHT="${PGC_V9_EXPERT_LORA_NATIVE_ACTION_WEIGHT:-1.0}"
+EXPERT_LORA_COUNTERFACTUAL_ACTION_WEIGHT="${PGC_V9_EXPERT_LORA_COUNTERFACTUAL_ACTION_WEIGHT:-1.0}"
+EXPERT_LORA_REGULARIZATION_WEIGHT="${PGC_V9_EXPERT_LORA_REGULARIZATION_WEIGHT:-1.0e-6}"
 if [[ "${STAGE}" == "action-semantic-causal" ]]; then
   ACTION_GROUNDING_LEARNING_RATE="${PGC_V9_ACTION_GROUNDING_LEARNING_RATE:-2.0e-5}"
   ACTION_CAUSAL_RANKING_WEIGHT="${PGC_V9_ACTION_CAUSAL_RANKING_WEIGHT:-2.0}"
@@ -1579,6 +1643,10 @@ echo "  isolated_clause_residual=wrong_suppression:${ACTION_CLAUSE_WRONG_SUPPRES
 if [[ "${STAGE}" == "action-context-injection" ]]; then
   echo "  action_context_injection=shared_action_expert:true trainable_scope:eraf_action_context_injector_only post_action_residual:false native_action_supervision:false"
 fi
+if [[ "${STAGE}" == "action-eraf-expert-lora" ]]; then
+  echo "  eraf_expert_lora=single_path:true video_action_lora:true rank:${EXPERT_LORA_RANK} alpha:${EXPERT_LORA_ALPHA} dropout:${EXPERT_LORA_DROPOUT} post_action_residual:false"
+  echo "  eraf_expert_supervision=world_flow:1 wrong_language:${EXPERT_LORA_WORLD_LANGUAGE_WEIGHT} native_action:${EXPERT_LORA_NATIVE_ACTION_WEIGHT} counterfactual_action:${EXPERT_LORA_COUNTERFACTUAL_ACTION_WEIGHT} eraf_preservation:${GROUNDING_AUX_WEIGHT}"
+fi
 echo "  v9.19_eef_affine=scale:${ACTION_EEF_SCALE} bias:${ACTION_EEF_BIAS}"
 echo "  role_preservation=attention:${ROLE_ATTENTION_PRESERVATION_WEIGHT} position:${ROLE_POSITION_PRESERVATION_WEIGHT} anchor:${ROLE_ANCHOR_PRESERVATION_WEIGHT} relation:${ROLE_RELATION_PRESERVATION_WEIGHT} energy:${ROLE_ADAPTER_ENERGY_WEIGHT}"
 if [[ "${CLOSED_LOOP_REBINDING}" == "true" || "${PHASE_SAFE_MEMORY}" == "true" ]]; then
@@ -1639,6 +1707,11 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   "model.policy_guard.entity_relation_grounding.action_grounding_learning_rate=${ACTION_GROUNDING_LEARNING_RATE}" \
   "model.policy_guard.entity_relation_grounding.action_causal_ranking_weight=${ACTION_CAUSAL_RANKING_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.action_causal_margin=${ACTION_CAUSAL_MARGIN}" \
+  "model.policy_guard.entity_relation_grounding.expert_lora_world_language_weight=${EXPERT_LORA_WORLD_LANGUAGE_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.expert_lora_world_language_margin=${EXPERT_LORA_WORLD_LANGUAGE_MARGIN}" \
+  "model.policy_guard.entity_relation_grounding.expert_lora_native_action_weight=${EXPERT_LORA_NATIVE_ACTION_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.expert_lora_counterfactual_action_weight=${EXPERT_LORA_COUNTERFACTUAL_ACTION_WEIGHT}" \
+  "model.policy_guard.entity_relation_grounding.expert_lora_regularization_weight=${EXPERT_LORA_REGULARIZATION_WEIGHT}" \
   "model.policy_guard.entity_relation_grounding.action_geometry_learning_rate=${ACTION_GEOMETRY_LEARNING_RATE}" \
   "model.policy_guard.entity_relation_grounding.action_geometry_residual_max_abs=${ACTION_GEOMETRY_RESIDUAL_MAX_ABS}" \
   "model.policy_guard.entity_relation_grounding.action_phase_residual_imitation_weight=${ACTION_PHASE_RESIDUAL_IMITATION_WEIGHT}" \
@@ -1730,4 +1803,9 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   model.policy_guard.verifier_wrong_entity_weight=0.5 \
   "model.policy_guard.verifier_wrong_relation_weight=${WRONG_RELATION_WEIGHT}" \
   model.policy_guard.require_direct_counterfactual_actions=true \
-  model.lora.enabled=false
+  "model.lora.enabled=${EXPERT_LORA_ENABLED}" \
+  "model.lora.rank=${EXPERT_LORA_RANK}" \
+  "model.lora.alpha=${EXPERT_LORA_ALPHA}" \
+  "model.lora.dropout=${EXPERT_LORA_DROPOUT}" \
+  'model.lora.experts=[video,action]' \
+  'model.lora.extra_trainable_patterns=[]'

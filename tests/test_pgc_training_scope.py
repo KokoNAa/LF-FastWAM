@@ -229,7 +229,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"action_expert_imitation_weight"',
             source,
         )
-        self.assertIn("set(range(1, 26))", source)
+        self.assertIn("set(range(1, 27))", source)
         self.assertIn(
             '"frozen_v921_expert_adapter_plus_isolated_clause_semantic_"',
             source,
@@ -248,6 +248,13 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             source,
         )
         self.assertIn('"eraf_action_context_injector_only"', source)
+        self.assertIn(
+            '"single_eraf_path_no_candidate_gate"', source
+        )
+        self.assertIn(
+            '"shared_video_action_lora_plus_eraf_action_context_injector"',
+            source,
+        )
         self.assertIn(
             '"every_denoising_step_no_post_action_residual"', source
         )
@@ -427,6 +434,32 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"${GROUNDING_OBJECTIVE_VERSION}" == "21"',
             source,
         )
+
+    def test_v926_uses_future_video_and_one_eraf_expert_lora_path(self):
+        launcher = (
+            REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh"
+        ).read_text(encoding="utf-8")
+        model = (
+            REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("action-eraf-expert-lora", launcher)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=26", launcher)
+        self.assertIn("START_STEP=19750", launcher)
+        self.assertIn("'model.lora.experts=[video,action]'", launcher)
+        self.assertIn("legacy_single_frame_policy_guard", model)
+        self.assertIn(
+            "self.policy_guard_eraf_grounding_objective_version >= 26",
+            model,
+        )
+        self.assertIn(
+            "def _training_loss_policy_guard_v926_eraf_expert_lora(", model
+        )
+        self.assertIn("world_flow_loss", model)
+        self.assertIn("world_language_ranking", model)
+        self.assertIn("native_action_loss", model)
+        self.assertIn("counterfactual_action_loss", model)
+        self.assertIn('"policy_guard_gate_mode": "eraf_only"', model)
+        self.assertIn('"policy_guard_eraf_single_path": True', model)
 
     def test_clause_ranking_launcher_calibrates_final_multiclause_actions(self):
         source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(

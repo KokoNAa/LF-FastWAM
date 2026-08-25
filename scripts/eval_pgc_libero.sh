@@ -180,8 +180,16 @@ if version not in {2, 3, 4, 5, 6, 7, 8, 9}:
     )
 if payload.get("format") != f"fastwam_policy_guard_v{version}":
     raise SystemExit("PGC checkpoint format/version mismatch")
+objective = (
+    int(metadata.get("eraf_grounding_objective_version", -1))
+    if version == 9
+    else 0
+)
+is_v926 = version == 9 and objective >= 26
 expected_protection = (
-    "single_immutable_base_plus_conservative_hard_gate"
+    "single_eraf_path_no_candidate_gate"
+    if is_v926
+    else "single_immutable_base_plus_conservative_hard_gate"
     if version >= 3
     else "immutable_base_plus_conservative_hard_gate"
 )
@@ -197,6 +205,12 @@ expected_tuning = {
     8: "closed_loop_replay_verified_target_acquisition_residual",
     9: "entity_relation_affordance_grounded_paired_action_residual",
 }[version]
+if is_v926:
+    expected_tuning = "native_and_counterfactual_world_action_joint_lora"
+elif version == 9 and objective >= 25:
+    expected_tuning = (
+        "counterfactual_only_internal_action_expert_context_conditioning"
+    )
 if metadata.get("counterfactual_tuning") != expected_tuning:
     raise SystemExit(f"PGC v{version} tuning metadata is incompatible")
 if version >= 3 and any(
@@ -208,6 +222,18 @@ if version >= 3 and any(
     )
 ):
     raise SystemExit("PGC v3+ must not contain an Action-Expert copy or LoRA")
+if is_v926:
+    if (
+        not isinstance(payload.get("eraf_shared_expert_lora"), dict)
+        or not payload["eraf_shared_expert_lora"]
+        or not isinstance(payload.get("eraf_shared_expert_lora_config"), dict)
+    ):
+        raise SystemExit("PGC V9.26 checkpoint lacks shared Expert LoRA")
+elif (
+    payload.get("eraf_shared_expert_lora") is not None
+    or payload.get("eraf_shared_expert_lora_config") is not None
+):
+    raise SystemExit("Pre-V9.26 checkpoint unexpectedly contains shared LoRA")
 if version >= 4:
     rollout_steps = int(metadata.get("rollout_num_inference_steps", -1))
     if rollout_steps != evaluation_inference_steps:
@@ -258,7 +284,6 @@ if version == 8 and (
 ):
     raise SystemExit("PGC v8 checkpoint lacks its audited corrective contract")
 if version == 9:
-    objective = int(metadata.get("eraf_grounding_objective_version", -1))
     completion_only_memory = bool(
         metadata.get("eraf_completion_only_memory", False)
     )
@@ -291,7 +316,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 26)):
+    if objective not in set(range(1, 27)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -360,7 +385,10 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_eraf_and_shared_action_expert_plus_internal_context_"
+            "frozen_eraf_completion_memory_plus_shared_video_action_expert_"
+            "lora_and_internal_context_injector_single_path"
+            if objective >= 26
+            else "frozen_eraf_and_shared_action_expert_plus_internal_context_"
             "injector_no_post_action_residual"
             if objective >= 25
             else "frozen_v921_expert_adapter_plus_isolated_clause_semantic_"
@@ -400,7 +428,9 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
-            "eraf_action_context_injector_only"
+            "shared_video_action_lora_plus_eraf_action_context_injector"
+            if objective >= 26
+            else "eraf_action_context_injector_only"
             if objective >= 25
             else "clause_semantic_retention_residual_only"
             if objective >= 24
@@ -430,7 +460,9 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
-            "eraf_action_context_injector_only"
+            "shared_video_action_lora_plus_eraf_action_context_injector"
+            if objective >= 26
+            else "eraf_action_context_injector_only"
             if objective >= 25
             else "clause_semantic_retention_residual_only"
             if objective >= 24
@@ -534,6 +566,24 @@ if version == 9:
         raise SystemExit(
             "PGC internal Action-Expert checkpoint lacks its no-residual "
             "ERAF context-injection contract"
+        )
+    if objective >= 26 and (
+        metadata.get("eraf_single_path") is not True
+        or metadata.get("gate_mode") != "eraf_only"
+        or metadata.get("verifier_deployment_role")
+        != "diagnostic_only_no_action_selection"
+        or metadata.get("world_model_supervision")
+        != "future_video_flow_plus_paired_wrong_language_ranking"
+        or set(
+            (metadata.get("eraf_shared_expert_lora_config") or {}).get(
+                "experts", []
+            )
+        )
+        != {"video", "action"}
+    ):
+        raise SystemExit(
+            "PGC V9.26 checkpoint lacks its single-path shared Expert-LoRA "
+            "contract"
         )
     if completion_only_memory and (
         training_stage != "action"
@@ -646,8 +696,8 @@ EXTRA_OVERRIDES=(
   "model.policy_guard.gate_mode=${GATE_MODE}"
   "model.policy_guard.gate_threshold=${GATE_THRESHOLD}"
   "model.policy_guard.min_counterfactual_score=${MIN_COUNTERFACTUAL_SCORE}"
-  # Keep construction adapter-free. v2 loading injects its saved LoRA; v3+
-  # strictly restore only their policy-guard sidecar tensors.
+  # Keep construction adapter-free. The loader injects saved v2 independent
+  # Action LoRA or V9.26 shared Video/Action LoRA before restoring tensors.
   "model.lora.enabled=false"
 )
 if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
@@ -717,6 +767,21 @@ mapping = {
     "eraf_action_eef_initial_bias": "action_eef_bias",
     "eraf_action_causal_ranking_weight": "action_causal_ranking_weight",
     "eraf_action_causal_margin": "action_causal_margin",
+    "eraf_expert_lora_world_language_weight": (
+        "expert_lora_world_language_weight"
+    ),
+    "eraf_expert_lora_world_language_margin": (
+        "expert_lora_world_language_margin"
+    ),
+    "eraf_expert_lora_native_action_weight": (
+        "expert_lora_native_action_weight"
+    ),
+    "eraf_expert_lora_counterfactual_action_weight": (
+        "expert_lora_counterfactual_action_weight"
+    ),
+    "eraf_expert_lora_regularization_weight": (
+        "expert_lora_regularization_weight"
+    ),
     "eraf_attention_mask_weight": "attention_mask_weight",
     "eraf_role_swap_weight": "role_swap_weight",
     "eraf_role_overlap_weight": "role_overlap_weight",
