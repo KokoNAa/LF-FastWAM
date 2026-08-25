@@ -18,6 +18,8 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn(
             "entity_relation_grounding.initialization_contract=", source
         )
+        self.assertIn("clean_base_bootstrap = (", source)
+        self.assertIn("if not clean_base_bootstrap:", source)
 
     def test_oracle_phase_servo_is_explicit_privileged_eval_ablation(self):
         launcher = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(

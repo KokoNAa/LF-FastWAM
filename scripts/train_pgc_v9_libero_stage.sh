@@ -1474,18 +1474,25 @@ else:
                 "Single-path ERAF shared Expert-LoRA training must warm-start "
                 "from the completed internal-context checkpoint at step 19750."
             )
-saved_base = payload.get("base_checkpoint")
-if not saved_base:
-    raise SystemExit(f"Initialization checkpoint has no protected base: {checkpoint}")
-saved_base_path = pathlib.Path(str(saved_base)).expanduser()
-if not saved_base_path.is_absolute():
-    saved_base_path = pathlib.Path(checkpoint).resolve().parent / saved_base_path
-if saved_base_path.resolve() != pathlib.Path(base_checkpoint).resolve():
-    raise SystemExit(
-        "Protected Base mismatch: initialization checkpoint references "
-        f"{saved_base_path.resolve()}, but the command supplied "
-        f"{pathlib.Path(base_checkpoint).resolve()}."
-    )
+clean_base_bootstrap = (
+    stage == "grounding"
+    and initialization_contract == "released_base_fresh_eraf"
+)
+if not clean_base_bootstrap:
+    saved_base = payload.get("base_checkpoint")
+    if not saved_base:
+        raise SystemExit(
+            f"Initialization checkpoint has no protected base: {checkpoint}"
+        )
+    saved_base_path = pathlib.Path(str(saved_base)).expanduser()
+    if not saved_base_path.is_absolute():
+        saved_base_path = pathlib.Path(checkpoint).resolve().parent / saved_base_path
+    if saved_base_path.resolve() != pathlib.Path(base_checkpoint).resolve():
+        raise SystemExit(
+            "Protected Base mismatch: initialization checkpoint references "
+            f"{saved_base_path.resolve()}, but the command supplied "
+            f"{pathlib.Path(base_checkpoint).resolve()}."
+        )
 datasets = [native_dataset]
 sidecars = [native_sidecar]
 expected_action_contracts = [
