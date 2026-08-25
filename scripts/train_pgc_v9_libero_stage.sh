@@ -5,7 +5,7 @@ SUITE="${1:?Usage: bash scripts/train_pgc_v9_libero_stage.sh <suite> <grounding|
 STAGE="${2:?Missing V9 training stage}"
 NPROC_PER_NODE="${3:?Missing GPU count}"
 BASE_CHECKPOINT="${4:?Missing released FastWAM checkpoint}"
-INIT_CHECKPOINT="${5:?Missing exact V5/V9 initialization checkpoint}"
+INIT_CHECKPOINT="${5:?Missing Base/V5/V9 initialization checkpoint}"
 ORIGINAL_CF_DATASET="${6:?Missing historical counterfactual dataset}"
 STRICT_CF_DATASET="${7:?Missing strict-conflict counterfactual dataset}"
 NATIVE_SIDECAR="${8:?Missing native ERAF sidecar}"
@@ -14,6 +14,7 @@ STRICT_CF_SIDECAR="${10:?Missing strict-CF ERAF sidecar}"
 TRAIN_SEED="${11:-42}"
 ABLATION="${12:-full}"
 REQUESTED_GROUNDING_OBJECTIVE_VERSION="${PGC_V9_GROUNDING_OBJECTIVE_VERSION:-}"
+REQUESTED_INITIALIZATION_CONTRACT="${PGC_V9_INITIALIZATION_CONTRACT:-}"
 
 case "${SUITE}" in
   libero_spatial|libero_object|libero_goal|libero_10) ;;
@@ -800,6 +801,39 @@ for directory in \
 done
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/bin/python}"
+if [[ -n "${REQUESTED_INITIALIZATION_CONTRACT}" ]]; then
+  INITIALIZATION_CONTRACT="${REQUESTED_INITIALIZATION_CONTRACT}"
+else
+  INITIALIZATION_CONTRACT="$(${PYTHON_BIN} - \
+    "${STAGE}" "${BASE_CHECKPOINT}" "${INIT_CHECKPOINT}" <<'PY'
+import pathlib
+import sys
+import torch
+
+stage, base_path, init_path = sys.argv[1:]
+payload = torch.load(init_path, map_location="cpu", weights_only=False)
+metadata = payload.get("architecture_metadata") or {}
+saved = str(metadata.get("warm_start_contract", ""))
+if saved:
+    print(saved)
+elif (
+    stage == "grounding"
+    and pathlib.Path(base_path).expanduser().resolve()
+    == pathlib.Path(init_path).expanduser().resolve()
+):
+    print("released_base_fresh_eraf")
+else:
+    print("exact_pgc_v5_sidecars")
+PY
+)"
+fi
+case "${INITIALIZATION_CONTRACT}" in
+  exact_pgc_v5_sidecars|released_base_fresh_eraf) ;;
+  *)
+    echo "Unsupported PGC v9 initialization contract: ${INITIALIZATION_CONTRACT}." >&2
+    exit 1
+    ;;
+esac
 LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-/root/gpufree-data/fastwam/FastWAM/data/libero_mujoco3.3.2}"
 NATIVE_DATASET="${LIBERO_DATA_ROOT}/${SUITE}_no_noops_lerobot"
 STATS_PATH="${STATS_PATH:-${DIFFSYNTH_MODEL_BASE_PATH:-./checkpoints}/fastwam_release/libero_uncond_2cam224_dataset_stats.json}"
@@ -867,6 +901,7 @@ fi
 
 "${PYTHON_BIN}" - \
   "${STAGE}" "${START_STEP}" "${GROUNDING_OBJECTIVE_VERSION}" \
+  "${INITIALIZATION_CONTRACT}" \
   "${BASE_CHECKPOINT}" "${INIT_CHECKPOINT}" \
   "${NATIVE_DATASET}" "${ORIGINAL_CF_DATASET}" "${STRICT_CF_DATASET}" \
   "${NATIVE_SIDECAR}" "${ORIGINAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}" \
@@ -882,6 +917,7 @@ import torch
     stage,
     expected_step,
     requested_objective,
+    initialization_contract,
     base_checkpoint,
     checkpoint,
     native_dataset,
@@ -897,9 +933,24 @@ payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
 fmt = str(payload.get("format", ""))
 version = int((payload.get("architecture_metadata") or {}).get("policy_guard_version", 0))
 if stage == "grounding":
-    if fmt != "fastwam_policy_guard_v5" or version != 5:
+    if initialization_contract == "released_base_fresh_eraf":
+        if pathlib.Path(base_checkpoint).resolve() != pathlib.Path(checkpoint).resolve():
+            raise SystemExit(
+                "Clean ERAF grounding must use the released Base checkpoint "
+                "as both base_checkpoint and init_checkpoint."
+            )
+        if fmt.startswith("fastwam_policy_guard_") or not (
+            isinstance(payload.get("mot"), dict)
+            or isinstance(payload.get("dit"), dict)
+        ):
+            raise SystemExit(
+                "Clean ERAF grounding requires a released FastWAM Base "
+                "checkpoint with `mot` or `dit` weights and no PGC sidecars."
+            )
+    elif fmt != "fastwam_policy_guard_v5" or version != 5:
         raise SystemExit(
-            "V9 grounding must warm-start from an exact suite-specific PGC V5 checkpoint."
+            "Historical V9 grounding must warm-start from an exact "
+            "suite-specific PGC V5 checkpoint."
         )
 elif stage in {
     "grounding-role",
@@ -918,6 +969,12 @@ elif stage in {
     metadata = payload.get("architecture_metadata") or {}
     if fmt != "fastwam_policy_guard_v9" or version != 9:
         raise SystemExit("V9 role repair must resume from a V9 checkpoint.")
+    if metadata.get("warm_start_contract") != initialization_contract:
+        raise SystemExit(
+            "V9 grounding initialization contract mismatch: "
+            f"checkpoint={metadata.get('warm_start_contract')!r} "
+            f"requested={initialization_contract!r}."
+        )
     expected_saved_objective = {
         "grounding-role": 2,
         "grounding-role-adapter": 2,
@@ -1623,6 +1680,7 @@ echo "  suite=${SUITE} cumulative_steps=${MAX_STEPS} start_step=${START_STEP} st
 echo "  ablation=${ABLATION} entity_only=${ENTITY_ONLY} use_anchors=${USE_ANCHORS}"
 echo "  effective_batch=$((NPROC_PER_NODE * GRADIENT_ACCUMULATION_STEPS)) (${NPROC_PER_NODE} GPUs x batch1 x grad_accum${GRADIENT_ACCUMULATION_STEPS})"
 echo "  grounding_objective=v${GROUNDING_OBJECTIVE_VERSION} attention_mask=${ATTENTION_MASK_WEIGHT} role_swap=${ROLE_SWAP_WEIGHT} role_overlap=${ROLE_OVERLAP_WEIGHT} margin=${ROLE_SWAP_MARGIN}"
+echo "  initialization_contract=${INITIALIZATION_CONTRACT}"
 echo "  role_assignment=${ROLE_ASSIGNMENT_WEIGHT} temperature=${ROLE_ASSIGNMENT_TEMPERATURE} hard_weight=${ROLE_ASSIGNMENT_HARD_WEIGHT}"
 echo "  structured_assignment=${STRUCTURED_ASSIGNMENT_WEIGHT} temperature=${STRUCTURED_ASSIGNMENT_TEMPERATURE} hard_weight=${STRUCTURED_ASSIGNMENT_HARD_WEIGHT} multi_clause=${MULTI_CLAUSE_CONSISTENCY_WEIGHT}"
 echo "  clause_tuple=assignment:${CLAUSE_TUPLE_ASSIGNMENT_WEIGHT} temperature:${CLAUSE_TUPLE_TEMPERATURE} hard_weight:${CLAUSE_TUPLE_HARD_WEIGHT} multi_consistency:${CLAUSE_TUPLE_MULTI_CONSISTENCY_WEIGHT}"
@@ -1697,6 +1755,7 @@ RUN_ID="pgc-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
   model.policy_guard.enabled=true \
   model.policy_guard.version=9 \
   "model.policy_guard.entity_relation_grounding.training_stage=${CONFIG_STAGE}" \
+  "model.policy_guard.entity_relation_grounding.initialization_contract=${INITIALIZATION_CONTRACT}" \
   "model.policy_guard.entity_relation_grounding.grounding_objective_version=${GROUNDING_OBJECTIVE_VERSION}" \
   "model.policy_guard.entity_relation_grounding.entity_only=${ENTITY_ONLY}" \
   "model.policy_guard.entity_relation_grounding.use_anchors=${USE_ANCHORS}" \

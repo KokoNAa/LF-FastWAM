@@ -6,6 +6,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PolicyGuardTrainingScopeTest(unittest.TestCase):
+    def test_v9_grounding_can_bootstrap_fresh_eraf_from_released_base(self):
+        source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("released_base_fresh_eraf", source)
+        self.assertIn(
+            "Clean ERAF grounding must use the released Base checkpoint",
+            source,
+        )
+        self.assertIn(
+            "entity_relation_grounding.initialization_contract=", source
+        )
+
     def test_oracle_phase_servo_is_explicit_privileged_eval_ablation(self):
         launcher = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
             encoding="utf-8"

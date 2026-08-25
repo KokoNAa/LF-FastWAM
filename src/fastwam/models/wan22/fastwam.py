@@ -639,6 +639,11 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_training_stage = str(
             eraf_config.get("training_stage", "grounding")
         ).strip().lower()
+        self.policy_guard_eraf_initialization_contract = str(
+            eraf_config.get(
+                "initialization_contract", "exact_pgc_v5_sidecars"
+            )
+        ).strip()
         self.policy_guard_eraf_hidden_dim = int(
             eraf_config.get("hidden_dim", 256)
         )
@@ -1413,6 +1418,15 @@ class FastWAM(torch.nn.Module):
                     "PGC v8 requires closed_loop_corrective_enabled=true."
                 )
             if self.policy_guard_version == 9:
+                if self.policy_guard_eraf_initialization_contract not in {
+                    "exact_pgc_v5_sidecars",
+                    "released_base_fresh_eraf",
+                }:
+                    raise ValueError(
+                        "PGC v9 ERAF initialization_contract must be "
+                        "'exact_pgc_v5_sidecars' or "
+                        "'released_base_fresh_eraf'."
+                    )
                 if self.policy_guard_eraf_grounding_objective_version not in {
                     1,
                     2,
@@ -15169,7 +15183,13 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "warm_start_contract": (
-                "exact_pgc_v5_sidecars" if (is_v8 or is_v9) else None
+                (
+                    self.policy_guard_eraf_initialization_contract
+                    if is_v9
+                    else "exact_pgc_v5_sidecars"
+                )
+                if (is_v8 or is_v9)
+                else None
             ),
             "eraf_training_stage": (
                 self.policy_guard_eraf_training_stage if is_v9 else None
@@ -16547,6 +16567,15 @@ class FastWAM(torch.nn.Module):
             saved_policy_guard_version == 5
             and int(self.policy_guard_version) == 9
         )
+        if (
+            migrate_v5_to_v9
+            and self.policy_guard_eraf_initialization_contract
+            != "exact_pgc_v5_sidecars"
+        ):
+            raise ValueError(
+                "A released-base fresh ERAF model cannot import PGC-V5 "
+                "sidecars. Load the released FastWAM checkpoint directly."
+            )
         migrate_v9_to_role_adapter = (
             saved_policy_guard_version == 9
             and int(self.policy_guard_version) == 9
@@ -17832,6 +17861,9 @@ class FastWAM(torch.nn.Module):
                                 "PGC v8 checkpoint has negative corrective weights."
                             )
                     elif saved_policy_guard_version == 9:
+                        saved_initialization_contract = str(
+                            metadata.get("warm_start_contract", "")
+                        )
                         expected_deployment_inputs = (
                             "rgb_language_proprio_completed_clause_bitset"
                             if saved_eraf_completion_only_memory
@@ -17842,8 +17874,11 @@ class FastWAM(torch.nn.Module):
                             )
                         )
                         if (
-                            metadata.get("warm_start_contract")
-                            != "exact_pgc_v5_sidecars"
+                            saved_initialization_contract
+                            not in {
+                                "exact_pgc_v5_sidecars",
+                                "released_base_fresh_eraf",
+                            }
                             or metadata.get("grounding")
                             != "predicate_entity_relation_affordance_field"
                             or metadata.get("privileged_supervision")
@@ -17855,6 +17890,13 @@ class FastWAM(torch.nn.Module):
                                 "PGC v9 checkpoint does not declare its ERAF "
                                 "deployment and supervision contract."
                             )
+                        # This field records checkpoint provenance rather than
+                        # a tensor-shape choice. Inherit it on every grounding
+                        # objective upgrade so clean Base restarts cannot be
+                        # mislabeled as historical PGC-V5 warm starts.
+                        self.policy_guard_eraf_initialization_contract = (
+                            saved_initialization_contract
+                        )
                         try:
                             saved_grounding_objective = int(
                                 metadata.get(

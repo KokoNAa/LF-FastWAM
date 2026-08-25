@@ -307,7 +307,8 @@ if version == 9:
         )
     entity_only, use_anchors = expected_ablation[v9_ablation]
     if (
-        metadata.get("warm_start_contract") != "exact_pgc_v5_sidecars"
+        metadata.get("warm_start_contract")
+        not in {"exact_pgc_v5_sidecars", "released_base_fresh_eraf"}
         or metadata.get("grounding")
         != "predicate_entity_relation_affordance_field"
         or metadata.get("privileged_supervision") != "training_only"

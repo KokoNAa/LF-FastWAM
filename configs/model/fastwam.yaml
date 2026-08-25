@@ -263,6 +263,10 @@ policy_guard:
   # deployment continues to consume only RGB, language, and proprio.
   entity_relation_grounding:
     training_stage: grounding
+    # Historical checkpoints inherit the frozen PGC-V5 policy sidecars.  A
+    # clean ERAF restart may instead load the released FastWAM checkpoint
+    # directly and initialize every ERAF/PGC sidecar from the configured seed.
+    initialization_contract: exact_pgc_v5_sidecars
     # v2 aligns every spatial objective with the normalized attention used by
     # deployment and by eval_pgc_v9_grounding_gate.py. Version 1 remains
     # loadable only for reproducing historical V9 checkpoints. Version 3 adds

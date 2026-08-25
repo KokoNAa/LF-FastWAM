@@ -3071,6 +3071,85 @@ class PGCERAFModuleTest(unittest.TestCase):
 
 
 class PGCERAFIntegrationTest(unittest.TestCase):
+    def test_released_base_bootstraps_fresh_eraf_without_pgc_sidecars(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            clean_path = root / "clean-eraf.pt"
+            base = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": base.mot.state_dict()},
+                base_path,
+            )
+
+            clean = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=2,
+                v9_initialization_contract="released_base_fresh_eraf",
+            )
+            fresh_eraf = {
+                name: value.detach().clone()
+                for name, value in clean.policy_guard_modules[
+                    "entity_relation_affordance"
+                ].state_dict().items()
+            }
+            clean.load_checkpoint(base_path)
+            for name, value in clean.policy_guard_modules[
+                "entity_relation_affordance"
+            ].state_dict().items():
+                self.assertTrue(torch.equal(value, fresh_eraf[name]), name)
+
+            clean.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in clean.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules.entity_relation_affordance."
+                    )
+                    for name in trainable
+                )
+            )
+            clean.save_checkpoint(clean_path, step=1500)
+            payload = torch.load(
+                clean_path, map_location="cpu", weights_only=False
+            )
+            self.assertEqual(
+                payload["architecture_metadata"]["warm_start_contract"],
+                "released_base_fresh_eraf",
+            )
+            self.assertEqual(
+                Path(payload["base_checkpoint"]).resolve(),
+                base_path.resolve(),
+            )
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=2,
+            )
+            restored.load_checkpoint(clean_path)
+            self.assertEqual(
+                restored.policy_guard_eraf_initialization_contract,
+                "released_base_fresh_eraf",
+            )
+
+            upgraded = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=4,
+            )
+            upgraded.load_checkpoint(clean_path)
+            self.assertEqual(
+                upgraded.policy_guard_eraf_initialization_contract,
+                "released_base_fresh_eraf",
+            )
+
     def test_v5_migration_is_exact_frozen_and_round_trips(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

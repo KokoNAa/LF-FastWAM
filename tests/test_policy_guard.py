@@ -42,6 +42,7 @@ def tiny_pgc_fastwam(
     v9_entity_only: bool = False,
     v9_use_anchors: bool = True,
     v9_grounding_objective_version: int = 2,
+    v9_initialization_contract: str = "exact_pgc_v5_sidecars",
     v9_completion_only_memory: bool = False,
     v9_action_joint_training: bool = False,
 ) -> FastWAM:
@@ -175,6 +176,7 @@ def tiny_pgc_fastwam(
             "min_counterfactual_score": 0.6,
             "entity_relation_grounding": {
                 "training_stage": v9_stage,
+                "initialization_contract": v9_initialization_contract,
                 "grounding_objective_version": v9_grounding_objective_version,
                 "hidden_dim": 8,
                 "num_heads": 2,
