@@ -871,11 +871,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         else _find_training_config(checkpoint)
     )
     cfg = OmegaConf.load(config_path)
+    configured_objective = int(
+        OmegaConf.select(
+            cfg,
+            "model.policy_guard.entity_relation_grounding."
+            "grounding_objective_version",
+            default=1,
+        )
+    )
     with open_dict(cfg):
         cfg.model.load_text_encoder = True
         cfg.model.skip_dit_load_from_pretrain = True
         cfg.model.action_dit_pretrained_path = None
-        cfg.model.lora.enabled = False
+        # Objective 26 changes the visual representation consumed by the
+        # frozen ERAF through Video-Expert LoRA.  Keep those adapters present
+        # when auditing the action-stage checkpoint; disabling them would
+        # silently measure the pre-upgrade visual backbone instead.
+        if configured_objective < 26:
+            cfg.model.lora.enabled = False
         cfg.model.policy_guard.enabled = True
         cfg.model.policy_guard.version = 9
         cfg.model.policy_guard.gate_mode = "base"
@@ -894,7 +907,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Grounding gate requires a PGC v9 checkpoint.")
     metadata = payload.get("architecture_metadata") or {}
     objective_version = int(metadata.get("eraf_grounding_objective_version", 1))
-    expected_step = {
+    grounding_expected_step = {
         2: 1500,
         3: 2500,
         4: 2500,
@@ -907,7 +920,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         11: 5750,
         12: 6250,
         13: 7250,
-    }.get(objective_version)
+        14: 7250,
+    }
+    action_expected_step = {
+        14: 11250,
+        15: 13250,
+        16: 13750,
+        17: 14250,
+        18: 15250,
+        19: 16250,
+        20: 17250,
+        21: 18250,
+        22: 18750,
+        23: 18750,
+        24: 18750,
+        25: 19750,
+        26: 20750,
+    }
+    audited_training_stage = str(metadata.get("eraf_training_stage", ""))
+    expected_step = {
+        "grounding": grounding_expected_step,
+        "action": action_expected_step,
+    }.get(audited_training_stage, {}).get(objective_version)
     checkpoint_step = int(payload.get("step", -1))
     intermediate_checkpoint = bool(args.allow_intermediate) and (
         (objective_version == 4 and checkpoint_step in {1750, 2000, 2250})
@@ -925,16 +959,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if (
         expected_step is None
         or (checkpoint_step != expected_step and not intermediate_checkpoint)
-        or metadata.get("eraf_training_stage") != "grounding"
     ):
         raise ValueError(
-            "The pre-action grounding gate requires the completed V9 "
-            "grounding-stage checkpoint: objective v2 at step 1500 or "
-            "objective v3/v4 at step 2500, objective v5/v6 at step 3500, "
-            "objective v7 at step 3000, objective v8 at step 3250, "
-            "objective v9 at step 3750, objective v10 at step 4750, or "
-            "objective v11 at step 5750, objective v12 at step 6250, or "
-            "objective v13 at step 7250."
+            "The grounding gate requires a completed V9 grounding checkpoint "
+            "or a completed action-stage checkpoint whose upstream Video/ERAF "
+            "representation is being audited; got "
+            f"stage={audited_training_stage!r} objective={objective_version} "
+            f"step={checkpoint_step}."
         )
     model = model.to(args.device).eval()
     lower, upper = pgc_entity_relation_workspace_bounds(
@@ -1000,6 +1031,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         {
             "checkpoint": str(checkpoint),
             "checkpoint_step": payload.get("step"),
+            "audited_training_stage": audited_training_stage,
             "intermediate_checkpoint": intermediate_checkpoint,
             "training_config": str(config_path),
             "seed": args.seed,

@@ -461,6 +461,13 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn('"policy_guard_gate_mode": "eraf_only"', model)
         self.assertIn('"policy_guard_eraf_single_path": True', model)
 
+        grounding_gate = (
+            REPO_ROOT / "scripts/eval_pgc_v9_grounding_gate.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("if configured_objective < 26:", grounding_gate)
+        self.assertIn("26: 20750", grounding_gate)
+        self.assertIn('"audited_training_stage"', grounding_gate)
+
     def test_clause_ranking_launcher_calibrates_final_multiclause_actions(self):
         source = (REPO_ROOT / "scripts/train_pgc_v9_libero_stage.sh").read_text(
             encoding="utf-8"
