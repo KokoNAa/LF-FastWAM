@@ -29,6 +29,7 @@ from .policy_guard import (
     ActionOutcomeVerifier,
     BoundedActionVelocityResidual,
     ClauseSemanticRetentionResidual,
+    ERAFActionContextInjector,
     GoalActionAlignmentLoss,
     GoalGraphEncoder,
     GoalResidualAdapter,
@@ -1422,10 +1423,11 @@ class FastWAM(torch.nn.Module):
                     22,
                     23,
                     24,
+                    25,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "between 1 and 24 inclusive."
+                        "between 1 and 25 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -2142,6 +2144,16 @@ class FastWAM(torch.nn.Module):
                                     self.policy_guard_eraf_action_geometry_hidden_dim
                                 ),
                             )
+                        if self.policy_guard_eraf_grounding_objective_version >= 25:
+                            self.policy_guard_modules[
+                                "eraf_action_context_injector"
+                            ] = ERAFActionContextInjector(
+                                goal_dim=int(policy_action_expert.hidden_dim),
+                                text_dim=self.text_dim,
+                                hidden_dim=(
+                                    self.policy_guard_eraf_action_geometry_hidden_dim
+                                ),
+                            )
                     if self.policy_guard_version in {6, 7}:
                         binder_kwargs = {
                             "text_dim": self.text_dim,
@@ -2601,6 +2613,20 @@ class FastWAM(torch.nn.Module):
                         elif self.policy_guard_eraf_training_stage == "action":
                             if (
                                 self.policy_guard_eraf_grounding_objective_version
+                                >= 25
+                            ):
+                                # V9.25 changes only the injection boundary:
+                                # ERAF tokens condition the shared frozen Action
+                                # Expert during denoising. Every post-sampler
+                                # Proposal/geometry/servo residual stays frozen
+                                # and is bypassed by training and deployment.
+                                context_injector = self.policy_guard_modules[
+                                    "eraf_action_context_injector"
+                                ]
+                                context_injector.train()
+                                context_injector.requires_grad_(True)
+                            elif (
+                                self.policy_guard_eraf_grounding_objective_version
                                 >= 24
                             ):
                                 # Preserve the admitted V9.21 action function
@@ -2899,6 +2925,13 @@ class FastWAM(torch.nn.Module):
             optimizer_modules.append(
                 (
                     "eraf_clause_semantic_retention_residual",
+                    self.policy_guard_eraf_action_geometry_learning_rate,
+                )
+            )
+        if "eraf_action_context_injector" in self.policy_guard_modules:
+            optimizer_modules.append(
+                (
+                    "eraf_action_context_injector",
                     self.policy_guard_eraf_action_geometry_learning_rate,
                 )
             )
@@ -3716,7 +3749,55 @@ class FastWAM(torch.nn.Module):
         video_tokens_per_frame: int,
         routed_goal_queries: torch.Tensor,
         return_metrics: bool = False,
+        checkpoint_frozen_action_expert: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if (
+            self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 25
+        ):
+            (
+                injected_context,
+                injected_context_mask,
+                injection_metrics,
+            ) = self.policy_guard_modules["eraf_action_context_injector"](
+                context=context,
+                context_mask=full_context_mask,
+                goal_queries=routed_goal_queries,
+            )
+            action_pre = self.action_expert.pre_dit(
+                action_tokens=action_tokens,
+                timestep=timestep_action,
+                context=injected_context,
+                context_mask=injected_context_mask,
+                use_queries=False,
+            )
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=video_seq_len,
+                action_seq_len=int(action_pre["tokens"].shape[1]),
+                video_tokens_per_frame=video_tokens_per_frame,
+                device=action_pre["tokens"].device,
+                num_queries=0,
+                action_reads_raw_video=True,
+                queries_read_raw_video=False,
+            )
+            output_tokens = self.mot.forward_action_with_video_cache(
+                action_tokens=action_pre["tokens"],
+                action_freqs=action_pre["freqs"],
+                action_t_mod=action_pre["t_mod"],
+                action_context_payload={
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+                action_expert=self.action_expert,
+                training_override=checkpoint_frozen_action_expert,
+            )
+            output = self.action_expert.post_dit(output_tokens, action_pre)
+            if return_metrics:
+                return output, injection_metrics
+            return output
         if self.policy_guard_version == 3:
             action_pre = self.action_expert.pre_dit(
                 action_tokens=action_tokens,
@@ -3763,7 +3844,8 @@ class FastWAM(torch.nn.Module):
         if self.policy_guard_version >= 4:
             raise RuntimeError(
                 "PGC v4 applies its proposal after the frozen Base sampler, "
-                "not inside a diffusion step."
+                "not inside a diffusion step (except the V9.25 internal "
+                "ERAF context-injection path)."
             )
         if self.policy_guard_action_expert is None:
             raise RuntimeError("PGC Action Expert is unavailable.")
@@ -5254,6 +5336,59 @@ class FastWAM(torch.nn.Module):
             video_pre["tokens"].detach(),
             video_tokens_per_frame,
         )
+
+    @torch.no_grad()
+    def _rollout_policy_guard_eraf_context_action(
+        self,
+        *,
+        initial_action_noise: torch.Tensor,
+        context: torch.Tensor,
+        full_context_mask: torch.Tensor,
+        state_only_context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        video_seq_len: int,
+        video_tokens_per_frame: int,
+        routed_goal_queries: torch.Tensor,
+        num_inference_steps: int,
+        sigma_shift: Optional[float] = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Denoise one candidate through internal ERAF context injection."""
+        if not (
+            self.policy_guard_enabled
+            and self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 25
+        ):
+            raise RuntimeError(
+                "Internal ERAF action rollout requires PGC v9 objective 25+."
+            )
+        action = initial_action_noise.detach().clone()
+        timesteps, deltas = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=action.device,
+            dtype=action.dtype,
+            shift_override=sigma_shift,
+        )
+        last_metrics: dict[str, torch.Tensor] = {}
+        for timestep, delta in zip(timesteps, deltas):
+            timestep_action = timestep.expand(action.shape[0]).to(
+                device=action.device, dtype=action.dtype
+            )
+            velocity, last_metrics = (
+                self._forward_policy_guard_action_from_cache(
+                    action_tokens=action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    full_context_mask=full_context_mask,
+                    state_only_context_mask=state_only_context_mask,
+                    video_kv_cache=video_kv_cache,
+                    video_seq_len=video_seq_len,
+                    video_tokens_per_frame=video_tokens_per_frame,
+                    routed_goal_queries=routed_goal_queries,
+                    return_metrics=True,
+                )
+            )
+            action = self.infer_action_scheduler.step(velocity, delta, action)
+        return action, last_metrics
 
     def _training_loss_policy_guard_v4(
         self,
@@ -7282,6 +7417,289 @@ class FastWAM(torch.nn.Module):
             }
         )
         return total, metrics
+
+    def _training_loss_policy_guard_v925_action_context(
+        self,
+        *,
+        inputs: dict[str, Any],
+        full_context_mask: torch.Tensor,
+        state_only_context_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Train internal ERAF conditioning with no action-space residual.
+
+        The released Action Expert, Video Expert, ERAF, memory, and gate are
+        frozen. Only the ERAF-to-context projection is optimized. Supervision
+        is restricted to direct counterfactual rows; native/correct rollout
+        continues to use the untouched Base candidate at deployment.
+        """
+        if not (
+            self.policy_guard_enabled
+            and self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 25
+            and self.policy_guard_eraf_training_stage == "action"
+        ):
+            raise RuntimeError(
+                "Internal ERAF action-context training requires PGC v9 "
+                "objective 25+ in the action stage."
+            )
+        action = inputs["action"]
+        action_is_pad = inputs["action_is_pad"]
+        is_counterfactual = inputs["pgc_is_counterfactual"]
+        direct_action_valid = inputs["pgc_direct_action_valid"]
+        paired_language_valid = inputs["pgc_paired_language_valid"]
+        source_context = inputs["pgc_source_context"]
+        source_context_mask = inputs["pgc_source_context_mask"]
+        if any(
+            value is None
+            for value in (
+                is_counterfactual,
+                direct_action_valid,
+                paired_language_valid,
+                source_context,
+                source_context_mask,
+            )
+        ):
+            raise ValueError(
+                "Internal ERAF action-context training requires direct "
+                "counterfactual and paired-language provenance."
+            )
+
+        batch_size = int(action.shape[0])
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=action.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(
+            action, noise_action, timestep_action
+        )
+        target_velocity = self.train_action_scheduler.training_target(
+            action, noise_action, timestep_action
+        )
+
+        with torch.no_grad():
+            first_frame_latents = inputs["input_latents"][:, :, 0:1]
+            timestep_video = torch.zeros(
+                (batch_size,),
+                device=first_frame_latents.device,
+                dtype=first_frame_latents.dtype,
+            )
+            video_pre = self.video_expert.pre_dit(
+                x=first_frame_latents,
+                timestep=timestep_video,
+                context=inputs["context"],
+                context_mask=full_context_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=inputs[
+                    "fuse_vae_embedding_in_latents"
+                ],
+            )
+            video_seq_len = int(video_pre["tokens"].shape[1])
+            video_tokens_per_frame = int(
+                video_pre["meta"]["tokens_per_frame"]
+            )
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=video_seq_len,
+                action_seq_len=int(action.shape[1]),
+                video_tokens_per_frame=video_tokens_per_frame,
+                device=video_pre["tokens"].device,
+                num_queries=0,
+                action_reads_raw_video=True,
+            )
+            prefill_result = self.mot.prefill_video_cache(
+                video_tokens=video_pre["tokens"],
+                video_freqs=video_pre["freqs"],
+                video_t_mod=video_pre["t_mod"],
+                video_context_payload={
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                video_attention_mask=attention_mask[
+                    :video_seq_len, :video_seq_len
+                ],
+                return_final_hidden=True,
+            )
+            if not isinstance(prefill_result, tuple):
+                raise RuntimeError(
+                    "Internal ERAF context training requires Video hidden state."
+                )
+            video_kv_cache, final_video_hidden = prefill_result
+            language_context_len = int(inputs["language_context_len"])
+            target_labels = self._policy_guard_v9_labels(inputs)
+            source_labels = self._policy_guard_v9_labels(
+                inputs, prefix="source_"
+            )
+            target_state = {
+                "phase_safe_memory_state_ids": target_labels[
+                    "phase_safe_memory_previous_state_ids"
+                ],
+                "phase_safe_memory_valid": target_labels[
+                    "phase_safe_memory_state_valid"
+                ],
+            }
+            source_state = {
+                "phase_safe_memory_state_ids": source_labels[
+                    "phase_safe_memory_previous_state_ids"
+                ],
+                "phase_safe_memory_valid": source_labels[
+                    "phase_safe_memory_state_valid"
+                ],
+            }
+            target_queries, _, _, _ = self._encode_policy_guard_eraf(
+                final_video_hidden=final_video_hidden,
+                current_visual_hidden=video_pre["tokens"],
+                video_tokens_per_frame=video_tokens_per_frame,
+                context=inputs["context"],
+                context_mask=full_context_mask,
+                language_context_len=language_context_len,
+                policy_guard_state=target_state,
+                proprio=inputs.get("proprio_current"),
+            )
+            source_queries, _, _, _ = self._encode_policy_guard_eraf(
+                final_video_hidden=final_video_hidden,
+                current_visual_hidden=video_pre["tokens"],
+                video_tokens_per_frame=video_tokens_per_frame,
+                context=source_context,
+                context_mask=source_context_mask,
+                language_context_len=language_context_len,
+                policy_guard_state=source_state,
+                proprio=inputs.get("proprio_current"),
+            )
+            base_velocity = self._predict_action_noise_with_cache(
+                latents_action=noisy_action,
+                timestep_action=timestep_action,
+                context=inputs["context"],
+                context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+            )
+
+        correct_velocity, injection_metrics = (
+            self._forward_policy_guard_action_from_cache(
+                action_tokens=noisy_action,
+                timestep_action=timestep_action,
+                context=inputs["context"],
+                full_context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
+                video_kv_cache=video_kv_cache,
+                video_seq_len=video_seq_len,
+                video_tokens_per_frame=video_tokens_per_frame,
+                routed_goal_queries=target_queries.detach(),
+                return_metrics=True,
+                checkpoint_frozen_action_expert=True,
+            )
+        )
+        wrong_velocity, _ = self._forward_policy_guard_action_from_cache(
+            action_tokens=noisy_action,
+            timestep_action=timestep_action,
+            context=inputs["context"],
+            full_context_mask=full_context_mask,
+            state_only_context_mask=state_only_context_mask,
+            video_kv_cache=video_kv_cache,
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+            routed_goal_queries=source_queries.detach(),
+            return_metrics=True,
+            checkpoint_frozen_action_expert=True,
+        )
+
+        correct_error = self._compute_action_loss_per_sample(
+            pred_action=correct_velocity,
+            target_action=target_velocity,
+            action_is_pad=action_is_pad,
+        )
+        wrong_error = self._compute_action_loss_per_sample(
+            pred_action=wrong_velocity,
+            target_action=target_velocity,
+            action_is_pad=action_is_pad,
+        )
+        base_error = self._compute_action_loss_per_sample(
+            pred_action=base_velocity,
+            target_action=target_velocity,
+            action_is_pad=action_is_pad,
+        )
+        action_weight = self.train_action_scheduler.training_weight(
+            timestep_action
+        ).to(device=correct_error.device, dtype=correct_error.dtype)
+        if action_weight.ndim == 0:
+            action_weight = action_weight.expand(batch_size)
+        else:
+            action_weight = action_weight.reshape(batch_size)
+        counterfactual_valid = direct_action_valid.to(
+            device=action.device, dtype=torch.bool
+        ) & is_counterfactual.to(device=action.device, dtype=torch.bool)
+        semantic_valid = counterfactual_valid & paired_language_valid.to(
+            device=action.device, dtype=torch.bool
+        )
+        imitation_loss = self._masked_policy_guard_mean(
+            correct_error * action_weight, counterfactual_valid
+        )
+        ranking_per_sample = torch.relu(
+            float(self.policy_guard_eraf_action_causal_margin)
+            + correct_error.detach()
+            - wrong_error
+        )
+        ranking_loss = self._masked_policy_guard_mean(
+            ranking_per_sample, semantic_valid
+        )
+        total = (
+            self.loss_lambda_action * imitation_loss
+            + self.policy_guard_eraf_action_causal_ranking_weight
+            * ranking_loss
+        )
+        valid_count = counterfactual_valid.float().sum().clamp_min(1.0)
+        semantic_count = semantic_valid.float().sum().clamp_min(1.0)
+        metrics: dict[str, torch.Tensor] = {
+            "loss_pgc_v925_internal_action_flow": imitation_loss.detach(),
+            "loss_pgc_v925_wrong_semantic_ranking": ranking_loss.detach(),
+            "pgc_v925_counterfactual_valid_fraction": (
+                counterfactual_valid.float().mean()
+            ),
+            "pgc_v925_semantic_valid_fraction": semantic_valid.float().mean(),
+            "pgc_v925_internal_velocity_delta_rms": (
+                (correct_velocity - base_velocity)
+                .float()
+                .square()
+                .mean()
+                .sqrt()
+            ),
+            "pgc_v925_expert_improvement_rate": (
+                ((correct_error < base_error).float() * counterfactual_valid.float())
+                .sum()
+                / valid_count
+            ),
+            "pgc_v925_wrong_semantics_worse_rate": (
+                ((wrong_error > correct_error).float() * semantic_valid.float())
+                .sum()
+                / semantic_count
+            ),
+            "pgc_v925_native_action_supervision_enabled": (
+                correct_error.new_zeros(())
+            ),
+            "pgc_v925_post_action_residual_enabled": (
+                correct_error.new_zeros(())
+            ),
+            "pgc_base_policy_frozen": correct_error.new_ones(()),
+            "pgc_v9_stage_action": correct_error.new_ones(()),
+            "pgc_v9_stage_grounding": correct_error.new_zeros(()),
+            "pgc_v9_stage_verifier": correct_error.new_zeros(()),
+        }
+        metrics.update(injection_metrics)
+        detached = detached_policy_guard_metrics(metrics)
+        detached.update(
+            {
+                "loss_video": 0.0,
+                "loss_action": float(total.detach().float().item()),
+                "loss_pgc_action": float(imitation_loss.detach().float().item()),
+                "loss_pgc_v9_eraf": 0.0,
+                "pgc_video_loss_optimization_weight": 0.0,
+                "pgc_action_effective_weight": 1.0,
+            }
+        )
+        return total, detached
 
     def _training_loss_policy_guard_v5(
         self,
@@ -10657,6 +11075,16 @@ class FastWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
 
+        if (
+            self.policy_guard_enabled
+            and self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 25
+        ):
+            return self._training_loss_policy_guard_v925_action_context(
+                inputs=inputs,
+                full_context_mask=full_context_mask,
+                state_only_context_mask=state_only_context_mask,
+            )
         if self.policy_guard_enabled and self.policy_guard_version >= 5:
             return self._training_loss_policy_guard_v5(
                 inputs=inputs,
@@ -12114,9 +12542,19 @@ class FastWAM(torch.nn.Module):
             device=rand_device,
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
+        policy_guard_initial_action_noise = latents_action.clone()
+        use_internal_eraf_action_context = bool(
+            self.policy_guard_enabled
+            and self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 25
+        )
         policy_guard_latents_action = (
             latents_action.clone()
-            if self.policy_guard_enabled and self.policy_guard_version <= 3
+            if self.policy_guard_enabled
+            and (
+                self.policy_guard_version <= 3
+                or use_internal_eraf_action_context
+            )
             else None
         )
 
@@ -12365,7 +12803,10 @@ class FastWAM(torch.nn.Module):
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
-            if self.policy_guard_enabled and self.policy_guard_version <= 3:
+            if self.policy_guard_enabled and (
+                self.policy_guard_version <= 3
+                or use_internal_eraf_action_context
+            ):
                 if (
                     policy_guard_latents_action is None
                     or policy_guard_goal_queries is None
@@ -12406,17 +12847,33 @@ class FastWAM(torch.nn.Module):
                 or policy_guard_current_video_hidden is None
             ):
                 raise RuntimeError("PGC v4 inference did not encode its goal state.")
-            (
-                policy_guard_latents_action,
-                action_residual,
-                policy_guard_proposal_metrics,
-            ) = self.policy_guard_modules["action_chunk_proposal"](
-                base_action=latents_action,
-                goal_queries=policy_guard_goal_queries,
-                action_is_pad=None,
-            )
+            if use_internal_eraf_action_context:
+                if policy_guard_latents_action is None:
+                    raise RuntimeError(
+                        "Internal ERAF action candidate was not denoised."
+                    )
+                action_residual = policy_guard_latents_action - latents_action
+                _, _, policy_guard_proposal_metrics = (
+                    self.policy_guard_modules["eraf_action_context_injector"](
+                        context=context,
+                        context_mask=context_mask,
+                        goal_queries=policy_guard_goal_queries,
+                    )
+                )
+            else:
+                (
+                    policy_guard_latents_action,
+                    action_residual,
+                    policy_guard_proposal_metrics,
+                ) = self.policy_guard_modules["action_chunk_proposal"](
+                    base_action=latents_action,
+                    goal_queries=policy_guard_goal_queries,
+                    action_is_pad=None,
+                )
             pre_geometry_policy_guard_action = policy_guard_latents_action
             if (
+                not use_internal_eraf_action_context
+                and
                 self.policy_guard_version == 9
                 and self.policy_guard_eraf_grounding_objective_version >= 17
             ):
@@ -12570,25 +13027,34 @@ class FastWAM(torch.nn.Module):
                 ),
                 action_is_pad=None,
             )
-            cap = self.policy_guard_modules[
-                "action_chunk_proposal"
-            ].max_abs.to(
-                device=action_residual.device,
-                dtype=action_residual.dtype,
-            )
             support_residual = action_residual[:, :verifier_horizon]
             residual_rms = support_residual.float().square().mean(
                 dim=(1, 2)
             ).sqrt()
-            saturation = (
-                support_residual.float().abs() >= cap.float() * 0.95
-            ).float().mean(dim=(1, 2))
-            candidate_supported = (
-                residual_rms <= self.policy_guard_candidate_max_delta_rms
-            ) & (
-                saturation
-                <= self.policy_guard_candidate_max_saturation_fraction
-            )
+            if use_internal_eraf_action_context:
+                # This is a fully denoised second candidate, not a clipped
+                # action residual. Retain delta RMS as a conservative guard,
+                # while reporting zero residual saturation by construction.
+                saturation = torch.zeros_like(residual_rms)
+                candidate_supported = (
+                    residual_rms <= self.policy_guard_candidate_max_delta_rms
+                )
+            else:
+                cap = self.policy_guard_modules[
+                    "action_chunk_proposal"
+                ].max_abs.to(
+                    device=action_residual.device,
+                    dtype=action_residual.dtype,
+                )
+                saturation = (
+                    support_residual.float().abs() >= cap.float() * 0.95
+                ).float().mean(dim=(1, 2))
+                candidate_supported = (
+                    residual_rms <= self.policy_guard_candidate_max_delta_rms
+                ) & (
+                    saturation
+                    <= self.policy_guard_candidate_max_saturation_fraction
+                )
             selected_action, selected_counterfactual = (
                 self._select_policy_guard_action(
                     base_action=latents_action,
@@ -12662,6 +13128,10 @@ class FastWAM(torch.nn.Module):
                 "pgc_v924_clause_suppression_mean",
                 "pgc_v924_clause_retention_mean",
                 "pgc_v924_clause_semantic_residual_rms",
+                "pgc_v925_action_context_token_rms",
+                "pgc_v925_action_context_scale",
+                "pgc_v925_action_context_token_count",
+                "pgc_v925_post_action_residual_enabled",
             ):
                 metric_value = policy_guard_proposal_metrics.get(metric_name)
                 if metric_value is not None:
@@ -12687,6 +13157,45 @@ class FastWAM(torch.nn.Module):
                         variant_metrics: Mapping[str, torch.Tensor] = (
                             policy_guard_proposal_metrics
                         )
+                    elif use_internal_eraf_action_context:
+                        bypass_internal_injection = bool(
+                            variant_eraf_outputs is not None
+                            and torch.as_tensor(
+                                variant_eraf_outputs.get(
+                                    "audit_bypass_bridge", False
+                                )
+                            ).all()
+                        )
+                        if bypass_internal_injection:
+                            # The bypass counterfactual is the exact Base
+                            # sampler result from the same initial noise. It
+                            # must not traverse any legacy Proposal/residual
+                            # module.
+                            variant_action = latents_action
+                            variant_residual = torch.zeros_like(latents_action)
+                            variant_metrics = {}
+                        else:
+                            variant_action, variant_metrics = (
+                                self._rollout_policy_guard_eraf_context_action(
+                                    initial_action_noise=(
+                                        policy_guard_initial_action_noise
+                                    ),
+                                    context=context,
+                                    full_context_mask=context_mask,
+                                    state_only_context_mask=(
+                                        state_only_context_mask
+                                    ),
+                                    video_kv_cache=video_kv_cache,
+                                    video_seq_len=video_seq_len,
+                                    video_tokens_per_frame=int(
+                                        video_pre["meta"]["tokens_per_frame"]
+                                    ),
+                                    routed_goal_queries=variant_queries,
+                                    num_inference_steps=num_inference_steps,
+                                    sigma_shift=sigma_shift,
+                                )
+                            )
+                            variant_residual = variant_action - latents_action
                     else:
                         (
                             variant_action,
@@ -13251,7 +13760,9 @@ class FastWAM(torch.nn.Module):
                 eraf_role_adapter_trainable_scope = (
                     (
                         (
-                            "clause_semantic_retention_residual_only"
+                            "eraf_action_context_injector_only"
+                            if objective_version >= 25
+                            else "clause_semantic_retention_residual_only"
                             if objective_version >= 24
                             else "phase_specific_privileged_expert_residual_adapter_only"
                             if objective_version >= 21
@@ -13345,7 +13856,10 @@ class FastWAM(torch.nn.Module):
             "base_policy": "frozen_released_fastwam",
             "base_action_interface": "query_free_joint_mot",
             "counterfactual_policy": (
-                "frozen_base_plus_rollout_aligned_action_chunk_proposal"
+                "shared_frozen_action_expert_with_internal_eraf_context_injection"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 25
+                else "frozen_base_plus_rollout_aligned_action_chunk_proposal"
                 if is_v4
                 else (
                     "frozen_base_plus_bounded_velocity_residual"
@@ -13358,7 +13872,10 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "counterfactual_tuning": (
-                "entity_relation_affordance_grounded_paired_action_residual"
+                "counterfactual_only_internal_action_expert_context_conditioning"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 25
+                else "entity_relation_affordance_grounded_paired_action_residual"
                 if is_v9
                 else (
                     "closed_loop_replay_verified_target_acquisition_residual"
@@ -13387,7 +13904,10 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "counterfactual_action_interface": (
-                "shared_frozen_base_final_action_chunk"
+                "same_noise_full_denoising_with_eraf_context_tokens"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 25
+                else "shared_frozen_base_final_action_chunk"
                 if is_v4
                 else (
                     "shared_frozen_base_raw_current_visual"
@@ -13400,7 +13920,10 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "goal_injection": (
-                "eraf_clause_tokens_cross_attention_to_v5_proposal"
+                "eraf_tokens_inside_shared_action_expert_denoising"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 25
+                else "eraf_clause_tokens_cross_attention_to_v5_proposal"
                 if is_v9
                 else (
                     "per_query_spatial_object_tokens_to_action_chunk_residual"
@@ -13897,7 +14420,10 @@ class FastWAM(torch.nn.Module):
             "eraf_action_joint_contract": (
                 (
                     (
-                        "frozen_v921_teacher_plus_alignment_preserving_"
+                        "frozen_eraf_and_shared_action_expert_plus_internal_"
+                        "context_injector_no_post_action_residual"
+                        if self.policy_guard_eraf_grounding_objective_version >= 25
+                        else "frozen_v921_teacher_plus_alignment_preserving_"
                         "negative_focused_final_action_clause_ranking"
                         if self.policy_guard_eraf_grounding_objective_version == 23
                         else "frozen_v921_expert_adapter_plus_isolated_clause_"
@@ -13942,7 +14468,9 @@ class FastWAM(torch.nn.Module):
             "eraf_action_trainable_scope": (
                 (
                     (
-                        "clause_semantic_retention_residual_only"
+                        "eraf_action_context_injector_only"
+                        if self.policy_guard_eraf_grounding_objective_version >= 25
+                        else "clause_semantic_retention_residual_only"
                         if self.policy_guard_eraf_grounding_objective_version >= 24
                         else "phase_specific_privileged_expert_residual_adapter_only"
                         if self.policy_guard_eraf_grounding_objective_version >= 21
@@ -13971,6 +14499,25 @@ class FastWAM(torch.nn.Module):
                     )
                 )
                 if is_v9 and self.policy_guard_eraf_action_joint_training
+                else None
+            ),
+            "eraf_action_context_injection_contract": (
+                "append_bounded_eraf_tokens_to_shared_action_expert_context_"
+                "at_every_denoising_step_no_post_action_residual"
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 25
+                else None
+            ),
+            "eraf_action_context_hidden_dim": (
+                self.policy_guard_eraf_action_geometry_hidden_dim
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 25
+                else None
+            ),
+            "eraf_post_action_residual_active": (
+                False
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version >= 25
                 else None
             ),
             "eraf_action_grounding_contract": (
@@ -15322,6 +15869,18 @@ class FastWAM(torch.nn.Module):
             and bool(metadata.get("eraf_action_joint_training", False))
             and self.policy_guard_eraf_action_joint_training
         )
+        migrate_v924_to_v925_action_context = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 24
+            and self.policy_guard_eraf_grounding_objective_version == 25
+            and self.policy_guard_eraf_training_stage == "action"
+            and metadata.get("eraf_training_stage") == "action"
+            and saved_eraf_completion_only_memory
+            and self.policy_guard_eraf_completion_only_memory
+            and bool(metadata.get("eraf_action_joint_training", False))
+            and self.policy_guard_eraf_action_joint_training
+        )
         if migrate_v914_to_v915_action_grounding:
             expected_v914_warm_start = {
                 "eraf_action_joint_contract": (
@@ -15592,6 +16151,30 @@ class FastWAM(torch.nn.Module):
                         f"checkpoint: {name}={metadata.get(name)!r}, "
                         f"expected={expected!r}."
                     )
+        if migrate_v924_to_v925_action_context:
+            expected_v924_warm_start = {
+                "eraf_action_joint_contract": (
+                    "frozen_v921_expert_adapter_plus_isolated_clause_"
+                    "semantic_retention_residual"
+                ),
+                "eraf_action_trainable_scope": (
+                    "clause_semantic_retention_residual_only"
+                ),
+                "eraf_role_adapter_trainable_scope": (
+                    "clause_semantic_retention_residual_only"
+                ),
+                "eraf_policy_state_contract": (
+                    "monotonic_completed_bitset_no_pending_holding_retry_"
+                    "recurrence"
+                ),
+            }
+            for name, expected in expected_v924_warm_start.items():
+                if metadata.get(name) != expected:
+                    raise ValueError(
+                        "PGC V9.25 requires an exact completed V9.24 action "
+                        f"checkpoint: {name}={metadata.get(name)!r}, "
+                        f"expected={expected!r}."
+                    )
         if migrate_v9_to_exclusive_all_entity:
             expected_v99_warm_start = {
                 "eraf_view_fusion_contract": (
@@ -15717,7 +16300,10 @@ class FastWAM(torch.nn.Module):
 
         if saved_policy_guard_version >= 3:
             expected_tuning = (
-                "entity_relation_affordance_grounded_paired_action_residual"
+                "counterfactual_only_internal_action_expert_context_conditioning"
+                if saved_policy_guard_version == 9
+                and int(saved_eraf_grounding_objective or 1) >= 25
+                else "entity_relation_affordance_grounded_paired_action_residual"
                 if saved_policy_guard_version == 9
                 else (
                     "closed_loop_replay_verified_target_acquisition_residual"
@@ -16432,6 +17018,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 24
                             )
+                            or (
+                                saved_grounding_objective == 24
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 25
+                            )
                         )
                         objective_upgrade = objective_upgrade and (
                             (
@@ -16449,6 +17040,7 @@ class FastWAM(torch.nn.Module):
                             or migrate_v921_to_v922_clause_ranking
                             or migrate_v921_to_v923_alignment_preserving_clause
                             or migrate_v921_to_v924_isolated_clause_residual
+                            or migrate_v924_to_v925_action_context
                         )
                         if (
                             saved_grounding_objective
@@ -17477,7 +18069,11 @@ class FastWAM(torch.nn.Module):
                                     )
                                 expected_action_joint_contract = (
                                     (
-                                        "frozen_v921_expert_adapter_plus_isolated_"
+                                        "frozen_eraf_and_shared_action_expert_plus_"
+                                        "internal_context_injector_no_post_action_"
+                                        "residual"
+                                        if saved_grounding_objective >= 25
+                                        else "frozen_v921_expert_adapter_plus_isolated_"
                                         "clause_semantic_retention_residual"
                                         if saved_grounding_objective >= 24
                                         else
@@ -17525,7 +18121,9 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_action_trainable_scope = (
                                     (
-                                        "clause_semantic_retention_residual_only"
+                                        "eraf_action_context_injector_only"
+                                        if saved_grounding_objective >= 25
+                                        else "clause_semantic_retention_residual_only"
                                         if saved_grounding_objective >= 24
                                         else "phase_specific_privileged_expert_residual_adapter_only"
                                         if saved_grounding_objective >= 21
@@ -17567,7 +18165,9 @@ class FastWAM(torch.nn.Module):
                                     ),
                                     "eraf_role_adapter_trainable_scope": (
                                         (
-                                            "clause_semantic_retention_residual_only"
+                                            "eraf_action_context_injector_only"
+                                            if saved_grounding_objective >= 25
+                                            else "clause_semantic_retention_residual_only"
                                             if saved_grounding_objective >= 24
                                             else "phase_specific_privileged_expert_residual_adapter_only"
                                             if saved_grounding_objective >= 21
@@ -17593,6 +18193,17 @@ class FastWAM(torch.nn.Module):
                                         )
                                     ),
                                 }
+                                if saved_grounding_objective >= 25:
+                                    expected_v914_contract.update(
+                                        {
+                                            "eraf_action_context_injection_contract": (
+                                                "append_bounded_eraf_tokens_to_shared_"
+                                                "action_expert_context_at_every_"
+                                                "denoising_step_no_post_action_residual"
+                                            ),
+                                            "eraf_post_action_residual_active": False,
+                                        }
+                                    )
                                 for name, expected in expected_v914_contract.items():
                                     if metadata.get(name) != expected:
                                         raise ValueError(
@@ -17731,6 +18342,7 @@ class FastWAM(torch.nn.Module):
                 or migrate_v920_to_v921_expert_alignment
                 or migrate_v921_to_v923_alignment_preserving_clause
                 or migrate_v921_to_v924_isolated_clause_residual
+                or migrate_v924_to_v925_action_context
             )
             incompatible = self.policy_guard_modules.load_state_dict(
                 guard_state, strict=not migrate_with_new_modules
@@ -17989,6 +18601,19 @@ class FastWAM(torch.nn.Module):
                         f"has incompatible sidecars: missing={missing}, "
                         f"unexpected={unexpected}."
                     )
+            elif migrate_v924_to_v925_action_context:
+                missing = list(incompatible.missing_keys)
+                unexpected = list(incompatible.unexpected_keys)
+                allowed_prefix = "eraf_action_context_injector."
+                disallowed_missing = [
+                    key for key in missing if not key.startswith(allowed_prefix)
+                ]
+                if disallowed_missing or unexpected or not missing:
+                    raise ValueError(
+                        "PGC V9.24 -> V9.25 internal action-context warm start "
+                        f"has incompatible sidecars: missing={missing}, "
+                        f"unexpected={unexpected}."
+                    )
             elif saved_policy_guard_version == 6:
                 self._load_policy_guard_target_prototype_state(
                     target_prototype_state
@@ -18020,6 +18645,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v921_to_v922_clause_ranking
                 and not migrate_v921_to_v923_alignment_preserving_clause
                 and not migrate_v921_to_v924_isolated_clause_residual
+                and not migrate_v924_to_v925_action_context
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
@@ -18220,6 +18846,16 @@ class FastWAM(torch.nn.Module):
                     "Warm-started PGC v9.24 isolated clause semantic residual "
                     "from exact V9.21 action sidecars at %s "
                     "(base=%s restored=%d new_clause_residual_tensors=%d).",
+                    path,
+                    resolved_base,
+                    len(guard_state),
+                    len(incompatible.missing_keys),
+                )
+            elif migrate_v924_to_v925_action_context:
+                logger.info(
+                    "Warm-started PGC v9.25 internal ERAF Action-Expert "
+                    "context injection from exact V9.24 action sidecars at %s "
+                    "(base=%s restored=%d new_context_tensors=%d).",
                     path,
                     resolved_base,
                     len(guard_state),

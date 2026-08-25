@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Same-state causal audit of the PGC V9 ERAF-to-Proposal interface.
+"""Same-state causal audit of the PGC V9 ERAF-to-action interface.
 
-The audit runs one frozen Base diffusion per row, then applies the same learned
-ActionChunkProposal to learned, privileged, bypassed, and deliberately corrupted
-ERAF routes.  Consequently action differences cannot be attributed to diffusion
-noise or a different visual state.
+The audit uses identical visual state and initial diffusion noise for learned,
+privileged, bypassed, and deliberately corrupted ERAF routes. Consequently
+action differences cannot be attributed to diffusion noise or a different
+visual state. Objective 25+ replays the shared Action Expert with internal ERAF
+context tokens; earlier objectives retain their post-sampler Proposal audit.
 """
 
 from __future__ import annotations
@@ -725,34 +726,58 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 np.float64
             )
             expert_mse = float(np.square(action[valid] - expert[valid]).mean())
-            # This backward pass touches only the 3M-parameter Proposal: Base
-            # action and ERAF queries are detached.  It diagnoses a locally
-            # disconnected/saturated Proposal without retaining the 5B Base
-            # diffusion graph.
+            # Keep the local-connectivity check cheap. Objective 25+ follows
+            # the deployed query -> context injector -> shared Action-Expert
+            # text-embedding edge; earlier checkpoints replay their Proposal.
+            # The full directional action test above remains the causal check.
             with torch.enable_grad():
                 query = values["goal_queries"].to(
                     device=args.device, dtype=model.torch_dtype
                 ).detach().requires_grad_(True)
-                base_tensor = prediction["policy_guard_base_action"].to(
-                    device=args.device, dtype=model.torch_dtype
-                ).unsqueeze(0)
-                expert_tensor = sample["action"].to(
-                    device=args.device, dtype=model.torch_dtype
-                ).unsqueeze(0)
-                gradient_action, _, _ = model.policy_guard_modules[
-                    "action_chunk_proposal"
-                ](
-                    base_action=base_tensor,
-                    goal_queries=query,
-                    action_is_pad=None,
-                )
-                valid_tensor = torch.as_tensor(
-                    valid, device=args.device, dtype=torch.long
-                )
-                gradient_loss = (
-                    gradient_action[:, valid_tensor]
-                    - expert_tensor[:, valid_tensor]
-                ).float().square().mean()
+                if int(metadata.get("eraf_grounding_objective_version", 0)) >= 25:
+                    context_tensor = sample["context"].to(
+                        device=args.device, dtype=model.torch_dtype
+                    )
+                    context_mask_tensor = sample["context_mask"].to(
+                        device=args.device, dtype=torch.bool
+                    )
+                    if context_tensor.ndim == 2:
+                        context_tensor = context_tensor.unsqueeze(0)
+                    if context_mask_tensor.ndim == 1:
+                        context_mask_tensor = context_mask_tensor.unsqueeze(0)
+                    injected_context, _, _ = model.policy_guard_modules[
+                        "eraf_action_context_injector"
+                    ](
+                        context=context_tensor,
+                        context_mask=context_mask_tensor,
+                        goal_queries=query,
+                    )
+                    injected_tokens = injected_context[:, -query.shape[1] :]
+                    embedded_tokens = model.action_expert.text_embedding(
+                        injected_tokens
+                    )
+                    gradient_loss = embedded_tokens.float().square().mean()
+                else:
+                    base_tensor = prediction["policy_guard_base_action"].to(
+                        device=args.device, dtype=model.torch_dtype
+                    ).unsqueeze(0)
+                    expert_tensor = sample["action"].to(
+                        device=args.device, dtype=model.torch_dtype
+                    ).unsqueeze(0)
+                    gradient_action, _, _ = model.policy_guard_modules[
+                        "action_chunk_proposal"
+                    ](
+                        base_action=base_tensor,
+                        goal_queries=query,
+                        action_is_pad=None,
+                    )
+                    valid_tensor = torch.as_tensor(
+                        valid, device=args.device, dtype=torch.long
+                    )
+                    gradient_loss = (
+                        gradient_action[:, valid_tensor]
+                        - expert_tensor[:, valid_tensor]
+                    ).float().square().mean()
                 query_gradient = torch.autograd.grad(
                     gradient_loss, query, retain_graph=False
                 )[0]

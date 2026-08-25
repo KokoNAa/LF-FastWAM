@@ -291,7 +291,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 25)):
+    if objective not in set(range(1, 26)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -360,7 +360,10 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_v921_expert_adapter_plus_isolated_clause_semantic_"
+            "frozen_eraf_and_shared_action_expert_plus_internal_context_"
+            "injector_no_post_action_residual"
+            if objective >= 25
+            else "frozen_v921_expert_adapter_plus_isolated_clause_semantic_"
             "retention_residual"
             if objective >= 24
             else "frozen_v921_teacher_plus_alignment_preserving_negative_"
@@ -397,7 +400,9 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
-            "clause_semantic_retention_residual_only"
+            "eraf_action_context_injector_only"
+            if objective >= 25
+            else "clause_semantic_retention_residual_only"
             if objective >= 24
             else "phase_specific_privileged_expert_residual_adapter_only"
             if objective >= 21
@@ -425,7 +430,9 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
-            "clause_semantic_retention_residual_only"
+            "eraf_action_context_injector_only"
+            if objective >= 25
+            else "clause_semantic_retention_residual_only"
             if objective >= 24
             else "phase_specific_privileged_expert_residual_adapter_only"
             if objective >= 21
@@ -517,6 +524,16 @@ if version == 9:
     ):
         raise SystemExit(
             "PGC isolated-clause checkpoint lacks its semantic residual contract"
+        )
+    if objective >= 25 and (
+        metadata.get("eraf_action_context_injection_contract")
+        != "append_bounded_eraf_tokens_to_shared_action_expert_context_at_"
+        "every_denoising_step_no_post_action_residual"
+        or metadata.get("eraf_post_action_residual_active") is not False
+    ):
+        raise SystemExit(
+            "PGC internal Action-Expert checkpoint lacks its no-residual "
+            "ERAF context-injection contract"
         )
     if completion_only_memory and (
         training_stage != "action"

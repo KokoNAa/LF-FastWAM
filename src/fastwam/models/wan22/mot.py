@@ -420,6 +420,7 @@ class MoT(nn.Module):
         video_seq_len: int,
         *,
         action_expert: Optional[nn.Module] = None,
+        training_override: Optional[bool] = None,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -462,6 +463,11 @@ class MoT(nn.Module):
             self.mixtures["action"]
             if action_expert is None
             else action_expert
+        )
+        checkpoint_training = (
+            expert.training
+            if training_override is None
+            else bool(training_override)
         )
         if len(expert.blocks) != self.num_layers:
             raise ValueError(
@@ -522,8 +528,10 @@ class MoT(nn.Module):
                 attention_mask=action_attention_mask,
                 # A PGC Action Expert can train through this frozen/eval MoT
                 # cache utility. Checkpointing must follow the override expert,
-                # not the protected MoT module's mode.
-                training_override=expert.training,
+                # not the protected MoT module's mode. Internal conditioning
+                # can explicitly request checkpointing while the shared expert
+                # remains frozen and in eval mode.
+                training_override=checkpoint_training,
             )
             x = self._apply_post_with_optional_checkpoint(
                 block=block,
@@ -535,7 +543,7 @@ class MoT(nn.Module):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
                 context_payload=action_context_payload,
-                training_override=expert.training,
+                training_override=checkpoint_training,
             )
         return x
 

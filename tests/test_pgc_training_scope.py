@@ -229,7 +229,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"action_expert_imitation_weight"',
             source,
         )
-        self.assertIn("set(range(1, 25))", source)
+        self.assertIn("set(range(1, 26))", source)
         self.assertIn(
             '"frozen_v921_expert_adapter_plus_isolated_clause_semantic_"',
             source,
@@ -242,6 +242,14 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn(
             '"frozen_v921_positive_action_plus_identity_initialized_clause_"',
             source,
+        )
+        self.assertIn(
+            '"frozen_eraf_and_shared_action_expert_plus_internal_context_"',
+            source,
+        )
+        self.assertIn('"eraf_action_context_injector_only"', source)
+        self.assertIn(
+            '"every_denoising_step_no_post_action_residual"', source
         )
         self.assertNotIn("phase_rebinding_energy_weight=0.01", source)
 
@@ -465,6 +473,10 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
         self.assertIn(
             "action_clause_wrong_suppression_weight: 4.0", config
         )
+        self.assertIn("action-context-injection", source)
+        self.assertIn("DEFAULT_GROUNDING_OBJECTIVE_VERSION=25", source)
+        self.assertIn("START_STEP=18750", source)
+        self.assertIn("eraf_action_context_injector_only", source)
         frozen_contract = source[
             source.index('if [[ "${GROUNDING_OBJECTIVE_VERSION}" == "14"') :
             source.index("if ! [[ \"${NPROC_PER_NODE}\"")

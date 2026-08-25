@@ -53,6 +53,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
 from fastwam.models.wan22.fastwam import FastWAM
 from fastwam.models.wan22.policy_guard import (
     ClauseSemanticRetentionResidual,
+    ERAFActionContextInjector,
     HardRoutedERAFPhaseServo,
     PhaseCompatibleERAFWaypointAdapter,
     PhaseConditionedERAFActionBridge,
@@ -952,6 +953,119 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
 
 
 class PGCERAFModuleTest(unittest.TestCase):
+    def test_v925_action_context_injector_appends_tokens_without_action_residual(self):
+        module = ERAFActionContextInjector(
+            goal_dim=12,
+            text_dim=10,
+            hidden_dim=8,
+            initial_scale=0.1,
+        )
+        context = torch.randn(2, 5, 10)
+        context_mask = torch.tensor(
+            [[True, True, True, False, False], [True, True, True, True, True]]
+        )
+        goal_queries = torch.randn(2, 3, 12, requires_grad=True)
+        augmented, augmented_mask, metrics = module(
+            context=context,
+            context_mask=context_mask,
+            goal_queries=goal_queries,
+        )
+        self.assertEqual(tuple(augmented.shape), (2, 8, 10))
+        self.assertEqual(tuple(augmented_mask.shape), (2, 8))
+        self.assertTrue(torch.equal(augmented[:, :5], context))
+        self.assertTrue(torch.equal(augmented_mask[:, :5], context_mask))
+        self.assertTrue(augmented_mask[:, 5:].all())
+        self.assertEqual(
+            float(metrics["pgc_v925_post_action_residual_enabled"].item()),
+            0.0,
+        )
+        augmented[:, 5:].float().square().mean().backward()
+        self.assertIsNotNone(goal_queries.grad)
+        self.assertGreater(float(goal_queries.grad.abs().sum().item()), 0.0)
+
+    def test_v925_action_forward_bypasses_post_sampler_proposal(self):
+        model = tiny_pgc_fastwam(
+            version=9,
+            v9_stage="action",
+            v9_grounding_objective_version=25,
+            v9_completion_only_memory=True,
+            v9_action_joint_training=True,
+        )
+        model.eval()
+        context = torch.randn(1, 5, 10)
+        context_mask = torch.ones(1, 5, dtype=torch.bool)
+        video_latents = torch.randn(1, 2, 1, 2, 2)
+        video_pre = model.video_expert.pre_dit(
+            x=video_latents,
+            timestep=torch.zeros(1),
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=True,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+        attention_mask = model._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=4,
+            video_tokens_per_frame=tokens_per_frame,
+            device=video_pre["tokens"].device,
+            num_queries=0,
+            action_reads_raw_video=True,
+        )
+        video_kv_cache, _ = model.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[
+                :video_seq_len, :video_seq_len
+            ],
+            return_final_hidden=True,
+        )
+        action_tokens = torch.randn(1, 4, 3)
+        queries_a = torch.randn(1, 3, 12)
+        queries_b = queries_a + 2.0
+        with patch.object(
+            model.policy_guard_modules["action_chunk_proposal"],
+            "forward",
+            side_effect=AssertionError("legacy Proposal must be bypassed"),
+        ):
+            velocity_a, metrics = (
+                model._forward_policy_guard_action_from_cache(
+                    action_tokens=action_tokens,
+                    timestep_action=torch.full((1,), 0.5),
+                    context=context,
+                    full_context_mask=context_mask,
+                    state_only_context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    video_seq_len=video_seq_len,
+                    video_tokens_per_frame=tokens_per_frame,
+                    routed_goal_queries=queries_a,
+                    return_metrics=True,
+                )
+            )
+            velocity_b = model._forward_policy_guard_action_from_cache(
+                action_tokens=action_tokens,
+                timestep_action=torch.full((1,), 0.5),
+                context=context,
+                full_context_mask=context_mask,
+                state_only_context_mask=context_mask,
+                video_kv_cache=video_kv_cache,
+                video_seq_len=video_seq_len,
+                video_tokens_per_frame=tokens_per_frame,
+                routed_goal_queries=queries_b,
+            )
+        self.assertEqual(tuple(velocity_a.shape), tuple(action_tokens.shape))
+        self.assertFalse(torch.allclose(velocity_a, velocity_b))
+        self.assertEqual(
+            float(metrics["pgc_v925_post_action_residual_enabled"].item()),
+            0.0,
+        )
+
     def test_training_metric_detach_preserves_only_scalar_diagnostics(self):
         metrics = detached_policy_guard_metrics(
             {
@@ -5492,6 +5606,119 @@ class PGCERAFIntegrationTest(unittest.TestCase):
             )
             restored.load_checkpoint(v924_path)
             for name, value in v924.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(
+                        value,
+                        restored.policy_guard_modules.state_dict()[name],
+                    ),
+                    name,
+                )
+
+    def test_v924_to_v925_internal_action_context_upgrade_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            v924_path = root / "v924.pt"
+            v925_path = root / "v925.pt"
+            v924 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=24,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": v924.mot.state_dict()},
+                base_path,
+            )
+            v924.load_checkpoint(base_path)
+            with torch.no_grad():
+                v924.policy_guard_modules[
+                    "eraf_clause_semantic_retention_residual"
+                ].suppression_head.bias.fill_(0.25)
+            v924.save_checkpoint(v924_path, step=18750)
+
+            v925 = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=25,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            v925.load_checkpoint(v924_path)
+            v924_state = v924.policy_guard_modules.state_dict()
+            v925_state = v925.policy_guard_modules.state_dict()
+            for name, value in v924_state.items():
+                self.assertTrue(torch.equal(value, v925_state[name]), name)
+            self.assertTrue(
+                any(
+                    name.startswith("eraf_action_context_injector.")
+                    for name in v925_state
+                    if name not in v924_state
+                )
+            )
+
+            v925.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in v925.named_parameters()
+                if parameter.requires_grad
+            }
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(
+                    name.startswith(
+                        "policy_guard_modules.eraf_action_context_injector."
+                    )
+                    for name in trainable
+                )
+            )
+            for legacy_name in (
+                "action_chunk_proposal",
+                "eraf_geometry_action_adapter",
+                "eraf_hard_routed_phase_servo",
+                "eraf_phase_compatible_waypoint_adapter",
+                "eraf_phase_expert_residual_adapter",
+                "eraf_clause_semantic_retention_residual",
+            ):
+                self.assertTrue(
+                    all(
+                        not parameter.requires_grad
+                        for parameter in v925.policy_guard_modules[
+                            legacy_name
+                        ].parameters()
+                    ),
+                    legacy_name,
+                )
+
+            v925.save_checkpoint(v925_path, step=19750)
+            metadata = torch.load(
+                v925_path, map_location="cpu", weights_only=False
+            )["architecture_metadata"]
+            self.assertEqual(
+                metadata["counterfactual_policy"],
+                "shared_frozen_action_expert_with_internal_eraf_context_injection",
+            )
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "eraf_action_context_injector_only",
+            )
+            self.assertEqual(
+                metadata["eraf_action_context_injection_contract"],
+                "append_bounded_eraf_tokens_to_shared_action_expert_context_"
+                "at_every_denoising_step_no_post_action_residual",
+            )
+            self.assertIs(metadata["eraf_post_action_residual_active"], False)
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=25,
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+            )
+            restored.load_checkpoint(v925_path)
+            for name, value in v925.policy_guard_modules.state_dict().items():
                 self.assertTrue(
                     torch.equal(
                         value,
