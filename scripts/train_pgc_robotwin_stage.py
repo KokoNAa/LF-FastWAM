@@ -225,7 +225,7 @@ def main() -> None:
         sys.executable,
         "scripts/precompute_text_embeds.py",
         *overrides,
-        "overwrite=false",
+        "+overwrite=false",
     ]
     train_command = [
         "bash",

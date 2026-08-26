@@ -130,6 +130,13 @@ class RoboTwinPGCDataContractTest(unittest.TestCase):
             matrix["sidecar_dirs"],
         )
 
+    def test_text_cache_hydra_flag_is_append_only(self):
+        launcher = Path("scripts/train_pgc_robotwin_stage.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"+overwrite=false"', launcher)
+        self.assertNotIn('\n        "overwrite=false",', launcher)
+
     def test_prepared_matrix_contains_both_kinds_for_both_directions(self):
         specs = dataset_specs(
             raw_root=Path("/raw"),
