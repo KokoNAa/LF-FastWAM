@@ -13,7 +13,7 @@ UPSTREAM_RAW="https://raw.githubusercontent.com/RoboTwin-Platform/RoboTwin/${UPS
 
 export CHECKPOINT_ROOT HF_ENDPOINT ROBOTWIN_ROOT
 
-for required_command in curl unzip "${PYTHON_BIN}"; do
+for required_command in curl "${PYTHON_BIN}"; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
     echo "Required command not found: ${required_command}" >&2
     exit 1
@@ -89,7 +89,17 @@ snapshot_download(
 )
 PY
     echo "[setup] extracting ${archive_name}"
-    unzip -q -o "${archive_path}" -d "${ROBOTWIN_ROOT}/assets"
+    ASSET_ARCHIVE_PATH="${archive_path}"
+    export ASSET_ARCHIVE_PATH
+    "${PYTHON_BIN}" - <<'PY'
+import os
+import zipfile
+
+archive = os.environ["ASSET_ARCHIVE_PATH"]
+destination = os.path.join(os.environ["ROBOTWIN_ROOT"], "assets")
+with zipfile.ZipFile(archive) as bundle:
+    bundle.extractall(destination)
+PY
     touch "${marker}"
   fi
   if [[ "${KEEP_ASSET_ARCHIVES}" == "0" ]]; then
