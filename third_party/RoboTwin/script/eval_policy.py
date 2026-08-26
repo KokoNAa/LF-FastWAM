@@ -418,10 +418,14 @@ def eval_policy(task_name,
     task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
     intervention_records = []
+    native_check_success = TASK_ENV.check_success
 
     args["eval_mode"] = True
 
     while succ_seed < test_num:
+        # A CIS rollout temporarily replaces the instance predicate. Always
+        # restore the class-native predicate before selecting the next seed.
+        TASK_ENV.check_success = native_check_success
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
@@ -429,7 +433,7 @@ def eval_policy(task_name,
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
-                native_expert_success = bool(TASK_ENV.check_success())
+                native_expert_success = bool(native_check_success())
                 if intervention_pair is not None:
                     from experiments.robotwin.language_interventions import GoalObserver
 
@@ -596,6 +600,7 @@ def eval_policy(task_name,
                 selected_goal=selected_goal
             )
             succ = bool(episode_diagnostics["selected_goal_success"])
+            rollout_observer.restore_native_goal()
         # task_total_reward += TASK_ENV.episode_score
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()

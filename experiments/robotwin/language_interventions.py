@@ -363,6 +363,8 @@ class GoalObserver:
     def __init__(self, env: Any, pair: InterventionPair):
         self.env = env
         self.pair = pair
+        self._native_check_success = env.check_success
+        self._selected_goal_installed = False
         self.evaluation_calls = 0
         self.source_ever_success = False
         self.counterfactual_ever_success = False
@@ -386,11 +388,21 @@ class GoalObserver:
     def install_selected_goal(self, goal_name: str) -> None:
         if goal_name not in {"source", "counterfactual"}:
             raise ValueError(f"Unsupported selected goal: {goal_name!r}")
+        if self._selected_goal_installed:
+            raise RuntimeError("A selected RoboTwin goal is already installed")
 
         def selected_check_success() -> bool:
             return self.update().selected(goal_name).success
 
         self.env.check_success = selected_check_success
+        self._selected_goal_installed = True
+
+    def restore_native_goal(self) -> None:
+        """Restore the environment's native success predicate after rollout."""
+
+        if self._selected_goal_installed:
+            self.env.check_success = self._native_check_success
+            self._selected_goal_installed = False
 
     def episode_diagnostics(self, *, selected_goal: str) -> dict[str, Any]:
         snapshot = self.update()

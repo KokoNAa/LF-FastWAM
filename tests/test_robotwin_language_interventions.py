@@ -141,6 +141,20 @@ class RoboTwinGoalTest(unittest.TestCase):
         self.assertTrue(diagnostics["selected_goal_success"])
         self.assertTrue(diagnostics["counterfactual_goal_ever_success"])
         self.assertFalse(diagnostics["counterfactual_goal_final_success"])
+        observer.restore_native_goal()
+        with self.assertRaisesRegex(AssertionError, "native check"):
+            env.check_success()
+
+    def test_observer_rejects_double_install_and_restore_is_idempotent(self):
+        env = _Env((-0.13, 0.05, 0.75), (0.0, -0.1, 0.75))
+        observer = GoalObserver(env, self.left_pair)
+        observer.install_selected_goal("source")
+        with self.assertRaisesRegex(RuntimeError, "already installed"):
+            observer.install_selected_goal("counterfactual")
+        observer.restore_native_goal()
+        observer.restore_native_goal()
+        with self.assertRaisesRegex(AssertionError, "native check"):
+            env.check_success()
 
 
 if __name__ == "__main__":
