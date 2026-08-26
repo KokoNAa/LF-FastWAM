@@ -102,7 +102,23 @@ def _compose_sim_cfg(
     sim_cfg_path: Optional[str],
     sim_cfg_name: Optional[str],
     sim_task: Optional[str],
+    resolved_sim_cfg_path: Optional[str] = None,
 ) -> DictConfig:
+    if not _is_none_like(resolved_sim_cfg_path):
+        resolved_path = Path(str(resolved_sim_cfg_path)).expanduser().resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(
+                f"Resolved simulation config not found: {resolved_path}"
+            )
+        cfg = OmegaConf.load(resolved_path)
+        for required_key in ("model", "data", "EVALUATION"):
+            if required_key not in cfg:
+                raise ValueError(
+                    f"Resolved simulation config {resolved_path} is missing "
+                    f"{required_key!r}."
+                )
+        return cfg
+
     config_name = _resolve_sim_cfg_name(sim_cfg_path=sim_cfg_path, sim_cfg_name=sim_cfg_name)
     configs_root = (PROJECT_ROOT / "configs").resolve()
     overrides = []
@@ -160,7 +176,20 @@ class WorldActionRobotWinPolicy:
         model_cfg_copy.load_text_encoder = True
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
-        self.model.load_checkpoint(checkpoint_path)
+        checkpoint_payload = self.model.load_checkpoint(checkpoint_path)
+        action_expert = getattr(self.model, "action_expert", None)
+        latent_queries_enabled = bool(
+            getattr(action_expert, "use_latent_action_queries", False)
+        )
+        if latent_queries_enabled:
+            mot_state = checkpoint_payload.get("mot", {})
+            latent_query_key = "mixtures.action.latent_action_queries"
+            if latent_query_key not in mot_state:
+                raise RuntimeError(
+                    "Evaluation config enables latent action queries, but the "
+                    f"checkpoint has no {latent_query_key!r} tensor. Refusing "
+                    "to evaluate with randomly initialized query parameters."
+                )
         self.model = self.model.to(device).eval()
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
@@ -330,10 +359,22 @@ def get_model(usr_args: Dict[str, Any]):
     sim_cfg_path = usr_args.get("sim_cfg_path")
     sim_cfg_name = usr_args.get("sim_cfg_name")
     sim_task = usr_args.get("sim_task")
+    resolved_sim_cfg_path = usr_args.get("resolved_sim_cfg_path")
     cfg = _compose_sim_cfg(
         sim_cfg_path=sim_cfg_path,
         sim_cfg_name=sim_cfg_name,
         sim_task=sim_task,
+        resolved_sim_cfg_path=resolved_sim_cfg_path,
+    )
+
+    logger.info(
+        "Resolved FastWAM evaluation architecture: latent_action_queries=%s "
+        "langforce=%s transition_contract=%s policy_guard=%s config=%s",
+        bool(cfg.model.action_dit_config.get("use_latent_action_queries", False)),
+        bool(cfg.model.get("langforce_mvp", {}).get("enabled", False)),
+        bool(cfg.model.get("transition_contract", {}).get("enabled", False)),
+        bool(cfg.model.get("policy_guard", {}).get("enabled", False)),
+        resolved_sim_cfg_path,
     )
 
     checkpoint_path = usr_args.get("ckpt_setting")

@@ -14,6 +14,9 @@ eval_num_episodes: 100
 sim_cfg_path: null
 sim_task: null
 sim_cfg_name: sim_robotwin.yaml
+# Exact Hydra snapshot composed by eval_robotwin_single.py.  This preserves
+# model architecture overrides across the RoboTwin subprocess boundary.
+resolved_sim_cfg_path: null
 mixed_precision: bf16
 device: cuda
 dataset_stats_path: null

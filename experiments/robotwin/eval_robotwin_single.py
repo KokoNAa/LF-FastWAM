@@ -227,6 +227,11 @@ def main(cfg: DictConfig):
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
+    resolved_sim_cfg_path = run_output_dir / f"eval_config_{log_tag}.yaml"
+    # The RoboTwin policy runs in a child process.  Persist the already-composed
+    # Hydra config so model overrides (B0/M1/TC/PGC) cannot be lost when that
+    # process constructs FastWAM.
+    OmegaConf.save(config=cfg, f=str(resolved_sim_cfg_path))
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg, ckpt_path)
 
@@ -253,6 +258,11 @@ def main(cfg: DictConfig):
 
     _append_override(overrides, "sim_cfg_path", str(sim_cfg_path))
     _append_override(overrides, "sim_task", sim_task)
+    _append_override(
+        overrides,
+        "resolved_sim_cfg_path",
+        str(resolved_sim_cfg_path),
+    )
     _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
@@ -308,10 +318,6 @@ def main(cfg: DictConfig):
         raise RuntimeError(f"RoboTwin evaluation failed with return code {return_code}. Log: {log_file}")
 
     print(f"Evaluation finished successfully. Log saved to: {log_file}")
-    OmegaConf.save(
-        config=cfg,
-        f=str(run_output_dir / f"eval_config_{log_tag}.yaml"),
-    )
 
 
 if __name__ == "__main__":

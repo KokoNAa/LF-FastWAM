@@ -93,6 +93,12 @@ launcher default.  Set `FASTWAM_EVAL_MODE=M1` for an M1 checkpoint.  For any
 other architecture, use `FASTWAM_EVAL_MODE=CUSTOM` and append its exact Hydra
 model overrides to the launcher command.
 
+The single-task entrypoint persists its fully composed Hydra configuration and
+passes that snapshot across the RoboTwin policy subprocess boundary.  Model
+architecture overrides therefore apply to the process that actually constructs
+FastWAM.  Evaluation also aborts if latent action queries are enabled but their
+checkpoint tensor is absent, rather than using randomly initialized queries.
+
 ## Runs
 
 One-episode, one-direction, clean-domain smoke test (three jobs):
