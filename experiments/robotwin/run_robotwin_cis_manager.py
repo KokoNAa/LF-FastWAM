@@ -79,6 +79,7 @@ def _is_blocked_override(raw_override: str) -> bool:
         "EVALUATION.output_dir",
         "EVALUATION.instruction_condition",
         "EVALUATION.language_intervention_manifest",
+        "EVALUATION.matched_episode_records_path",
         "EVALUATION.cis_tasks",
         "EVALUATION.cis_conditions",
         "EVALUATION.cis_task_configs",
@@ -153,6 +154,11 @@ def main(cfg: DictConfig) -> None:
         [normalize_condition(value) for value in cfg.EVALUATION.cis_conditions],
         field="EVALUATION.cis_conditions",
     )
+    if any(condition != "correct" for condition in conditions) and "correct" not in conditions:
+        raise ValueError(
+            "Matched shuffled/counterfactual evaluation requires the `correct` "
+            "condition to select canonical scene seeds."
+        )
     task_configs = _unique_strings(
         cfg.EVALUATION.cis_task_configs,
         field="EVALUATION.cis_task_configs",
@@ -216,9 +222,11 @@ def main(cfg: DictConfig) -> None:
     def job_dir(spec: JobSpec) -> Path:
         return run_root / spec.source_task / spec.task_config / spec.condition
 
-    def load_complete_job(spec: JobSpec) -> dict[str, Any] | None:
+    def load_complete_job(
+        spec: JobSpec,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
         try:
-            summary, _ = load_job_output(
+            output = load_job_output(
                 job_dir(spec),
                 expected_episodes=expected_episodes,
                 expected_source_task=spec.source_task,
@@ -228,7 +236,26 @@ def main(cfg: DictConfig) -> None:
             )
         except (FileNotFoundError, ValueError, KeyError):
             return None
-        return summary
+        return output
+
+    def matches_correct_records(
+        spec: JobSpec, records: list[dict[str, Any]]
+    ) -> bool:
+        if spec.condition == "correct":
+            return True
+        correct_spec = JobSpec(spec.source_task, spec.task_config, "correct")
+        correct_output = load_complete_job(correct_spec)
+        if correct_output is None:
+            return False
+        _, correct_records = correct_output
+        fields = (
+            "scene_seed",
+            "source_instruction",
+            "counterfactual_instruction",
+        )
+        return [tuple(record.get(field) for field in fields) for record in records] == [
+            tuple(record.get(field) for field in fields) for record in correct_records
+        ]
 
     def write_state() -> None:
         payload = {
@@ -270,13 +297,21 @@ def main(cfg: DictConfig) -> None:
                         f"reason={failed[spec.key]['reason']}\n"
                     )
 
-    for spec in all_specs:
-        cached = load_complete_job(spec) if resume_completed else None
-        if cached is None:
+    # Load Correct jobs first so cached intervention jobs can be checked against
+    # the canonical records rather than accepted only on their own metadata.
+    ordered_specs = sorted(all_specs, key=lambda spec: spec.condition != "correct")
+    for spec in ordered_specs:
+        cached_output = load_complete_job(spec) if resume_completed else None
+        if cached_output is None:
             pending.append(spec)
         else:
-            completed[spec.key] = cached
-            log(f"resume skip complete job={spec.key}")
+            cached_summary, cached_records = cached_output
+            if matches_correct_records(spec, cached_records):
+                completed[spec.key] = cached_summary
+                log(f"resume skip complete job={spec.key}")
+            else:
+                pending.append(spec)
+                log(f"resume invalidate unmatched canonical job={spec.key}")
 
     def gpu_running_count(gpu_id: str) -> int:
         return sum(
@@ -295,6 +330,12 @@ def main(cfg: DictConfig) -> None:
             f"EVALUATION.language_intervention_manifest={manifest_path}",
             f"EVALUATION.output_dir={output_dir}",
         ]
+        if spec.condition != "correct":
+            correct_spec = JobSpec(spec.source_task, spec.task_config, "correct")
+            command.append(
+                "EVALUATION.matched_episode_records_path="
+                f"{job_dir(correct_spec) / 'episodes.jsonl'}"
+            )
         command.extend(extra_overrides)
         return command
 
@@ -304,9 +345,19 @@ def main(cfg: DictConfig) -> None:
         process = subprocess.Popen(command, cwd=str(PROJECT_ROOT), text=True)
         return RunningJob(spec=spec, gpu_id=gpu_id, process=process)
 
+    def is_launchable(spec: JobSpec) -> bool:
+        if spec.condition == "correct":
+            return True
+        correct_spec = JobSpec(spec.source_task, spec.task_config, "correct")
+        return correct_spec.key in completed
+
     def fill_gpu(gpu_id: str) -> None:
         while pending and gpu_running_count(gpu_id) < max_tasks_per_gpu:
-            running.append(launch(pending.popleft(), gpu_id))
+            spec = next((candidate for candidate in pending if is_launchable(candidate)), None)
+            if spec is None:
+                return
+            pending.remove(spec)
+            running.append(launch(spec, gpu_id))
 
     def terminate_running() -> None:
         for item in running:
@@ -350,21 +401,31 @@ def main(cfg: DictConfig) -> None:
                         f"return_code={return_code}"
                     )
                 else:
-                    summary = load_complete_job(item.spec)
-                    if summary is None:
+                    output = load_complete_job(item.spec)
+                    if output is None:
                         failed[item.spec.key] = {
                             "return_code": int(return_code),
                             "reason": "incomplete_or_invalid_output",
                         }
                         log(f"failed output validation job={item.spec.key}")
                     else:
-                        completed[item.spec.key] = summary
-                        log(
-                            f"done job={item.spec.key} gpu={item.gpu_id} "
-                            f"selected_goal_rate={summary['selected_goal_success_rate']:.4f}"
-                        )
+                        summary, records = output
+                        if not matches_correct_records(item.spec, records):
+                            failed[item.spec.key] = {
+                                "return_code": int(return_code),
+                                "reason": "unmatched_canonical_output",
+                            }
+                            log(f"failed canonical validation job={item.spec.key}")
+                        else:
+                            completed[item.spec.key] = summary
+                            log(
+                                f"done job={item.spec.key} gpu={item.gpu_id} "
+                                f"selected_goal_rate="
+                                f"{summary['selected_goal_success_rate']:.4f}"
+                            )
                 write_state()
-                fill_gpu(item.gpu_id)
+                for gpu_id in gpu_ids:
+                    fill_gpu(gpu_id)
             if not progressed:
                 time.sleep(POLL_INTERVAL_SEC)
     except (KeyboardInterrupt, SystemExit):
@@ -372,6 +433,15 @@ def main(cfg: DictConfig) -> None:
         terminate_running()
         write_state()
         raise
+
+    if pending:
+        for spec in pending:
+            failed[spec.key] = {
+                "return_code": -1,
+                "reason": "canonical_correct_job_not_completed",
+            }
+            log(f"failed dependency job={spec.key}")
+        pending.clear()
 
     write_state()
     if completed:

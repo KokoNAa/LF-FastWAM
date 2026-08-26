@@ -292,6 +292,98 @@ def select_intervention_pair(
     return matches[0]
 
 
+def load_matched_episode_records(
+    path: str | Path,
+    *,
+    expected_pair_id: str,
+    expected_source_task: str,
+    expected_counterfactual_task: str,
+    expected_task_config: str,
+    expected_instruction_type: str,
+    expected_episodes: int,
+) -> list[dict[str, Any]]:
+    """Load canonical Correct records used to replay matched CIS scenes."""
+
+    records_path = Path(path).expanduser().resolve()
+    records: list[dict[str, Any]] = []
+    with records_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid matched episode JSON at {records_path}:{line_number}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"Matched episode at {records_path}:{line_number} must be an object"
+                )
+            records.append(record)
+
+    if len(records) != int(expected_episodes):
+        raise ValueError(
+            f"Matched episode file {records_path} has {len(records)} records; "
+            f"expected {expected_episodes}"
+        )
+
+    expected_fields = {
+        "format": EPISODE_FORMAT,
+        "pair_id": str(expected_pair_id),
+        "source_task": str(expected_source_task),
+        "counterfactual_task": str(expected_counterfactual_task),
+        "task_config": str(expected_task_config),
+        "condition": "correct",
+        "instruction_type": str(expected_instruction_type),
+    }
+    seen_seeds: set[int] = set()
+    for index, record in enumerate(records):
+        for field, expected in expected_fields.items():
+            if record.get(field) != expected:
+                raise ValueError(
+                    f"Matched episode {index} field {field!r} is "
+                    f"{record.get(field)!r}; expected {expected!r}"
+                )
+        try:
+            seed = int(record["scene_seed"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Matched episode {index} has an invalid scene_seed"
+            ) from exc
+        if seed in seen_seeds:
+            raise ValueError(f"Matched episode file contains duplicate seed {seed}")
+        seen_seeds.add(seed)
+        if record.get("episode_index") != index:
+            raise ValueError(
+                f"Matched episode {index} has episode_index="
+                f"{record.get('episode_index')!r}"
+            )
+        for field in ("source_instruction", "counterfactual_instruction"):
+            if not str(record.get(field, "")).strip():
+                raise ValueError(f"Matched episode {index} has empty {field}")
+        if record.get("initial_source_goal_success") is not False:
+            raise ValueError(f"Matched episode {index} has a true initial source goal")
+        if record.get("initial_counterfactual_goal_success") is not False:
+            raise ValueError(
+                f"Matched episode {index} has a true initial counterfactual goal"
+            )
+        if record.get("instruction_goal") != "source":
+            raise ValueError(
+                f"Matched episode {index} is not a Correct/source instruction record"
+            )
+        if record.get("selected_goal") != "source":
+            raise ValueError(
+                f"Matched episode {index} is not a Correct/source goal record"
+            )
+        if record.get("policy_instruction") != record.get("source_instruction"):
+            raise ValueError(
+                f"Matched episode {index} does not use its source instruction"
+            )
+    return records
+
+
 def _actor_position(env: Any, attribute: str) -> tuple[float, float, float]:
     if not hasattr(env, attribute):
         raise AttributeError(

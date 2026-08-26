@@ -4,10 +4,12 @@ import unittest
 from pathlib import Path
 
 from experiments.robotwin.language_interventions import (
+    EPISODE_FORMAT,
     GoalObserver,
     ManifestError,
     condition_contract,
     evaluate_goal,
+    load_matched_episode_records,
     load_intervention_manifest,
     stable_instruction_seed,
     validate_manifest_data,
@@ -99,6 +101,73 @@ class RoboTwinManifestTest(unittest.TestCase):
         )
         self.assertEqual(first, second)
         self.assertNotEqual(first, different)
+
+    def _write_matched_records(self, records):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "episodes.jsonl"
+        path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return path
+
+    @staticmethod
+    def _matched_record(index, seed):
+        source_instruction = f"put object left {index}"
+        return {
+            "format": EPISODE_FORMAT,
+            "pair_id": "place_a2b_left_to_right",
+            "source_task": "place_a2b_left",
+            "counterfactual_task": "place_a2b_right",
+            "task_config": "demo_clean",
+            "condition": "correct",
+            "episode_index": index,
+            "scene_seed": seed,
+            "instruction_type": "unseen",
+            "source_instruction": source_instruction,
+            "counterfactual_instruction": f"put object right {index}",
+            "policy_instruction": source_instruction,
+            "instruction_goal": "source",
+            "selected_goal": "source",
+            "initial_source_goal_success": False,
+            "initial_counterfactual_goal_success": False,
+        }
+
+    def _load_matched(self, path, expected_episodes=2):
+        return load_matched_episode_records(
+            path,
+            expected_pair_id="place_a2b_left_to_right",
+            expected_source_task="place_a2b_left",
+            expected_counterfactual_task="place_a2b_right",
+            expected_task_config="demo_clean",
+            expected_instruction_type="unseen",
+            expected_episodes=expected_episodes,
+        )
+
+    def test_matched_episode_loader_preserves_canonical_order(self):
+        records = [
+            self._matched_record(0, 4300000),
+            self._matched_record(1, 4300004),
+        ]
+        loaded = self._load_matched(self._write_matched_records(records))
+        self.assertEqual(
+            [record["scene_seed"] for record in loaded],
+            [4300000, 4300004],
+        )
+
+    def test_matched_episode_loader_rejects_contract_drift(self):
+        records = [
+            self._matched_record(0, 4300000),
+            self._matched_record(1, 4300004),
+        ]
+        records[1]["condition"] = "shuffled"
+        with self.assertRaisesRegex(ValueError, "condition"):
+            self._load_matched(self._write_matched_records(records))
+
+        records[1] = self._matched_record(1, 4300000)
+        with self.assertRaisesRegex(ValueError, "duplicate seed"):
+            self._load_matched(self._write_matched_records(records))
 
 
 class RoboTwinGoalTest(unittest.TestCase):

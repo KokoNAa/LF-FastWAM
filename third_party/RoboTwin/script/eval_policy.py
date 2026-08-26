@@ -239,6 +239,31 @@ def main(usr_args):
     condition, intervention_pair, instruction_goal, selected_goal = (
         _load_language_intervention(usr_args, task_name)
     )
+    matched_episode_records = None
+    matched_records_value = usr_args.get("matched_episode_records_path")
+    if matched_records_value is not None and str(matched_records_value).strip().lower() not in {
+        "",
+        "none",
+        "null",
+    }:
+        if intervention_pair is None or condition == "correct":
+            raise ValueError(
+                "Canonical matched episode records are only valid for "
+                "shuffled/counterfactual CIS workers."
+            )
+        from experiments.robotwin.language_interventions import (
+            load_matched_episode_records,
+        )
+
+        matched_episode_records = load_matched_episode_records(
+            matched_records_value,
+            expected_pair_id=intervention_pair.pair_id,
+            expected_source_task=task_name,
+            expected_counterfactual_task=intervention_pair.counterfactual_task,
+            expected_task_config=task_config,
+            expected_instruction_type=instruction_type,
+            expected_episodes=eval_num_episodes,
+        )
 
     get_model = eval_function_decorator(policy_name, "get_model")
 
@@ -352,6 +377,7 @@ def main(usr_args):
         instruction_goal=instruction_goal,
         selected_goal=selected_goal,
         episode_results_path=episode_results_path,
+        matched_episode_records=matched_episode_records,
     )
     suc_nums.append(suc_num)
 
@@ -398,11 +424,12 @@ def eval_policy(task_name,
                 intervention_pair=None,
                 instruction_goal=None,
                 selected_goal=None,
-                episode_results_path=None):
+                episode_results_path=None,
+                matched_episode_records=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = True
+    expert_check = matched_episode_records is None
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
@@ -423,6 +450,10 @@ def eval_policy(task_name,
     args["eval_mode"] = True
 
     while succ_seed < test_num:
+        canonical_record = None
+        if matched_episode_records is not None:
+            canonical_record = matched_episode_records[succ_seed]
+            now_seed = int(canonical_record["scene_seed"])
         # A CIS rollout temporarily replaces the instance predicate. Always
         # restore the class-native predicate before selecting the next seed.
         TASK_ENV.check_success = native_check_success
@@ -482,6 +513,12 @@ def eval_policy(task_name,
         try:
             TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         except UnStableError as e:
+            if canonical_record is not None:
+                TASK_ENV.close_env()
+                raise CISContractError(
+                    "Canonical CIS scene became unstable during replay: "
+                    f"task={task_name}, seed={now_seed}."
+                ) from e
             # This seed passed expert_check but failed during rollout env init.
             # Roll back the accepted-seed counter and skip to next seed.
             succ_seed -= 1
@@ -491,6 +528,12 @@ def eval_policy(task_name,
             now_seed += 1
             continue
         except Exception as e:
+            if canonical_record is not None:
+                TASK_ENV.close_env()
+                raise CISContractError(
+                    "Canonical CIS scene failed during replay setup: "
+                    f"task={task_name}, seed={now_seed}."
+                ) from e
             succ_seed -= 1
             if len(suc_test_seed_list) > 0 and suc_test_seed_list[-1] == now_seed:
                 suc_test_seed_list.pop()
@@ -515,18 +558,24 @@ def eval_policy(task_name,
         else:
             from experiments.robotwin.language_interventions import GoalObserver
 
-            source_instruction = _deterministic_instruction(
-                task_name=intervention_pair.source_task,
-                episode_info=episode_info["info"],
-                instruction_type=instruction_type,
-                scene_seed=now_seed,
-            )
-            counterfactual_instruction = _deterministic_instruction(
-                task_name=intervention_pair.counterfactual_task,
-                episode_info=episode_info["info"],
-                instruction_type=instruction_type,
-                scene_seed=now_seed,
-            )
+            if canonical_record is None:
+                source_instruction = _deterministic_instruction(
+                    task_name=intervention_pair.source_task,
+                    episode_info=episode_info["info"],
+                    instruction_type=instruction_type,
+                    scene_seed=now_seed,
+                )
+                counterfactual_instruction = _deterministic_instruction(
+                    task_name=intervention_pair.counterfactual_task,
+                    episode_info=episode_info["info"],
+                    instruction_type=instruction_type,
+                    scene_seed=now_seed,
+                )
+            else:
+                source_instruction = str(canonical_record["source_instruction"])
+                counterfactual_instruction = str(
+                    canonical_record["counterfactual_instruction"]
+                )
             instruction = (
                 source_instruction
                 if instruction_goal == "source"
@@ -535,6 +584,12 @@ def eval_policy(task_name,
             rollout_observer = GoalObserver(TASK_ENV, intervention_pair)
             initial_snapshot = rollout_observer.update()
             if initial_snapshot.source.success or initial_snapshot.counterfactual.success:
+                if canonical_record is not None:
+                    TASK_ENV.close_env()
+                    raise CISContractError(
+                        "Canonical CIS scene changed its initial goal state: "
+                        f"task={task_name}, seed={now_seed}."
+                    )
                 succ_seed -= 1
                 if suc_test_seed_list and suc_test_seed_list[-1] == now_seed:
                     suc_test_seed_list.pop()

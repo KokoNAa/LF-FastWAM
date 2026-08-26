@@ -243,6 +243,11 @@ def main(cfg: DictConfig):
         "language_intervention_manifest",
         None if manifest_path is None else str(manifest_path),
     )
+    _append_override(
+        overrides,
+        "matched_episode_records_path",
+        cfg.EVALUATION.matched_episode_records_path,
+    )
     _append_override(overrides, "project_root", str(PROJECT_ROOT))
     _append_override(overrides, "eval_num_episodes", cfg.EVALUATION.eval_num_episodes)
 

@@ -23,6 +23,9 @@ EVALUATION:
   # Correct / Shuffle (DTL) / Counterfactual (CIS) result directories.
   instruction_condition: correct
   language_intervention_manifest: null
+  # Non-Correct CIS workers receive the canonical Correct episodes from the
+  # manager and replay their exact seeds/instructions.
+  matched_episode_records_path: null
   cis_tasks: []
   cis_conditions: [correct, shuffled, counterfactual]
   cis_task_configs: [demo_clean, demo_randomized]

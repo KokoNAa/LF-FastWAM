@@ -24,7 +24,12 @@ under three conditions:
 | `counterfactual` | alternate | alternate | CIS (higher is better) |
 
 `shuffled` and `counterfactual` receive the exact same alternate instruction.
-The manager also requires the same ordered scene seeds across all conditions.
+The manager runs each `correct` job first and saves its accepted episodes as a
+canonical seed bank.  Only then are the corresponding `shuffled` and
+`counterfactual` jobs launched; they replay the canonical seeds and exact
+source/alternate instruction strings without independently rerunning expert
+seed selection.  This two-stage schedule prevents nondeterministic CuRobo
+planning from silently changing the scene matrix between conditions.
 Before a rollout, both goals must be false.  During a rollout, source and
 alternate predicates are observed independently and their ever-success and
 final-success values are retained.
@@ -127,17 +132,22 @@ same checkpoint, run tag, episode count, tasks, domains, and conditions skips
 only fully validated job directories.  Partial or checkpoint-mismatched output
 is rerun.
 
-To evaluate only randomized scenes or only the CIS condition:
+To evaluate only randomized scenes and the two conditions needed for CIS:
 
 ```bash
 CIS_TASK_CONFIGS=demo_randomized \
-CIS_CONDITIONS=counterfactual \
+CIS_CONDITIONS=correct,counterfactual \
 RUN_TAG=robotwin_cis_only \
 bash scripts/eval_robotwin_cis.sh \
   8 100 10 42 \
   "$ROBOTWIN_CKPT" \
   "$STATS_PATH"
 ```
+
+Any run containing `shuffled` or `counterfactual` must also contain `correct`,
+because the latter supplies the canonical episodes.  During the first stage,
+some GPUs can intentionally remain idle until their matching `correct` job has
+finished.
 
 ## Outputs and validation
 
