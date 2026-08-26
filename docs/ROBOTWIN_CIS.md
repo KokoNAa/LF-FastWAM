@@ -57,6 +57,7 @@ checkpoint, pinned RoboTwin task configs, and required assets through a mirror:
 
 ```bash
 HF_ENDPOINT=https://hf-mirror.com bash scripts/setup_robotwin_cis_server.sh
+bash scripts/setup_robotwin_cis_python_env.sh
 ```
 
 Downloads are resumable. Large asset archives use curl with retry and low-speed

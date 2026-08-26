@@ -40,7 +40,7 @@ for required_command in nvidia-smi ffmpeg; do
 done
 
 nvidia-smi -L
-"${PYTHON_BIN}" -c 'import cv2, hydra, mplib, numpy, omegaconf, sapien, torch, transforms3d; assert torch.cuda.is_available(); print("torch={} cuda_devices={} sapien={}".format(torch.__version__, torch.cuda.device_count(), getattr(sapien, "__version__", "unknown")))'
+"${PYTHON_BIN}" -c 'import cv2, gymnasium, hydra, mplib, numpy, omegaconf, open3d, sapien, torch, transforms3d, trimesh; assert torch.cuda.is_available(); print("torch={} cuda_devices={} sapien={}".format(torch.__version__, torch.cuda.device_count(), getattr(sapien, "__version__", "unknown")))'
 "${PYTHON_BIN}" scripts/validate_robotwin_cis_manifest.py \
   "${MANIFEST_PATH}" \
   --robotwin-root "${ROBOTWIN_ROOT}"
