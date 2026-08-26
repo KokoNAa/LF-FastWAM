@@ -367,14 +367,28 @@ def get_model(usr_args: Dict[str, Any]):
         resolved_sim_cfg_path=resolved_sim_cfg_path,
     )
 
-    logger.info(
-        "Resolved FastWAM evaluation architecture: latent_action_queries=%s "
-        "langforce=%s transition_contract=%s policy_guard=%s config=%s",
-        bool(cfg.model.action_dit_config.get("use_latent_action_queries", False)),
-        bool(cfg.model.get("langforce_mvp", {}).get("enabled", False)),
-        bool(cfg.model.get("transition_contract", {}).get("enabled", False)),
-        bool(cfg.model.get("policy_guard", {}).get("enabled", False)),
-        resolved_sim_cfg_path,
+    architecture_contract = {
+        "latent_action_queries": bool(
+            cfg.model.action_dit_config.get("use_latent_action_queries", False)
+        ),
+        "langforce": bool(
+            cfg.model.get("langforce_mvp", {}).get("enabled", False)
+        ),
+        "transition_contract": bool(
+            cfg.model.get("transition_contract", {}).get("enabled", False)
+        ),
+        "policy_guard": bool(
+            cfg.model.get("policy_guard", {}).get("enabled", False)
+        ),
+    }
+    print(
+        "[policy-config] "
+        + " ".join(
+            f"{key}={str(value).lower()}"
+            for key, value in architecture_contract.items()
+        )
+        + f" snapshot={resolved_sim_cfg_path}",
+        flush=True,
     )
 
     checkpoint_path = usr_args.get("ckpt_setting")
