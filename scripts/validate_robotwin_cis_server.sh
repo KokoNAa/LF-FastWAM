@@ -13,6 +13,7 @@ for required_file in \
   "${MANIFEST_PATH}" \
   "${ROBOTWIN_ROOT}/task_config/_eval_step_limit.yml" \
   "${ROBOTWIN_ROOT}/task_config/_camera_config.yml" \
+  "${ROBOTWIN_ROOT}/task_config/_embodiment_config.yml" \
   "${ROBOTWIN_ROOT}/task_config/demo_clean.yml" \
   "${ROBOTWIN_ROOT}/task_config/demo_randomized.yml"; do
   if [[ ! -f "${required_file}" ]]; then
@@ -21,8 +22,10 @@ for required_file in \
   fi
 done
 for required_dir in \
+  "${ROBOTWIN_ROOT}/assets/background_texture" \
   "${ROBOTWIN_ROOT}/assets/objects" \
   "${ROBOTWIN_ROOT}/assets/embodiments" \
+  "${ROBOTWIN_ROOT}/assets/embodiments/aloha-agilex" \
   "${ROBOTWIN_ROOT}/policy"; do
   if [[ ! -d "${required_dir}" ]]; then
     echo "Required directory not found: ${required_dir}" >&2

@@ -160,7 +160,7 @@ release 的模型权重以及对应的 dataset stats 已经发布到 [Hugging Fa
 从 Hugging Face 下载 release 权重和 dataset stats：
 
 ```bash
-pip install -U huggingface_hub
+pip install "huggingface_hub==0.29.2"
 
 huggingface-cli download yuanty/fastwam \
   libero_uncond_2cam224.pt \

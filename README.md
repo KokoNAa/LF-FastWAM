@@ -160,7 +160,7 @@ The released checkpoints and their corresponding dataset stats are available on 
 Optional: download released checkpoints and dataset stats from Hugging Face:
 
 ```bash
-pip install -U huggingface_hub
+pip install "huggingface_hub==0.29.2"
 
 huggingface-cli download yuanty/fastwam \
   libero_uncond_2cam224.pt \
