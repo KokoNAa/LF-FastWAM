@@ -66,6 +66,10 @@ extracted archives are marked under `third_party/RoboTwin/assets`; archives are
 deleted after extraction by default to save disk space. Set
 `KEEP_ASSET_ARCHIVES=1` to retain them.
 
+The Python environment setup pins CuRobo `v0.7.8`, the upstream-recommended
+version for the v1 API used by vendored RoboTwin. Building CuRobo requires a
+CUDA toolkit with `nvcc`; a runtime-only CUDA container is insufficient.
+
 ```bash
 cd /path/to/fast-WAM
 git pull --ff-only origin main

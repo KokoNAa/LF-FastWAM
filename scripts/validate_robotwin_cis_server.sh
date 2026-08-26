@@ -41,6 +41,10 @@ done
 
 nvidia-smi -L
 "${PYTHON_BIN}" -c 'import cv2, gymnasium, hydra, mplib, numpy, omegaconf, open3d, sapien, torch, transforms3d, trimesh; assert torch.cuda.is_available(); print("torch={} cuda_devices={} sapien={}".format(torch.__version__, torch.cuda.device_count(), getattr(sapien, "__version__", "unknown")))'
+(
+  cd "${ROBOTWIN_ROOT}"
+  "${PYTHON_BIN}" -c 'from envs.robot.planner import CuroboPlanner, MplibPlanner; print("RoboTwin planners import passed")'
+)
 "${PYTHON_BIN}" scripts/validate_robotwin_cis_manifest.py \
   "${MANIFEST_PATH}" \
   --robotwin-root "${ROBOTWIN_ROOT}"
