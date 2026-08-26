@@ -52,6 +52,17 @@ The server needs the normal RoboTwin environment, assets, `task_config`,
 FastWAM checkpoint, and matching dataset statistics.  It does not need the
 RoboTwin training dataset for evaluation.
 
+On servers that cannot reach `huggingface.co` directly, install the release
+checkpoint, pinned RoboTwin task configs, and required assets through a mirror:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com bash scripts/setup_robotwin_cis_server.sh
+```
+
+Downloads are resumable.  Successfully extracted archives are marked under
+`third_party/RoboTwin/assets`; archives are deleted after extraction by
+default to save disk space.  Set `KEEP_ASSET_ARCHIVES=1` to retain them.
+
 ```bash
 cd /path/to/fast-WAM
 git pull --ff-only origin main
