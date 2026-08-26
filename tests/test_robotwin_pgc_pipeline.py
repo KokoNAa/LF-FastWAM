@@ -18,6 +18,7 @@ from experiments.robotwin.pgc_data import (
 from scripts.inspect_pgc_checkpoint import hydra_overrides, validate_payload
 from scripts.build_pgc_robotwin_entity_relations import build_sidecar
 from scripts.convert_pgc_robotwin_to_lerobot import _decode_rgb, robotwin_lerobot_features
+from scripts.prepare_pgc_robotwin_datasets import dataset_specs
 from fastwam.datasets.pgc_libero import load_pgc_entity_relation_index
 
 
@@ -84,6 +85,23 @@ class RoboTwinPGCCheckpointTest(unittest.TestCase):
 
 
 class RoboTwinPGCDataContractTest(unittest.TestCase):
+    def test_prepared_matrix_contains_both_kinds_for_both_directions(self):
+        specs = dataset_specs(
+            raw_root=Path("/raw"),
+            dataset_root=Path("/dataset"),
+            sidecar_root=Path("/sidecar"),
+        )
+        self.assertEqual(len(specs), 4)
+        self.assertEqual(
+            {(spec.pair_id, spec.dataset_kind) for spec in specs},
+            {
+                ("place_a2b_left_to_place_a2b_right", "native"),
+                ("place_a2b_left_to_place_a2b_right", "counterfactual"),
+                ("place_a2b_right_to_place_a2b_left", "native"),
+                ("place_a2b_right_to_place_a2b_left", "counterfactual"),
+            },
+        )
+
     def test_lerobot_conversion_schema_keeps_three_rgb_and_qpos14(self):
         features = robotwin_lerobot_features(480, 640)
         self.assertEqual(features["observation.images.cam_high"]["shape"], (3, 480, 640))

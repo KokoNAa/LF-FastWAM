@@ -38,23 +38,19 @@ python scripts/validate_pgc_robotwin_raw.py \
 
 After the two-episode gate passes, rerun collection with `--episodes 50`.
 
-Convert each capture to LeRobot, then bind the ERAF sidecar to that exact
+Convert all four captures to LeRobot and bind each ERAF sidecar to its exact
 converted dataset path:
 
 ```bash
-python scripts/convert_pgc_robotwin_to_lerobot.py \
-  --raw-root data/pgc_robotwin_raw/place_a2b_left_to_place_a2b_right/counterfactual \
-  --output data/pgc_robotwin_lerobot/place_a2b_left_to_place_a2b_right/counterfactual
-
-python scripts/build_pgc_robotwin_entity_relations.py \
-  --raw-root data/pgc_robotwin_raw/place_a2b_left_to_place_a2b_right/counterfactual \
-  --dataset-root data/pgc_robotwin_lerobot/place_a2b_left_to_place_a2b_right/counterfactual \
-  --output-root data/pgc_robotwin_eraf/place_a2b_left_to_place_a2b_right/counterfactual
+python scripts/prepare_pgc_robotwin_datasets.py \
+  --raw-root data/pgc_robotwin_raw \
+  --dataset-root data/pgc_robotwin_lerobot \
+  --sidecar-root data/pgc_robotwin_eraf
 ```
 
-Run the conversion and sidecar commands for both `native` and
-`counterfactual` under both direction pairs. Their scene-seed and initial-state
-hash sequences must match within each pair.
+The command is resumable only after a complete dataset+sidecar pair exists. It
+rejects partial output and verifies that native/counterfactual initial-state
+hash sequences match within each direction pair.
 
 ## Matched CIS evaluation
 
