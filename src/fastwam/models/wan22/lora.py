@@ -34,6 +34,7 @@ DEFAULT_EXTRA_TRAINABLE_PATTERNS = (
 
 DEFAULT_PAIRED_LANGUAGE_CONTROL = {
     "enabled": False,
+    "bidirectional_supervision": False,
     "world_language_weight": 0.10,
     "world_language_margin": 0.01,
     "native_action_weight": 1.0,
@@ -51,10 +52,13 @@ def normalize_paired_language_control_config(
     raw = dict(config or {})
     normalized = {
         "enabled": bool(raw.get("enabled", False)),
+        "bidirectional_supervision": bool(
+            raw.get("bidirectional_supervision", False)
+        ),
         **{
             name: float(raw.get(name, default))
             for name, default in DEFAULT_PAIRED_LANGUAGE_CONTROL.items()
-            if name != "enabled"
+            if name not in {"enabled", "bidirectional_supervision"}
         },
     }
     non_negative = (
@@ -75,6 +79,11 @@ def normalize_paired_language_control_config(
         raise ValueError(
             "LoRA paired-language control values must be non-negative, "
             f"got {invalid}."
+        )
+    if normalized["bidirectional_supervision"] and not normalized["enabled"]:
+        raise ValueError(
+            "LoRA bidirectional supervision requires "
+            "`paired_language_control.enabled=true`."
         )
     return normalized
 

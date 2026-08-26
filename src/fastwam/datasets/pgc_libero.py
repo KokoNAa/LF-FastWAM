@@ -112,6 +112,54 @@ def build_pgc_pair_balanced_sample_indices(
     ]
 
 
+def build_pgc_bidirectional_language_pair_index(
+    episode_pairs: Mapping[int, Mapping[int, Mapping[str, object]]],
+) -> dict[str, tuple[dict[str, object], ...]]:
+    """Index audited target languages for native-state reverse ranking.
+
+    Counterfactual datasets may repeat one language pair across many episodes
+    or expose multiple audited targets for a source instruction. Deduplicate
+    exact target texts and return a deterministic ordering. This index supplies
+    language only; it never treats independently rolled-out native and CF
+    actions as time-aligned labels for the same state.
+    """
+    grouped: dict[str, dict[str, dict[str, object]]] = {}
+    for dataset_index in sorted(episode_pairs):
+        pairs = episode_pairs[dataset_index]
+        for episode_index in sorted(pairs):
+            pair = pairs[episode_index]
+            source = str(pair.get("source_instruction", "")).strip()
+            target = str(pair.get("counterfactual_instruction", "")).strip()
+            if not source or not target:
+                raise ValueError(
+                    "Bidirectional language supervision found an incomplete "
+                    f"pair at dataset/episode {dataset_index}/{episode_index}."
+                )
+            source_key = source.casefold()
+            target_key = target.casefold()
+            if source_key == target_key:
+                raise ValueError(
+                    "Bidirectional language supervision requires distinct "
+                    f"instructions, got {source!r}."
+                )
+            grouped.setdefault(source_key, {}).setdefault(
+                target_key,
+                {
+                    "pair_id": str(pair.get("pair_id", "")),
+                    "source_instruction": source,
+                    "counterfactual_instruction": target,
+                    "source_suite": str(pair.get("source_suite", "")),
+                    "source_task_id": int(pair.get("source_task_id", -1)),
+                },
+            )
+    return {
+        source_key: tuple(
+            targets[target_key] for target_key in sorted(targets)
+        )
+        for source_key, targets in sorted(grouped.items())
+    }
+
+
 def pgc_entity_relation_workspace_bounds(
     indices: Mapping[int, Mapping[str, Any]],
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:

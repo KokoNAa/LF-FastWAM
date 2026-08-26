@@ -481,6 +481,9 @@ lora:
   # objectives but uses only the released query-free shared Experts.
   paired_language_control:
     enabled: false
+    # When enabled, native rows use the audited target language as their
+    # same-state negative while CF rows keep the audited source negative.
+    bidirectional_supervision: false
     world_language_weight: 0.10
     world_language_margin: 0.01
     native_action_weight: 1.0

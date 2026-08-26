@@ -35,6 +35,7 @@ model:
     extra_trainable_patterns: []
     paired_language_control:
       enabled: true
+      bidirectional_supervision: true
       world_language_weight: 0.10
       world_language_margin: 0.01
       native_action_weight: 1.0
@@ -51,6 +52,7 @@ data:
     pgc_balance_native_counterfactual: true
     pgc_entity_relation_supervision_required: true
     pgc_entity_relation_sidecar_dirs: []
+    pgc_bidirectional_language_supervision_required: true
     pgc_v9_balanced_sampling: true
     pgc_v9_structured_role_sampling: false
     pgc_v9_hard_role_curriculum: false

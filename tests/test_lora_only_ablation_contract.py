@@ -15,12 +15,15 @@ class LoRAOnlyAblationContractTest(unittest.TestCase):
             'LEARNING_RATE="${LORA_ONLY_LEARNING_RATE:-5.0e-6}"',
             "data.train.pgc_v9_balanced_sampling=true",
             "data.train.pgc_v9_phase_safe_memory=true",
+            "data.train.pgc_bidirectional_language_supervision_required=true",
             "data.train.pgc_v9_closed_loop_native_dataset_count=1",
             "model.policy_guard.enabled=false",
             "model.lora.rank=16",
             "model.lora.alpha=16",
             "model.lora.dropout=0.05",
             "model.lora.paired_language_control.enabled=true",
+            "model.lora.paired_language_control.bidirectional_supervision=true",
+            "lora-only-no-eraf-bidirectional-10k-seed",
         ):
             self.assertIn(contract, source)
         self.assertIn(
@@ -36,6 +39,10 @@ class LoRAOnlyAblationContractTest(unittest.TestCase):
         self.assertIn("experts: [video, action]", source)
         self.assertIn("extra_trainable_patterns: []", source)
         self.assertIn("paired_language_control:\n      enabled: true", source)
+        self.assertIn("bidirectional_supervision: true", source)
+        self.assertIn(
+            "pgc_bidirectional_language_supervision_required: true", source
+        )
         self.assertIn("max_steps: 10000", source)
 
     def test_evaluator_rejects_nonformal_adapter(self):
@@ -45,6 +52,12 @@ class LoRAOnlyAblationContractTest(unittest.TestCase):
         self.assertIn('EXPECTED_STEP="${LORA_ONLY_EXPECTED_STEP:-10000}"', source)
         self.assertIn('payload.get("format") != "fastwam_lora_adapter_v1"', source)
         self.assertIn("Checkpoint is not the strict paired-language no-ERAF control.", source)
+        self.assertIn('control.get("bidirectional_supervision") is not True', source)
+        self.assertIn("lora_only_no_eraf_bidirectional_", source)
+        self.assertIn(
+            "model.lora.paired_language_control.bidirectional_supervision=false",
+            source,
+        )
         self.assertIn("model.policy_guard.enabled=false", source)
 
 

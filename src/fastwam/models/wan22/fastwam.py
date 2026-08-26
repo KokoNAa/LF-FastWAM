@@ -4128,6 +4128,81 @@ class FastWAM(torch.nn.Module):
         )
         return self.action_expert.post_dit(output_tokens, action_pre)
 
+    @staticmethod
+    def _select_bidirectional_language_contexts(
+        *,
+        is_counterfactual: torch.Tensor,
+        source_context: torch.Tensor,
+        source_context_mask: torch.Tensor,
+        target_context: torch.Tensor,
+        target_context_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return row-wise correct and wrong language with state unchanged.
+
+        Native rows supervise source language and rank target language as the
+        wrong instruction. Counterfactual rows do the exact reverse. Context
+        selection happens before either Video or Action forward so each row's
+        two branches share its state, diffusion noise, timestep, and action.
+        """
+        if source_context.shape != target_context.shape:
+            raise ValueError(
+                "Bidirectional source/target contexts must have identical "
+                f"shape, got {tuple(source_context.shape)} and "
+                f"{tuple(target_context.shape)}."
+            )
+        if source_context_mask.shape != target_context_mask.shape:
+            raise ValueError(
+                "Bidirectional source/target masks must have identical shape."
+            )
+        if len(
+            {
+                source_context.device,
+                source_context_mask.device,
+                target_context.device,
+                target_context_mask.device,
+            }
+        ) != 1:
+            raise ValueError(
+                "Bidirectional source/target tensors must share a device."
+            )
+        if source_context.ndim < 2:
+            raise ValueError("Bidirectional language contexts must be batched.")
+        batch_size = int(source_context.shape[0])
+        direction = torch.as_tensor(
+            is_counterfactual,
+            device=source_context.device,
+            dtype=torch.bool,
+        )
+        if direction.shape != (batch_size,):
+            raise ValueError(
+                "`is_counterfactual` must be [B] for bidirectional context "
+                f"selection, got {tuple(direction.shape)}."
+            )
+        context_direction = direction.view(
+            batch_size, *([1] * (source_context.ndim - 1))
+        )
+        mask_direction = direction.view(
+            batch_size, *([1] * (source_context_mask.ndim - 1))
+        )
+        correct_context = torch.where(
+            context_direction, target_context, source_context
+        )
+        wrong_context = torch.where(
+            context_direction, source_context, target_context
+        )
+        correct_context_mask = torch.where(
+            mask_direction, target_context_mask, source_context_mask
+        )
+        wrong_context_mask = torch.where(
+            mask_direction, source_context_mask, target_context_mask
+        )
+        return (
+            correct_context,
+            correct_context_mask,
+            wrong_context,
+            wrong_context_mask,
+        )
+
     def _policy_guard_clean_action_from_velocity(
         self,
         *,
@@ -7948,11 +8023,12 @@ class FastWAM(torch.nn.Module):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Strict shared-Expert LoRA control with no ERAF path.
 
-        This retains the V9.26 four-way world/action and paired-language
-        objectives while replacing ERAF-conditioned action denoising with the
-        released Action Expert's ordinary language context. No policy-guard,
-        ERAF, completion-memory, context-injector, or ERAF-preservation tensor
-        participates in the forward or loss.
+        Native rows explicitly supervise source language and rank their
+        audited target language as wrong; counterfactual rows supervise target
+        language and rank source language as wrong. Each correct/wrong pair
+        shares the row's state, action, diffusion noise, timestep, and correct
+        Video cache. No policy-guard, ERAF, completion-memory,
+        context-injector, or ERAF-preservation tensor participates.
         """
         if not (
             self.lora_paired_language_control_enabled
@@ -7972,6 +8048,10 @@ class FastWAM(torch.nn.Module):
         paired_language_valid = inputs["pgc_paired_language_valid"]
         source_context = inputs["pgc_source_context"]
         source_context_mask = inputs["pgc_source_context_mask"]
+        control = self.lora_paired_language_control_config
+        bidirectional_supervision = bool(
+            control.get("bidirectional_supervision", False)
+        )
         if any(
             value is None
             for value in (
@@ -7985,6 +8065,42 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 "The no-ERAF paired-language control requires four-way "
                 "provenance and same-state source language."
+            )
+
+        correct_context = inputs["context"]
+        correct_context_mask = full_context_mask
+        wrong_context = source_context
+        wrong_context_mask = source_context_mask
+        bidirectional_language_valid = paired_language_valid
+        if bidirectional_supervision:
+            target_context = inputs.get("pgc_target_context")
+            target_context_mask = inputs.get("pgc_target_context_mask")
+            bidirectional_language_valid = inputs.get(
+                "pgc_bidirectional_language_valid"
+            )
+            if any(
+                value is None
+                for value in (
+                    target_context,
+                    target_context_mask,
+                    bidirectional_language_valid,
+                )
+            ):
+                raise ValueError(
+                    "Bidirectional no-ERAF supervision requires target "
+                    "language and bidirectional-valid fields."
+                )
+            (
+                correct_context,
+                correct_context_mask,
+                wrong_context,
+                wrong_context_mask,
+            ) = self._select_bidirectional_language_contexts(
+                is_counterfactual=is_counterfactual,
+                source_context=source_context,
+                source_context_mask=source_context_mask,
+                target_context=target_context,
+                target_context_mask=target_context_mask,
             )
 
         batch_size = int(action.shape[0])
@@ -8007,8 +8123,8 @@ class FastWAM(torch.nn.Module):
         video_pre = self.video_expert.pre_dit(
             x=noisy_video,
             timestep=timestep_video,
-            context=inputs["context"],
-            context_mask=full_context_mask,
+            context=correct_context,
+            context_mask=correct_context_mask,
             action=action,
             fuse_vae_embedding_in_latents=inputs[
                 "fuse_vae_embedding_in_latents"
@@ -8064,13 +8180,14 @@ class FastWAM(torch.nn.Module):
             video_weight = video_weight.expand(batch_size)
         else:
             video_weight = video_weight.reshape(batch_size)
-        world_flow_loss = (correct_video_error * video_weight).mean()
+        weighted_video_error = correct_video_error * video_weight
+        world_flow_loss = weighted_video_error.mean()
 
         wrong_video_pre = self.video_expert.pre_dit(
             x=noisy_video,
             timestep=timestep_video,
-            context=source_context,
-            context_mask=source_context_mask,
+            context=wrong_context,
+            context_mask=wrong_context_mask,
             action=action,
             fuse_vae_embedding_in_latents=inputs[
                 "fuse_vae_embedding_in_latents"
@@ -8114,17 +8231,42 @@ class FastWAM(torch.nn.Module):
         paired_language_valid = paired_language_valid.to(
             device=action.device, dtype=torch.bool
         )
+        bidirectional_language_valid = torch.as_tensor(
+            bidirectional_language_valid,
+            device=action.device,
+            dtype=torch.bool,
+        )
+        if bidirectional_language_valid.shape != (batch_size,):
+            raise ValueError(
+                "`pgc_bidirectional_language_valid` must be [B], got "
+                f"{tuple(bidirectional_language_valid.shape)}."
+            )
         native_valid = direct_action_valid & ~is_counterfactual
         counterfactual_valid = direct_action_valid & is_counterfactual
-        semantic_valid = counterfactual_valid & paired_language_valid
-        control = self.lora_paired_language_control_config
-        world_language_ranking = self._masked_policy_guard_mean(
-            torch.relu(
-                float(control["world_language_margin"])
-                + correct_video_error.detach()
-                - wrong_video_error
-            ),
-            semantic_valid,
+        source_semantic_valid = torch.zeros_like(native_valid)
+        if bidirectional_supervision:
+            source_semantic_valid = (
+                native_valid & bidirectional_language_valid
+            )
+        target_semantic_valid = (
+            counterfactual_valid
+            & paired_language_valid
+            & bidirectional_language_valid
+        )
+        semantic_valid = source_semantic_valid | target_semantic_valid
+        world_ranking_per_sample = torch.relu(
+            float(control["world_language_margin"])
+            + correct_video_error.detach()
+            - wrong_video_error
+        )
+        source_world_language_ranking = self._masked_policy_guard_mean(
+            world_ranking_per_sample, source_semantic_valid
+        )
+        target_world_language_ranking = self._masked_policy_guard_mean(
+            world_ranking_per_sample, target_semantic_valid
+        )
+        world_language_ranking = (
+            source_world_language_ranking + target_world_language_ranking
         )
 
         noise_action = torch.randn_like(action)
@@ -8142,8 +8284,8 @@ class FastWAM(torch.nn.Module):
         correct_action = self._forward_shared_action_from_cache(
             action_tokens=noisy_action,
             timestep_action=timestep_action,
-            context=inputs["context"],
-            context_mask=full_context_mask,
+            context=correct_context,
+            context_mask=correct_context_mask,
             video_kv_cache=video_kv_cache,
             video_seq_len=video_seq_len,
             video_tokens_per_frame=video_tokens_per_frame,
@@ -8151,8 +8293,8 @@ class FastWAM(torch.nn.Module):
         wrong_action = self._forward_shared_action_from_cache(
             action_tokens=noisy_action,
             timestep_action=timestep_action,
-            context=source_context,
-            context_mask=source_context_mask,
+            context=wrong_context,
+            context_mask=wrong_context_mask,
             video_kv_cache=video_kv_cache,
             video_seq_len=video_seq_len,
             video_tokens_per_frame=video_tokens_per_frame,
@@ -8180,13 +8322,20 @@ class FastWAM(torch.nn.Module):
         counterfactual_action_loss = self._masked_policy_guard_mean(
             correct_action_error * action_weight, counterfactual_valid
         )
-        wrong_semantic_ranking = self._masked_policy_guard_mean(
-            torch.relu(
-                float(control["action_language_margin"])
-                + correct_action_error.detach()
-                - wrong_action_error
-            ),
-            semantic_valid,
+        action_ranking_per_sample = torch.relu(
+            float(control["action_language_margin"])
+            + correct_action_error.detach()
+            - wrong_action_error
+        )
+        source_action_language_ranking = self._masked_policy_guard_mean(
+            action_ranking_per_sample, source_semantic_valid
+        )
+        target_action_language_ranking = self._masked_policy_guard_mean(
+            action_ranking_per_sample, target_semantic_valid
+        )
+        wrong_semantic_ranking = (
+            source_action_language_ranking
+            + target_action_language_ranking
         )
 
         lora_terms = [
@@ -8215,18 +8364,52 @@ class FastWAM(torch.nn.Module):
             * lora_regularization
         )
 
+        source_world_flow_loss = self._masked_policy_guard_mean(
+            weighted_video_error, native_valid
+        )
+        target_world_flow_loss = self._masked_policy_guard_mean(
+            weighted_video_error, counterfactual_valid
+        )
         semantic_count = semantic_valid.float().sum().clamp_min(1.0)
+        source_semantic_count = (
+            source_semantic_valid.float().sum().clamp_min(1.0)
+        )
+        target_semantic_count = (
+            target_semantic_valid.float().sum().clamp_min(1.0)
+        )
         metrics: dict[str, torch.Tensor] = {
             "loss_lora_only_world_flow": world_flow_loss.detach(),
+            "loss_lora_only_source_world_flow": (
+                source_world_flow_loss.detach()
+            ),
+            "loss_lora_only_target_world_flow": (
+                target_world_flow_loss.detach()
+            ),
             "loss_lora_only_world_language_ranking": (
                 world_language_ranking.detach()
             ),
+            "loss_lora_only_source_world_language_ranking": (
+                source_world_language_ranking.detach()
+            ),
+            "loss_lora_only_target_world_language_ranking": (
+                target_world_language_ranking.detach()
+            ),
             "loss_lora_only_native_action_flow": native_action_loss.detach(),
+            "loss_lora_only_source_action_flow": native_action_loss.detach(),
             "loss_lora_only_counterfactual_action_flow": (
+                counterfactual_action_loss.detach()
+            ),
+            "loss_lora_only_target_action_flow": (
                 counterfactual_action_loss.detach()
             ),
             "loss_lora_only_wrong_semantic_ranking": (
                 wrong_semantic_ranking.detach()
+            ),
+            "loss_lora_only_source_action_language_ranking": (
+                source_action_language_ranking.detach()
+            ),
+            "loss_lora_only_target_action_language_ranking": (
+                target_action_language_ranking.detach()
             ),
             "loss_lora_only_regularization": lora_regularization.detach(),
             "lora_only_native_fraction": native_valid.float().mean(),
@@ -8234,12 +8417,35 @@ class FastWAM(torch.nn.Module):
                 counterfactual_valid.float().mean()
             ),
             "lora_only_semantic_fraction": semantic_valid.float().mean(),
+            "lora_only_source_semantic_fraction": (
+                source_semantic_valid.float().mean()
+            ),
+            "lora_only_target_semantic_fraction": (
+                target_semantic_valid.float().mean()
+            ),
+            "lora_only_bidirectional_pair_fraction": (
+                bidirectional_language_valid.float().mean()
+            ),
             "lora_only_world_wrong_language_worse_rate": (
                 (
                     (wrong_video_error > correct_video_error).float()
                     * semantic_valid.float()
                 ).sum()
                 / semantic_count
+            ),
+            "lora_only_source_world_wrong_language_worse_rate": (
+                (
+                    (wrong_video_error > correct_video_error).float()
+                    * source_semantic_valid.float()
+                ).sum()
+                / source_semantic_count
+            ),
+            "lora_only_target_world_wrong_language_worse_rate": (
+                (
+                    (wrong_video_error > correct_video_error).float()
+                    * target_semantic_valid.float()
+                ).sum()
+                / target_semantic_count
             ),
             "lora_only_action_wrong_language_worse_rate": (
                 (
@@ -8248,12 +8454,31 @@ class FastWAM(torch.nn.Module):
                 ).sum()
                 / semantic_count
             ),
+            "lora_only_source_action_wrong_language_worse_rate": (
+                (
+                    (wrong_action_error > correct_action_error).float()
+                    * source_semantic_valid.float()
+                ).sum()
+                / source_semantic_count
+            ),
+            "lora_only_target_action_wrong_language_worse_rate": (
+                (
+                    (wrong_action_error > correct_action_error).float()
+                    * target_semantic_valid.float()
+                ).sum()
+                / target_semantic_count
+            ),
             "lora_only_action_supervised_fraction": (
                 direct_action_valid.float().mean()
             ),
             "lora_only_eraf_enabled": correct_action_error.new_zeros(()),
             "lora_only_policy_guard_enabled": (
                 correct_action_error.new_zeros(())
+            ),
+            "lora_only_bidirectional_supervision_enabled": (
+                correct_action_error.new_tensor(
+                    float(bidirectional_supervision)
+                )
             ),
             "lora_only_shared_video_action_expert": (
                 correct_action_error.new_ones(())
@@ -11220,6 +11445,12 @@ class FastWAM(torch.nn.Module):
         pgc_source_context_mask = sample.get("pgc_source_context_mask")
         pgc_source_goal_id = sample.get("pgc_source_goal_id")
         pgc_paired_language_valid = sample.get("pgc_paired_language_valid")
+        pgc_target_context = sample.get("pgc_target_context")
+        pgc_target_context_mask = sample.get("pgc_target_context_mask")
+        pgc_target_goal_id = sample.get("pgc_target_goal_id")
+        pgc_bidirectional_language_valid = sample.get(
+            "pgc_bidirectional_language_valid"
+        )
         pgc_completion_phase = sample.get("pgc_completion_phase")
         pgc_completion_phase_valid = sample.get("pgc_completion_phase_valid")
         pgc_target_object_mask = sample.get("pgc_target_object_mask")
@@ -11295,6 +11526,36 @@ class FastWAM(torch.nn.Module):
                         f"{missing_v5}. Recreate the dataset loader after "
                         "updating LF-FastWAM."
                     )
+                if (
+                    self.lora_paired_language_control_enabled
+                    and bool(
+                        self.lora_paired_language_control_config.get(
+                            "bidirectional_supervision", False
+                        )
+                    )
+                ):
+                    missing_bidirectional = [
+                        name
+                        for name, value in (
+                            ("pgc_target_context", pgc_target_context),
+                            (
+                                "pgc_target_context_mask",
+                                pgc_target_context_mask,
+                            ),
+                            ("pgc_target_goal_id", pgc_target_goal_id),
+                            (
+                                "pgc_bidirectional_language_valid",
+                                pgc_bidirectional_language_valid,
+                            ),
+                        )
+                        if value is None
+                    ]
+                    if missing_bidirectional:
+                        raise ValueError(
+                            "Bidirectional no-ERAF supervision requires "
+                            "audited source and target language fields: "
+                            f"{missing_bidirectional}."
+                        )
             if (
                 self.policy_guard_version == 8
                 and pgc_is_closed_loop_corrective is None
@@ -11464,6 +11725,26 @@ class FastWAM(torch.nn.Module):
                     "Paired-language current/source text-cache tensor shapes "
                     "must match."
                 )
+            if bool(
+                self.lora_paired_language_control_config.get(
+                    "bidirectional_supervision", False
+                )
+            ):
+                if (
+                    pgc_target_context.ndim != 3
+                    or pgc_target_context_mask.ndim != 2
+                ):
+                    raise ValueError(
+                        "Bidirectional target context/mask must be "
+                        "[B,L,D]/[B,L]."
+                    )
+                if pgc_target_context.shape != context.shape or (
+                    pgc_target_context_mask.shape != context_mask.shape
+                ):
+                    raise ValueError(
+                        "Bidirectional source/current/target text-cache "
+                        "tensor shapes must match."
+                    )
         if self.policy_guard_version == 7:
             if pgc_aux_context.ndim != 3 or pgc_aux_context_mask.ndim != 2:
                 raise ValueError(
@@ -11530,6 +11811,17 @@ class FastWAM(torch.nn.Module):
                 non_blocking=True,
             )
             pgc_source_context_mask = pgc_source_context_mask.to(
+                device=self.device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
+        if pgc_target_context is not None:
+            pgc_target_context = pgc_target_context.to(
+                device=self.device,
+                dtype=self.torch_dtype,
+                non_blocking=True,
+            )
+            pgc_target_context_mask = pgc_target_context_mask.to(
                 device=self.device,
                 dtype=torch.bool,
                 non_blocking=True,
@@ -11640,6 +11932,14 @@ class FastWAM(torch.nn.Module):
                 pgc_source_goal_id = pgc_source_goal_id.expand(batch_size)
             if pgc_source_goal_id.shape != (batch_size,):
                 raise ValueError("`pgc_source_goal_id` must be [B].")
+        if pgc_target_goal_id is not None:
+            pgc_target_goal_id = torch.as_tensor(
+                pgc_target_goal_id, device=self.device, dtype=torch.long
+            )
+            if pgc_target_goal_id.ndim == 0:
+                pgc_target_goal_id = pgc_target_goal_id.expand(batch_size)
+            if pgc_target_goal_id.shape != (batch_size,):
+                raise ValueError("`pgc_target_goal_id` must be [B].")
         if pgc_paired_language_valid is not None:
             pgc_paired_language_valid = torch.as_tensor(
                 pgc_paired_language_valid,
@@ -11652,6 +11952,20 @@ class FastWAM(torch.nn.Module):
                 )
             if pgc_paired_language_valid.shape != (batch_size,):
                 raise ValueError("`pgc_paired_language_valid` must be [B].")
+        if pgc_bidirectional_language_valid is not None:
+            pgc_bidirectional_language_valid = torch.as_tensor(
+                pgc_bidirectional_language_valid,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            if pgc_bidirectional_language_valid.ndim == 0:
+                pgc_bidirectional_language_valid = (
+                    pgc_bidirectional_language_valid.expand(batch_size)
+                )
+            if pgc_bidirectional_language_valid.shape != (batch_size,):
+                raise ValueError(
+                    "`pgc_bidirectional_language_valid` must be [B]."
+                )
         if pgc_completion_phase is not None:
             pgc_completion_phase = torch.as_tensor(
                 pgc_completion_phase,
@@ -11817,6 +12131,14 @@ class FastWAM(torch.nn.Module):
                         proprio=proprio_current,
                     )
                 )
+            if pgc_target_context is not None:
+                pgc_target_context, pgc_target_context_mask = (
+                    self._append_proprio_to_context(
+                        context=pgc_target_context,
+                        context_mask=pgc_target_context_mask,
+                        proprio=proprio_current,
+                    )
+                )
             if pgc_aux_context is not None:
                 pgc_aux_context, pgc_aux_context_mask = (
                     self._append_proprio_to_context(
@@ -11851,6 +12173,12 @@ class FastWAM(torch.nn.Module):
             "pgc_source_context_mask": pgc_source_context_mask,
             "pgc_source_goal_id": pgc_source_goal_id,
             "pgc_paired_language_valid": pgc_paired_language_valid,
+            "pgc_target_context": pgc_target_context,
+            "pgc_target_context_mask": pgc_target_context_mask,
+            "pgc_target_goal_id": pgc_target_goal_id,
+            "pgc_bidirectional_language_valid": (
+                pgc_bidirectional_language_valid
+            ),
             "pgc_completion_phase": pgc_completion_phase,
             "pgc_completion_phase_valid": pgc_completion_phase_valid,
             "pgc_target_object_mask": pgc_target_object_mask,

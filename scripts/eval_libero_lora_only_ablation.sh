@@ -29,7 +29,7 @@ EXPECTED_STEP="${LORA_ONLY_EXPECTED_STEP:-10000}"
 CONDITION="${LORA_ONLY_EVAL_CONDITION:-correct}"
 MANIFEST_PATH="${LORA_ONLY_MANIFEST_PATH:-}"
 STATS_PATH="${STATS_PATH:-${DIFFSYNTH_MODEL_BASE_PATH:-./checkpoints}/fastwam_release/libero_uncond_2cam224_dataset_stats.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$(pwd)/evaluate_results/${SUITE}_lora_only_no_eraf_${CONDITION}_seed${EVAL_SEED}_trials${NUM_TRIALS}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$(pwd)/evaluate_results/${SUITE}_lora_only_no_eraf_bidirectional_${CONDITION}_seed${EVAL_SEED}_trials${NUM_TRIALS}}"
 
 case "${CONDITION}" in
   correct|null|shuffled|counterfactual) ;;
@@ -78,7 +78,11 @@ config = payload.get("lora_config")
 if not isinstance(config, dict):
     raise SystemExit("LoRA-only checkpoint has no LoRA configuration.")
 control = config.get("paired_language_control")
-if not isinstance(control, dict) or control.get("enabled") is not True:
+if (
+    not isinstance(control, dict)
+    or control.get("enabled") is not True
+    or control.get("bidirectional_supervision") is not True
+):
     raise SystemExit("Checkpoint is not the strict paired-language no-ERAF control.")
 if set(config.get("experts", [])) != {"video", "action"}:
     raise SystemExit("Checkpoint does not contain shared Video+Action LoRA.")
@@ -126,6 +130,7 @@ OVERRIDES=(
   model.policy_guard.enabled=false
   model.lora.enabled=false
   model.lora.paired_language_control.enabled=false
+  model.lora.paired_language_control.bidirectional_supervision=false
 )
 if [[ -n "${MANIFEST_PATH}" ]]; then
   OVERRIDES+=("EVALUATION.language_intervention_manifest=${MANIFEST_PATH}")
@@ -136,7 +141,7 @@ echo "  suite=${SUITE} checkpoint=${LORA_ONLY_CHECKPOINT}"
 echo "  condition=${CONDITION} trials=${NUM_TRIALS} seed=${EVAL_SEED}"
 echo "  output=${OUTPUT_ROOT}"
 
-EXP_NAME="lora-only-${CONDITION}" "${PYTHON_BIN}" \
+EXP_NAME="lora-only-bidirectional-${CONDITION}" "${PYTHON_BIN}" \
   experiments/libero/run_libero_manager.py "${OVERRIDES[@]}"
 
 echo "[FastWAM] evaluation complete: ${OUTPUT_ROOT}"

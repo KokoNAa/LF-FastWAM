@@ -96,6 +96,10 @@ train:
   # order. No privileged field is consumed by inference.
   pgc_entity_relation_supervision_required: false
   pgc_entity_relation_sidecar_dirs: []
+  # No-ERAF bidirectional control only. Native rows recover an audited target
+  # language from the already-loaded CF provenance; no action is time-aligned
+  # across divergent native/CF trajectories.
+  pgc_bidirectional_language_supervision_required: false
   # V9: exact native:CF=1:1, original:strict=1:1, with strict conflict
   # categories balanced before the outer mixture is constructed.
   pgc_v9_balanced_sampling: false

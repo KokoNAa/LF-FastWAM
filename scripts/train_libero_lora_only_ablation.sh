@@ -182,13 +182,13 @@ NATIVE_JSON="$(json_array "${NATIVE_DATASET}" "${CLOSED_LOOP_DATASET}")"
 CF_JSON="$(json_array "${HISTORICAL_CF_DATASET}" "${STRICT_CF_DATASET}")"
 SIDECAR_JSON="$(json_array "${NATIVE_SIDECAR}" "${CLOSED_LOOP_SIDECAR}" "${HISTORICAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}")"
 
-RUN_TAG="${RUN_TAG:-${SUITE}-lora-only-no-eraf-10k-seed${TRAIN_SEED}-v1}"
+RUN_TAG="${RUN_TAG:-${SUITE}-lora-only-no-eraf-bidirectional-10k-seed${TRAIN_SEED}-v2}"
 echo "[FastWAM] strict LIBERO LoRA-only / no-ERAF ablation"
 echo "  suite=${SUITE} steps=${MAX_STEPS} seed=${TRAIN_SEED}"
 echo "  base=${BASE_CHECKPOINT}"
 echo "  mixture=offline_native:closed_loop_native:historical_cf:strict_cf 1:1:1:1"
 echo "  lora=video+action rank16 alpha16 dropout0.05; extra_trainables=none"
-echo "  objectives=world_flow+world_language_rank+native_action+counterfactual_action+action_language_rank+lora_reg"
+echo "  objectives=source+target world/action positives + bidirectional same-row language ranks + lora_reg"
 echo "  removed=ERAF+context_injector+completion_memory+ERAF_preservation+policy_guard"
 echo "  optimizer=AdamW lr=${LEARNING_RATE} cosine weight_decay=1e-2 grad_accum=${GRADIENT_ACCUMULATION_STEPS}"
 
@@ -201,6 +201,7 @@ RUN_ID="lora-only-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE
   data.train.pgc_counterfactual_oversample_factor=1 \
   data.train.pgc_balance_native_counterfactual=true \
   data.train.pgc_entity_relation_supervision_required=true \
+  data.train.pgc_bidirectional_language_supervision_required=true \
   "data.train.pgc_entity_relation_sidecar_dirs=${SIDECAR_JSON}" \
   data.train.pgc_v9_balanced_sampling=true \
   data.train.pgc_v9_structured_role_sampling=false \
@@ -231,6 +232,7 @@ RUN_ID="lora-only-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE
   'model.lora.experts=[video,action]' \
   'model.lora.extra_trainable_patterns=[]' \
   model.lora.paired_language_control.enabled=true \
+  model.lora.paired_language_control.bidirectional_supervision=true \
   model.lora.paired_language_control.world_language_weight=0.10 \
   model.lora.paired_language_control.world_language_margin=0.01 \
   model.lora.paired_language_control.native_action_weight=1.0 \

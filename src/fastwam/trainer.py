@@ -110,6 +110,16 @@ class Wan22Trainer:
                 "pgc_v9_balanced_sampling": True,
                 "pgc_v9_phase_safe_memory": True,
             }
+            if bool(
+                getattr(
+                    self.model,
+                    "lora_paired_language_control_config",
+                    {},
+                ).get("bidirectional_supervision", False)
+            ):
+                required_dataset_contracts[
+                    "pgc_bidirectional_language_supervision_required"
+                ] = True
             mismatches = {
                 name: bool(getattr(self.train_dataset, name, False))
                 for name, expected in required_dataset_contracts.items()

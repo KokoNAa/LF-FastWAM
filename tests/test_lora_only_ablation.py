@@ -15,6 +15,7 @@ CONTROL_CONFIG = {
     "extra_trainable_patterns": [],
     "paired_language_control": {
         "enabled": True,
+        "bidirectional_supervision": True,
         "world_language_weight": 0.10,
         "world_language_margin": 0.01,
         "native_action_weight": 1.0,
@@ -85,6 +86,11 @@ class LoRAOnlyAblationTest(unittest.TestCase):
             ),
             "pgc_source_context": torch.randn(batch_size, 4, 10),
             "pgc_source_context_mask": context_mask.clone(),
+            "pgc_target_context": torch.randn(batch_size, 4, 10),
+            "pgc_target_context_mask": context_mask.clone(),
+            "pgc_bidirectional_language_valid": torch.ones(
+                batch_size, dtype=torch.bool
+            ),
         }
         loss, metrics = model._training_loss_lora_paired_language_control(
             inputs=inputs,
@@ -94,6 +100,18 @@ class LoRAOnlyAblationTest(unittest.TestCase):
         self.assertEqual(metrics["lora_only_eraf_enabled"], 0.0)
         self.assertEqual(metrics["lora_only_policy_guard_enabled"], 0.0)
         self.assertEqual(metrics["loss_pgc_v9_eraf"], 0.0)
+        self.assertEqual(
+            metrics["lora_only_bidirectional_supervision_enabled"], 1.0
+        )
+        for name in (
+            "loss_lora_only_source_action_flow",
+            "loss_lora_only_target_action_flow",
+            "loss_lora_only_source_world_language_ranking",
+            "loss_lora_only_target_world_language_ranking",
+            "loss_lora_only_source_action_language_ranking",
+            "loss_lora_only_target_action_language_ranking",
+        ):
+            self.assertIn(name, metrics)
 
         loss.backward()
         gradient_names = {
@@ -107,6 +125,25 @@ class LoRAOnlyAblationTest(unittest.TestCase):
             any(name.startswith("policy_guard_") for name in gradient_names)
         )
 
+    def test_bidirectional_context_selection_reverses_by_row(self):
+        source = torch.tensor([[[1.0]], [[2.0]]])
+        target = torch.tensor([[[10.0]], [[20.0]]])
+        source_mask = torch.tensor([[True], [False]])
+        target_mask = torch.tensor([[False], [True]])
+        correct, correct_mask, wrong, wrong_mask = (
+            tiny_lora_only_control()._select_bidirectional_language_contexts(
+                is_counterfactual=torch.tensor([False, True]),
+                source_context=source,
+                source_context_mask=source_mask,
+                target_context=target,
+                target_context_mask=target_mask,
+            )
+        )
+        self.assertTrue(torch.equal(correct[:, 0, 0], torch.tensor([1.0, 20.0])))
+        self.assertTrue(torch.equal(wrong[:, 0, 0], torch.tensor([10.0, 2.0])))
+        self.assertTrue(torch.equal(correct_mask[:, 0], torch.tensor([True, True])))
+        self.assertTrue(torch.equal(wrong_mask[:, 0], torch.tensor([False, False])))
+
     def test_checkpoint_persists_strict_control_contract(self):
         model = tiny_lora_only_control()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -119,6 +156,11 @@ class LoRAOnlyAblationTest(unittest.TestCase):
         self.assertEqual(payload["step"], 10000)
         self.assertTrue(
             payload["lora_config"]["paired_language_control"]["enabled"]
+        )
+        self.assertTrue(
+            payload["lora_config"]["paired_language_control"][
+                "bidirectional_supervision"
+            ]
         )
         self.assertEqual(payload["lora_config"]["experts"], ["video", "action"])
         self.assertEqual(

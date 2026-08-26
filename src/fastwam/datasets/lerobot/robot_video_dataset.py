@@ -25,6 +25,7 @@ from ..pgc_libero import (
     PGC_ACTION_CONVENTION_LIBERO_ENV,
     PGC_ENTITY_RELATION_ARRAY_NAMES,
     array_sha256,
+    build_pgc_bidirectional_language_pair_index,
     build_pgc_pair_balanced_sample_indices,
     classify_strict_conflict,
     load_pgc_closed_loop_corrective_index,
@@ -416,6 +417,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_completion_phase_supervision_required: bool = False,
         pgc_entity_relation_supervision_required: bool = False,
         pgc_entity_relation_sidecar_dirs: Optional[list[str]] = None,
+        pgc_bidirectional_language_supervision_required: bool = False,
         pgc_v9_balanced_sampling: bool = False,
         pgc_pair_balanced_sampling: bool = False,
         pgc_v9_structured_role_sampling: bool = False,
@@ -481,6 +483,32 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             + offset: (load_pgc_episode_language_pairs(dataset_dir))
             for offset, dataset_dir in enumerate(self.pgc_counterfactual_dataset_dirs)
         }
+        self.pgc_bidirectional_language_supervision_required = bool(
+            pgc_bidirectional_language_supervision_required
+        )
+        if (
+            self.pgc_bidirectional_language_supervision_required
+            and not self.pgc_has_counterfactual_data
+        ):
+            raise ValueError(
+                "Bidirectional language supervision requires audited "
+                "counterfactual datasets."
+            )
+        self.pgc_bidirectional_language_pairs_by_source = (
+            build_pgc_bidirectional_language_pair_index(
+                self.pgc_episode_language_pairs
+            )
+            if self.pgc_episode_language_pairs
+            else {}
+        )
+        if (
+            self.pgc_bidirectional_language_supervision_required
+            and not self.pgc_bidirectional_language_pairs_by_source
+        ):
+            raise ValueError(
+                "Bidirectional language supervision found no audited "
+                "source/target instruction pairs."
+            )
         self.pgc_closed_loop_corrective_indices: dict[
             int, dict[int, dict[str, object]]
         ] = {
@@ -1966,7 +1994,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             + self.pgc_offline_counterfactual_dataset_count
         )
         pgc_source_task = str(task)
+        pgc_target_task = str(task)
         pgc_pair_valid = False
+        pgc_bidirectional_language_valid = False
         pgc_completion_phase = 0
         pgc_completion_phase_valid = False
         episode_index = (
@@ -2008,7 +2038,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     f"{task!r} != {recorded_counterfactual!r}."
                 )
             pgc_source_task = str(pair["source_instruction"]).strip()
+            pgc_target_task = recorded_counterfactual
             pgc_pair_valid = True
+            pgc_bidirectional_language_valid = True
             if pgc_is_closed_loop_corrective:
                 try:
                     corrective_record = self.pgc_closed_loop_corrective_indices[
@@ -2051,6 +2083,35 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 ):
                     pgc_completion_phase = 2
                 pgc_completion_phase_valid = True
+        elif self.pgc_bidirectional_language_supervision_required:
+            source_key = str(task).strip().casefold()
+            candidates = self.pgc_bidirectional_language_pairs_by_source.get(
+                source_key
+            )
+            if not candidates:
+                raise KeyError(
+                    "No audited counterfactual language is available for "
+                    f"native instruction {task!r}; bidirectional supervision "
+                    "cannot silently fall back to an unrelated task."
+                )
+            selection_key = (
+                max(episode_index, 0) * 1_000_003
+                + max(frame_index, 0)
+                + dataset_index * 9_176
+            )
+            native_pair = candidates[selection_key % len(candidates)]
+            pgc_source_task = str(
+                native_pair["source_instruction"]
+            ).strip()
+            pgc_target_task = str(
+                native_pair["counterfactual_instruction"]
+            ).strip()
+            if pgc_source_task.casefold() != source_key:
+                raise ValueError(
+                    "Native instruction and audited bidirectional source do "
+                    f"not match: {task!r} != {pgc_source_task!r}."
+                )
+            pgc_bidirectional_language_valid = True
 
         pgc_eraf_sample: dict[str, torch.Tensor] = {}
         if self.pgc_entity_relation_supervision_required:
@@ -2075,7 +2136,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         context[~context_mask] = 0.0
         context_mask = torch.ones_like(context_mask)
 
-        if pgc_pair_valid:
+        if pgc_source_task.strip().casefold() != str(task).strip().casefold():
             pgc_source_prompt = DEFAULT_PROMPT.format(task=pgc_source_task)
             pgc_source_context, pgc_source_context_mask = self._get_cached_text_context(
                 pgc_source_prompt
@@ -2083,11 +2144,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             pgc_source_context[~pgc_source_context_mask] = 0.0
             pgc_source_context_mask = torch.ones_like(pgc_source_context_mask)
         else:
-            # Keep the batch schema uniform. Native rows do not use this copy;
-            # their ordinary zero-residual objective remains authoritative.
+            # Keep the canonical source branch explicit for native rows.
             pgc_source_prompt = instruction
             pgc_source_context = context.clone()
             pgc_source_context_mask = context_mask.clone()
+
+        if pgc_target_task.strip().casefold() != str(task).strip().casefold():
+            pgc_target_prompt = DEFAULT_PROMPT.format(task=pgc_target_task)
+            pgc_target_context, pgc_target_context_mask = (
+                self._get_cached_text_context(pgc_target_prompt)
+            )
+            pgc_target_context[~pgc_target_context_mask] = 0.0
+            pgc_target_context_mask = torch.ones_like(pgc_target_context_mask)
+        else:
+            pgc_target_prompt = instruction
+            pgc_target_context = context.clone()
+            pgc_target_context_mask = context_mask.clone()
 
         mask_height, mask_width = map(int, self.pgc_target_mask_shape)
         empty_mask = torch.zeros((mask_height, mask_width), dtype=torch.bool)
@@ -2202,6 +2274,20 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "pgc_aux_goal_id": torch.tensor(pgc_aux_goal_id, dtype=torch.long),
             "pgc_dataset_index": torch.tensor(dataset_index, dtype=torch.long),
         }
+        if self.pgc_bidirectional_language_supervision_required:
+            data.update(
+                {
+                    "pgc_target_prompt": pgc_target_prompt,
+                    "pgc_target_context": pgc_target_context,
+                    "pgc_target_context_mask": pgc_target_context_mask,
+                    "pgc_target_goal_id": torch.tensor(
+                        stable_instruction_id(pgc_target_task), dtype=torch.long
+                    ),
+                    "pgc_bidirectional_language_valid": torch.tensor(
+                        pgc_bidirectional_language_valid, dtype=torch.bool
+                    ),
+                }
+            )
         data.update(pgc_eraf_sample)
         if negative_context is not None:
             data.update(
