@@ -193,3 +193,6 @@ python scripts/summarize_robotwin_cis.py \
   --condition counterfactual \
   --require-complete
 ```
+
+Validated baseline and future method comparisons are recorded in
+[`ROBOTWIN_CIS_RESULTS.md`](ROBOTWIN_CIS_RESULTS.md).
