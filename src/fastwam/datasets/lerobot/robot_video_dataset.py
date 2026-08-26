@@ -25,6 +25,7 @@ from ..pgc_libero import (
     PGC_ACTION_CONVENTION_LIBERO_ENV,
     PGC_ENTITY_RELATION_ARRAY_NAMES,
     array_sha256,
+    build_pgc_pair_balanced_sample_indices,
     classify_strict_conflict,
     load_pgc_closed_loop_corrective_index,
     load_pgc_completion_phase_index,
@@ -416,6 +417,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_entity_relation_supervision_required: bool = False,
         pgc_entity_relation_sidecar_dirs: Optional[list[str]] = None,
         pgc_v9_balanced_sampling: bool = False,
+        pgc_pair_balanced_sampling: bool = False,
         pgc_v9_structured_role_sampling: bool = False,
         pgc_v9_hard_role_curriculum: bool = False,
         pgc_v9_hard_role_index_path: Optional[str] = None,
@@ -500,7 +502,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.pgc_entity_relation_supervision_required = bool(
             pgc_entity_relation_supervision_required
         )
+        self.pgc_balance_native_counterfactual = bool(
+            pgc_balance_native_counterfactual
+        )
         self.pgc_v9_balanced_sampling = bool(pgc_v9_balanced_sampling)
+        self.pgc_pair_balanced_sampling = bool(pgc_pair_balanced_sampling)
         self.pgc_v9_structured_role_sampling = bool(pgc_v9_structured_role_sampling)
         self.pgc_v9_hard_role_curriculum = bool(pgc_v9_hard_role_curriculum)
         self.pgc_v9_hard_role_index_path = (
@@ -557,6 +563,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 "PGC hard-role curriculum requires balanced and structured "
                 "V9 sampling."
             )
+        if self.pgc_pair_balanced_sampling:
+            if self.pgc_v9_balanced_sampling or self.pgc_v9_closed_loop_grounding:
+                raise ValueError(
+                    "PGC pair-balanced sampling is mutually exclusive with "
+                    "LIBERO strict/closed-loop V9 sampling."
+                )
+            if not self.pgc_balance_native_counterfactual:
+                raise ValueError(
+                    "PGC pair-balanced sampling requires "
+                    "pgc_balance_native_counterfactual=true."
+                )
+            if self.pgc_counterfactual_oversample_factor != 1:
+                raise ValueError(
+                    "PGC pair-balanced sampling requires counterfactual "
+                    "oversample factor 1."
+                )
         if self.pgc_v9_hard_role_curriculum and not self.pgc_v9_hard_role_index_path:
             raise ValueError(
                 "PGC hard-role curriculum requires an audited teacher index."
@@ -692,7 +714,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             tuple[int, int], dict[str, np.ndarray]
         ] = OrderedDict()
         self._pgc_entity_relation_cache_size = 2
-        self.pgc_balance_native_counterfactual = bool(pgc_balance_native_counterfactual)
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=combined_dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
@@ -746,7 +767,58 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             int(dataset.num_frames) for dataset in underlying[:offline_dataset_end]
         )
         total_frame_count = sum(int(dataset.num_frames) for dataset in underlying)
-        if self.pgc_v9_balanced_sampling:
+        if self.pgc_pair_balanced_sampling:
+            if not self.pgc_entity_relation_supervision_required:
+                raise ValueError(
+                    "PGC pair-balanced sampling requires audited ERAF sidecars."
+                )
+            if self.pgc_native_dataset_count != self.pgc_offline_counterfactual_dataset_count:
+                raise ValueError(
+                    "PGC pair-balanced sampling requires one native and one "
+                    "counterfactual dataset per direction."
+                )
+            offset = 0
+            frame_groups: list[list[int]] = []
+            pair_ids_by_kind = {"native": [], "counterfactual": []}
+            for dataset_index, dataset in enumerate(underlying):
+                count = int(dataset.num_frames)
+                frame_groups.append(list(range(offset, offset + count)))
+                offset += count
+                index = self.pgc_entity_relation_indices[dataset_index]
+                pair_ids = {
+                    str(record.get("pair_id", "")).strip()
+                    for record in index["episodes_by_index"].values()
+                }
+                if len(pair_ids) != 1 or not next(iter(pair_ids)):
+                    raise ValueError(
+                        "Every PGC pair-balanced dataset must contain exactly "
+                        f"one non-empty pair_id; dataset_index={dataset_index}."
+                    )
+                kind = (
+                    "native"
+                    if dataset_index < self.pgc_native_dataset_count
+                    else "counterfactual"
+                )
+                if str(index.get("dataset_kind")) != kind:
+                    raise ValueError(
+                        "PGC pair-balanced dataset/sidecar kind mismatch at "
+                        f"index {dataset_index}."
+                    )
+                pair_ids_by_kind[kind].append(next(iter(pair_ids)))
+            if len(set(pair_ids_by_kind["native"])) != len(
+                pair_ids_by_kind["native"]
+            ):
+                raise ValueError("PGC pair-balanced native pair IDs must be unique.")
+            if set(pair_ids_by_kind["native"]) != set(
+                pair_ids_by_kind["counterfactual"]
+            ):
+                raise ValueError(
+                    "PGC pair-balanced native/counterfactual direction sets differ."
+                )
+            self._sample_indices = build_pgc_pair_balanced_sample_indices(
+                frame_groups
+            )
+        elif self.pgc_v9_balanced_sampling:
             if not self.pgc_entity_relation_supervision_required:
                 raise ValueError(
                     "PGC v9 balanced sampling requires audited ERAF sidecars."

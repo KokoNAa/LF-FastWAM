@@ -1829,14 +1829,17 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     "`verifier_action_mse_temperature` must be positive."
                 )
-            if self.policy_guard_gate_mode not in {
-                "guarded",
-                "base",
-                "counterfactual",
-            }:
+            allowed_gate_modes = {"guarded", "base", "counterfactual"}
+            if (
+                self.policy_guard_version == 9
+                and self.policy_guard_eraf_grounding_objective_version >= 26
+            ):
+                allowed_gate_modes.add("eraf_only")
+            if self.policy_guard_gate_mode not in allowed_gate_modes:
                 raise ValueError(
-                    "`policy_guard.gate_mode` must be guarded, base, or "
-                    "counterfactual."
+                    "Unsupported `policy_guard.gate_mode` for this PGC "
+                    f"objective: {self.policy_guard_gate_mode!r}; "
+                    f"allowed={sorted(allowed_gate_modes)}."
                 )
 
             num_action_queries = int(

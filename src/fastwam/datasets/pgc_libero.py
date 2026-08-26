@@ -88,6 +88,30 @@ LIBERO_SUITES = (
 PGC_STATE_TRANSFER_MODES = ("flat_exact", "named_joint_remap")
 
 
+def build_pgc_pair_balanced_sample_indices(
+    dataset_index_groups: list[list[int]],
+) -> list[int]:
+    """Interleave matched native/CF direction datasets with equal weight."""
+    groups = [[int(index) for index in group] for group in dataset_index_groups]
+    if not groups or any(not group for group in groups):
+        raise ValueError("PGC pair-balanced sampling requires non-empty datasets.")
+    flattened = [index for group in groups for index in group]
+    if len(set(flattened)) != len(flattened):
+        raise ValueError("PGC pair-balanced dataset frame ranges must be disjoint.")
+    target_count = max(len(group) for group in groups)
+
+    def repeat_to(group: list[int]) -> list[int]:
+        repeats = (target_count + len(group) - 1) // len(group)
+        return (group * repeats)[:target_count]
+
+    balanced = [repeat_to(group) for group in groups]
+    return [
+        balanced[group_index][position]
+        for position in range(target_count)
+        for group_index in range(len(balanced))
+    ]
+
+
 def pgc_entity_relation_workspace_bounds(
     indices: Mapping[int, Mapping[str, Any]],
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:

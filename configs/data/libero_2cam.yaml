@@ -99,6 +99,7 @@ train:
   # V9: exact native:CF=1:1, original:strict=1:1, with strict conflict
   # categories balanced before the outer mixture is constructed.
   pgc_v9_balanced_sampling: false
+  pgc_pair_balanced_sampling: false
   pgc_v9_structured_role_sampling: false
   # V9.6/V9.7: an audited V9.3 role-failure index drives equal native-hard,
   # native-easy, historical-CF, and strict-CF optimizer-window sampling.

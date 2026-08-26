@@ -52,6 +52,29 @@ The command is resumable only after a complete dataset+sidecar pair exists. It
 rejects partial output and verifies that native/counterfactual initial-state
 hash sequences match within each direction pair.
 
+## Training gate
+
+RoboTwin cannot warm-start a LIBERO PGC checkpoint: the camera geometry and
+action/proprio dimensions differ. Start the staged port from the released
+RoboTwin Base and first train fresh three-camera ERAF grounding (V9.1). The
+launcher validates the prepared matrix again, orders both native datasets
+before both counterfactual datasets, balances all four direction-condition
+groups exactly, and prepares the two required text embeddings when absent:
+
+```bash
+python scripts/train_pgc_robotwin_stage.py grounding \
+  --gpus 4 \
+  --base-checkpoint checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt \
+  --prepared-manifest data/pgc_robotwin_lerobot/pgc_robotwin_prepared.json \
+  --steps 2 \
+  --run-tag pgc-robotwin-v91-grounding-smoke2-seed42
+```
+
+The two-step run is a forward/backward integration gate, not a result
+checkpoint. Do not label it V9.26. V9.26 shared Video/Action Expert LoRA is
+valid only after the RoboTwin ERAF grounding/action stages have produced a
+compatible initialization checkpoint.
+
 ## Matched CIS evaluation
 
 The evaluator reconstructs the exact checkpoint architecture and rejects a

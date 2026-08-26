@@ -46,6 +46,9 @@ data:
     pgc_counterfactual_dataset_dirs: []
     pgc_counterfactual_oversample_factor: 1
     pgc_balance_native_counterfactual: true
+    # Equalize both directions and both language/action conditions at frame
+    # level; expert trajectories can have different lengths.
+    pgc_pair_balanced_sampling: true
     pgc_entity_relation_supervision_required: false
     pgc_entity_relation_sidecar_dirs: []
 

@@ -19,7 +19,11 @@ from scripts.inspect_pgc_checkpoint import hydra_overrides, validate_payload
 from scripts.build_pgc_robotwin_entity_relations import build_sidecar
 from scripts.convert_pgc_robotwin_to_lerobot import _decode_rgb, robotwin_lerobot_features
 from scripts.prepare_pgc_robotwin_datasets import dataset_specs
-from fastwam.datasets.pgc_libero import load_pgc_entity_relation_index
+from scripts.train_pgc_robotwin_stage import build_overrides
+from fastwam.datasets.pgc_libero import (
+    build_pgc_pair_balanced_sample_indices,
+    load_pgc_entity_relation_index,
+)
 
 
 def _checkpoint_payload():
@@ -85,6 +89,47 @@ class RoboTwinPGCCheckpointTest(unittest.TestCase):
 
 
 class RoboTwinPGCDataContractTest(unittest.TestCase):
+    def test_direction_condition_sampling_is_exactly_balanced(self):
+        groups = [[0, 1], [2, 3, 4], [5], [6, 7]]
+        sample_indices = build_pgc_pair_balanced_sample_indices(groups)
+        self.assertEqual(len(sample_indices), 12)
+        for group in groups:
+            self.assertEqual(
+                sum(index in group for index in sample_indices),
+                3,
+            )
+        self.assertEqual(sample_indices[:4], [0, 2, 5, 6])
+
+    def test_grounding_launch_uses_native_first_and_no_libero_strict_sampler(self):
+        matrix = {
+            "dataset_dirs": ["/data/left/native", "/data/right/native"],
+            "counterfactual_dirs": ["/data/left/cf", "/data/right/cf"],
+            "sidecar_dirs": ["/side/ln", "/side/rn", "/side/lc", "/side/rc"],
+        }
+        overrides = build_overrides(
+            matrix=matrix,
+            base_checkpoint=Path("/checkpoint/base.pt"),
+            seed=42,
+            steps=2,
+            stats_path=None,
+            cache_dir=Path("/cache"),
+        )
+        self.assertIn("data.train.pgc_pair_balanced_sampling=true", overrides)
+        self.assertIn("data.train.pgc_v9_balanced_sampling=false", overrides)
+        self.assertIn(
+            "model.policy_guard.entity_relation_grounding.grounding_objective_version=2",
+            overrides,
+        )
+        sidecar_override = next(
+            value
+            for value in overrides
+            if value.startswith("data.train.pgc_entity_relation_sidecar_dirs=")
+        )
+        self.assertEqual(
+            json.loads(sidecar_override.split("=", 1)[1]),
+            matrix["sidecar_dirs"],
+        )
+
     def test_prepared_matrix_contains_both_kinds_for_both_directions(self):
         specs = dataset_specs(
             raw_root=Path("/raw"),

@@ -59,6 +59,11 @@ train:
       - _target_: torchvision.transforms.Resize
         size: [240, 320]
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin
+  # PGC extensions remain inert for ordinary RoboTwin training. Task-specific
+  # configs/launchers enable them with audited paired datasets.
+  pgc_v9_balanced_sampling: false
+  pgc_v9_structured_role_sampling: false
+  pgc_pair_balanced_sampling: false
   context_len: 128
 
 val:
