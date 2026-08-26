@@ -1,0 +1,72 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam
+  - _self_
+
+# Strict control for the suite-specific 10k ERAF+LoRA runs. The launcher
+# supplies the exact same offline-native, closed-loop-native, historical-CF,
+# and strict-CF datasets and their audited 1:1:1:1 sample plan. ERAF sidecar
+# labels are loaded only to reproduce that plan; this model never constructs
+# or consumes ERAF, completion memory, policy-guard, or context-injector state.
+batch_size: 1
+num_workers: 2
+gradient_accumulation_steps: 4
+
+model:
+  mot_checkpoint_mixed_attn: true
+  action_dit_config:
+    use_latent_action_queries: false
+  langforce_mvp:
+    enabled: false
+    enable_prior: false
+    enable_posterior_advantage: false
+  transition_contract:
+    enabled: false
+  policy_guard:
+    enabled: false
+  lora:
+    enabled: true
+    rank: 16
+    alpha: 16
+    dropout: 0.05
+    experts: [video, action]
+    extra_trainable_patterns: []
+    paired_language_control:
+      enabled: true
+      world_language_weight: 0.10
+      world_language_margin: 0.01
+      native_action_weight: 1.0
+      counterfactual_action_weight: 1.0
+      action_language_weight: 1.0
+      action_language_margin: 0.01
+      regularization_weight: 1.0e-6
+
+data:
+  train:
+    pretrained_norm_stats: ./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json
+    pgc_counterfactual_dataset_dirs: []
+    pgc_counterfactual_oversample_factor: 1
+    pgc_balance_native_counterfactual: true
+    pgc_entity_relation_supervision_required: true
+    pgc_entity_relation_sidecar_dirs: []
+    pgc_v9_balanced_sampling: true
+    pgc_v9_structured_role_sampling: false
+    pgc_v9_hard_role_curriculum: false
+    pgc_v9_hard_role_index_path: null
+    pgc_v9_closed_loop_rebinding: false
+    pgc_v9_phase_safe_memory: true
+    pgc_v9_closed_loop_native_dataset_count: 1
+
+learning_rate: 5.0e-6
+lr_scheduler_type: cosine
+weight_decay: 1.0e-2
+max_grad_norm: 1.0
+num_epochs: 1
+max_steps: 10000
+log_every: 10
+save_every: 250
+eval_every: 0
+save_training_state: false
+resume: null

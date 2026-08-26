@@ -2293,6 +2293,10 @@ class FastWAM(torch.nn.Module):
         self.lora_config = normalize_lora_config(None)
         self.lora_enabled = False
         self.lora_base_checkpoint: Optional[str] = None
+        self.lora_paired_language_control_config = dict(
+            self.lora_config["paired_language_control"]
+        )
+        self.lora_paired_language_control_enabled = False
 
         self.to(self.device)
 
@@ -2407,11 +2411,22 @@ class FastWAM(torch.nn.Module):
 
     def configure_lora(self, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         normalized = normalize_lora_config(config)
+        paired_language_control = dict(
+            normalized["paired_language_control"]
+        )
+        paired_language_control_enabled = bool(
+            paired_language_control["enabled"]
+        )
         eraf_shared_expert_lora = bool(
             self.policy_guard_enabled
             and self.policy_guard_version == 9
             and self.policy_guard_eraf_grounding_objective_version >= 26
         )
+        if paired_language_control_enabled and self.policy_guard_enabled:
+            raise ValueError(
+                "The paired-language LoRA control is the no-ERAF ablation "
+                "and requires `policy_guard.enabled=false`."
+            )
         if self.policy_guard_enabled and normalized["enabled"]:
             if self.policy_guard_version >= 3 and not eraf_shared_expert_lora:
                 raise ValueError(
@@ -2441,10 +2456,41 @@ class FastWAM(torch.nn.Module):
                         else "."
                     )
                 )
+        if paired_language_control_enabled:
+            if not normalized["enabled"]:
+                raise ValueError(
+                    "The paired-language LoRA control requires LoRA to be enabled."
+                )
+            if set(normalized["experts"]) != {"video", "action"}:
+                raise ValueError(
+                    "The paired-language LoRA control requires shared Video and "
+                    "Action Expert LoRA (`lora.experts=[video,action]`)."
+                )
+            if normalized["extra_trainable_patterns"]:
+                raise ValueError(
+                    "The paired-language LoRA control permits only LoRA A/B "
+                    "parameters; set `lora.extra_trainable_patterns=[]`."
+                )
+            if self.langforce_mvp_enabled or self.transition_contract_enabled:
+                raise ValueError(
+                    "The paired-language LoRA control requires LangForce MVP and "
+                    "the Transition Contract to be disabled."
+                )
+            if bool(
+                getattr(self.action_expert, "use_latent_action_queries", False)
+            ):
+                raise ValueError(
+                    "The paired-language LoRA control requires the released "
+                    "query-free Action Expert path."
+                )
         if not normalized["enabled"]:
             if self.lora_enabled:
                 raise ValueError("Cannot disable LoRA after adapters have been injected.")
             self.lora_config = normalized
+            self.lora_paired_language_control_config = (
+                paired_language_control
+            )
+            self.lora_paired_language_control_enabled = False
             return {"enabled": False, "modules": [], "parameters": 0}
 
         if self.lora_enabled:
@@ -2455,6 +2501,7 @@ class FastWAM(torch.nn.Module):
                 "experts",
                 "target_modules",
                 "extra_trainable_patterns",
+                "paired_language_control",
             )
             mismatch = {
                 key: (self.lora_config.get(key), normalized.get(key))
@@ -2498,6 +2545,10 @@ class FastWAM(torch.nn.Module):
 
         self.lora_config = normalized
         self.lora_enabled = True
+        self.lora_paired_language_control_config = paired_language_control
+        self.lora_paired_language_control_enabled = (
+            paired_language_control_enabled
+        )
         report = self.lora_report()
         logger.info(
             "Injected LoRA: experts=%s rank=%d alpha=%.2f dropout=%.3f "
@@ -4033,6 +4084,49 @@ class FastWAM(torch.nn.Module):
                 action_pre.get("policy_guard_residual_metrics", {})
             )
         return output
+
+    def _forward_shared_action_from_cache(
+        self,
+        *,
+        action_tokens: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        video_seq_len: int,
+        video_tokens_per_frame: int,
+    ) -> torch.Tensor:
+        """Run the released query-free Action Expert with a prefetched video."""
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=action_tokens,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+            use_queries=False,
+        )
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=int(action_pre["tokens"].shape[1]),
+            video_tokens_per_frame=video_tokens_per_frame,
+            device=action_pre["tokens"].device,
+            num_queries=0,
+            action_reads_raw_video=True,
+            queries_read_raw_video=False,
+        )
+        output_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+            action_expert=self.action_expert,
+        )
+        return self.action_expert.post_dit(output_tokens, action_pre)
 
     def _policy_guard_clean_action_from_velocity(
         self,
@@ -7846,6 +7940,352 @@ class FastWAM(torch.nn.Module):
         )
         return total, detached
 
+    def _training_loss_lora_paired_language_control(
+        self,
+        *,
+        inputs: dict[str, Any],
+        full_context_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Strict shared-Expert LoRA control with no ERAF path.
+
+        This retains the V9.26 four-way world/action and paired-language
+        objectives while replacing ERAF-conditioned action denoising with the
+        released Action Expert's ordinary language context. No policy-guard,
+        ERAF, completion-memory, context-injector, or ERAF-preservation tensor
+        participates in the forward or loss.
+        """
+        if not (
+            self.lora_paired_language_control_enabled
+            and self.lora_enabled
+            and not self.policy_guard_enabled
+        ):
+            raise RuntimeError(
+                "The no-ERAF paired-language control requires shared Expert "
+                "LoRA with `policy_guard.enabled=false`."
+            )
+
+        action = inputs["action"]
+        action_is_pad = inputs["action_is_pad"]
+        image_is_pad = inputs["image_is_pad"]
+        is_counterfactual = inputs["pgc_is_counterfactual"]
+        direct_action_valid = inputs["pgc_direct_action_valid"]
+        paired_language_valid = inputs["pgc_paired_language_valid"]
+        source_context = inputs["pgc_source_context"]
+        source_context_mask = inputs["pgc_source_context_mask"]
+        if any(
+            value is None
+            for value in (
+                is_counterfactual,
+                direct_action_valid,
+                paired_language_valid,
+                source_context,
+                source_context_mask,
+            )
+        ):
+            raise ValueError(
+                "The no-ERAF paired-language control requires four-way "
+                "provenance and same-state source language."
+            )
+
+        batch_size = int(action.shape[0])
+        input_latents = inputs["input_latents"]
+        noise_video = torch.randn_like(input_latents)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=input_latents.device,
+            dtype=input_latents.dtype,
+        )
+        noisy_video = self.train_video_scheduler.add_noise(
+            input_latents, noise_video, timestep_video
+        )
+        target_video = self.train_video_scheduler.training_target(
+            input_latents, noise_video, timestep_video
+        )
+        if inputs["first_frame_latents"] is not None:
+            noisy_video[:, :, 0:1] = inputs["first_frame_latents"]
+
+        video_pre = self.video_expert.pre_dit(
+            x=noisy_video,
+            timestep=timestep_video,
+            context=inputs["context"],
+            context_mask=full_context_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=inputs[
+                "fuse_vae_embedding_in_latents"
+            ],
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        video_tokens_per_frame = int(
+            video_pre["meta"]["tokens_per_frame"]
+        )
+        video_attention_mask = self.video_expert.build_video_to_video_mask(
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+            device=video_pre["tokens"].device,
+        )
+        prefill_result = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=video_attention_mask,
+            return_final_hidden=True,
+        )
+        if not isinstance(prefill_result, tuple):
+            raise RuntimeError(
+                "The no-ERAF LoRA control Video prefill returned no hidden state."
+            )
+        video_kv_cache, final_video_hidden = prefill_result
+        pred_video = self.video_expert.post_dit(
+            final_video_hidden, video_pre
+        )
+
+        include_initial_video_step = inputs["first_frame_latents"] is None
+        target_video_for_loss = target_video
+        if not include_initial_video_step:
+            pred_video = pred_video[:, :, 1:]
+            target_video_for_loss = target_video_for_loss[:, :, 1:]
+        correct_video_error = self._compute_video_loss_per_sample(
+            pred_video=pred_video,
+            target_video=target_video_for_loss,
+            image_is_pad=image_is_pad,
+            include_initial_video_step=include_initial_video_step,
+        )
+        video_weight = self.train_video_scheduler.training_weight(
+            timestep_video
+        ).to(
+            device=correct_video_error.device,
+            dtype=correct_video_error.dtype,
+        )
+        if video_weight.ndim == 0:
+            video_weight = video_weight.expand(batch_size)
+        else:
+            video_weight = video_weight.reshape(batch_size)
+        world_flow_loss = (correct_video_error * video_weight).mean()
+
+        wrong_video_pre = self.video_expert.pre_dit(
+            x=noisy_video,
+            timestep=timestep_video,
+            context=source_context,
+            context_mask=source_context_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=inputs[
+                "fuse_vae_embedding_in_latents"
+            ],
+        )
+        wrong_prefill_result = self.mot.prefill_video_cache(
+            video_tokens=wrong_video_pre["tokens"],
+            video_freqs=wrong_video_pre["freqs"],
+            video_t_mod=wrong_video_pre["t_mod"],
+            video_context_payload={
+                "context": wrong_video_pre["context"],
+                "mask": wrong_video_pre["context_mask"],
+            },
+            video_attention_mask=video_attention_mask,
+            return_final_hidden=True,
+        )
+        if not isinstance(wrong_prefill_result, tuple):
+            raise RuntimeError(
+                "The no-ERAF LoRA control wrong-language Video prefill "
+                "returned no hidden state."
+            )
+        _, wrong_video_hidden = wrong_prefill_result
+        wrong_pred_video = self.video_expert.post_dit(
+            wrong_video_hidden, wrong_video_pre
+        )
+        if not include_initial_video_step:
+            wrong_pred_video = wrong_pred_video[:, :, 1:]
+        wrong_video_error = self._compute_video_loss_per_sample(
+            pred_video=wrong_pred_video,
+            target_video=target_video_for_loss,
+            image_is_pad=image_is_pad,
+            include_initial_video_step=include_initial_video_step,
+        )
+
+        direct_action_valid = direct_action_valid.to(
+            device=action.device, dtype=torch.bool
+        )
+        is_counterfactual = is_counterfactual.to(
+            device=action.device, dtype=torch.bool
+        )
+        paired_language_valid = paired_language_valid.to(
+            device=action.device, dtype=torch.bool
+        )
+        native_valid = direct_action_valid & ~is_counterfactual
+        counterfactual_valid = direct_action_valid & is_counterfactual
+        semantic_valid = counterfactual_valid & paired_language_valid
+        control = self.lora_paired_language_control_config
+        world_language_ranking = self._masked_policy_guard_mean(
+            torch.relu(
+                float(control["world_language_margin"])
+                + correct_video_error.detach()
+                - wrong_video_error
+            ),
+            semantic_valid,
+        )
+
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=action.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(
+            action, noise_action, timestep_action
+        )
+        target_action = self.train_action_scheduler.training_target(
+            action, noise_action, timestep_action
+        )
+        correct_action = self._forward_shared_action_from_cache(
+            action_tokens=noisy_action,
+            timestep_action=timestep_action,
+            context=inputs["context"],
+            context_mask=full_context_mask,
+            video_kv_cache=video_kv_cache,
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+        )
+        wrong_action = self._forward_shared_action_from_cache(
+            action_tokens=noisy_action,
+            timestep_action=timestep_action,
+            context=source_context,
+            context_mask=source_context_mask,
+            video_kv_cache=video_kv_cache,
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+        )
+        correct_action_error = self._compute_action_loss_per_sample(
+            pred_action=correct_action,
+            target_action=target_action,
+            action_is_pad=action_is_pad,
+        )
+        wrong_action_error = self._compute_action_loss_per_sample(
+            pred_action=wrong_action,
+            target_action=target_action,
+            action_is_pad=action_is_pad,
+        )
+        action_weight = self.train_action_scheduler.training_weight(
+            timestep_action
+        ).to(device=action.device, dtype=correct_action_error.dtype)
+        if action_weight.ndim == 0:
+            action_weight = action_weight.expand(batch_size)
+        else:
+            action_weight = action_weight.reshape(batch_size)
+        native_action_loss = self._masked_policy_guard_mean(
+            correct_action_error * action_weight, native_valid
+        )
+        counterfactual_action_loss = self._masked_policy_guard_mean(
+            correct_action_error * action_weight, counterfactual_valid
+        )
+        wrong_semantic_ranking = self._masked_policy_guard_mean(
+            torch.relu(
+                float(control["action_language_margin"])
+                + correct_action_error.detach()
+                - wrong_action_error
+            ),
+            semantic_valid,
+        )
+
+        lora_terms = [
+            parameter.float().square().mean()
+            for name, parameter in self.mot.named_parameters()
+            if name.endswith(".lora_B")
+        ]
+        if not lora_terms:
+            raise RuntimeError(
+                "The no-ERAF LoRA control found no LoRA-B parameters."
+            )
+        lora_regularization = torch.stack(lora_terms).mean()
+        action_objective = self.loss_lambda_action * (
+            float(control["native_action_weight"]) * native_action_loss
+            + float(control["counterfactual_action_weight"])
+            * counterfactual_action_loss
+        )
+        total = (
+            self.loss_lambda_video * world_flow_loss
+            + float(control["world_language_weight"])
+            * world_language_ranking
+            + action_objective
+            + float(control["action_language_weight"])
+            * wrong_semantic_ranking
+            + float(control["regularization_weight"])
+            * lora_regularization
+        )
+
+        semantic_count = semantic_valid.float().sum().clamp_min(1.0)
+        metrics: dict[str, torch.Tensor] = {
+            "loss_lora_only_world_flow": world_flow_loss.detach(),
+            "loss_lora_only_world_language_ranking": (
+                world_language_ranking.detach()
+            ),
+            "loss_lora_only_native_action_flow": native_action_loss.detach(),
+            "loss_lora_only_counterfactual_action_flow": (
+                counterfactual_action_loss.detach()
+            ),
+            "loss_lora_only_wrong_semantic_ranking": (
+                wrong_semantic_ranking.detach()
+            ),
+            "loss_lora_only_regularization": lora_regularization.detach(),
+            "lora_only_native_fraction": native_valid.float().mean(),
+            "lora_only_counterfactual_fraction": (
+                counterfactual_valid.float().mean()
+            ),
+            "lora_only_semantic_fraction": semantic_valid.float().mean(),
+            "lora_only_world_wrong_language_worse_rate": (
+                (
+                    (wrong_video_error > correct_video_error).float()
+                    * semantic_valid.float()
+                ).sum()
+                / semantic_count
+            ),
+            "lora_only_action_wrong_language_worse_rate": (
+                (
+                    (wrong_action_error > correct_action_error).float()
+                    * semantic_valid.float()
+                ).sum()
+                / semantic_count
+            ),
+            "lora_only_action_supervised_fraction": (
+                direct_action_valid.float().mean()
+            ),
+            "lora_only_eraf_enabled": correct_action_error.new_zeros(()),
+            "lora_only_policy_guard_enabled": (
+                correct_action_error.new_zeros(())
+            ),
+            "lora_only_shared_video_action_expert": (
+                correct_action_error.new_ones(())
+            ),
+        }
+        detached = detached_policy_guard_metrics(metrics)
+        detached.update(
+            {
+                "loss_video": float(
+                    (self.loss_lambda_video * world_flow_loss)
+                    .detach()
+                    .float()
+                    .item()
+                ),
+                "loss_action": float(
+                    action_objective.detach().float().item()
+                ),
+                "loss_pgc_action": float(
+                    counterfactual_action_loss.detach().float().item()
+                ),
+                "loss_pgc_v9_eraf": 0.0,
+                "pgc_video_loss_optimization_weight": float(
+                    self.loss_lambda_video
+                ),
+                "pgc_action_effective_weight": float(
+                    self.loss_lambda_action
+                ),
+                "pgc_v9_grounding_effective_weight": 0.0,
+            }
+        )
+        return total, detached
+
     def _training_loss_policy_guard_v926_eraf_expert_lora(
         self,
         *,
@@ -10814,7 +11254,10 @@ class FastWAM(torch.nn.Module):
             raise ValueError(f"`sample['video']` channel dimension must be 3, got shape {tuple(video.shape)}")
 
         batch_size, _, num_frames, height, width = video.shape
-        if self.policy_guard_enabled:
+        if (
+            self.policy_guard_enabled
+            or self.lora_paired_language_control_enabled
+        ):
             missing_pgc = [
                 name
                 for name, value in (
@@ -10829,7 +11272,10 @@ class FastWAM(torch.nn.Module):
                     "PGC training requires dataset provenance fields: "
                     f"{missing_pgc}. Use RobotVideoDataset with the PGC data options."
                 )
-            if self.policy_guard_version >= 5:
+            if (
+                self.lora_paired_language_control_enabled
+                or self.policy_guard_version >= 5
+            ):
                 missing_v5 = [
                     name
                     for name, value in (
@@ -10845,7 +11291,7 @@ class FastWAM(torch.nn.Module):
                 ]
                 if missing_v5:
                     raise ValueError(
-                        "PGC v5+ requires same-state paired-language fields: "
+                        "Paired-language training requires same-state fields: "
                         f"{missing_v5}. Recreate the dataset loader after "
                         "updating LF-FastWAM."
                     )
@@ -11000,19 +11446,23 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
             )
-        if self.policy_guard_version >= 5:
+        if (
+            self.lora_paired_language_control_enabled
+            or self.policy_guard_version >= 5
+        ):
             if (
                 pgc_source_context.ndim != 3
                 or pgc_source_context_mask.ndim != 2
             ):
                 raise ValueError(
-                    "PGC v5 source context/mask must be [B,L,D]/[B,L]."
+                    "Paired-language source context/mask must be [B,L,D]/[B,L]."
                 )
             if pgc_source_context.shape != context.shape or (
                 pgc_source_context_mask.shape != context_mask.shape
             ):
                 raise ValueError(
-                    "PGC v5 current/source text-cache tensor shapes must match."
+                    "Paired-language current/source text-cache tensor shapes "
+                    "must match."
                 )
         if self.policy_guard_version == 7:
             if pgc_aux_context.ndim != 3 or pgc_aux_context_mask.ndim != 2:
@@ -11647,6 +12097,11 @@ class FastWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
 
+        if self.lora_paired_language_control_enabled:
+            return self._training_loss_lora_paired_language_control(
+                inputs=inputs,
+                full_context_mask=full_context_mask,
+            )
         if (
             self.policy_guard_enabled
             and self.policy_guard_version == 9

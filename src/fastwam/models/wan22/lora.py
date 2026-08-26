@@ -32,6 +32,52 @@ DEFAULT_EXTRA_TRAINABLE_PATTERNS = (
     "proprio_encoder.*",
 )
 
+DEFAULT_PAIRED_LANGUAGE_CONTROL = {
+    "enabled": False,
+    "world_language_weight": 0.10,
+    "world_language_margin": 0.01,
+    "native_action_weight": 1.0,
+    "counterfactual_action_weight": 1.0,
+    "action_language_weight": 1.0,
+    "action_language_margin": 0.01,
+    "regularization_weight": 1.0e-6,
+}
+
+
+def normalize_paired_language_control_config(
+    config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Normalize the strict no-ERAF paired-language LoRA control."""
+    raw = dict(config or {})
+    normalized = {
+        "enabled": bool(raw.get("enabled", False)),
+        **{
+            name: float(raw.get(name, default))
+            for name, default in DEFAULT_PAIRED_LANGUAGE_CONTROL.items()
+            if name != "enabled"
+        },
+    }
+    non_negative = (
+        "world_language_weight",
+        "world_language_margin",
+        "native_action_weight",
+        "counterfactual_action_weight",
+        "action_language_weight",
+        "action_language_margin",
+        "regularization_weight",
+    )
+    invalid = {
+        name: normalized[name]
+        for name in non_negative
+        if normalized[name] < 0.0
+    }
+    if invalid:
+        raise ValueError(
+            "LoRA paired-language control values must be non-negative, "
+            f"got {invalid}."
+        )
+    return normalized
+
 
 def normalize_lora_config(config: dict[str, Any] | None) -> dict[str, Any]:
     config = dict(config or {})
@@ -50,6 +96,9 @@ def normalize_lora_config(config: dict[str, Any] | None) -> dict[str, Any]:
             "extra_trainable_patterns", DEFAULT_EXTRA_TRAINABLE_PATTERNS
         )
     ]
+    paired_language_control = normalize_paired_language_control_config(
+        config.get("paired_language_control")
+    )
 
     if rank <= 0:
         raise ValueError(f"LoRA `rank` must be positive, got {rank}.")
@@ -75,6 +124,7 @@ def normalize_lora_config(config: dict[str, Any] | None) -> dict[str, Any]:
         "experts": experts,
         "target_modules": target_modules,
         "extra_trainable_patterns": extra_trainable_patterns,
+        "paired_language_control": paired_language_control,
     }
 
 

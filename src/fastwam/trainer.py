@@ -96,6 +96,40 @@ class Wan22Trainer:
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
+        if bool(
+            getattr(
+                self.model,
+                "lora_paired_language_control_enabled",
+                False,
+            )
+        ):
+            required_dataset_contracts = {
+                "pgc_has_counterfactual_data": True,
+                "pgc_balance_native_counterfactual": True,
+                "pgc_entity_relation_supervision_required": True,
+                "pgc_v9_balanced_sampling": True,
+                "pgc_v9_phase_safe_memory": True,
+            }
+            mismatches = {
+                name: bool(getattr(self.train_dataset, name, False))
+                for name, expected in required_dataset_contracts.items()
+                if bool(getattr(self.train_dataset, name, False)) != expected
+            }
+            closed_loop_count = int(
+                getattr(
+                    self.train_dataset,
+                    "pgc_v9_closed_loop_native_dataset_count",
+                    0,
+                )
+            )
+            if mismatches or closed_loop_count != 1:
+                raise ValueError(
+                    "The no-ERAF LoRA control requires the exact V9.26 "
+                    "offline-native/closed-loop-native/historical-CF/strict-CF "
+                    "1:1:1:1 dataset contract; "
+                    f"mismatches={mismatches}, "
+                    f"closed_loop_native_count={closed_loop_count}."
+                )
         if bool(getattr(self.model, "policy_guard_enabled", False)) and bool(
             getattr(
                 self.model,

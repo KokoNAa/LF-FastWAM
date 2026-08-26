@@ -477,3 +477,14 @@ lora:
     - action_expert.action_encoder.*
     - action_expert.head.*
     - proprio_encoder.*
+  # Strict ERAF ablation. It keeps the V9.26 paired-language world/action
+  # objectives but uses only the released query-free shared Experts.
+  paired_language_control:
+    enabled: false
+    world_language_weight: 0.10
+    world_language_margin: 0.01
+    native_action_weight: 1.0
+    counterfactual_action_weight: 1.0
+    action_language_weight: 1.0
+    action_language_margin: 0.01
+    regularization_weight: 1.0e-6
