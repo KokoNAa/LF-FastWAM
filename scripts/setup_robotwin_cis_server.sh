@@ -74,20 +74,18 @@ for archive_name in background_texture.zip embodiments.zip objects.zip; do
     rm -f "${marker}"
   fi
   if [[ ! -f "${marker}" ]]; then
-    ASSET_ARCHIVE_NAME="${archive_name}"
-    export ASSET_ARCHIVE_NAME
-    "${PYTHON_BIN}" - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-
-snapshot_download(
-    repo_id="TianxingChen/RoboTwin2.0",
-    repo_type="dataset",
-    allow_patterns=[os.environ["ASSET_ARCHIVE_NAME"]],
-    local_dir=os.path.join(os.environ["ROBOTWIN_ROOT"], "assets"),
-    resume_download=True,
-)
-PY
+    partial_path="${archive_path}.part"
+    asset_url="${HF_ENDPOINT%/}/datasets/TianxingChen/RoboTwin2.0/resolve/main/${archive_name}"
+    if [[ ! -s "${archive_path}" ]]; then
+      echo "[setup] downloading ${archive_name} with resumable curl"
+      curl --fail --location \
+        --retry 20 --retry-delay 5 --retry-connrefused \
+        --connect-timeout 30 --speed-limit 1024 --speed-time 180 \
+        --continue-at - \
+        "${asset_url}" \
+        --output "${partial_path}"
+      mv "${partial_path}" "${archive_path}"
+    fi
     echo "[setup] extracting ${archive_name}"
     ASSET_ARCHIVE_PATH="${archive_path}"
     export ASSET_ARCHIVE_PATH

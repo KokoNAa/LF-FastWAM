@@ -59,9 +59,11 @@ checkpoint, pinned RoboTwin task configs, and required assets through a mirror:
 HF_ENDPOINT=https://hf-mirror.com bash scripts/setup_robotwin_cis_server.sh
 ```
 
-Downloads are resumable.  Successfully extracted archives are marked under
-`third_party/RoboTwin/assets`; archives are deleted after extraction by
-default to save disk space.  Set `KEEP_ASSET_ARCHIVES=1` to retain them.
+Downloads are resumable. Large asset archives use curl with retry and low-speed
+timeouts so a stalled mirror connection does not hang forever. Successfully
+extracted archives are marked under `third_party/RoboTwin/assets`; archives are
+deleted after extraction by default to save disk space. Set
+`KEEP_ASSET_ARCHIVES=1` to retain them.
 
 ```bash
 cd /path/to/fast-WAM
