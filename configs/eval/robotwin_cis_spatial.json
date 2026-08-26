@@ -1,0 +1,60 @@
+{
+  "format": "robotwin_language_interventions_v1",
+  "description": "Bidirectional same-scene left/right spatial intervention pair for RoboTwin CIS.",
+  "pairs": [
+    {
+      "pair_id": "place_a2b_left_to_right",
+      "source_task": "place_a2b_left",
+      "counterfactual_task": "place_a2b_right",
+      "source_goal": {
+        "type": "relative_pose",
+        "actor": "object",
+        "reference": "target_object",
+        "axis": "x",
+        "direction": "negative",
+        "min_planar_distance": 0.08,
+        "max_planar_distance": 0.2,
+        "max_orthogonal_distance": 0.05,
+        "require_both_grippers_open": true
+      },
+      "counterfactual_goal": {
+        "type": "relative_pose",
+        "actor": "object",
+        "reference": "target_object",
+        "axis": "x",
+        "direction": "positive",
+        "min_planar_distance": 0.08,
+        "max_planar_distance": 0.2,
+        "max_orthogonal_distance": 0.05,
+        "require_both_grippers_open": true
+      }
+    },
+    {
+      "pair_id": "place_a2b_right_to_left",
+      "source_task": "place_a2b_right",
+      "counterfactual_task": "place_a2b_left",
+      "source_goal": {
+        "type": "relative_pose",
+        "actor": "object",
+        "reference": "target_object",
+        "axis": "x",
+        "direction": "positive",
+        "min_planar_distance": 0.08,
+        "max_planar_distance": 0.2,
+        "max_orthogonal_distance": 0.05,
+        "require_both_grippers_open": true
+      },
+      "counterfactual_goal": {
+        "type": "relative_pose",
+        "actor": "object",
+        "reference": "target_object",
+        "axis": "x",
+        "direction": "negative",
+        "min_planar_distance": 0.08,
+        "max_planar_distance": 0.2,
+        "max_orthogonal_distance": 0.05,
+        "require_both_grippers_open": true
+      }
+    }
+  ]
+}

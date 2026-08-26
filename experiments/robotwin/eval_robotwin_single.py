@@ -36,11 +36,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from experiments.robotwin.language_interventions import (
+    load_intervention_manifest,
+    normalize_condition,
+    select_intervention_pair,
+)
+
 POLICY_NAME = "fastwam_policy"
 
 
@@ -153,6 +162,8 @@ def main(cfg: DictConfig):
     if cfg.EVALUATION.task_name is None:
         raise ValueError("`EVALUATION.task_name` must not be None.")
 
+    condition = normalize_condition(cfg.EVALUATION.instruction_condition)
+
     ckpt_path = _resolve_path(str(cfg.ckpt), base=PROJECT_ROOT)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -161,6 +172,28 @@ def main(cfg: DictConfig):
     robotwin_root = _resolve_path(str(cfg.EVALUATION.robotwin_root), base=PROJECT_ROOT)
     if not robotwin_root.exists():
         raise FileNotFoundError(f"RoboTwin root not found: {robotwin_root}")
+
+    manifest_path = _resolve_optional_path(
+        cfg.EVALUATION.language_intervention_manifest,
+        base=PROJECT_ROOT,
+    )
+    if manifest_path is None and condition != "correct":
+        raise ValueError(
+            "RoboTwin shuffled/counterfactual evaluation requires "
+            "EVALUATION.language_intervention_manifest."
+        )
+    if manifest_path is not None:
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"Language intervention manifest not found: {manifest_path}"
+            )
+        intervention_pairs = load_intervention_manifest(
+            manifest_path, robotwin_root=robotwin_root
+        )
+        select_intervention_pair(
+            intervention_pairs,
+            source_task=str(cfg.EVALUATION.task_name),
+        )
 
     policy_source_dir = (PROJECT_ROOT / "experiments" / "robotwin" / POLICY_NAME).resolve()
     if not policy_source_dir.is_dir():
@@ -180,17 +213,17 @@ def main(cfg: DictConfig):
         / run_ts
     )
     run_output_dir.mkdir(parents=True, exist_ok=True)
+    log_tag = f"{str(cfg.EVALUATION.task_name)}_{str(cfg.EVALUATION.task_config)}"
+    if manifest_path is not None:
+        log_tag += f"_{condition}"
     log_file = run_output_dir / (
-        f"eval_{str(cfg.EVALUATION.task_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        f"eval_{log_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     )
-    robotwin_eval_base = (
-        PROJECT_ROOT
-        / "evaluate_results"
-        / "robotwin"
-        / ckpt_tag
-        / run_ts
-        / str(cfg.EVALUATION.task_name)
-    )
+    robotwin_eval_base = run_output_dir / str(cfg.EVALUATION.task_name)
+    if manifest_path is not None:
+        robotwin_eval_base = (
+            robotwin_eval_base / str(cfg.EVALUATION.task_config) / condition
+        )
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
@@ -204,6 +237,13 @@ def main(cfg: DictConfig):
     _append_override(overrides, "seed", cfg.seed)
     _append_override(overrides, "policy_name", cfg.EVALUATION.policy_name)
     _append_override(overrides, "instruction_type", cfg.EVALUATION.instruction_type)
+    _append_override(overrides, "instruction_condition", condition)
+    _append_override(
+        overrides,
+        "language_intervention_manifest",
+        None if manifest_path is None else str(manifest_path),
+    )
+    _append_override(overrides, "project_root", str(PROJECT_ROOT))
     _append_override(overrides, "eval_num_episodes", cfg.EVALUATION.eval_num_episodes)
 
     _append_override(overrides, "sim_cfg_path", str(sim_cfg_path))
@@ -265,7 +305,7 @@ def main(cfg: DictConfig):
     print(f"Evaluation finished successfully. Log saved to: {log_file}")
     OmegaConf.save(
         config=cfg,
-        f=str(run_output_dir / f"eval_config_{str(cfg.EVALUATION.task_name)}.yaml"),
+        f=str(run_output_dir / f"eval_config_{log_tag}.yaml"),
     )
 
 

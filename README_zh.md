@@ -223,6 +223,22 @@ python experiments/robotwin/run_robotwin_manager.py \
   MULTIRUN.num_gpus=8
 ```
 
+同场景 RoboTwin Correct / Shuffle（DTL）/ Counterfactual（CIS）评测：
+
+```bash
+bash scripts/validate_robotwin_cis_server.sh \
+  ./checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt \
+  ./checkpoints/fastwam_release/robotwin_uncond_3cam_384_dataset_stats.json
+
+bash scripts/eval_robotwin_cis.sh \
+  8 5 10 42 \
+  ./checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt \
+  ./checkpoints/fastwam_release/robotwin_uncond_3cam_384_dataset_stats.json
+```
+
+严格配对协议、正式实验命令、输出格式和适用范围见
+[`docs/ROBOTWIN_CIS.md`](docs/ROBOTWIN_CIS.md)。
+
 为了加速 RoboTwin 评测，我们在 [`configs/sim_robotwin.yaml`](./configs/sim_robotwin.yaml) 中打开了 `EVALUATION.skip_get_obs_within_replan=true`。
 它会在一次 replan 窗口内连续执行一个 action chunk 时跳过 RGB 渲染，评测更快，但保存下来的视频帧率会低。
 如果想保存完整视频，可以把它设为 `false`。

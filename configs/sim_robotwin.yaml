@@ -19,6 +19,14 @@ EVALUATION:
   task_name: null
   task_config: demo_randomized
   instruction_type: unseen
+  # Language intervention contract.  A non-null manifest activates matched
+  # Correct / Shuffle (DTL) / Counterfactual (CIS) result directories.
+  instruction_condition: correct
+  language_intervention_manifest: null
+  cis_tasks: []
+  cis_conditions: [correct, shuffled, counterfactual]
+  cis_task_configs: [demo_clean, demo_randomized]
+  resume_completed: true
   eval_num_episodes: 100
   output_dir: ./evaluate_results/robotwin/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
 

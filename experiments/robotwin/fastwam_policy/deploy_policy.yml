@@ -5,6 +5,9 @@ task_config: null
 ckpt_setting: null
 seed: 0
 instruction_type: unseen
+instruction_condition: correct
+language_intervention_manifest: null
+project_root: null
 eval_num_episodes: 100
 
 # fastwam policy args

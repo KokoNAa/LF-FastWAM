@@ -1,6 +1,8 @@
 import sys
 import os
 import subprocess
+import json
+import random
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -23,6 +25,10 @@ from generate_episode_instructions import *
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
+
+
+class CISContractError(RuntimeError):
+    """Raised when the checked-in CIS goal no longer matches RoboTwin."""
 
 
 def class_decorator(task_name):
@@ -99,6 +105,120 @@ def _result_suffix_from_task_config(task_config):
     )
 
 
+def _load_language_intervention(usr_args, task_name):
+    manifest_value = usr_args.get("language_intervention_manifest")
+    condition = str(usr_args.get("instruction_condition", "correct")).strip().lower()
+    project_root_value = usr_args.get("project_root")
+
+    if condition not in {"correct", "shuffled", "counterfactual"}:
+        raise ValueError(f"Unsupported RoboTwin instruction condition: {condition!r}")
+    if manifest_value is None or str(manifest_value).strip().lower() in {
+        "",
+        "none",
+        "null",
+    }:
+        if condition != "correct":
+            raise ValueError(
+                "RoboTwin shuffled/counterfactual evaluation requires "
+                "`language_intervention_manifest`."
+            )
+        return condition, None, None, None
+
+    if project_root_value is not None and str(project_root_value).strip() != "":
+        project_root = str(Path(str(project_root_value)).expanduser().resolve())
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+
+    from experiments.robotwin.language_interventions import (
+        condition_contract,
+        load_intervention_manifest,
+        select_intervention_pair,
+    )
+
+    manifest_path = Path(str(manifest_value)).expanduser().resolve()
+    pairs = load_intervention_manifest(manifest_path, robotwin_root=Path.cwd())
+    pair = select_intervention_pair(pairs, source_task=task_name)
+    instruction_goal, selected_goal = condition_contract(condition)
+    return condition, pair, instruction_goal, selected_goal
+
+
+def _deterministic_instruction(
+    *, task_name, episode_info, instruction_type, scene_seed
+):
+    from experiments.robotwin.language_interventions import stable_instruction_seed
+
+    instruction_seed = stable_instruction_seed(
+        scene_seed=int(scene_seed),
+        task_name=str(task_name),
+        instruction_type=str(instruction_type),
+    )
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    try:
+        random.seed(instruction_seed)
+        np.random.seed(instruction_seed % (2**32))
+        results = generate_episode_descriptions(
+            str(task_name), [episode_info], max_descriptions=1
+        )
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+    if not results:
+        raise ValueError(
+            f"No instruction templates matched task={task_name!r}, "
+            f"scene_seed={scene_seed}."
+        )
+    instructions = results[0].get(str(instruction_type), [])
+    if not instructions:
+        raise ValueError(
+            f"No {instruction_type!r} instruction was generated for "
+            f"task={task_name!r}, scene_seed={scene_seed}."
+        )
+    return str(instructions[0])
+
+
+def _append_episode_record(path, record):
+    with Path(path).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+
+
+def _summarize_intervention_records(
+    *, records, pair, condition, task_config, instruction_type, checkpoint
+):
+    total = len(records)
+
+    def count(field):
+        return sum(bool(record[field]) for record in records)
+
+    def rate(field):
+        return None if total == 0 else count(field) / total
+
+    return {
+        "format": "robotwin_language_intervention_summary_v1",
+        "pair_id": pair.pair_id,
+        "source_task": pair.source_task,
+        "counterfactual_task": pair.counterfactual_task,
+        "condition": condition,
+        "task_config": task_config,
+        "instruction_type": instruction_type,
+        "checkpoint": str(checkpoint),
+        "total_episodes": total,
+        "selected_goal_successes": count("selected_goal_success"),
+        "selected_goal_success_rate": rate("selected_goal_success"),
+        "source_goal_successes": count("source_goal_ever_success"),
+        "source_goal_success_rate": rate("source_goal_ever_success"),
+        "counterfactual_goal_successes": count(
+            "counterfactual_goal_ever_success"
+        ),
+        "counterfactual_goal_success_rate": rate(
+            "counterfactual_goal_ever_success"
+        ),
+        "scene_seeds": [int(record["scene_seed"]) for record in records],
+    }
+
+
 def main(usr_args):
     eval_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     task_name = usr_args["task_name"]
@@ -115,6 +235,10 @@ def main(usr_args):
     save_dir = None
     video_save_dir = None
     video_size = None
+
+    condition, intervention_pair, instruction_goal, selected_goal = (
+        _load_language_intervention(usr_args, task_name)
+    )
 
     get_model = eval_function_decorator(policy_name, "get_model")
 
@@ -208,15 +332,27 @@ def main(usr_args):
     topk = 1
 
     model = get_model(usr_args)
-    st_seed, suc_num = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                   test_num=test_num,
-                                   video_size=video_size,
-                                   instruction_type=instruction_type,
-                                   skip_get_obs_within_replan=skip_get_obs_within_replan)
+    episode_results_path = None
+    if intervention_pair is not None:
+        episode_results_path = save_dir / "episodes.jsonl"
+        episode_results_path.write_text("", encoding="utf-8")
+
+    st_seed, suc_num, intervention_records = eval_policy(
+        task_name,
+        TASK_ENV,
+        args,
+        model,
+        st_seed,
+        test_num=test_num,
+        video_size=video_size,
+        instruction_type=instruction_type,
+        skip_get_obs_within_replan=skip_get_obs_within_replan,
+        condition=condition,
+        intervention_pair=intervention_pair,
+        instruction_goal=instruction_goal,
+        selected_goal=selected_goal,
+        episode_results_path=episode_results_path,
+    )
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -228,6 +364,22 @@ def main(usr_args):
         file.write(f"Instruction Type: {instruction_type}\n\n")
         # file.write(str(task_reward) + '\n')
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
+
+    if intervention_pair is not None:
+        intervention_summary = _summarize_intervention_records(
+            records=intervention_records,
+            pair=intervention_pair,
+            condition=condition,
+            task_config=task_config,
+            instruction_type=instruction_type,
+            checkpoint=ckpt_setting,
+        )
+        summary_path = save_dir / "summary.json"
+        summary_path.write_text(
+            json.dumps(intervention_summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"Intervention summary saved to {summary_path}")
 
     print(f"Data has been saved to {file_path}")
     # return task_reward
@@ -241,7 +393,12 @@ def eval_policy(task_name,
                 test_num=100,
                 video_size=None,
                 instruction_type=None,
-                skip_get_obs_within_replan=False):
+                skip_get_obs_within_replan=False,
+                condition="correct",
+                intervention_pair=None,
+                instruction_goal=None,
+                selected_goal=None,
+                episode_results_path=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -260,6 +417,7 @@ def eval_policy(task_name,
     now_seed = st_seed
     task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
+    intervention_records = []
 
     args["eval_mode"] = True
 
@@ -271,6 +429,19 @@ def eval_policy(task_name,
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
+                native_expert_success = bool(TASK_ENV.check_success())
+                if intervention_pair is not None:
+                    from experiments.robotwin.language_interventions import GoalObserver
+
+                    expert_observer = GoalObserver(TASK_ENV, intervention_pair)
+                    declarative_expert_success = expert_observer.update().source.success
+                    if native_expert_success != declarative_expert_success:
+                        raise CISContractError(
+                            "RoboTwin CIS source-goal contract drift: native "
+                            f"check_success={native_expert_success}, declarative "
+                            f"source_goal={declarative_expert_success}, "
+                            f"task={task_name}, seed={now_seed}."
+                        )
                 TASK_ENV.close_env()
             except UnStableError as e:
                 # print(" -------------")
@@ -280,6 +451,9 @@ def eval_policy(task_name,
                 now_seed += 1
                 args["render_freq"] = render_freq
                 continue
+            except CISContractError:
+                TASK_ENV.close_env()
+                raise
             except Exception as e:
                 print(" -------------")
                 print("Error: ", e)
@@ -291,7 +465,7 @@ def eval_policy(task_name,
                 print("error occurs !")
                 continue
 
-        if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
+        if (not expert_check) or (TASK_ENV.plan_success and native_expert_success):
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
@@ -324,9 +498,50 @@ def eval_policy(task_name,
             now_seed += 1
             print("error occurs !")
             continue
-        episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        source_instruction = None
+        counterfactual_instruction = None
+        rollout_observer = None
+        initial_snapshot = None
+        if intervention_pair is None:
+            episode_info_list = [episode_info["info"]]
+            results = generate_episode_descriptions(
+                args["task_name"], episode_info_list, test_num
+            )
+            instruction = np.random.choice(results[0][instruction_type])
+        else:
+            from experiments.robotwin.language_interventions import GoalObserver
+
+            source_instruction = _deterministic_instruction(
+                task_name=intervention_pair.source_task,
+                episode_info=episode_info["info"],
+                instruction_type=instruction_type,
+                scene_seed=now_seed,
+            )
+            counterfactual_instruction = _deterministic_instruction(
+                task_name=intervention_pair.counterfactual_task,
+                episode_info=episode_info["info"],
+                instruction_type=instruction_type,
+                scene_seed=now_seed,
+            )
+            instruction = (
+                source_instruction
+                if instruction_goal == "source"
+                else counterfactual_instruction
+            )
+            rollout_observer = GoalObserver(TASK_ENV, intervention_pair)
+            initial_snapshot = rollout_observer.update()
+            if initial_snapshot.source.success or initial_snapshot.counterfactual.success:
+                succ_seed -= 1
+                if suc_test_seed_list and suc_test_seed_list[-1] == now_seed:
+                    suc_test_seed_list.pop()
+                TASK_ENV.close_env()
+                now_seed += 1
+                print(
+                    "Skipping invalid CIS scene whose initial state already "
+                    f"satisfies a goal: task={task_name}, seed={now_seed - 1}"
+                )
+                continue
+            rollout_observer.install_selected_goal(selected_goal)
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         current_video_path = None
@@ -375,17 +590,68 @@ def eval_policy(task_name,
             if TASK_ENV.eval_success:
                 succ = True
                 break
+        episode_diagnostics = None
+        if rollout_observer is not None:
+            episode_diagnostics = rollout_observer.episode_diagnostics(
+                selected_goal=selected_goal
+            )
+            succ = bool(episode_diagnostics["selected_goal_success"])
         # task_total_reward += TASK_ENV.episode_score
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
             if current_video_path is None or not current_video_path.exists():
                 raise FileNotFoundError(f"Expected eval video file not found: {current_video_path}")
             is_randomized = "randomized" in str(args["task_config"]).lower()
-            renamed_video_path = (
-                Path(TASK_ENV.eval_video_path)
-                / f"episode{episode_idx}_randomized-{str(is_randomized).lower()}_success-{str(succ).lower()}.mp4"
+            video_name = (
+                f"episode{episode_idx}_randomized-{str(is_randomized).lower()}"
+                f"_success-{str(succ).lower()}"
             )
+            if episode_diagnostics is not None:
+                video_name += (
+                    f"_source-{str(episode_diagnostics['source_goal_ever_success']).lower()}"
+                    f"_counterfactual-{str(episode_diagnostics['counterfactual_goal_ever_success']).lower()}"
+                )
+            renamed_video_path = Path(TASK_ENV.eval_video_path) / f"{video_name}.mp4"
             current_video_path.rename(renamed_video_path)
+
+        if episode_diagnostics is not None:
+            from experiments.robotwin.language_interventions import EPISODE_FORMAT
+
+            timing_rollout = None
+            if hasattr(model, "get_timing_rollout"):
+                timing_rollout = model.get_timing_rollout()
+            record = {
+                "format": EPISODE_FORMAT,
+                "pair_id": intervention_pair.pair_id,
+                "source_task": intervention_pair.source_task,
+                "counterfactual_task": intervention_pair.counterfactual_task,
+                "task_config": str(args["task_config"]),
+                "condition": condition,
+                "episode_index": int(now_id),
+                "scene_seed": int(now_seed),
+                "instruction_type": str(instruction_type),
+                "checkpoint": str(args["ckpt_setting"]),
+                "source_instruction": source_instruction,
+                "counterfactual_instruction": counterfactual_instruction,
+                "policy_instruction": str(instruction),
+                "instruction_goal": instruction_goal,
+                "initial_source_goal_success": bool(initial_snapshot.source.success),
+                "initial_counterfactual_goal_success": bool(
+                    initial_snapshot.counterfactual.success
+                ),
+                "steps": int(TASK_ENV.take_action_cnt),
+                "step_limit": int(TASK_ENV.step_lim),
+                "native_eval_success": bool(TASK_ENV.eval_success),
+                "video_path": (
+                    None
+                    if TASK_ENV.eval_video_path is None
+                    else str(renamed_video_path.resolve())
+                ),
+                "timing": timing_rollout,
+                **episode_diagnostics,
+            }
+            intervention_records.append(record)
+            _append_episode_record(episode_results_path, record)
 
         if succ:
             TASK_ENV.suc += 1
@@ -408,7 +674,7 @@ def eval_policy(task_name,
         # TASK_ENV._take_picture()
         now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    return now_seed, TASK_ENV.suc, intervention_records
 
 
 def parse_args_and_config():
