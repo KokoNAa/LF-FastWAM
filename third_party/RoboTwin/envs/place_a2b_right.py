@@ -121,7 +121,10 @@ class place_a2b_right(Base_Task):
         self.add_prohibit_area(self.object, padding=0.05)
         self.add_prohibit_area(self.target_object, padding=0.1)
 
-    def play_once(self):
+    def play_once_direction(self, direction="right"):
+        direction = str(direction).strip().lower()
+        if direction not in {"left", "right"}:
+            raise ValueError(f"Unsupported place_a2b direction: {direction!r}")
         # Determine which arm to use based on object's x position (right if positive, left if negative)
         arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
 
@@ -132,7 +135,7 @@ class place_a2b_right(Base_Task):
 
         # Calculate the target place pose by offsetting target's x position by +0.13
         target_pose = self.target_object.get_pose().p.tolist()
-        target_pose[0] += 0.13
+        target_pose[0] += -0.13 if direction == "left" else 0.13
 
         # Place the object at the calculated target pose
         self.move(self.place_actor(self.object, arm_tag=arm_tag, target_pose=target_pose))
@@ -145,10 +148,29 @@ class place_a2b_right(Base_Task):
         }
         return self.info
 
-    def check_success(self):
+    def play_once(self):
+        return self.play_once_direction("right")
+
+    def check_direction_success(self, direction="right"):
+        direction = str(direction).strip().lower()
+        if direction not in {"left", "right"}:
+            raise ValueError(f"Unsupported place_a2b direction: {direction!r}")
         object_pose = self.object.get_pose().p
         target_pos = self.target_object.get_pose().p
         distance = np.sqrt(np.sum((object_pose[:2] - target_pos[:2])**2))
-        return np.all(distance < 0.2 and distance > 0.08 and object_pose[0] > target_pos[0]
-                      and abs(object_pose[1] - target_pos[1]) < 0.05 and self.robot.is_left_gripper_open()
-                      and self.robot.is_right_gripper_open())
+        direction_ok = (
+            object_pose[0] < target_pos[0]
+            if direction == "left"
+            else object_pose[0] > target_pos[0]
+        )
+        return np.all(
+            distance < 0.2
+            and distance > 0.08
+            and direction_ok
+            and abs(object_pose[1] - target_pos[1]) < 0.05
+            and self.robot.is_left_gripper_open()
+            and self.robot.is_right_gripper_open()
+        )
+
+    def check_success(self):
+        return self.check_direction_success("right")

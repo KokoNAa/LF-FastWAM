@@ -216,6 +216,18 @@ def _summarize_intervention_records(
             "counterfactual_goal_ever_success"
         ),
         "scene_seeds": [int(record["scene_seed"]) for record in records],
+        "policy_diagnostics_available_episodes": sum(
+            record.get("policy_diagnostics") is not None for record in records
+        ),
+        "policy_diagnostics_mean_replans": (
+            None
+            if total == 0
+            else sum(
+                int((record.get("policy_diagnostics") or {}).get("replan_count", 0))
+                for record in records
+            )
+            / total
+        ),
     }
 
 
@@ -680,6 +692,9 @@ def eval_policy(task_name,
             timing_rollout = None
             if hasattr(model, "get_timing_rollout"):
                 timing_rollout = model.get_timing_rollout()
+            policy_diagnostics = None
+            if hasattr(model, "get_policy_diagnostics"):
+                policy_diagnostics = model.get_policy_diagnostics()
             record = {
                 "format": EPISODE_FORMAT,
                 "pair_id": intervention_pair.pair_id,
@@ -708,6 +723,7 @@ def eval_policy(task_name,
                     else str(renamed_video_path.resolve())
                 ),
                 "timing": timing_rollout,
+                "policy_diagnostics": policy_diagnostics,
                 **episode_diagnostics,
             }
             intervention_records.append(record)

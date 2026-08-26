@@ -1,0 +1,61 @@
+# @package _global_
+
+defaults:
+  - override /data: robotwin
+  - override /model: fastwam
+  - _self_
+
+# RoboTwin PGC uses the native 14-D dual-arm qpos interface.  The three RGB
+# views are composed as a 384x320 head-over-wrists mosaic by the data processor
+# and deployment policy.
+batch_size: 1
+num_workers: 2
+
+model:
+  mot_checkpoint_mixed_attn: true
+  action_dit_config:
+    use_latent_action_queries: false
+  langforce_mvp:
+    enabled: false
+    enable_prior: false
+    enable_posterior_advantage: false
+  transition_contract:
+    enabled: false
+  policy_guard:
+    enabled: true
+    version: 9
+    gate_mode: eraf_only
+    entity_relation_grounding:
+      training_stage: action
+      initialization_contract: released_base_fresh_eraf
+      grounding_objective_version: 26
+      camera_count: 3
+      visual_aspect_ratio: 0.8333333333333334
+      camera_layout: robotwin_mosaic
+      completion_only_memory: true
+      action_joint_training: true
+  # Construction stays adapter-free. Checkpoint loading injects the exact
+  # saved V9.26 shared Video/Action Expert LoRA configuration and tensors.
+  lora:
+    enabled: false
+    experts: [video, action]
+    extra_trainable_patterns: []
+
+data:
+  train:
+    pgc_counterfactual_dataset_dirs: []
+    pgc_counterfactual_oversample_factor: 1
+    pgc_balance_native_counterfactual: true
+    pgc_entity_relation_supervision_required: false
+    pgc_entity_relation_sidecar_dirs: []
+
+learning_rate: 2.0e-5
+num_epochs: 1
+max_steps: null
+log_every: 10
+save_every: 250
+eval_every: 0
+gradient_accumulation_steps: 4
+weight_decay: 1.0e-2
+resume: null
+save_training_state: false

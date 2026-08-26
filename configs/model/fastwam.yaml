@@ -326,6 +326,9 @@ policy_guard:
     max_clauses: 4
     camera_count: 2
     visual_aspect_ratio: 2.0
+    # horizontal: equal-width cameras concatenated left-to-right (LIBERO).
+    # robotwin_mosaic: full-width head camera above two wrist cameras.
+    camera_layout: horizontal
     temperature: 0.07
     entity_only: false
     use_anchors: true

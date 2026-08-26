@@ -408,6 +408,33 @@ class Camera:
                 res[camera_name][f"{level}_segmentation"] = _get_segmentation(camera, level=level)
         return res
 
+    def get_raw_segmentation(self, level="actor") -> dict:
+        """Return lossless SAPIEN IDs for training-only supervision.
+
+        ``get_segmentation`` intentionally colorizes IDs for visualization and
+        truncates them to uint8. ERAF sidecars need the original uint32 actor
+        or visual-shape IDs so masks remain stable when a scene has many links.
+        """
+        channel = {"mesh": 0, "actor": 1}.get(str(level))
+        if channel is None:
+            raise ValueError("Raw segmentation level must be 'mesh' or 'actor'.")
+
+        def labels(camera):
+            return np.asarray(
+                camera.get_picture("Segmentation")[..., channel], dtype=np.uint32
+            ).copy()
+
+        result = {}
+        if self.collect_wrist_camera:
+            result["left_camera"] = labels(self.left_camera)
+            result["right_camera"] = labels(self.right_camera)
+        for camera, camera_name in zip(
+            self.static_camera_list, self.static_camera_name
+        ):
+            if camera_name != "head_camera" or self.collect_head_camera:
+                result[camera_name] = labels(camera)
+        return result
+
     # Get Camera Depth
     def get_depth(self) -> dict:
 

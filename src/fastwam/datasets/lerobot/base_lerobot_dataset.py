@@ -12,6 +12,7 @@ from .processors.base_processor import BaseProcessor
 from ..pgc_libero import (
     PGC_ACTION_CONVENTION_FASTWAM,
     PGC_ACTION_CONVENTION_LIBERO_ENV,
+    PGC_ACTION_CONVENTION_ROBOTWIN_QPOS,
 )
 
 logger = get_logger(__name__)
@@ -150,6 +151,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         allowed = {
             PGC_ACTION_CONVENTION_FASTWAM,
             PGC_ACTION_CONVENTION_LIBERO_ENV,
+            PGC_ACTION_CONVENTION_ROBOTWIN_QPOS,
         }
         unknown = sorted(set(normalized.values()) - allowed)
         if unknown:
@@ -189,6 +191,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         if convention == PGC_ACTION_CONVENTION_LIBERO_ENV:
             action = action.clone()
             action[..., -1] = (1.0 - action[..., -1]) * 0.5
+        elif convention == PGC_ACTION_CONVENTION_ROBOTWIN_QPOS:
+            pass
         elif (
             self.action_conventions_by_dataset_index
             and convention != PGC_ACTION_CONVENTION_FASTWAM

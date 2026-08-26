@@ -659,6 +659,9 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_visual_aspect_ratio = float(
             eraf_config.get("visual_aspect_ratio", 2.0)
         )
+        self.policy_guard_eraf_camera_layout = str(
+            eraf_config.get("camera_layout", "horizontal")
+        ).strip().lower()
         self.policy_guard_eraf_temperature = float(
             eraf_config.get("temperature", 0.07)
         )
@@ -2004,6 +2007,7 @@ class FastWAM(torch.nn.Module):
                             visual_aspect_ratio=(
                                 self.policy_guard_eraf_visual_aspect_ratio
                             ),
+                            camera_layout=self.policy_guard_eraf_camera_layout,
                             temperature=self.policy_guard_eraf_temperature,
                             entity_only=self.policy_guard_eraf_entity_only,
                             use_anchors=self.policy_guard_eraf_use_anchors,
@@ -14637,6 +14641,8 @@ class FastWAM(torch.nn.Module):
                 else "frozen_released_fastwam"
             ),
             "base_action_interface": "query_free_joint_mot",
+            "action_output_dim": int(self.action_expert.action_dim),
+            "proprio_dim": self.proprio_dim,
             "counterfactual_policy": (
                 "single_eraf_path_shared_video_action_expert_lora"
                 if is_v926
@@ -15208,6 +15214,9 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_visual_aspect_ratio": (
                 self.policy_guard_eraf_visual_aspect_ratio if is_v9 else None
+            ),
+            "eraf_camera_layout": (
+                self.policy_guard_eraf_camera_layout if is_v9 else None
             ),
             "eraf_temperature": (
                 self.policy_guard_eraf_temperature if is_v9 else None
@@ -19297,6 +19306,15 @@ class FastWAM(torch.nn.Module):
                         eraf = self.policy_guard_modules[
                             "entity_relation_affordance"
                         ]
+                        saved_camera_layout = str(
+                            metadata.get("eraf_camera_layout", "horizontal")
+                        ).strip().lower()
+                        if saved_camera_layout != eraf.entity_grounder.camera_layout:
+                            raise ValueError(
+                                "PGC v9 eraf_camera_layout mismatch: "
+                                f"checkpoint={saved_camera_layout}, "
+                                f"model={eraf.entity_grounder.camera_layout}."
+                            )
                         for metadata_name, expected_value in {
                             "eraf_visual_aspect_ratio": float(
                                 eraf.entity_grounder.visual_aspect_ratio

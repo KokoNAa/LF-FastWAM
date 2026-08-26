@@ -41,6 +41,7 @@ from fastwam.models.wan22.entity_relation_affordance import (
     ClauseActivationCalibrationAdapter,
     ERAFLossWeights,
     EntityRelationAffordanceField,
+    MultiViewEntityGrounder,
     PhaseSafeClauseMemory,
     _balanced_bipartite_assignment_loss,
     _balanced_clause_tuple_assignment_loss,
@@ -369,6 +370,47 @@ class PGCERAFGeometryTest(unittest.TestCase):
         self.assertTrue(torch.equal(camera_grid[:, 14:], torch.ones(14, 14, dtype=torch.long)))
         local_x = view_coordinates[:, 0].reshape(14, 28)
         self.assertTrue(torch.equal(local_x[:, :14], local_x[:, 14:]))
+
+    def test_robotwin_mosaic_patch_grid_keeps_three_view_identity(self):
+        self.assertEqual(
+            infer_spatial_patch_grid(480, aspect_ratio=5.0 / 6.0), (24, 20)
+        )
+        module = EntityRelationAffordanceField(
+            text_dim=10,
+            video_dim=16,
+            action_dim=12,
+            projection_dim=8,
+            hidden_dim=8,
+            num_heads=2,
+            camera_count=3,
+            visual_aspect_ratio=5.0 / 6.0,
+            camera_layout="robotwin_mosaic",
+        )
+        _, _, camera_ids, view_coordinates = (
+            module.entity_grounder._spatial_visual(torch.randn(1, 480, 16))
+        )
+        camera_grid = camera_ids.reshape(24, 20)
+        self.assertTrue(torch.equal(camera_grid[:16], torch.zeros(16, 20, dtype=torch.long)))
+        self.assertTrue(torch.equal(camera_grid[16:, :10], torch.ones(8, 10, dtype=torch.long)))
+        self.assertTrue(torch.equal(camera_grid[16:, 10:], torch.full((8, 10), 2, dtype=torch.long)))
+        self.assertEqual(torch.bincount(camera_ids, minlength=3).tolist(), [320, 80, 80])
+        local = view_coordinates.reshape(24, 20, 2)
+        torch.testing.assert_close(local[0, 0], torch.tensor([-1.0, -1.0]))
+        torch.testing.assert_close(local[15, 19], torch.tensor([1.0, 1.0]))
+        torch.testing.assert_close(local[16, 0], torch.tensor([-1.0, -1.0]))
+        torch.testing.assert_close(local[23, 9], torch.tensor([1.0, 1.0]))
+        torch.testing.assert_close(local[16, 10], torch.tensor([-1.0, -1.0]))
+        torch.testing.assert_close(local[23, 19], torch.tensor([1.0, 1.0]))
+
+    def test_robotwin_mosaic_requires_three_cameras(self):
+        with self.assertRaisesRegex(ValueError, "camera_count=3"):
+            MultiViewEntityGrounder(
+                video_dim=16,
+                hidden_dim=8,
+                camera_count=2,
+                visual_aspect_ratio=5.0 / 6.0,
+                camera_layout="robotwin_mosaic",
+            )
 
 
 class PGCERAFSamplingTest(unittest.TestCase):

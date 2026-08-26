@@ -57,6 +57,7 @@ CIS_TASKS="${CIS_TASKS:-}"
 INSTRUCTION_TYPE="${INSTRUCTION_TYPE:-unseen}"
 MAX_TASKS_PER_GPU="${MAX_TASKS_PER_GPU:-1}"
 FASTWAM_EVAL_MODE="${FASTWAM_EVAL_MODE:-B0}"
+ROBOTWIN_TASK_CONFIG="${ROBOTWIN_TASK_CONFIG:-robotwin_uncond_3cam_384_1e-4}"
 CKPT_STEM="$(basename "${ROBOTWIN_CKPT}")"
 CKPT_STEM="${CKPT_STEM%.*}"
 RUN_TAG="${RUN_TAG:-robotwin_cis_${FASTWAM_EVAL_MODE}_${CKPT_STEM}_seed${EVAL_SEED}_episodes${NUM_EPISODES}}"
@@ -102,10 +103,21 @@ case "${FASTWAM_EVAL_MODE}" in
       model.policy_guard.enabled=false
     )
     ;;
+  PGC)
+    ROBOTWIN_TASK_CONFIG=robotwin_pgc_3cam_384
+    PGC_OVERRIDES="$("${PYTHON_BIN}" scripts/inspect_pgc_checkpoint.py \
+      "${ROBOTWIN_CKPT}" \
+      --target robotwin \
+      --inference-steps "${NUM_INFERENCE_STEPS}" \
+      --format hydra)"
+    while IFS= read -r override; do
+      [[ -z "${override}" ]] || MODEL_OVERRIDES+=("${override}")
+    done <<< "${PGC_OVERRIDES}"
+    ;;
   CUSTOM)
     ;;
   *)
-    echo "FASTWAM_EVAL_MODE must be B0, M1, or CUSTOM." >&2
+    echo "FASTWAM_EVAL_MODE must be B0, M1, PGC, or CUSTOM." >&2
     exit 1
     ;;
 esac
@@ -120,7 +132,7 @@ echo "[RoboTwin CIS] output selector=${OUTPUT_ROOT}"
 echo "[RoboTwin CIS] conditions=${CIS_CONDITIONS} task_configs=${CIS_TASK_CONFIGS}"
 
 "${PYTHON_BIN}" experiments/robotwin/run_robotwin_cis_manager.py \
-  task=robotwin_uncond_3cam_384_1e-4 \
+  "task=${ROBOTWIN_TASK_CONFIG}" \
   "ckpt=${ROBOTWIN_CKPT}" \
   "seed=${EVAL_SEED}" \
   "EVALUATION.dataset_stats_path=${STATS_PATH}" \

@@ -22,6 +22,7 @@ from ..counterfactual import (
 )
 from ..pgc_libero import (
     PGC_ACTION_CONVENTION_FASTWAM,
+    PGC_ACTION_CONVENTION_LIBERO_ENV,
     PGC_ENTITY_RELATION_ARRAY_NAMES,
     array_sha256,
     classify_strict_conflict,
@@ -668,6 +669,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     f"{sorted(eraf_mask_shapes)}."
                 )
             self.pgc_entity_relation_mask_shape = next(iter(eraf_mask_shapes))
+            eraf_camera_counts = {
+                int(index["camera_count"])
+                for index in self.pgc_entity_relation_indices.values()
+            }
+            if len(eraf_camera_counts) != 1:
+                raise ValueError(
+                    "PGC v9 sidecars disagree on camera count: "
+                    f"{sorted(eraf_camera_counts)}."
+                )
+            self.pgc_entity_relation_camera_count = next(iter(eraf_camera_counts))
             self.pgc_entity_relation_workspace_bounds = (
                 pgc_entity_relation_workspace_bounds(
                     self.pgc_entity_relation_indices
@@ -675,6 +686,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )
         else:
             self.pgc_entity_relation_mask_shape = (56, 112)
+            self.pgc_entity_relation_camera_count = 2
             self.pgc_entity_relation_workspace_bounds = None
         self._pgc_entity_relation_cache: OrderedDict[
             tuple[int, int], dict[str, np.ndarray]
@@ -699,7 +711,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 action_conventions
             )
             aligned_count = sum(
-                convention != PGC_ACTION_CONVENTION_FASTWAM
+                convention == PGC_ACTION_CONVENTION_LIBERO_ENV
                 for convention in action_conventions.values()
             )
             logger.info(
@@ -1276,9 +1288,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 if hasattr(action, "detach"):
                     action = action.detach().cpu().numpy()
                 action = np.ascontiguousarray(np.asarray(action, dtype=np.float32))
-                if action.ndim != 2 or action.shape[1] != 7:
+                expected_action_dim = int(index["action_dim"])
+                if action.ndim != 2 or action.shape[1] != expected_action_dim:
                     raise ValueError(
-                        "PGC v9 audited actions must be [T,7], got "
+                        "PGC v9 audited actions have the wrong shape; expected "
+                        f"[T,{expected_action_dim}], got "
                         f"{action.shape} at dataset/episode "
                         f"{dataset_index}/{episode_index}."
                     )
@@ -1476,8 +1490,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             for role in ("target", "source"):
                 expected_scalar_shape = (frame_count, max_clauses)
                 expected_vector_shape = (*expected_scalar_shape, 3)
-                expected_view_visible_shape = (*expected_scalar_shape, 2)
-                expected_view_center_shape = (*expected_scalar_shape, 2, 2)
+                camera_count = int(index["camera_count"])
+                expected_view_visible_shape = (*expected_scalar_shape, camera_count)
+                expected_view_center_shape = (
+                    *expected_scalar_shape,
+                    camera_count,
+                    2,
+                )
                 expected_mask_shape = (
                     *expected_scalar_shape,
                     mask_height,

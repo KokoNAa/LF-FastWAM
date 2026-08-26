@@ -285,6 +285,7 @@ class MultiViewEntityGrounder(nn.Module):
         hidden_dim: int = 256,
         camera_count: int = 2,
         visual_aspect_ratio: float = 2.0,
+        camera_layout: str = "horizontal",
         temperature: float = 0.07,
         view_fusion_enabled: bool = False,
         view_fusion_adapter_hidden_dim: int = 256,
@@ -299,6 +300,16 @@ class MultiViewEntityGrounder(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.camera_count = int(camera_count)
         self.visual_aspect_ratio = float(visual_aspect_ratio)
+        self.camera_layout = str(camera_layout).strip().lower()
+        if self.camera_layout not in {"horizontal", "robotwin_mosaic"}:
+            raise ValueError(
+                "ERAF camera_layout must be 'horizontal' or "
+                "'robotwin_mosaic'."
+            )
+        if self.camera_layout == "robotwin_mosaic" and self.camera_count != 3:
+            raise ValueError(
+                "ERAF robotwin_mosaic layout requires camera_count=3."
+            )
         self.temperature = float(temperature)
         self.view_fusion_enabled = bool(view_fusion_enabled)
         self.visual_projection = nn.Sequential(
@@ -363,27 +374,96 @@ class MultiViewEntityGrounder(nn.Module):
         )
         yy, xx = torch.meshgrid(y, x, indexing="ij")
         coordinates = torch.stack((xx, yy), dim=-1).reshape(token_count, 2)
+        rows = torch.arange(grid_height, device=visual_hidden.device)
         columns = torch.arange(grid_width, device=visual_hidden.device)
-        if grid_width % self.camera_count:
-            raise ValueError(
-                "ERAF horizontally concatenated patch width must be divisible "
-                "by camera_count."
+        row_grid, column_grid = torch.meshgrid(rows, columns, indexing="ij")
+        if self.camera_layout == "horizontal":
+            if grid_width % self.camera_count:
+                raise ValueError(
+                    "ERAF horizontally concatenated patch width must be "
+                    "divisible by camera_count."
+                )
+            camera_width = grid_width // self.camera_count
+            camera_ids = torch.div(
+                column_grid * self.camera_count,
+                grid_width,
+                rounding_mode="floor",
+            ).clamp(max=self.camera_count - 1)
+            local_x_axis = torch.linspace(
+                -1.0,
+                1.0,
+                camera_width,
+                device=visual_hidden.device,
+                dtype=visual_hidden.dtype,
             )
-        camera_ids = torch.div(
-            columns * self.camera_count, grid_width, rounding_mode="floor"
-        ).clamp(max=self.camera_count - 1)
-        camera_ids = camera_ids.unsqueeze(0).expand(grid_height, -1).reshape(-1)
-        camera_width = grid_width // self.camera_count
-        local_x = torch.linspace(
-            -1.0,
-            1.0,
-            camera_width,
-            device=visual_hidden.device,
-            dtype=visual_hidden.dtype,
-        )
-        local_x = local_x[columns.remainder(camera_width)]
-        local_x = local_x.unsqueeze(0).expand(grid_height, -1).reshape(-1)
-        local_y = yy.reshape(-1)
+            local_x = local_x_axis[column_grid.remainder(camera_width)]
+            local_y = yy
+        else:
+            # RobotVideoDataset composes RoboTwin observations as one full-width
+            # head view on top (2/3 height) and two half-width wrist views on
+            # the bottom (1/3 height).  Keep both camera identity and local
+            # coordinates aligned with that exact pixel/token geometry.
+            if grid_height % 3 or grid_width % 2:
+                raise ValueError(
+                    "ERAF robotwin_mosaic patch grid requires height divisible "
+                    "by 3 and width divisible by 2."
+                )
+            head_height = 2 * grid_height // 3
+            wrist_height = grid_height // 3
+            wrist_width = grid_width // 2
+            camera_ids = torch.zeros_like(row_grid)
+            wrist_rows = row_grid >= head_height
+            camera_ids = torch.where(
+                wrist_rows & (column_grid < wrist_width),
+                torch.ones_like(camera_ids),
+                camera_ids,
+            )
+            camera_ids = torch.where(
+                wrist_rows & (column_grid >= wrist_width),
+                torch.full_like(camera_ids, 2),
+                camera_ids,
+            )
+            head_x_axis = torch.linspace(
+                -1.0,
+                1.0,
+                grid_width,
+                device=visual_hidden.device,
+                dtype=visual_hidden.dtype,
+            )
+            wrist_x_axis = torch.linspace(
+                -1.0,
+                1.0,
+                wrist_width,
+                device=visual_hidden.device,
+                dtype=visual_hidden.dtype,
+            )
+            head_y_axis = torch.linspace(
+                -1.0,
+                1.0,
+                head_height,
+                device=visual_hidden.device,
+                dtype=visual_hidden.dtype,
+            )
+            wrist_y_axis = torch.linspace(
+                -1.0,
+                1.0,
+                wrist_height,
+                device=visual_hidden.device,
+                dtype=visual_hidden.dtype,
+            )
+            local_x = torch.where(
+                wrist_rows,
+                wrist_x_axis[column_grid.remainder(wrist_width)],
+                head_x_axis[column_grid],
+            )
+            local_y = torch.where(
+                wrist_rows,
+                wrist_y_axis[(row_grid - head_height).clamp_min(0)],
+                head_y_axis[row_grid.clamp_max(head_height - 1)],
+            )
+        camera_ids = camera_ids.reshape(-1)
+        local_x = local_x.reshape(-1)
+        local_y = local_y.reshape(-1)
         view_coordinates = torch.stack((local_x, local_y), dim=-1)
         visual = self.visual_projection(visual_hidden)
         visual = visual + self.position_projection(coordinates).unsqueeze(0)
@@ -1601,6 +1681,7 @@ class EntityRelationAffordanceField(nn.Module):
         max_clauses: int = 4,
         camera_count: int = 2,
         visual_aspect_ratio: float = 2.0,
+        camera_layout: str = "horizontal",
         temperature: float = 0.07,
         entity_only: bool = False,
         use_anchors: bool = True,
@@ -1698,6 +1779,7 @@ class EntityRelationAffordanceField(nn.Module):
             hidden_dim=hidden_dim,
             camera_count=camera_count,
             visual_aspect_ratio=visual_aspect_ratio,
+            camera_layout=camera_layout,
             temperature=temperature,
             view_fusion_enabled=view_fusion_enabled,
             view_fusion_adapter_hidden_dim=view_fusion_adapter_hidden_dim,

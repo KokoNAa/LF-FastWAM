@@ -151,6 +151,70 @@ def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.uint8)
 
 
+def _json_tensor(value: Any) -> Any:
+    """Convert one compact diagnostic tensor into a JSON-safe value."""
+    if torch.is_tensor(value):
+        value = value.detach().cpu()
+        if value.ndim > 0 and value.shape[0] == 1:
+            value = value[0]
+        return value.tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _summarize_eraf_diagnostics(pred: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Retain causal/phase diagnostics without serializing patch heatmaps."""
+    raw = pred.get("policy_guard_eraf_diagnostics")
+    if not isinstance(raw, dict):
+        return None
+    result: Dict[str, Any] = {"path": "single_eraf_shared_expert_lora"}
+    transforms = {
+        "active_logits": ("active_probability", torch.sigmoid),
+        "predicate_logits": ("predicate_ids", lambda value: value.argmax(dim=-1)),
+        "subject_position": ("subject_position", lambda value: value),
+        "reference_position": ("reference_position", lambda value: value),
+        "subject_view_attention_mass": (
+            "subject_view_attention_mass",
+            lambda value: value,
+        ),
+        "reference_view_attention_mass": (
+            "reference_view_attention_mass",
+            lambda value: value,
+        ),
+        "grasp_anchor": ("grasp_anchor", lambda value: value),
+        "goal_anchor": ("goal_anchor", lambda value: value),
+        "interaction_anchor": ("interaction_anchor", lambda value: value),
+        "predicate_truth_logits": (
+            "predicate_truth_probability",
+            torch.sigmoid,
+        ),
+        "phase_logits": ("phase_ids", lambda value: value.argmax(dim=-1)),
+        "clause_execution_probability": (
+            "clause_execution_probability",
+            lambda value: value,
+        ),
+        "phase_safe_memory_next_state_ids": (
+            "phase_safe_memory_next_state_ids",
+            lambda value: value,
+        ),
+        "phase_safe_memory_next_state_valid": (
+            "phase_safe_memory_next_state_valid",
+            lambda value: value,
+        ),
+    }
+    for source_key, (output_key, transform) in transforms.items():
+        value = raw.get(source_key)
+        if value is None:
+            continue
+        if torch.is_tensor(value):
+            value = transform(value)
+        result[output_key] = _json_tensor(value)
+    return result
+
+
 class WorldActionRobotWinPolicy:
     def __init__(
         self,
@@ -212,6 +276,7 @@ class WorldActionRobotWinPolicy:
         # V9.13 policy state is caller-owned and reset for every RoboTwin
         # episode; the shared model never retains environment-specific memory.
         self.policy_guard_state: Optional[dict[str, Any]] = None
+        self.policy_diagnostics: list[Dict[str, Any]] = []
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
@@ -296,6 +361,10 @@ class WorldActionRobotWinPolicy:
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
         self.policy_guard_state = pred.get("policy_guard_state")
+        eraf_diagnostics = _summarize_eraf_diagnostics(pred)
+        if eraf_diagnostics is not None:
+            eraf_diagnostics["replan_index"] = len(self.policy_diagnostics)
+            self.policy_diagnostics.append(eraf_diagnostics)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
@@ -343,9 +412,19 @@ class WorldActionRobotWinPolicy:
             "sim_s": float(self._timing_rollout["sim_s"]),
         }
 
+    def get_policy_diagnostics(self) -> Optional[Dict[str, Any]]:
+        if not self.policy_diagnostics:
+            return None
+        return {
+            "format": "robotwin_pgc_eraf_diagnostics_v1",
+            "replan_count": len(self.policy_diagnostics),
+            "replans": list(self.policy_diagnostics),
+        }
+
     def reset(self) -> None:
         self.pending_actions.clear()
         self.policy_guard_state = None
+        self.policy_diagnostics.clear()
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()

@@ -27,6 +27,7 @@ PGC_COMPLETION_PHASE_INDEX = Path("meta/pgc_v5_completion_phases.json")
 PGC_CLOSED_LOOP_CORRECTIVE_FORMAT = "pgc_libero_closed_loop_corrective_v1"
 PGC_CLOSED_LOOP_CORRECTIVE_INDEX = Path("meta/pgc_v8_closed_loop/index.json")
 PGC_ENTITY_RELATION_FORMAT = "pgc_libero_entity_relation_v1"
+PGC_ROBOTWIN_ENTITY_RELATION_FORMAT = "pgc_robotwin_entity_relation_v1"
 PGC_ENTITY_RELATION_INDEX = Path("index.json")
 PGC_ENTITY_RELATION_WORKSPACE_MIN = (-0.8, -0.8, 0.0)
 PGC_ENTITY_RELATION_WORKSPACE_MAX = (0.8, 0.8, 1.2)
@@ -34,6 +35,7 @@ PGC_ACTION_CONVENTION_FASTWAM = "fastwam_gripper_open_1_close_0"
 PGC_ACTION_CONVENTION_LIBERO_ENV = (
     "libero_env_gripper_open_minus1_close_plus1"
 )
+PGC_ACTION_CONVENTION_ROBOTWIN_QPOS = "robotwin_dual_arm_qpos14"
 PGC_ACTION_REPLAY_IDENTITY = "identity"
 PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV = "fastwam_to_libero_env"
 PGC_ENTITY_RELATION_PREDICATES = (
@@ -779,7 +781,11 @@ def load_pgc_entity_relation_index(
             "scripts/build_pgc_libero_entity_relations.py first."
         )
     payload = json.loads(index_path.read_text(encoding="utf-8"))
-    if payload.get("format") != PGC_ENTITY_RELATION_FORMAT:
+    sidecar_format = payload.get("format")
+    if sidecar_format not in {
+        PGC_ENTITY_RELATION_FORMAT,
+        PGC_ROBOTWIN_ENTITY_RELATION_FORMAT,
+    }:
         raise ValueError(
             f"Unsupported PGC v9 sidecar format at {index_path}: "
             f"{payload.get('format')!r}."
@@ -795,16 +801,30 @@ def load_pgc_entity_relation_index(
     replay_transform = str(
         payload.get("simulator_replay_action_transform", "")
     )
-    expected_action_contract = {
-        "native": (
-            PGC_ACTION_CONVENTION_FASTWAM,
-            PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV,
-        ),
-        "counterfactual": (
-            PGC_ACTION_CONVENTION_LIBERO_ENV,
-            PGC_ACTION_REPLAY_IDENTITY,
-        ),
-    }
+    is_robotwin = sidecar_format == PGC_ROBOTWIN_ENTITY_RELATION_FORMAT
+    expected_action_contract = (
+        {
+            "native": (
+                PGC_ACTION_CONVENTION_ROBOTWIN_QPOS,
+                PGC_ACTION_REPLAY_IDENTITY,
+            ),
+            "counterfactual": (
+                PGC_ACTION_CONVENTION_ROBOTWIN_QPOS,
+                PGC_ACTION_REPLAY_IDENTITY,
+            ),
+        }
+        if is_robotwin
+        else {
+            "native": (
+                PGC_ACTION_CONVENTION_FASTWAM,
+                PGC_ACTION_REPLAY_FASTWAM_TO_LIBERO_ENV,
+            ),
+            "counterfactual": (
+                PGC_ACTION_CONVENTION_LIBERO_ENV,
+                PGC_ACTION_REPLAY_IDENTITY,
+            ),
+        }
+    )
     if dataset_kind not in expected_action_contract:
         raise ValueError(
             "PGC v9 sidecars must declare dataset_kind as native or "
@@ -848,15 +868,23 @@ def load_pgc_entity_relation_index(
         or len(mask_size) != 2
         or any(int(value) <= 0 for value in mask_size)
         or int(mask_size[1]) % 2
+        or (is_robotwin and int(mask_size[0]) % 3)
     ):
         raise ValueError(
             "PGC v9 sidecar mask_size must be positive with an even width."
         )
-    if payload.get("camera_names") != [
-        "agentview",
-        "robot0_eye_in_hand",
-    ]:
+    expected_camera_names = (
+        ["cam_high", "cam_left_wrist", "cam_right_wrist"]
+        if is_robotwin
+        else ["agentview", "robot0_eye_in_hand"]
+    )
+    if payload.get("camera_names") != expected_camera_names:
         raise ValueError("PGC v9 sidecar camera order is incompatible.")
+    action_dim = int(payload.get("action_dim", 14 if is_robotwin else 7))
+    if action_dim != (14 if is_robotwin else 7):
+        raise ValueError(
+            f"PGC v9 sidecar action_dim is incompatible: {action_dim}."
+        )
     if (
         payload.get("view_center_coordinate_system")
         != "per_camera_normalized_xy"
@@ -920,6 +948,8 @@ def load_pgc_entity_relation_index(
     if set(indexed) != set(range(len(indexed))):
         raise ValueError("PGC v9 sidecar episode indices must be dense.")
     result = dict(payload)
+    result["camera_count"] = len(expected_camera_names)
+    result["action_dim"] = action_dim
     result["index_path"] = str(index_path)
     result["episodes_by_index"] = indexed
     return result
