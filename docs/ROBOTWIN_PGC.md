@@ -13,9 +13,10 @@ LoRA method to RoboTwin without reusing LIBERO's 7-D Cartesian assumptions.
   residual or candidate gate, and contain shared Video + Action Expert LoRA.
 - Counterfactual expert data is collected inside the source task's initialized
   scene. Independently sampled left/right scenes are invalid pairs.
-- SAPIEN actor IDs, entity positions, qpos actions, seed, initial-state hash and
-  action hash are training-only audited data. Deployment remains RGB, language,
-  proprio and caller-owned completion memory.
+- SAPIEN actor IDs (stored losslessly at the 24x20 ERAF token geometry), entity
+  positions, qpos actions, seed, initial-state hash and action hash are
+  training-only audited data. Deployment remains RGB, language, proprio and
+  caller-owned completion memory.
 
 ## Server collection smoke test
 

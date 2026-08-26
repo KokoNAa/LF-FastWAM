@@ -490,7 +490,22 @@ class Base_Task(gym.Env):
         if self.data_type.get("actor_segmentation_ids", False):
             actor_ids = self.cameras.get_raw_segmentation(level="actor")
             for camera_name, labels in actor_ids.items():
-                pkl_dic["observation"][camera_name]["actor_segmentation_ids"] = labels
+                # ERAF supervises the 24x20 patch grid, so persisting full
+                # 480x640 uint32 labels would waste hundreds of MB per
+                # episode. Preserve integer IDs with nearest-neighbor sampling
+                # directly at the exact head/wrist token geometry.
+                target_height, target_width = (
+                    (16, 20) if camera_name == "head_camera" else (8, 10)
+                )
+                row_indices = np.rint(
+                    np.linspace(0, labels.shape[0] - 1, target_height)
+                ).astype(np.int64)
+                column_indices = np.rint(
+                    np.linspace(0, labels.shape[1] - 1, target_width)
+                ).astype(np.int64)
+                pkl_dic["observation"][camera_name][
+                    "actor_segmentation_ids"
+                ] = labels[np.ix_(row_indices, column_indices)]
         # depth
         if self.data_type.get("depth", False):
             depth = self.cameras.get_depth()
