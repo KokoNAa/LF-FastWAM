@@ -111,11 +111,19 @@ echo "[python-env] building CuRobo ${CUROBO_TAG} with nvcc=$(command -v nvcc) ar
 nvcc --version
 "${PYTHON_BIN}" -m pip install -e "${CUROBO_ROOT}" --no-build-isolation
 
+# CuRobo's transitive dependencies currently select newer releases than the
+# FastWAM/Requests environment supports. Restore the shared compatibility pins
+# after the editable CuRobo install; neither package affects the CUDA build.
+"${PYTHON_BIN}" -m pip install --no-deps \
+  "packaging==25.0" \
+  "chardet==5.2.0"
+
 "${PYTHON_BIN}" - <<'PY'
 import curobo
 import gymnasium
 import mplib
 import open3d
+import requests
 import sapien
 import transforms3d
 import trimesh
