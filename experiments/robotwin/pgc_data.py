@@ -88,6 +88,18 @@ def validate_pair_record(record: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("RoboTwin PGC task/direction labels disagree.")
     if target != opposite_direction(source):
         raise ValueError("RoboTwin PGC pair must reverse left/right semantics.")
+    dataset_kind = record.get("dataset_kind")
+    if dataset_kind is not None:
+        dataset_kind = str(dataset_kind)
+        if dataset_kind not in {"native", "counterfactual"}:
+            raise ValueError(
+                f"RoboTwin PGC dataset_kind is invalid: {dataset_kind!r}."
+            )
+        expected_execution = source if dataset_kind == "native" else target
+        if str(record.get("executed_direction", "")) != expected_execution:
+            raise ValueError(
+                "RoboTwin PGC executed direction does not match dataset_kind."
+            )
     if int(record["scene_seed"]) < 0 or int(record["action_count"]) <= 0:
         raise ValueError("RoboTwin PGC seed/action_count is invalid.")
     for key in ("initial_state_sha256", "action_sha256"):

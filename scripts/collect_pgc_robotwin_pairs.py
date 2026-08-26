@@ -123,133 +123,37 @@ def _close(task: Any, *, clear_cache: bool = False) -> None:
         task.close_env()
 
 
-def collect_direction(
-    *,
-    robotwin_root: Path,
-    output_root: Path,
-    source_task: str,
-    task_config: str,
-    episodes: int,
-    start_seed: int,
-) -> Path:
-    source_direction = direction_from_task(source_task)
-    target_direction = opposite_direction(source_direction)
-    target_task = f"place_a2b_{target_direction}"
-    pair_id = f"{source_task}_to_{target_task}"
-    run_root = output_root / pair_id
-    task, args = _load_robotwin_args(
-        robotwin_root=robotwin_root,
-        task_name=source_task,
-        task_config=task_config,
-        output_root=run_root,
+def _capture_data_type(args: dict[str, Any]) -> dict[str, Any]:
+    data_type = dict(args.get("data_type") or {})
+    data_type.update(
+        rgb=True,
+        qpos=True,
+        actor_segmentation_ids=True,
+        pgc_entity_state=True,
     )
-    run_root.mkdir(parents=True, exist_ok=True)
-    state_dir = run_root / "meta" / "initial_states"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    accepted: list[tuple[int, np.ndarray]] = []
-    seed = int(start_seed)
+    return data_type
 
-    plan_args = dict(args)
-    plan_args["data_type"] = dict(plan_args.get("data_type") or {})
-    plan_args["data_type"]["rgb"] = True
-    plan_args["data_type"]["qpos"] = True
-    plan_args["data_type"]["actor_segmentation_ids"] = True
-    plan_args["data_type"]["pgc_entity_state"] = True
-    plan_args.update(need_plan=True, save_data=False, render_freq=0)
-    while len(accepted) < episodes:
-        episode_index = len(accepted)
-        try:
-            task.setup_demo(now_ep_num=episode_index, seed=seed, **plan_args)
-            initial_state = scene_state_vector(task)
-            task.play_once_direction(target_direction)
-            if task.plan_success and task.check_direction_success(target_direction):
-                task.save_traj_data(episode_index)
-                state_path = state_dir / f"episode{episode_index}.npy"
-                np.save(state_path, initial_state, allow_pickle=False)
-                accepted.append((seed, initial_state))
-                print(
-                    f"[plan] accepted {pair_id} episode={episode_index} seed={seed}",
-                    flush=True,
-                )
-            else:
-                print(f"[plan] rejected {pair_id} seed={seed}", flush=True)
-            _close(task)
-        except Exception:
-            print(traceback.format_exc(), flush=True)
-            _close(task)
-        seed += 1
 
-    audit_path = run_root / "meta" / "pgc_episodes.jsonl"
-    audit_path.write_text("", encoding="utf-8")
-    replay_args = dict(args)
-    replay_args["data_type"] = dict(replay_args.get("data_type") or {})
-    replay_args["data_type"]["rgb"] = True
-    replay_args["data_type"]["qpos"] = True
-    replay_args["data_type"]["actor_segmentation_ids"] = True
-    replay_args["data_type"]["pgc_entity_state"] = True
-    replay_args.update(need_plan=False, save_data=True, render_freq=0)
-    for episode_index, (scene_seed, planned_state) in enumerate(accepted):
-        task.setup_demo(
-            now_ep_num=episode_index,
-            seed=scene_seed,
-            **replay_args,
-        )
-        replay_state = scene_state_vector(task)
-        if not np.array_equal(replay_state, planned_state):
-            _close(task)
-            raise RuntimeError(
-                f"Scene replay drift for {pair_id} episode={episode_index}."
-            )
-        trajectory = task.load_tran_data(episode_index)
-        replay_args["left_joint_path"] = trajectory["left_joint_path"]
-        replay_args["right_joint_path"] = trajectory["right_joint_path"]
-        task.set_path_lst(replay_args)
-        info = task.play_once_direction(target_direction)
-        if not task.check_direction_success(target_direction):
-            _close(task)
-            raise RuntimeError(
-                f"Counterfactual replay failed for {pair_id} episode={episode_index}."
-            )
-        _close(task, clear_cache=((episode_index + 1) % int(args["clear_cache_freq"]) == 0))
-        task.merge_pkl_to_hdf5_video()
-        task.remove_data_cache()
-        hdf5_path = run_root / "data" / f"episode{episode_index}.hdf5"
-        actions = _load_actions(hdf5_path)
-        state_relpath = Path("meta") / "initial_states" / f"episode{episode_index}.npy"
-        record = validate_pair_record(
-            {
-                "format": PGC_ROBOTWIN_PAIR_FORMAT,
-                "episode_index": episode_index,
-                "pair_id": pair_id,
-                "source_task": source_task,
-                "counterfactual_task": target_task,
-                "source_direction": source_direction,
-                "counterfactual_direction": target_direction,
-                "scene_seed": scene_seed,
-                "initial_state_sha256": array_sha256(planned_state),
-                "source_initial_state_catalog": state_relpath.as_posix(),
-                "action_sha256": array_sha256(actions),
-                "action_count": int(actions.shape[0]),
-                "raw_hdf5": hdf5_path.relative_to(run_root).as_posix(),
-                "source_instruction": f"Place object A to the {source_direction} of object B.",
-                "counterfactual_instruction": f"Place object A to the {target_direction} of object B.",
-                "scene_info": info,
-            }
-        )
-        _append_jsonl(audit_path, record)
-        print(
-            f"[record] completed {pair_id} episode={episode_index} seed={scene_seed}",
-            flush=True,
-        )
-
+def _write_provenance(
+    *,
+    run_root: Path,
+    pair_id: str,
+    source_task: str,
+    target_task: str,
+    source_direction: str,
+    target_direction: str,
+    dataset_kind: str,
+    episode_count: int,
+) -> None:
     provenance = {
         "format": PGC_DATA_FORMAT,
         "raw_format": PGC_ROBOTWIN_RAW_FORMAT,
         "platform": "robotwin",
+        "dataset_kind": dataset_kind,
         "state_aligned": True,
         "action_dim": 14,
         "camera_names": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
-        "successful_episode_count": episodes,
+        "successful_episode_count": episode_count,
         "pairs": [
             {
                 "pair_id": pair_id,
@@ -267,7 +171,219 @@ def collect_direction(
     (run_root / "meta" / "pgc_provenance.json").write_text(
         json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    return run_root
+
+
+def _replay_dataset(
+    *,
+    task: Any,
+    base_args: dict[str, Any],
+    run_root: Path,
+    accepted: list[tuple[int, np.ndarray]],
+    execution_direction: str,
+    dataset_kind: str,
+    pair_id: str,
+    source_task: str,
+    target_task: str,
+    source_direction: str,
+    target_direction: str,
+) -> None:
+    audit_path = run_root / "meta" / "pgc_episodes.jsonl"
+    audit_path.write_text("", encoding="utf-8")
+    replay_args = dict(base_args)
+    replay_args.update(
+        save_path=str(run_root),
+        data_type=_capture_data_type(base_args),
+        need_plan=False,
+        save_data=True,
+        render_freq=0,
+    )
+    for episode_index, (scene_seed, planned_state) in enumerate(accepted):
+        task.setup_demo(now_ep_num=episode_index, seed=scene_seed, **replay_args)
+        replay_state = scene_state_vector(task)
+        if not np.array_equal(replay_state, planned_state):
+            _close(task)
+            raise RuntimeError(
+                f"Scene replay drift for {pair_id}/{dataset_kind} "
+                f"episode={episode_index}."
+            )
+        trajectory = task.load_tran_data(episode_index)
+        replay_args["left_joint_path"] = trajectory["left_joint_path"]
+        replay_args["right_joint_path"] = trajectory["right_joint_path"]
+        task.set_path_lst(replay_args)
+        info = task.play_once_direction(execution_direction)
+        if not task.check_direction_success(execution_direction):
+            _close(task)
+            raise RuntimeError(
+                f"{dataset_kind} replay failed for {pair_id} "
+                f"episode={episode_index}."
+            )
+        _close(
+            task,
+            clear_cache=(
+                (episode_index + 1) % int(base_args["clear_cache_freq"]) == 0
+            ),
+        )
+        task.merge_pkl_to_hdf5_video()
+        task.remove_data_cache()
+        hdf5_path = run_root / "data" / f"episode{episode_index}.hdf5"
+        actions = _load_actions(hdf5_path)
+        state_relpath = (
+            Path("meta") / "initial_states" / f"episode{episode_index}.npy"
+        )
+        record = validate_pair_record(
+            {
+                "format": PGC_ROBOTWIN_PAIR_FORMAT,
+                "episode_index": episode_index,
+                "pair_id": pair_id,
+                "dataset_kind": dataset_kind,
+                "source_task": source_task,
+                "counterfactual_task": target_task,
+                "source_direction": source_direction,
+                "counterfactual_direction": target_direction,
+                "executed_direction": execution_direction,
+                "scene_seed": scene_seed,
+                "initial_state_sha256": array_sha256(planned_state),
+                "source_initial_state_catalog": state_relpath.as_posix(),
+                "action_sha256": array_sha256(actions),
+                "action_count": int(actions.shape[0]),
+                "raw_hdf5": hdf5_path.relative_to(run_root).as_posix(),
+                "source_instruction": f"Place object A to the {source_direction} of object B.",
+                "counterfactual_instruction": f"Place object A to the {target_direction} of object B.",
+                "scene_info": info,
+            }
+        )
+        _append_jsonl(audit_path, record)
+        print(
+            f"[record] completed {pair_id}/{dataset_kind} "
+            f"episode={episode_index} seed={scene_seed}",
+            flush=True,
+        )
+    _write_provenance(
+        run_root=run_root,
+        pair_id=pair_id,
+        source_task=source_task,
+        target_task=target_task,
+        source_direction=source_direction,
+        target_direction=target_direction,
+        dataset_kind=dataset_kind,
+        episode_count=len(accepted),
+    )
+
+
+def collect_direction(
+    *,
+    robotwin_root: Path,
+    output_root: Path,
+    source_task: str,
+    task_config: str,
+    episodes: int,
+    start_seed: int,
+) -> Path:
+    source_direction = direction_from_task(source_task)
+    target_direction = opposite_direction(source_direction)
+    target_task = f"place_a2b_{target_direction}"
+    pair_id = f"{source_task}_to_{target_task}"
+    pair_root = output_root / pair_id
+    native_root = pair_root / "native"
+    counterfactual_root = pair_root / "counterfactual"
+    task, args = _load_robotwin_args(
+        robotwin_root=robotwin_root,
+        task_name=source_task,
+        task_config=task_config,
+        output_root=pair_root,
+    )
+    for run_root in (native_root, counterfactual_root):
+        (run_root / "meta" / "initial_states").mkdir(parents=True, exist_ok=True)
+    accepted: list[tuple[int, np.ndarray]] = []
+    seed = int(start_seed)
+
+    plan_args = dict(args)
+    plan_args["data_type"] = _capture_data_type(args)
+    plan_args.update(need_plan=True, save_data=False, render_freq=0)
+    while len(accepted) < episodes:
+        episode_index = len(accepted)
+        try:
+            target_plan_args = dict(plan_args, save_path=str(counterfactual_root))
+            task.setup_demo(now_ep_num=episode_index, seed=seed, **target_plan_args)
+            target_initial_state = scene_state_vector(task)
+            task.play_once_direction(target_direction)
+            target_ok = bool(
+                task.plan_success
+                and task.check_direction_success(target_direction)
+            )
+            if target_ok:
+                task.save_traj_data(episode_index)
+            _close(task)
+            if not target_ok:
+                print(f"[plan] rejected target {pair_id} seed={seed}", flush=True)
+                seed += 1
+                continue
+
+            native_plan_args = dict(plan_args, save_path=str(native_root))
+            task.setup_demo(now_ep_num=episode_index, seed=seed, **native_plan_args)
+            native_initial_state = scene_state_vector(task)
+            if not np.array_equal(native_initial_state, target_initial_state):
+                raise RuntimeError(
+                    f"Joint seed selection changed scene state for {pair_id} seed={seed}."
+                )
+            task.play_once_direction(source_direction)
+            native_ok = bool(
+                task.plan_success
+                and task.check_direction_success(source_direction)
+            )
+            if native_ok:
+                task.save_traj_data(episode_index)
+            _close(task)
+            if not native_ok:
+                print(f"[plan] rejected native {pair_id} seed={seed}", flush=True)
+                seed += 1
+                continue
+
+            for run_root in (native_root, counterfactual_root):
+                state_path = (
+                    run_root
+                    / "meta"
+                    / "initial_states"
+                    / f"episode{episode_index}.npy"
+                )
+                np.save(state_path, target_initial_state, allow_pickle=False)
+            accepted.append((seed, target_initial_state))
+            print(
+                f"[plan] jointly accepted {pair_id} episode={episode_index} "
+                f"seed={seed}",
+                flush=True,
+            )
+        except Exception:
+            print(traceback.format_exc(), flush=True)
+            _close(task)
+        seed += 1
+    _replay_dataset(
+        task=task,
+        base_args=args,
+        run_root=native_root,
+        accepted=accepted,
+        execution_direction=source_direction,
+        dataset_kind="native",
+        pair_id=pair_id,
+        source_task=source_task,
+        target_task=target_task,
+        source_direction=source_direction,
+        target_direction=target_direction,
+    )
+    _replay_dataset(
+        task=task,
+        base_args=args,
+        run_root=counterfactual_root,
+        accepted=accepted,
+        execution_direction=target_direction,
+        dataset_kind="counterfactual",
+        pair_id=pair_id,
+        source_task=source_task,
+        target_task=target_task,
+        source_direction=source_direction,
+        target_direction=target_direction,
+    )
+    return pair_root
 
 
 def main() -> None:

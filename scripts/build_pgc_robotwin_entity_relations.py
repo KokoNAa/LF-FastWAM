@@ -225,6 +225,12 @@ def build_sidecar(*, raw_root: Path, dataset_root: Path, output_root: Path) -> P
     records = read_jsonl(raw_root / "meta" / "pgc_episodes.jsonl")
     if not records:
         raise ValueError(f"Raw RoboTwin PGC capture has no episodes: {raw_root}.")
+    provenance = json.loads(
+        (raw_root / "meta" / "pgc_provenance.json").read_text(encoding="utf-8")
+    )
+    dataset_kind = str(provenance.get("dataset_kind", ""))
+    if dataset_kind not in {"native", "counterfactual"}:
+        raise ValueError(f"Invalid raw RoboTwin dataset_kind: {dataset_kind!r}.")
     output_root.mkdir(parents=True, exist_ok=True)
     episode_dir = output_root / "episodes"
     episode_dir.mkdir(parents=True, exist_ok=True)
@@ -283,7 +289,7 @@ def build_sidecar(*, raw_root: Path, dataset_root: Path, output_root: Path) -> P
         "privileged_supervision": "training_only",
         "deployment_inputs": "rgb_language_proprio",
         "dataset": str(dataset_root.resolve()),
-        "dataset_kind": "counterfactual",
+        "dataset_kind": dataset_kind,
         "dataset_action_convention": PGC_ACTION_CONVENTION_ROBOTWIN_QPOS,
         "simulator_replay_action_transform": PGC_ACTION_REPLAY_IDENTITY,
         "action_dim": 14,

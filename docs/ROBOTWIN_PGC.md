@@ -30,8 +30,10 @@ python scripts/collect_pgc_robotwin_pairs.py \
   --source-tasks place_a2b_left place_a2b_right
 
 python scripts/validate_pgc_robotwin_raw.py \
-  data/pgc_robotwin_raw/place_a2b_left_to_place_a2b_right \
-  data/pgc_robotwin_raw/place_a2b_right_to_place_a2b_left
+  data/pgc_robotwin_raw/place_a2b_left_to_place_a2b_right/native \
+  data/pgc_robotwin_raw/place_a2b_left_to_place_a2b_right/counterfactual \
+  data/pgc_robotwin_raw/place_a2b_right_to_place_a2b_left/native \
+  data/pgc_robotwin_raw/place_a2b_right_to_place_a2b_left/counterfactual
 ```
 
 After the two-episode gate passes, rerun collection with `--episodes 50`.
@@ -41,14 +43,18 @@ converted dataset path:
 
 ```bash
 python scripts/convert_pgc_robotwin_to_lerobot.py \
-  --raw-root data/pgc_robotwin_raw/place_a2b_left_to_place_a2b_right \
-  --output data/pgc_robotwin_lerobot/place_a2b_left_to_place_a2b_right
+  --raw-root data/pgc_robotwin_raw/place_a2b_left_to_place_a2b_right/counterfactual \
+  --output data/pgc_robotwin_lerobot/place_a2b_left_to_place_a2b_right/counterfactual
 
 python scripts/build_pgc_robotwin_entity_relations.py \
-  --raw-root data/pgc_robotwin_raw/place_a2b_left_to_place_a2b_right \
-  --dataset-root data/pgc_robotwin_lerobot/place_a2b_left_to_place_a2b_right \
-  --output-root data/pgc_robotwin_eraf/place_a2b_left_to_place_a2b_right
+  --raw-root data/pgc_robotwin_raw/place_a2b_left_to_place_a2b_right/counterfactual \
+  --dataset-root data/pgc_robotwin_lerobot/place_a2b_left_to_place_a2b_right/counterfactual \
+  --output-root data/pgc_robotwin_eraf/place_a2b_left_to_place_a2b_right/counterfactual
 ```
+
+Run the conversion and sidecar commands for both `native` and
+`counterfactual` under both direction pairs. Their scene-seed and initial-state
+hash sequences must match within each pair.
 
 ## Matched CIS evaluation
 

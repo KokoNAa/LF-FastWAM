@@ -75,6 +75,12 @@ def convert_dataset(
     from fastwam.datasets.lerobot.lerobot.lerobot_dataset import LeRobotDataset
 
     records = read_jsonl(raw_root / "meta" / "pgc_episodes.jsonl")
+    provenance = json.loads(
+        (raw_root / "meta" / "pgc_provenance.json").read_text(encoding="utf-8")
+    )
+    dataset_kind = str(provenance.get("dataset_kind", ""))
+    if dataset_kind not in {"native", "counterfactual"}:
+        raise ValueError(f"Invalid raw RoboTwin dataset_kind: {dataset_kind!r}.")
     first_path = raw_root / str(records[0]["raw_hdf5"])
     with h5py.File(first_path, "r") as handle:
         first_rgb = _decode_rgb(_array(handle, "observation/head_camera/rgb")[0])
@@ -92,7 +98,12 @@ def convert_dataset(
     output_audits = []
     for episode_index, record in enumerate(records):
         raw_path = raw_root / str(record["raw_hdf5"])
-        instruction = str(record["counterfactual_instruction"]).strip()
+        instruction_key = (
+            "source_instruction"
+            if dataset_kind == "native"
+            else "counterfactual_instruction"
+        )
+        instruction = str(record[instruction_key]).strip()
         with h5py.File(raw_path, "r") as handle:
             actions = _array(handle, "joint_action/vector").astype(np.float32)
             rgb = {
@@ -121,9 +132,6 @@ def convert_dataset(
         normalized["episode_index"] = episode_index
         output_audits.append(normalized)
 
-    provenance = json.loads(
-        (raw_root / "meta" / "pgc_provenance.json").read_text(encoding="utf-8")
-    )
     provenance["converted_format"] = "lerobot_v2.1"
     provenance["converted_dataset"] = str(output.resolve())
     provenance["fps"] = int(fps)

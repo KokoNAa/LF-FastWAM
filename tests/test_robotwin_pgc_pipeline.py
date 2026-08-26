@@ -176,6 +176,9 @@ class RoboTwinPGCDataContractTest(unittest.TestCase):
             (raw_root / "meta" / "pgc_episodes.jsonl").write_text(
                 json.dumps(audit) + "\n", encoding="utf-8"
             )
+            (raw_root / "meta" / "pgc_provenance.json").write_text(
+                json.dumps({"dataset_kind": "counterfactual"}), encoding="utf-8"
+            )
             sidecar_root = root / "sidecar"
             build_sidecar(
                 raw_root=raw_root,

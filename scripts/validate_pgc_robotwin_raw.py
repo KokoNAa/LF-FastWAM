@@ -52,12 +52,18 @@ def validate_raw_dataset(root: Path) -> dict:
         raise ValueError("Raw PGC provenance is not a RoboTwin same-scene capture.")
     if provenance.get("state_aligned") is not True or int(provenance.get("action_dim", -1)) != 14:
         raise ValueError("Raw RoboTwin PGC provenance lacks state/action alignment.")
+    dataset_kind = str(provenance.get("dataset_kind", ""))
+    if dataset_kind not in {"native", "counterfactual"}:
+        raise ValueError(f"Invalid raw RoboTwin dataset_kind: {dataset_kind!r}.")
     records = read_jsonl(audit_path)
     if len(records) != int(provenance.get("successful_episode_count", -1)):
         raise ValueError("Raw RoboTwin PGC episode count is inconsistent.")
     seeds = set()
+    matched_signatures = []
+    pair_ids = set()
     for expected_index, raw_record in enumerate(records):
         record = validate_pair_record(raw_record)
+        pair_ids.add(str(record["pair_id"]))
         if int(record.get("episode_index", -1)) != expected_index:
             raise ValueError("Raw RoboTwin PGC episode indices must be dense.")
         seed = int(record["scene_seed"])
@@ -74,10 +80,16 @@ def validate_raw_dataset(root: Path) -> dict:
             raise ValueError(f"Action count mismatch for episode {expected_index}.")
         if array_sha256(actions) != record["action_sha256"]:
             raise ValueError(f"Action hash mismatch for episode {expected_index}.")
+        matched_signatures.append((seed, str(record["initial_state_sha256"])))
+    if len(pair_ids) != 1:
+        raise ValueError(f"Raw RoboTwin dataset must contain one pair_id: {pair_ids}.")
     return {
         "format": "pgc_robotwin_raw_validation_v1",
         "root": str(root),
         "episodes": len(records),
+        "dataset_kind": dataset_kind,
+        "pair_id": next(iter(pair_ids)),
+        "_matched_signatures": matched_signatures,
         "unique_scene_seeds": len(seeds),
         "valid": True,
     }
@@ -91,6 +103,19 @@ def main() -> None:
         validate_raw_dataset(path.expanduser().resolve())
         for path in args.dataset_roots
     ]
+    by_pair = {}
+    for report in reports:
+        by_pair.setdefault(report["pair_id"], {})[report["dataset_kind"]] = report
+    for pair_id, kinds in by_pair.items():
+        if set(kinds) == {"native", "counterfactual"} and (
+            kinds["native"]["_matched_signatures"]
+            != kinds["counterfactual"]["_matched_signatures"]
+        ):
+            raise ValueError(
+                f"Native/counterfactual scenes are not matched for {pair_id}."
+            )
+    for report in reports:
+        report.pop("_matched_signatures", None)
     print(json.dumps(reports, ensure_ascii=False, indent=2))
 
 
