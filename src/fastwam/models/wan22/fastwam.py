@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import math
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Union
@@ -696,6 +697,31 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_fresh_joint_training = bool(
             eraf_config.get("fresh_joint_training", False)
         )
+        # Clean warm-start experiment: load only the validated ERAF perception,
+        # grounding, and phase-memory tensors from a historical V9.13+ PGC
+        # checkpoint.  The released FastWAM Base, Action-context injector, and
+        # shared Video/Action LoRA remain independently initialized so no
+        # legacy Proposal or post-action residual can leak into the run.
+        self.policy_guard_eraf_pretrained_joint_training = bool(
+            eraf_config.get("pretrained_joint_training", False)
+        )
+        raw_pretrained_checkpoint = eraf_config.get(
+            "pretrained_checkpoint", None
+        )
+        self.policy_guard_eraf_pretrained_checkpoint = (
+            None
+            if raw_pretrained_checkpoint in (None, "", "null")
+            else str(raw_pretrained_checkpoint)
+        )
+        self.policy_guard_eraf_end_to_end_joint_training = bool(
+            self.policy_guard_eraf_fresh_joint_training
+            or self.policy_guard_eraf_pretrained_joint_training
+        )
+        self.policy_guard_eraf_pretrained_source_checkpoint: Optional[str] = None
+        self.policy_guard_eraf_pretrained_source_sha256: Optional[str] = None
+        self.policy_guard_eraf_pretrained_source_objective: Optional[int] = None
+        self.policy_guard_eraf_pretrained_source_step: Optional[int] = None
+        self.policy_guard_eraf_pretrained_tensor_count = 0
         self.policy_guard_eraf_bidirectional_supervision = bool(
             eraf_config.get("bidirectional_supervision", False)
         )
@@ -1442,11 +1468,13 @@ class FastWAM(torch.nn.Module):
                 if self.policy_guard_eraf_initialization_contract not in {
                     "exact_pgc_v5_sidecars",
                     "released_base_fresh_eraf",
+                    "released_base_pretrained_eraf",
                 }:
                     raise ValueError(
                         "PGC v9 ERAF initialization_contract must be "
                         "'exact_pgc_v5_sidecars' or "
-                        "'released_base_fresh_eraf'."
+                        "'released_base_fresh_eraf' or "
+                        "'released_base_pretrained_eraf'."
                     )
                 if self.policy_guard_eraf_grounding_objective_version not in {
                     1,
@@ -1621,6 +1649,49 @@ class FastWAM(torch.nn.Module):
                         raise ValueError(
                             "Fresh ERAF joint training requires bidirectional "
                             "source/target language supervision."
+                        )
+                if (
+                    self.policy_guard_eraf_fresh_joint_training
+                    and self.policy_guard_eraf_pretrained_joint_training
+                ):
+                    raise ValueError(
+                        "ERAF joint training cannot be both fresh and "
+                        "pretrained-initialized."
+                    )
+                if (
+                    self.policy_guard_eraf_pretrained_checkpoint is not None
+                    and not self.policy_guard_eraf_pretrained_joint_training
+                ):
+                    raise ValueError(
+                        "ERAF pretrained_checkpoint is only valid when "
+                        "pretrained_joint_training=true."
+                    )
+                if self.policy_guard_eraf_pretrained_joint_training:
+                    if not (
+                        self.policy_guard_eraf_grounding_objective_version >= 26
+                        and self.policy_guard_eraf_training_stage == "action"
+                        and self.policy_guard_eraf_action_joint_training
+                        and self.policy_guard_eraf_completion_only_memory
+                    ):
+                        raise ValueError(
+                            "Pretrained ERAF joint training requires objective "
+                            "26+, the action stage, action_joint_training=true, "
+                            "and completion_only_memory=true."
+                        )
+                    if (
+                        self.policy_guard_eraf_initialization_contract
+                        != "released_base_pretrained_eraf"
+                    ):
+                        raise ValueError(
+                            "Pretrained ERAF joint training must initialize the "
+                            "FastWAM policy from the released Base and import "
+                            "only ERAF tensors with initialization_contract="
+                            "released_base_pretrained_eraf."
+                        )
+                    if not self.policy_guard_eraf_bidirectional_supervision:
+                        raise ValueError(
+                            "Pretrained ERAF joint training requires "
+                            "bidirectional source/target language supervision."
                         )
                 if (
                     self.policy_guard_eraf_grounding_objective_version >= 15
@@ -2421,14 +2492,15 @@ class FastWAM(torch.nn.Module):
         return float(scale)
 
     def _policy_guard_eraf_context_injection_scale(self) -> float:
-        """Cold-start a fresh ERAF without perturbing the Action Expert.
+        """Introduce a fresh injector without abruptly perturbing Action.
 
         At deployment, and for every historical pretrained-ERAF checkpoint,
-        the injector remains fully active.  Only the explicit fresh-joint
-        training path receives an exact no-injection warmup followed by a
-        linear token-amplitude ramp.
+        the injector remains fully active.  Explicit end-to-end joint runs
+        receive an exact no-injection warmup followed by a linear token-
+        amplitude ramp; this protects both random ERAF cold starts and a
+        pretrained ERAF connected through a newly initialized injector.
         """
-        if not self.policy_guard_eraf_fresh_joint_training:
+        if not self.policy_guard_eraf_end_to_end_joint_training:
             return 1.0
         if not self._policy_guard_training_progress_active:
             return 1.0
@@ -2831,11 +2903,10 @@ class FastWAM(torch.nn.Module):
                                 >= 26
                             ):
                                 # Historical V9.26 keeps ERAF frozen.  The
-                                # explicit fresh-joint contract is the only
-                                # path that opens the newly initialized ERAF
-                                # core alongside the shared Expert LoRA and
-                                # internal context projection.
-                                if self.policy_guard_eraf_fresh_joint_training:
+                                # Explicit end-to-end joint contracts are the
+                                # only paths that open ERAF alongside the shared
+                                # Expert LoRA and internal context projection.
+                                if self.policy_guard_eraf_end_to_end_joint_training:
                                     eraf = self.policy_guard_modules[
                                         "entity_relation_affordance"
                                     ]
@@ -8608,11 +8679,12 @@ class FastWAM(torch.nn.Module):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Jointly adapt the one ERAF policy path with shared Expert LoRA.
 
-        Historical V9.26 keeps ERAF and completion memory frozen.  The
-        explicit fresh-joint variant instead optimizes a newly initialized
-        ERAF with its privileged labels, while preserving the same four-way
-        data mixture and bidirectional paired-language objectives as the
-        no-ERAF control.  Both variants bypass every post-action residual.
+        Historical V9.26 keeps ERAF and completion memory frozen.  Explicit
+        end-to-end variants instead optimize either a newly initialized or an
+        ERAF-only warm-started module with privileged labels, while preserving
+        the same four-way data mixture and bidirectional paired-language
+        objectives as the no-ERAF control.  Both variants bypass every
+        post-action residual.
         """
         if not (
             self.policy_guard_enabled
@@ -8633,7 +8705,7 @@ class FastWAM(torch.nn.Module):
         paired_language_valid = inputs["pgc_paired_language_valid"]
         source_context = inputs["pgc_source_context"]
         source_context_mask = inputs["pgc_source_context_mask"]
-        fresh_joint = self.policy_guard_eraf_fresh_joint_training
+        end_to_end_joint = self.policy_guard_eraf_end_to_end_joint_training
         if any(
             value is None
             for value in (
@@ -8654,7 +8726,7 @@ class FastWAM(torch.nn.Module):
         wrong_context = source_context
         wrong_context_mask = source_context_mask
         bidirectional_language_valid = paired_language_valid
-        if fresh_joint:
+        if end_to_end_joint:
             target_context = inputs.get("pgc_target_context")
             target_context_mask = inputs.get("pgc_target_context_mask")
             bidirectional_language_valid = inputs.get(
@@ -8669,8 +8741,8 @@ class FastWAM(torch.nn.Module):
                 )
             ):
                 raise ValueError(
-                    "Fresh ERAF joint training requires target language and "
-                    "bidirectional-valid fields."
+                    "End-to-end ERAF joint training requires target language "
+                    "and bidirectional-valid fields."
                 )
             (
                 correct_context,
@@ -8817,7 +8889,7 @@ class FastWAM(torch.nn.Module):
         native_valid = direct_action_valid & ~is_counterfactual
         counterfactual_valid = direct_action_valid & is_counterfactual
         source_semantic_valid = torch.zeros_like(native_valid)
-        if fresh_joint:
+        if end_to_end_joint:
             source_semantic_valid = (
                 native_valid & bidirectional_language_valid
             )
@@ -8863,7 +8935,7 @@ class FastWAM(torch.nn.Module):
                 "phase_safe_memory_state_valid"
             ],
         }
-        wrong_state = target_state if fresh_joint else source_state
+        wrong_state = target_state if end_to_end_joint else source_state
         target_queries, _, target_eraf_outputs, target_goal_metrics = (
             self._encode_policy_guard_eraf(
                 final_video_hidden=final_video_hidden,
@@ -8894,7 +8966,7 @@ class FastWAM(torch.nn.Module):
             weights=self.policy_guard_eraf_loss_weights,
         )
         source_eraf_metrics: dict[str, torch.Tensor] = {}
-        if fresh_joint:
+        if end_to_end_joint:
             # Every row's labels describe its correct instruction: source on
             # native rows and target on counterfactual rows.  The wrong branch
             # participates only in same-state ranking and must not receive
@@ -9101,15 +9173,22 @@ class FastWAM(torch.nn.Module):
                 direct_action_valid.float().mean()
             ),
             "pgc_v926_eraf_frozen": correct_action_error.new_tensor(
-                float(not fresh_joint)
+                float(not end_to_end_joint)
             ),
             "pgc_v926_fresh_eraf_joint_training": (
-                correct_action_error.new_tensor(float(fresh_joint))
+                correct_action_error.new_tensor(
+                    float(self.policy_guard_eraf_fresh_joint_training)
+                )
+            ),
+            "pgc_v926_pretrained_eraf_joint_training": (
+                correct_action_error.new_tensor(
+                    float(self.policy_guard_eraf_pretrained_joint_training)
+                )
             ),
             "pgc_v926_bidirectional_supervision_enabled": (
                 correct_action_error.new_tensor(
                     float(
-                        fresh_joint
+                        end_to_end_joint
                         and self.policy_guard_eraf_bidirectional_supervision
                     )
                 )
@@ -9125,7 +9204,7 @@ class FastWAM(torch.nn.Module):
         }
         metrics.update(injection_metrics)
         metrics.update(target_goal_metrics)
-        wrong_metric_prefix = "wrong" if fresh_joint else "source"
+        wrong_metric_prefix = "wrong" if end_to_end_joint else "source"
         metrics.update(
             {
                 f"pgc_v9_{wrong_metric_prefix}_{name.removeprefix('pgc_v9_')}": value
@@ -15535,6 +15614,12 @@ class FastWAM(torch.nn.Module):
         fresh_eraf_joint = bool(
             is_v926 and self.policy_guard_eraf_fresh_joint_training
         )
+        pretrained_eraf_joint = bool(
+            is_v926 and self.policy_guard_eraf_pretrained_joint_training
+        )
+        end_to_end_eraf_joint = bool(
+            fresh_eraf_joint or pretrained_eraf_joint
+        )
         uses_target_binder = is_v6 or is_v7
         residual_cap = None
         if is_v3:
@@ -15567,9 +15652,15 @@ class FastWAM(torch.nn.Module):
                 eraf_role_adapter_trainable_scope = (
                     (
                         (
-                            "fresh_eraf_plus_shared_video_action_lora_plus_"
-                            "eraf_action_context_injector"
-                            if objective_version >= 26 and fresh_eraf_joint
+                            (
+                                "pretrained_eraf_plus_shared_video_action_lora_"
+                                "plus_eraf_action_context_injector"
+                                if pretrained_eraf_joint
+                                else "fresh_eraf_plus_shared_video_action_lora_"
+                                "plus_eraf_action_context_injector"
+                            )
+                            if objective_version >= 26
+                            and end_to_end_eraf_joint
                             else "shared_video_action_lora_plus_eraf_action_"
                             "context_injector"
                             if objective_version >= 26
@@ -15693,6 +15784,10 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "counterfactual_tuning": (
+                "pretrained_eraf_native_counterfactual_bidirectional_world_"
+                "action_joint_lora"
+                if pretrained_eraf_joint
+                else
                 "fresh_eraf_native_counterfactual_bidirectional_world_action_"
                 "joint_lora"
                 if fresh_eraf_joint
@@ -15829,6 +15924,9 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_require_direct_counterfactual_actions
             ),
             "policy_protection": (
+                "pretrained_eraf_ramp_then_single_path_no_candidate_gate"
+                if pretrained_eraf_joint
+                else
                 "fresh_eraf_warmup_then_single_path_no_candidate_gate"
                 if fresh_eraf_joint
                 else "single_eraf_path_no_candidate_gate"
@@ -16283,6 +16381,36 @@ class FastWAM(torch.nn.Module):
                 if is_v9
                 else None
             ),
+            "eraf_pretrained_joint_training": (
+                self.policy_guard_eraf_pretrained_joint_training
+                if is_v9
+                else None
+            ),
+            "eraf_pretrained_source_checkpoint": (
+                self.policy_guard_eraf_pretrained_source_checkpoint
+                if pretrained_eraf_joint
+                else None
+            ),
+            "eraf_pretrained_source_sha256": (
+                self.policy_guard_eraf_pretrained_source_sha256
+                if pretrained_eraf_joint
+                else None
+            ),
+            "eraf_pretrained_source_objective": (
+                self.policy_guard_eraf_pretrained_source_objective
+                if pretrained_eraf_joint
+                else None
+            ),
+            "eraf_pretrained_source_step": (
+                self.policy_guard_eraf_pretrained_source_step
+                if pretrained_eraf_joint
+                else None
+            ),
+            "eraf_pretrained_tensor_count": (
+                self.policy_guard_eraf_pretrained_tensor_count
+                if pretrained_eraf_joint
+                else None
+            ),
             "eraf_bidirectional_supervision": (
                 self.policy_guard_eraf_bidirectional_supervision
                 if is_v9
@@ -16301,6 +16429,11 @@ class FastWAM(torch.nn.Module):
             "eraf_action_joint_contract": (
                 (
                     (
+                        "pretrained_eraf_plus_fresh_shared_video_action_expert_"
+                        "lora_bidirectional_joint_training_with_ramped_fresh_"
+                        "context_injector_single_path"
+                        if pretrained_eraf_joint
+                        else
                         "fresh_eraf_plus_shared_video_action_expert_lora_"
                         "bidirectional_joint_training_with_delayed_internal_"
                         "context_injection_single_path"
@@ -16357,6 +16490,10 @@ class FastWAM(torch.nn.Module):
             "eraf_action_trainable_scope": (
                 (
                     (
+                        "pretrained_eraf_plus_shared_video_action_lora_plus_"
+                        "fresh_eraf_action_context_injector"
+                        if pretrained_eraf_joint
+                        else
                         "fresh_eraf_plus_shared_video_action_lora_plus_eraf_"
                         "action_context_injector"
                         if fresh_eraf_joint
@@ -16399,7 +16536,7 @@ class FastWAM(torch.nn.Module):
             "eraf_action_context_injection_contract": (
                 "exact_no_injection_warmup_then_append_bounded_eraf_tokens_"
                 "to_shared_action_expert_context_no_post_action_residual"
-                if fresh_eraf_joint
+                if end_to_end_eraf_joint
                 else "append_bounded_eraf_tokens_to_shared_action_expert_"
                 "context_at_every_denoising_step_no_post_action_residual"
                 if is_v9
@@ -16439,12 +16576,12 @@ class FastWAM(torch.nn.Module):
                     ),
                     (
                         "eraf_joint_grounding"
-                        if fresh_eraf_joint
+                        if end_to_end_eraf_joint
                         else "eraf_preservation"
                     ): (
                         self.policy_guard_eraf_grounding_aux_weight
                     ),
-                    "bidirectional_language_ranking": fresh_eraf_joint,
+                    "bidirectional_language_ranking": end_to_end_eraf_joint,
                 }
                 if is_v926
                 else None
@@ -16885,6 +17022,9 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "eraf_geometry_protection_contract": (
+                "jointly_trained_pretrained_eraf_no_post_action_residual"
+                if pretrained_eraf_joint
+                else
                 "jointly_trained_fresh_eraf_no_post_action_residual"
                 if fresh_eraf_joint
                 else "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
@@ -16909,6 +17049,9 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "eraf_phase_safe_memory_warm_start": (
+                "eraf_only_exact_v9_13_or_later"
+                if pretrained_eraf_joint
+                else
                 "none_random_seeded_from_released_base"
                 if fresh_eraf_joint
                 else "exact_v9_11_geometry"
@@ -17313,6 +17456,14 @@ class FastWAM(torch.nn.Module):
                     "PGC checkpoint cannot be saved before a protected base "
                     "checkpoint has been loaded."
                 )
+            if (
+                self.policy_guard_eraf_pretrained_joint_training
+                and self.policy_guard_eraf_pretrained_tensor_count <= 0
+            ):
+                raise ValueError(
+                    "Pretrained ERAF joint checkpoint cannot be saved before "
+                    "the ERAF-only warm start is loaded."
+                )
             payload = {
                 "format": f"fastwam_policy_guard_v{self.policy_guard_version}",
                 "base_checkpoint": self.policy_guard_base_checkpoint,
@@ -17643,6 +17794,21 @@ class FastWAM(torch.nn.Module):
         saved_eraf_fresh_joint_training = bool(
             metadata.get("eraf_fresh_joint_training", False)
         )
+        saved_eraf_pretrained_joint_training = bool(
+            metadata.get("eraf_pretrained_joint_training", False)
+        )
+        saved_eraf_end_to_end_joint_training = bool(
+            saved_eraf_fresh_joint_training
+            or saved_eraf_pretrained_joint_training
+        )
+        if (
+            saved_eraf_fresh_joint_training
+            and saved_eraf_pretrained_joint_training
+        ):
+            raise ValueError(
+                "PGC V9.26 checkpoint cannot declare both fresh and "
+                "pretrained ERAF joint initialization."
+            )
         migrate_v5_to_target_binder = (
             saved_policy_guard_version == 5
             and int(self.policy_guard_version) in {6, 7}
@@ -18348,6 +18514,13 @@ class FastWAM(torch.nn.Module):
 
         if saved_policy_guard_version >= 3:
             expected_tuning = (
+                "pretrained_eraf_native_counterfactual_bidirectional_world_"
+                "action_joint_lora"
+                if saved_eraf_pretrained_joint_training
+                else "fresh_eraf_native_counterfactual_bidirectional_world_"
+                "action_joint_lora"
+                if saved_eraf_fresh_joint_training
+                else
                 "native_and_counterfactual_world_action_joint_lora"
                 if saved_policy_guard_version == 9
                 and int(saved_eraf_grounding_objective or 1) >= 26
@@ -18379,6 +18552,11 @@ class FastWAM(torch.nn.Module):
                 )
             )
             expected_protection = (
+                "pretrained_eraf_ramp_then_single_path_no_candidate_gate"
+                if saved_eraf_pretrained_joint_training
+                else "fresh_eraf_warmup_then_single_path_no_candidate_gate"
+                if saved_eraf_fresh_joint_training
+                else
                 "single_eraf_path_no_candidate_gate"
                 if saved_policy_guard_version == 9
                 and int(saved_eraf_grounding_objective or 1) >= 26
@@ -18966,6 +19144,7 @@ class FastWAM(torch.nn.Module):
                             not in {
                                 "exact_pgc_v5_sidecars",
                                 "released_base_fresh_eraf",
+                                "released_base_pretrained_eraf",
                             }
                             or metadata.get("grounding")
                             != "predicate_entity_relation_affordance_field"
@@ -19140,15 +19319,20 @@ class FastWAM(torch.nn.Module):
                             expected_fresh_contract = bool(
                                 self.policy_guard_eraf_fresh_joint_training
                             )
+                            expected_pretrained_contract = bool(
+                                self.policy_guard_eraf_pretrained_joint_training
+                            )
                             if (
                                 saved_eraf_fresh_joint_training
                                 != expected_fresh_contract
+                                or saved_eraf_pretrained_joint_training
+                                != expected_pretrained_contract
                             ):
                                 raise ValueError(
-                                    "PGC V9.26 fresh-joint checkpoint contract "
+                                    "PGC V9.26 end-to-end joint checkpoint contract "
                                     "does not match the model configuration."
                                 )
-                            if saved_eraf_fresh_joint_training:
+                            if saved_eraf_end_to_end_joint_training:
                                 expected_schedule = {
                                     "eraf_bidirectional_supervision": bool(
                                         self.policy_guard_eraf_bidirectional_supervision
@@ -19163,11 +19347,53 @@ class FastWAM(torch.nn.Module):
                                 for name, expected in expected_schedule.items():
                                     if metadata.get(name) != expected:
                                         raise ValueError(
-                                            "Fresh ERAF joint checkpoint "
+                                            "End-to-end ERAF joint checkpoint "
                                             f"mismatch: {name}="
                                             f"{metadata.get(name)!r}, "
                                             f"expected={expected!r}."
                                         )
+                            if saved_eraf_pretrained_joint_training:
+                                provenance_fields = {
+                                    "eraf_pretrained_source_checkpoint": str,
+                                    "eraf_pretrained_source_sha256": str,
+                                    "eraf_pretrained_source_objective": int,
+                                    "eraf_pretrained_source_step": int,
+                                    "eraf_pretrained_tensor_count": int,
+                                }
+                                restored_provenance = {}
+                                for name, cast in provenance_fields.items():
+                                    value = metadata.get(name)
+                                    if value in (None, ""):
+                                        raise ValueError(
+                                            "Pretrained ERAF joint checkpoint "
+                                            f"is missing provenance {name!r}."
+                                        )
+                                    restored_provenance[name] = cast(value)
+                                self.policy_guard_eraf_pretrained_source_checkpoint = (
+                                    restored_provenance[
+                                        "eraf_pretrained_source_checkpoint"
+                                    ]
+                                )
+                                self.policy_guard_eraf_pretrained_source_sha256 = (
+                                    restored_provenance[
+                                        "eraf_pretrained_source_sha256"
+                                    ]
+                                )
+                                self.policy_guard_eraf_pretrained_source_objective = (
+                                    restored_provenance[
+                                        "eraf_pretrained_source_objective"
+                                    ]
+                                )
+                                self.policy_guard_eraf_pretrained_source_step = (
+                                    restored_provenance[
+                                        "eraf_pretrained_source_step"
+                                    ]
+                                )
+                                self.policy_guard_eraf_pretrained_tensor_count = (
+                                    restored_provenance[
+                                        "eraf_pretrained_tensor_count"
+                                    ]
+                                )
                         if (
                             saved_grounding_objective >= 15
                             and not objective_upgrade
@@ -20161,6 +20387,10 @@ class FastWAM(torch.nn.Module):
                                     "completed"
                                 ),
                                 "eraf_geometry_protection_contract": (
+                                    "jointly_trained_pretrained_eraf_no_post_"
+                                    "action_residual"
+                                    if saved_eraf_pretrained_joint_training
+                                    else
                                     "jointly_trained_fresh_eraf_no_post_action_"
                                     "residual"
                                     if saved_eraf_fresh_joint_training
@@ -20174,6 +20404,9 @@ class FastWAM(torch.nn.Module):
                                     expected_policy_state_contract
                                 ),
                                 "eraf_phase_safe_memory_warm_start": (
+                                    "eraf_only_exact_v9_13_or_later"
+                                    if saved_eraf_pretrained_joint_training
+                                    else
                                     "none_random_seeded_from_released_base"
                                     if saved_eraf_fresh_joint_training
                                     else "exact_v9_11_geometry"
@@ -20194,6 +20427,12 @@ class FastWAM(torch.nn.Module):
                                     )
                                 expected_action_joint_contract = (
                                     (
+                                        "pretrained_eraf_plus_fresh_shared_video_"
+                                        "action_expert_lora_bidirectional_joint_"
+                                        "training_with_ramped_fresh_context_"
+                                        "injector_single_path"
+                                        if saved_eraf_pretrained_joint_training
+                                        else
                                         "fresh_eraf_plus_shared_video_action_"
                                         "expert_lora_bidirectional_joint_training_"
                                         "with_delayed_internal_context_injection_"
@@ -20255,6 +20494,11 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_action_trainable_scope = (
                                     (
+                                        "pretrained_eraf_plus_shared_video_action_"
+                                        "lora_plus_fresh_eraf_action_context_"
+                                        "injector"
+                                        if saved_eraf_pretrained_joint_training
+                                        else
                                         "fresh_eraf_plus_shared_video_action_lora_"
                                         "plus_eraf_action_context_injector"
                                         if saved_eraf_fresh_joint_training
@@ -20305,6 +20549,11 @@ class FastWAM(torch.nn.Module):
                                     ),
                                     "eraf_role_adapter_trainable_scope": (
                                         (
+                                            "pretrained_eraf_plus_shared_video_"
+                                            "action_lora_plus_eraf_action_context_"
+                                            "injector"
+                                            if saved_eraf_pretrained_joint_training
+                                            else
                                             "fresh_eraf_plus_shared_video_action_"
                                             "lora_plus_eraf_action_context_injector"
                                             if saved_eraf_fresh_joint_training
@@ -20347,7 +20596,7 @@ class FastWAM(torch.nn.Module):
                                                 "append_bounded_eraf_tokens_to_shared_"
                                                 "action_expert_context_no_post_action_"
                                                 "residual"
-                                                if saved_eraf_fresh_joint_training
+                                                if saved_eraf_end_to_end_joint_training
                                                 else "append_bounded_eraf_tokens_to_"
                                                 "shared_action_expert_context_at_every_"
                                                 "denoising_step_no_post_action_residual"
@@ -21193,6 +21442,182 @@ class FastWAM(torch.nn.Module):
             len(guard_state),
         )
         return payload
+
+    def load_pretrained_eraf_checkpoint(
+        self, path: str
+    ) -> dict[str, Any]:
+        """Restore only the admitted ERAF field from a historical V9 checkpoint.
+
+        This deliberately bypasses the ordinary PGC checkpoint loader: the
+        released FastWAM Base has already been loaded, and no GoalGraph,
+        Proposal, context injector, legacy action residual, or Expert LoRA is
+        allowed to cross this initialization boundary.
+        """
+        if not self.policy_guard_eraf_pretrained_joint_training:
+            raise ValueError(
+                "ERAF-only warm start requires pretrained_joint_training=true."
+            )
+        if (
+            self.policy_guard_eraf_initialization_contract
+            != "released_base_pretrained_eraf"
+        ):
+            raise ValueError(
+                "ERAF-only warm start requires initialization_contract="
+                "released_base_pretrained_eraf."
+            )
+        if not self.policy_guard_base_checkpoint:
+            raise ValueError(
+                "Load the released FastWAM Base before importing ERAF weights."
+            )
+        checkpoint_path = Path(path).expanduser().resolve()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Pretrained ERAF checkpoint not found: {checkpoint_path}"
+            )
+        payload = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        if not isinstance(payload, Mapping):
+            raise ValueError("Pretrained ERAF checkpoint root must be a mapping.")
+        if payload.get("format") != "fastwam_policy_guard_v9":
+            raise ValueError(
+                "Pretrained ERAF source must be a PGC V9 checkpoint."
+            )
+        metadata = payload.get("architecture_metadata") or {}
+        if not isinstance(metadata, Mapping):
+            raise ValueError(
+                "Pretrained ERAF checkpoint architecture_metadata must be a mapping."
+            )
+        if metadata.get("architecture") != "pgc_fastwam":
+            raise ValueError("Pretrained ERAF source is not PGC-FastWAM.")
+        source_objective = int(
+            metadata.get("eraf_grounding_objective_version", -1)
+        )
+        if source_objective < 14 or source_objective > 26:
+            raise ValueError(
+                "ERAF-only warm start requires an admitted V9.13+ source "
+                f"with objective 14..26; got {source_objective}."
+            )
+        if bool(metadata.get("eraf_fresh_joint_training", False)) or bool(
+            metadata.get("eraf_pretrained_joint_training", False)
+        ):
+            raise ValueError(
+                "ERAF pretraining source must precede the new end-to-end joint "
+                "experiments; a previous fresh/pretrained joint checkpoint is "
+                "not an independent ERAF warm start."
+            )
+        expected_metadata = {
+            "eraf_hidden_dim": self.policy_guard_eraf_hidden_dim,
+            "eraf_num_heads": self.policy_guard_eraf_num_heads,
+            "eraf_max_clauses": self.policy_guard_eraf_max_clauses,
+            "eraf_camera_count": self.policy_guard_eraf_camera_count,
+            "eraf_camera_layout": self.policy_guard_eraf_camera_layout,
+            "eraf_phase_safe_memory_contract": (
+                "explicit_cross_replan_pending_holding_retry_completed"
+            ),
+            "eraf_geometry_protection_contract": (
+                "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
+            ),
+            "eraf_phase_safe_memory_warm_start": "exact_v9_11_geometry",
+        }
+        for name, expected in expected_metadata.items():
+            if metadata.get(name) != expected:
+                raise ValueError(
+                    "Pretrained ERAF architecture mismatch: "
+                    f"{name}={metadata.get(name)!r}, expected={expected!r}."
+                )
+        source_aspect = float(
+            metadata.get("eraf_visual_aspect_ratio", float("nan"))
+        )
+        if not math.isclose(
+            source_aspect,
+            self.policy_guard_eraf_visual_aspect_ratio,
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        ):
+            raise ValueError(
+                "Pretrained ERAF visual aspect ratio mismatch: "
+                f"checkpoint={source_aspect}, "
+                f"model={self.policy_guard_eraf_visual_aspect_ratio}."
+            )
+        source_base = payload.get("base_checkpoint")
+        if not source_base:
+            raise ValueError(
+                "Pretrained ERAF checkpoint is missing base_checkpoint."
+            )
+        resolved_source_base = self._resolve_adapter_base_checkpoint(
+            str(checkpoint_path), str(source_base)
+        )
+        resolved_current_base = str(
+            Path(self.policy_guard_base_checkpoint).expanduser().resolve()
+        )
+        if resolved_source_base != resolved_current_base:
+            raise ValueError(
+                "Pretrained ERAF and joint run must reference the same released "
+                "FastWAM Base: "
+                f"source={resolved_source_base}, current={resolved_current_base}."
+            )
+        guard_state = payload.get("policy_guard")
+        if not isinstance(guard_state, Mapping) or not guard_state:
+            raise ValueError("Pretrained ERAF checkpoint has no policy_guard state.")
+        prefix = "entity_relation_affordance."
+        eraf_state = {
+            str(name)[len(prefix) :]: value
+            for name, value in guard_state.items()
+            if str(name).startswith(prefix)
+        }
+        if "entity_relation_affordance" not in self.policy_guard_modules:
+            raise RuntimeError("Current model has no ERAF module to initialize.")
+        eraf = self.policy_guard_modules["entity_relation_affordance"]
+        expected_state = eraf.state_dict()
+        missing = sorted(set(expected_state) - set(eraf_state))
+        unexpected = sorted(set(eraf_state) - set(expected_state))
+        shape_mismatches = {
+            name: (tuple(eraf_state[name].shape), tuple(expected_state[name].shape))
+            for name in set(eraf_state) & set(expected_state)
+            if tuple(eraf_state[name].shape) != tuple(expected_state[name].shape)
+        }
+        if missing or unexpected or shape_mismatches:
+            raise ValueError(
+                "Pretrained ERAF tensor contract mismatch: "
+                f"missing={missing[:20]}, unexpected={unexpected[:20]}, "
+                f"shape_mismatches={shape_mismatches}."
+            )
+        eraf.load_state_dict(eraf_state, strict=True)
+
+        digest = hashlib.sha256()
+        with checkpoint_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        source_step = int(payload.get("step", -1))
+        if source_step < 7250:
+            raise ValueError(
+                "Pretrained ERAF source must be the completed V9.13 or later "
+                f"checkpoint at step >=7250; got step={source_step}."
+            )
+        self.policy_guard_eraf_pretrained_source_checkpoint = str(
+            checkpoint_path
+        )
+        self.policy_guard_eraf_pretrained_source_sha256 = digest.hexdigest()
+        self.policy_guard_eraf_pretrained_source_objective = source_objective
+        self.policy_guard_eraf_pretrained_source_step = source_step
+        self.policy_guard_eraf_pretrained_tensor_count = len(eraf_state)
+        logger.info(
+            "Warm-started ERAF only from %s (objective=%d step=%d tensors=%d "
+            "sha256=%s); retained released Base plus fresh injector/LoRA.",
+            checkpoint_path,
+            source_objective,
+            source_step,
+            len(eraf_state),
+            self.policy_guard_eraf_pretrained_source_sha256,
+        )
+        return {
+            "checkpoint": str(checkpoint_path),
+            "sha256": self.policy_guard_eraf_pretrained_source_sha256,
+            "objective": source_objective,
+            "step": source_step,
+            "tensor_count": len(eraf_state),
+        }
 
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")

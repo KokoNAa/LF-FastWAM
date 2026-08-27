@@ -5,7 +5,7 @@ defaults:
   - override /model: fastwam
   - _self_
 
-# Clean-start ERAF joint experiment.  The launcher supplies exactly the same
+# Pretrained-ERAF joint experiment.  The launcher supplies exactly the same
 # offline-native, closed-loop-native, historical-CF, and strict-CF 1:1:1:1
 # mixture used by the formal no-ERAF control.  Native rows supervise source
 # language and rank target language as wrong; counterfactual rows reverse it.
@@ -28,15 +28,17 @@ model:
     version: 9
     entity_relation_grounding:
       training_stage: action
-      initialization_contract: released_base_fresh_eraf
+      initialization_contract: released_base_pretrained_eraf
       grounding_objective_version: 26
       completion_only_memory: true
       action_joint_training: true
-      fresh_joint_training: true
+      fresh_joint_training: false
+      pretrained_joint_training: true
+      pretrained_checkpoint: null
       bidirectional_supervision: true
-      context_injection_warmup_steps: 1500
+      context_injection_warmup_steps: 0
       context_injection_ramp_steps: 1000
-      learning_rate: 1.0e-4
+      learning_rate: 2.0e-5
       grounding_aux_weight: 1.0
       action_geometry_learning_rate: 2.0e-5
       expert_lora_world_language_weight: 0.10
@@ -47,9 +49,9 @@ model:
       action_causal_ranking_weight: 1.0
       action_causal_margin: 0.01
 
-      # Train the fresh ERAF directly from the audited sidecar targets.  The
-      # staged teacher-preservation terms stay disabled because there is no
-      # pretrained ERAF teacher in this experiment.
+      # Continue adapting the pretrained ERAF from the audited sidecar targets.
+      # Staged teacher-preservation terms stay disabled: the imported ERAF is
+      # the initialization, while the joint task loss is allowed to update it.
       mask_weight: 1.0
       attention_mask_weight: 2.0
       entity_weight: 1.0

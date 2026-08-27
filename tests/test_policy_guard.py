@@ -46,6 +46,8 @@ def tiny_pgc_fastwam(
     v9_completion_only_memory: bool = False,
     v9_action_joint_training: bool = False,
     v9_fresh_joint_training: bool = False,
+    v9_pretrained_joint_training: bool = False,
+    v9_pretrained_checkpoint: str | None = None,
     v9_bidirectional_supervision: bool = False,
     v9_context_injection_warmup_steps: int = 1500,
     v9_context_injection_ramp_steps: int = 1000,
@@ -197,6 +199,8 @@ def tiny_pgc_fastwam(
                 "completion_only_memory": v9_completion_only_memory,
                 "action_joint_training": v9_action_joint_training,
                 "fresh_joint_training": v9_fresh_joint_training,
+                "pretrained_joint_training": v9_pretrained_joint_training,
+                "pretrained_checkpoint": v9_pretrained_checkpoint,
                 "bidirectional_supervision": v9_bidirectional_supervision,
                 "context_injection_warmup_steps": (
                     v9_context_injection_warmup_steps

@@ -10,6 +10,22 @@ NATIVE_SIDECAR="${6:?Missing native ERAF sidecar}"
 HISTORICAL_CF_SIDECAR="${7:?Missing historical-CF ERAF sidecar}"
 STRICT_CF_SIDECAR="${8:?Missing strict-CF ERAF sidecar}"
 TRAIN_SEED="${9:-42}"
+PRETRAINED_ERAF_CHECKPOINT="${ERAF_PRETRAINED_CHECKPOINT:-}"
+if [[ -n "${PRETRAINED_ERAF_CHECKPOINT}" ]]; then
+  ERAF_INITIALIZATION_CONTRACT="released_base_pretrained_eraf"
+  ERAF_FRESH_JOINT="false"
+  ERAF_PRETRAINED_JOINT="true"
+  DEFAULT_INJECTION_WARMUP_STEPS=0
+  DEFAULT_ERAF_LEARNING_RATE="2.0e-5"
+  ERAF_JOINT_KIND="pretrained"
+else
+  ERAF_INITIALIZATION_CONTRACT="released_base_fresh_eraf"
+  ERAF_FRESH_JOINT="true"
+  ERAF_PRETRAINED_JOINT="false"
+  DEFAULT_INJECTION_WARMUP_STEPS=1500
+  DEFAULT_ERAF_LEARNING_RATE="1.0e-4"
+  ERAF_JOINT_KIND="fresh"
+fi
 
 case "${SUITE}" in
   libero_spatial|libero_object|libero_goal|libero_10) ;;
@@ -37,9 +53,9 @@ STATS_PATH="${STATS_PATH:-${DIFFSYNTH_MODEL_BASE_PATH:-./checkpoints}/fastwam_re
 CACHE_DIR="${TEXT_CACHE_DIR:-data/text_embeds_cache/libero}"
 MAX_STEPS="${ERAF_JOINT_MAX_STEPS:-15000}"
 LEARNING_RATE="${ERAF_JOINT_LORA_LEARNING_RATE:-5.0e-6}"
-ERAF_LEARNING_RATE="${ERAF_JOINT_ERAF_LEARNING_RATE:-1.0e-4}"
+ERAF_LEARNING_RATE="${ERAF_JOINT_ERAF_LEARNING_RATE:-${DEFAULT_ERAF_LEARNING_RATE}}"
 INJECTOR_LEARNING_RATE="${ERAF_JOINT_INJECTOR_LEARNING_RATE:-2.0e-5}"
-INJECTION_WARMUP_STEPS="${ERAF_JOINT_INJECTION_WARMUP_STEPS:-1500}"
+INJECTION_WARMUP_STEPS="${ERAF_JOINT_INJECTION_WARMUP_STEPS:-${DEFAULT_INJECTION_WARMUP_STEPS}}"
 INJECTION_RAMP_STEPS="${ERAF_JOINT_INJECTION_RAMP_STEPS:-1000}"
 GRADIENT_ACCUMULATION_STEPS="${ERAF_JOINT_GRADIENT_ACCUMULATION_STEPS:-4}"
 SAVE_EVERY="${ERAF_JOINT_SAVE_EVERY:-250}"
@@ -66,6 +82,10 @@ for file_path in "${BASE_CHECKPOINT}" "${STATS_PATH}"; do
     exit 1
   fi
 done
+if [[ -n "${PRETRAINED_ERAF_CHECKPOINT}" && ! -f "${PRETRAINED_ERAF_CHECKPOINT}" ]]; then
+  echo "Pretrained ERAF checkpoint not found: ${PRETRAINED_ERAF_CHECKPOINT}" >&2
+  exit 1
+fi
 for dataset_path in \
   "${NATIVE_DATASET}" \
   "${CLOSED_LOOP_DATASET}" \
@@ -107,6 +127,9 @@ resolve_file() {
 }
 
 BASE_CHECKPOINT="$(resolve_file "${BASE_CHECKPOINT}")"
+if [[ -n "${PRETRAINED_ERAF_CHECKPOINT}" ]]; then
+  PRETRAINED_ERAF_CHECKPOINT="$(resolve_file "${PRETRAINED_ERAF_CHECKPOINT}")"
+fi
 STATS_PATH="$(resolve_file "${STATS_PATH}")"
 NATIVE_DATASET="$(resolve_dir "${NATIVE_DATASET}")"
 CLOSED_LOOP_DATASET="$(resolve_dir "${CLOSED_LOOP_DATASET}")"
@@ -119,14 +142,15 @@ STRICT_CF_SIDECAR="$(resolve_dir "${STRICT_CF_SIDECAR}")"
 CACHE_DIR="$(resolve_dir "${CACHE_DIR}")"
 
 # Keep the exact same released-base, action-convention, sidecar binding, and
-# workspace checks as the formal no-ERAF control.  A fresh ERAF run is invalid
+# workspace checks as the formal no-ERAF control.  An ERAF joint run is invalid
 # if any one of the four pools is substituted or expressed in another frame.
 "${PYTHON_BIN}" - \
   "${BASE_CHECKPOINT}" \
   "${NATIVE_DATASET}" "${CLOSED_LOOP_DATASET}" \
   "${HISTORICAL_CF_DATASET}" "${STRICT_CF_DATASET}" \
   "${NATIVE_SIDECAR}" "${CLOSED_LOOP_SIDECAR}" \
-  "${HISTORICAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}" <<'PY'
+  "${HISTORICAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}" \
+  "${PRETRAINED_ERAF_CHECKPOINT}" <<'PY'
 import json
 import math
 import pathlib
@@ -137,14 +161,57 @@ import torch
 base_checkpoint = pathlib.Path(sys.argv[1]).resolve()
 datasets = [pathlib.Path(value).resolve() for value in sys.argv[2:6]]
 sidecars = [pathlib.Path(value).resolve() for value in sys.argv[6:10]]
+pretrained_eraf = (
+    pathlib.Path(sys.argv[10]).resolve() if len(sys.argv) > 10 and sys.argv[10] else None
+)
 
 payload = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
 if str(payload.get("format", "")).startswith("fastwam_policy_guard_"):
     raise SystemExit(
-        "Fresh ERAF joint training must start from the released Base, not a PGC checkpoint."
+        "ERAF joint training must start from the released Base, not a PGC checkpoint."
     )
 if not isinstance(payload.get("mot"), dict) and not isinstance(payload.get("dit"), dict):
     raise SystemExit("Released Base checkpoint must contain `mot` or `dit` weights.")
+
+if pretrained_eraf is not None:
+    eraf_payload = torch.load(
+        pretrained_eraf, map_location="cpu", weights_only=False
+    )
+    eraf_metadata = eraf_payload.get("architecture_metadata") or {}
+    objective = int(eraf_metadata.get("eraf_grounding_objective_version", -1))
+    source_step = int(eraf_payload.get("step", -1))
+    if eraf_payload.get("format") != "fastwam_policy_guard_v9":
+        raise SystemExit("Pretrained ERAF source must be a PGC V9 checkpoint.")
+    if not 14 <= objective <= 26:
+        raise SystemExit(
+            f"Pretrained ERAF source must be admitted V9.13+ objective 14..26; got {objective}."
+        )
+    if source_step < 7250:
+        raise SystemExit(
+            f"Pretrained ERAF source must be completed V9.13+ step >=7250; got {source_step}."
+        )
+    if eraf_metadata.get("eraf_phase_safe_memory_contract") != (
+        "explicit_cross_replan_pending_holding_retry_completed"
+    ):
+        raise SystemExit("Pretrained ERAF source lacks the phase-safe-memory contract.")
+    if eraf_metadata.get("eraf_geometry_protection_contract") != (
+        "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
+    ):
+        raise SystemExit("Pretrained ERAF source is not the frozen admitted geometry path.")
+    if bool(eraf_metadata.get("eraf_fresh_joint_training", False)) or bool(
+        eraf_metadata.get("eraf_pretrained_joint_training", False)
+    ):
+        raise SystemExit(
+            "Pretrained ERAF source must precede the new end-to-end joint experiments."
+        )
+    guard = eraf_payload.get("policy_guard") or {}
+    eraf_keys = [
+        str(name)
+        for name in guard
+        if str(name).startswith("entity_relation_affordance.")
+    ]
+    if not eraf_keys:
+        raise SystemExit("Pretrained ERAF source contains no ERAF tensors.")
 
 expected_contracts = [
     ("native", "fastwam_gripper_open_1_close_0", "fastwam_to_libero_env"),
@@ -195,13 +262,16 @@ NATIVE_JSON="$(json_array "${NATIVE_DATASET}" "${CLOSED_LOOP_DATASET}")"
 CF_JSON="$(json_array "${HISTORICAL_CF_DATASET}" "${STRICT_CF_DATASET}")"
 SIDECAR_JSON="$(json_array "${NATIVE_SIDECAR}" "${CLOSED_LOOP_SIDECAR}" "${HISTORICAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}")"
 
-RUN_TAG="${RUN_TAG:-${SUITE}-fresh-eraf-joint-bidirectional-15k-seed${TRAIN_SEED}-v1}"
-echo "[FastWAM] LIBERO fresh-ERAF + shared Expert LoRA joint training"
+RUN_TAG="${RUN_TAG:-${SUITE}-${ERAF_JOINT_KIND}-eraf-joint-bidirectional-15k-seed${TRAIN_SEED}-v1}"
+echo "[FastWAM] LIBERO ${ERAF_JOINT_KIND}-ERAF + shared Expert LoRA joint training"
 echo "  suite=${SUITE} steps=${MAX_STEPS} seed=${TRAIN_SEED}"
 echo "  base=${BASE_CHECKPOINT}"
 echo "  mixture=offline_native:closed_loop_native:historical_cf:strict_cf 1:1:1:1"
 echo "  lora=video+action rank16 alpha16 dropout0.05; extra_trainables=none"
-echo "  eraf=fresh trainable lr=${ERAF_LEARNING_RATE}; injector_lr=${INJECTOR_LEARNING_RATE}"
+echo "  eraf=${ERAF_JOINT_KIND} trainable lr=${ERAF_LEARNING_RATE}; injector=fresh lr=${INJECTOR_LEARNING_RATE}"
+if [[ -n "${PRETRAINED_ERAF_CHECKPOINT}" ]]; then
+  echo "  eraf_pretrained_checkpoint=${PRETRAINED_ERAF_CHECKPOINT} (ERAF tensors only)"
+fi
 echo "  injection=exact-off through step ${INJECTION_WARMUP_STEPS}, ramp ${INJECTION_RAMP_STEPS} steps"
 echo "  objectives=source+target world/action positives + bidirectional same-row language ranks + ERAF labels + lora_reg"
 
@@ -235,11 +305,13 @@ RUN_ID="eraf-joint-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NOD
   model.policy_guard.enabled=true \
   model.policy_guard.version=9 \
   model.policy_guard.entity_relation_grounding.training_stage=action \
-  model.policy_guard.entity_relation_grounding.initialization_contract=released_base_fresh_eraf \
+  "model.policy_guard.entity_relation_grounding.initialization_contract=${ERAF_INITIALIZATION_CONTRACT}" \
   model.policy_guard.entity_relation_grounding.grounding_objective_version=26 \
   model.policy_guard.entity_relation_grounding.completion_only_memory=true \
   model.policy_guard.entity_relation_grounding.action_joint_training=true \
-  model.policy_guard.entity_relation_grounding.fresh_joint_training=true \
+  "model.policy_guard.entity_relation_grounding.fresh_joint_training=${ERAF_FRESH_JOINT}" \
+  "model.policy_guard.entity_relation_grounding.pretrained_joint_training=${ERAF_PRETRAINED_JOINT}" \
+  "model.policy_guard.entity_relation_grounding.pretrained_checkpoint=${PRETRAINED_ERAF_CHECKPOINT:-null}" \
   model.policy_guard.entity_relation_grounding.bidirectional_supervision=true \
   "model.policy_guard.entity_relation_grounding.context_injection_warmup_steps=${INJECTION_WARMUP_STEPS}" \
   "model.policy_guard.entity_relation_grounding.context_injection_ramp_steps=${INJECTION_RAMP_STEPS}" \

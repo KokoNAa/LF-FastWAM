@@ -143,7 +143,7 @@ class Wan22Trainer:
         if bool(
             getattr(
                 self.model,
-                "policy_guard_eraf_fresh_joint_training",
+                "policy_guard_eraf_end_to_end_joint_training",
                 False,
             )
         ):
@@ -169,12 +169,25 @@ class Wan22Trainer:
             )
             if mismatches or closed_loop_count != 1:
                 raise ValueError(
-                    "Fresh ERAF joint training requires the exact no-ERAF "
+                    "End-to-end ERAF joint training requires the exact no-ERAF "
                     "offline-native/closed-loop-native/historical-CF/strict-CF "
                     "1:1:1:1 dataset and bidirectional supervision contract; "
                     f"mismatches={mismatches}, "
                     f"closed_loop_native_count={closed_loop_count}."
                 )
+        if bool(
+            getattr(
+                self.model,
+                "policy_guard_eraf_pretrained_joint_training",
+                False,
+            )
+        ) and not getattr(
+            self.model, "policy_guard_eraf_pretrained_checkpoint", None
+        ):
+            raise ValueError(
+                "Pretrained ERAF joint training requires "
+                "entity_relation_grounding.pretrained_checkpoint."
+            )
         if bool(getattr(self.model, "policy_guard_enabled", False)) and bool(
             getattr(
                 self.model,
@@ -700,9 +713,25 @@ class Wan22Trainer:
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
         logger.info("Loading weight checkpoint only: %s", resume)
-        payload = self.accelerator.unwrap_model(self.model).load_checkpoint(
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        payload = unwrapped_model.load_checkpoint(
             str(resume_path), optimizer=None
         )
+        pretrained_eraf = getattr(
+            unwrapped_model,
+            "policy_guard_eraf_pretrained_checkpoint",
+            None,
+        )
+        if pretrained_eraf is not None:
+            if str(payload.get("format", "")).startswith(
+                "fastwam_policy_guard_"
+            ):
+                raise ValueError(
+                    "Pretrained ERAF joint training must load the released "
+                    "FastWAM Base in resume and import ERAF through the "
+                    "separate pretrained_checkpoint field."
+                )
+            unwrapped_model.load_pretrained_eraf_checkpoint(pretrained_eraf)
         self._sync_optimizer_recovery_parameter_groups()
         if self.weight_only_start_step is None:
             logger.warning(

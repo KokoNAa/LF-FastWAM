@@ -340,6 +340,11 @@ policy_guard:
     # seed and trained together with the shared Video/Action LoRA.  The
     # historical objective-26 path keeps this false and retains frozen ERAF.
     fresh_joint_training: false
+    # Clean two-stage alternative: load only entity_relation_affordance.* from
+    # an admitted V9.13+ checkpoint, while the released Base, context injector,
+    # and shared Video/Action LoRA all start independently for the new run.
+    pretrained_joint_training: false
+    pretrained_checkpoint: null
     bidirectional_supervision: false
     context_injection_warmup_steps: 1500
     context_injection_ramp_steps: 1000

@@ -25,6 +25,11 @@ ERAF_CONFIG_MAPPING = {
     "eraf_grounding_aux_weight": "grounding_aux_weight",
     "eraf_completion_only_memory": "completion_only_memory",
     "eraf_action_joint_training": "action_joint_training",
+    "eraf_fresh_joint_training": "fresh_joint_training",
+    "eraf_pretrained_joint_training": "pretrained_joint_training",
+    "eraf_bidirectional_supervision": "bidirectional_supervision",
+    "eraf_context_injection_warmup_steps": "context_injection_warmup_steps",
+    "eraf_context_injection_ramp_steps": "context_injection_ramp_steps",
     "eraf_action_grounding_hidden_dim": "action_grounding_hidden_dim",
     "eraf_action_grounding_num_heads": "action_grounding_num_heads",
     "eraf_action_grounding_learning_rate": "action_grounding_learning_rate",
@@ -126,10 +131,25 @@ def validate_payload(
         )
     if payload.get("format") != "fastwam_policy_guard_v9":
         raise ValueError("Checkpoint format/version does not match PGC V9.")
+    fresh_joint = bool(metadata.get("eraf_fresh_joint_training", False))
+    pretrained_joint = bool(
+        metadata.get("eraf_pretrained_joint_training", False)
+    )
+    if fresh_joint and pretrained_joint:
+        raise ValueError(
+            "PGC V9.26 cannot be both fresh and pretrained ERAF joint."
+        )
+    expected_protection = (
+        "pretrained_eraf_ramp_then_single_path_no_candidate_gate"
+        if pretrained_joint
+        else "fresh_eraf_warmup_then_single_path_no_candidate_gate"
+        if fresh_joint
+        else "single_eraf_path_no_candidate_gate"
+    )
     required_metadata = {
         "eraf_single_path": True,
         "gate_mode": "eraf_only",
-        "policy_protection": "single_eraf_path_no_candidate_gate",
+        "policy_protection": expected_protection,
         "eraf_post_action_residual_active": False,
         "counterfactual_action_interface": "single_eraf_conditioned_action_denoising_path",
     }
@@ -138,6 +158,24 @@ def validate_payload(
             raise ValueError(
                 f"Checkpoint violates {key}: expected={expected!r}, "
                 f"got={metadata.get(key)!r}."
+            )
+    if pretrained_joint:
+        required_provenance = (
+            "eraf_pretrained_source_checkpoint",
+            "eraf_pretrained_source_sha256",
+            "eraf_pretrained_source_objective",
+            "eraf_pretrained_source_step",
+            "eraf_pretrained_tensor_count",
+        )
+        missing = [
+            name
+            for name in required_provenance
+            if metadata.get(name) in (None, "")
+        ]
+        if missing:
+            raise ValueError(
+                "Pretrained ERAF joint checkpoint lacks provenance: "
+                f"{missing}."
             )
     rollout_steps = int(metadata.get("rollout_num_inference_steps", -1))
     if rollout_steps != int(inference_steps):

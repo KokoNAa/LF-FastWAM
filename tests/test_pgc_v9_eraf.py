@@ -1149,6 +1149,127 @@ class PGCERAFModuleTest(unittest.TestCase):
                     name,
                 )
 
+    def test_pretrained_eraf_joint_imports_only_eraf_and_round_trips_provenance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            source_path = root / "v913-eraf.pt"
+            joint_path = root / "pretrained-eraf-joint.pt"
+            released_base = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {
+                    "format": "fastwam_full_v1",
+                    "mot": released_base.mot.state_dict(),
+                },
+                base_path,
+            )
+
+            source = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=14,
+                v9_initialization_contract="exact_pgc_v5_sidecars",
+            )
+            source.load_checkpoint(base_path)
+            with torch.no_grad():
+                next(
+                    source.policy_guard_modules[
+                        "entity_relation_affordance"
+                    ].parameters()
+                ).fill_(0.125)
+            source.save_checkpoint(source_path, step=7250)
+
+            model = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=26,
+                v9_initialization_contract="released_base_pretrained_eraf",
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+                v9_pretrained_joint_training=True,
+                v9_pretrained_checkpoint=str(source_path),
+                v9_bidirectional_supervision=True,
+                v9_context_injection_warmup_steps=0,
+                v9_context_injection_ramp_steps=1000,
+            )
+            injector_before = {
+                name: value.detach().clone()
+                for name, value in model.policy_guard_modules[
+                    "eraf_action_context_injector"
+                ].state_dict().items()
+            }
+            model.load_checkpoint(base_path)
+            provenance = model.load_pretrained_eraf_checkpoint(source_path)
+            self.assertEqual(provenance["objective"], 14)
+            self.assertEqual(provenance["step"], 7250)
+            self.assertGreater(provenance["tensor_count"], 0)
+            self.assertEqual(len(provenance["sha256"]), 64)
+            for name, value in source.policy_guard_modules[
+                "entity_relation_affordance"
+            ].state_dict().items():
+                self.assertTrue(
+                    torch.equal(
+                        value,
+                        model.policy_guard_modules[
+                            "entity_relation_affordance"
+                        ].state_dict()[name],
+                    ),
+                    name,
+                )
+            for name, value in injector_before.items():
+                self.assertTrue(
+                    torch.equal(
+                        value,
+                        model.policy_guard_modules[
+                            "eraf_action_context_injector"
+                        ].state_dict()[name],
+                    ),
+                    name,
+                )
+
+            model.prepare_trainable_parameters()
+            self.assertEqual(
+                model._policy_guard_eraf_context_injection_scale(), 1.0
+            )
+            model.set_training_progress(0, 15000)
+            self.assertEqual(
+                model._policy_guard_eraf_context_injection_scale(), 0.0
+            )
+            model.set_training_progress(500, 15000)
+            self.assertEqual(
+                model._policy_guard_eraf_context_injection_scale(), 0.5
+            )
+            metadata = model._policy_guard_metadata()
+            self.assertIs(metadata["eraf_pretrained_joint_training"], True)
+            self.assertEqual(
+                metadata["eraf_pretrained_source_objective"], 14
+            )
+            self.assertEqual(metadata["eraf_pretrained_source_step"], 7250)
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "pretrained_eraf_plus_shared_video_action_lora_plus_fresh_"
+                "eraf_action_context_injector",
+            )
+            model.save_checkpoint(joint_path, step=15000)
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=26,
+                v9_initialization_contract="released_base_pretrained_eraf",
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+                v9_pretrained_joint_training=True,
+                v9_bidirectional_supervision=True,
+                v9_context_injection_warmup_steps=0,
+                v9_context_injection_ramp_steps=1000,
+            )
+            restored.load_checkpoint(joint_path)
+            self.assertEqual(
+                restored.policy_guard_eraf_pretrained_source_sha256,
+                provenance["sha256"],
+            )
+
     def test_v925_action_context_injector_appends_tokens_without_action_residual(self):
         module = ERAFActionContextInjector(
             goal_dim=12,

@@ -187,7 +187,14 @@ objective = (
 )
 is_v926 = version == 9 and objective >= 26
 fresh_eraf_joint = bool(metadata.get("eraf_fresh_joint_training", False))
+pretrained_eraf_joint = bool(
+    metadata.get("eraf_pretrained_joint_training", False)
+)
+end_to_end_eraf_joint = fresh_eraf_joint or pretrained_eraf_joint
 expected_protection = (
+    "pretrained_eraf_ramp_then_single_path_no_candidate_gate"
+    if pretrained_eraf_joint
+    else
     "fresh_eraf_warmup_then_single_path_no_candidate_gate"
     if fresh_eraf_joint
     else "single_eraf_path_no_candidate_gate"
@@ -210,6 +217,10 @@ expected_tuning = {
 }[version]
 if is_v926:
     expected_tuning = (
+        "pretrained_eraf_native_counterfactual_bidirectional_world_action_"
+        "joint_lora"
+        if pretrained_eraf_joint
+        else
         "fresh_eraf_native_counterfactual_bidirectional_world_action_joint_lora"
         if fresh_eraf_joint
         else "native_and_counterfactual_world_action_joint_lora"
@@ -315,7 +326,11 @@ if version == 9:
     entity_only, use_anchors = expected_ablation[v9_ablation]
     if (
         metadata.get("warm_start_contract")
-        not in {"exact_pgc_v5_sidecars", "released_base_fresh_eraf"}
+        not in {
+            "exact_pgc_v5_sidecars",
+            "released_base_fresh_eraf",
+            "released_base_pretrained_eraf",
+        }
         or metadata.get("grounding")
         != "predicate_entity_relation_affordance_field"
         or metadata.get("privileged_supervision") != "training_only"
@@ -379,6 +394,9 @@ if version == 9:
         != "explicit_cross_replan_pending_holding_retry_completed"
         or metadata.get("eraf_geometry_protection_contract")
         != (
+            "jointly_trained_pretrained_eraf_no_post_action_residual"
+            if pretrained_eraf_joint
+            else
             "jointly_trained_fresh_eraf_no_post_action_residual"
             if fresh_eraf_joint
             else "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
@@ -393,6 +411,9 @@ if version == 9:
         )
         or metadata.get("eraf_phase_safe_memory_warm_start")
         != (
+            "eraf_only_exact_v9_13_or_later"
+            if pretrained_eraf_joint
+            else
             "none_random_seeded_from_released_base"
             if fresh_eraf_joint
             else "exact_v9_11_geometry"
@@ -401,6 +422,11 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
+            "pretrained_eraf_plus_fresh_shared_video_action_expert_lora_"
+            "bidirectional_joint_training_with_ramped_fresh_context_injector_"
+            "single_path"
+            if pretrained_eraf_joint
+            else
             "fresh_eraf_plus_shared_video_action_expert_lora_bidirectional_"
             "joint_training_with_delayed_internal_context_injection_single_path"
             if fresh_eraf_joint
@@ -447,6 +473,10 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
+            "pretrained_eraf_plus_shared_video_action_lora_plus_fresh_eraf_"
+            "action_context_injector"
+            if pretrained_eraf_joint
+            else
             "fresh_eraf_plus_shared_video_action_lora_plus_eraf_action_"
             "context_injector"
             if fresh_eraf_joint
@@ -482,6 +512,10 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
+            "pretrained_eraf_plus_shared_video_action_lora_plus_eraf_action_"
+            "context_injector"
+            if pretrained_eraf_joint
+            else
             "fresh_eraf_plus_shared_video_action_lora_plus_eraf_action_"
             "context_injector"
             if fresh_eraf_joint
@@ -587,7 +621,7 @@ if version == 9:
         != (
             "exact_no_injection_warmup_then_append_bounded_eraf_tokens_to_"
             "shared_action_expert_context_no_post_action_residual"
-            if fresh_eraf_joint
+            if end_to_end_eraf_joint
             else "append_bounded_eraf_tokens_to_shared_action_expert_context_at_"
             "every_denoising_step_no_post_action_residual"
         )
@@ -615,6 +649,26 @@ if version == 9:
             "PGC V9.26 checkpoint lacks its single-path shared Expert-LoRA "
             "contract"
         )
+    if pretrained_eraf_joint:
+        required_pretrained_provenance = (
+            "eraf_pretrained_source_checkpoint",
+            "eraf_pretrained_source_sha256",
+            "eraf_pretrained_source_objective",
+            "eraf_pretrained_source_step",
+            "eraf_pretrained_tensor_count",
+        )
+        if any(
+            metadata.get(name) in (None, "")
+            for name in required_pretrained_provenance
+        ):
+            raise SystemExit(
+                "Pretrained ERAF joint checkpoint lacks initialization provenance"
+            )
+        sha256 = str(metadata["eraf_pretrained_source_sha256"])
+        if len(sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in sha256.lower()
+        ):
+            raise SystemExit("Pretrained ERAF source SHA256 is invalid")
     if completion_only_memory and (
         training_stage != "action"
         or metadata.get("eraf_action_joint_training") is not True
@@ -765,6 +819,7 @@ mapping = {
     "eraf_completion_only_memory": "completion_only_memory",
     "eraf_action_joint_training": "action_joint_training",
     "eraf_fresh_joint_training": "fresh_joint_training",
+    "eraf_pretrained_joint_training": "pretrained_joint_training",
     "eraf_bidirectional_supervision": "bidirectional_supervision",
     "eraf_context_injection_warmup_steps": (
         "context_injection_warmup_steps"
