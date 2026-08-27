@@ -66,6 +66,22 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         ):
             self.assertIn(contract, source)
 
+    def test_legacy_libero_eraf_defaults_missing_camera_layout_to_horizontal(self):
+        model_source = (
+            REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"
+        ).read_text(encoding="utf-8")
+        launcher_source = (
+            REPO_ROOT / "scripts/train_libero_eraf_joint_from_scratch.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'metadata.get("eraf_camera_layout", "horizontal")',
+            model_source,
+        )
+        self.assertIn(
+            'eraf_metadata.get("eraf_camera_layout", "horizontal")',
+            launcher_source,
+        )
+
     def test_standard_pgc_evaluator_reconstructs_joint_metadata(self):
         source = (
             REPO_ROOT / "scripts/eval_pgc_libero.sh"

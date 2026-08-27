@@ -1178,6 +1178,13 @@ class PGCERAFModuleTest(unittest.TestCase):
                     ].parameters()
                 ).fill_(0.125)
             source.save_checkpoint(source_path, step=7250)
+            source_payload = torch.load(
+                source_path, map_location="cpu", weights_only=False
+            )
+            source_payload["architecture_metadata"].pop(
+                "eraf_camera_layout", None
+            )
+            torch.save(source_payload, source_path)
 
             model = tiny_pgc_fastwam(
                 version=9,

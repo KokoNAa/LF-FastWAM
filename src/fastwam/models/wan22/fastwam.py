@@ -21511,7 +21511,6 @@ class FastWAM(torch.nn.Module):
             "eraf_num_heads": self.policy_guard_eraf_num_heads,
             "eraf_max_clauses": self.policy_guard_eraf_max_clauses,
             "eraf_camera_count": self.policy_guard_eraf_camera_count,
-            "eraf_camera_layout": self.policy_guard_eraf_camera_layout,
             "eraf_phase_safe_memory_contract": (
                 "explicit_cross_replan_pending_holding_retry_completed"
             ),
@@ -21526,6 +21525,19 @@ class FastWAM(torch.nn.Module):
                     "Pretrained ERAF architecture mismatch: "
                     f"{name}={metadata.get(name)!r}, expected={expected!r}."
                 )
+        # LIBERO V9.13 predates the explicit camera-layout metadata field.
+        # Its two-camera checkpoints used the horizontal mosaic, which is also
+        # the ordinary V9 loader's compatibility default. An explicitly
+        # recorded different layout remains a hard architecture mismatch.
+        source_camera_layout = str(
+            metadata.get("eraf_camera_layout", "horizontal")
+        ).strip().lower()
+        if source_camera_layout != self.policy_guard_eraf_camera_layout:
+            raise ValueError(
+                "Pretrained ERAF architecture mismatch: "
+                f"eraf_camera_layout={source_camera_layout!r}, "
+                f"expected={self.policy_guard_eraf_camera_layout!r}."
+            )
         source_aspect = float(
             metadata.get("eraf_visual_aspect_ratio", float("nan"))
         )

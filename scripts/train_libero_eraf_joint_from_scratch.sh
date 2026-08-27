@@ -190,6 +190,14 @@ if pretrained_eraf is not None:
         raise SystemExit(
             f"Pretrained ERAF source must be completed V9.13+ step >=7250; got {source_step}."
         )
+    camera_layout = str(
+        eraf_metadata.get("eraf_camera_layout", "horizontal")
+    ).strip().lower()
+    if camera_layout != "horizontal":
+        raise SystemExit(
+            "Pretrained ERAF source has an incompatible camera layout: "
+            f"{camera_layout!r}."
+        )
     if eraf_metadata.get("eraf_phase_safe_memory_contract") != (
         "explicit_cross_replan_pending_holding_retry_completed"
     ):
