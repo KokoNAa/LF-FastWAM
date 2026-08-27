@@ -48,6 +48,11 @@ from experiments.libero.eraf_shadow_audit import (
     verify_shadow_action_integrity,
 )
 from experiments.libero.language_condition import normalize_instruction_condition
+from experiments.libero.language_ood import (
+    resolve_paraphrase_instruction,
+    sha256_file,
+    validate_language_ood_record,
+)
 from experiments.libero.oracle_phase_servo import (
     OraclePhaseServoConfig,
     apply_oracle_phase_servo,
@@ -562,10 +567,10 @@ def _resolve_language_intervention(
         # Keep a normal encoder input but mask every language position inside
         # FastWAM. Proprio/state tokens remain visible.
         return condition, task_description, True, None
-    if condition not in {"shuffled", "counterfactual"}:
+    if condition not in {"shuffled", "counterfactual", "paraphrase"}:
         raise ValueError(
             "EVALUATION.instruction_condition must be one of "
-            "correct/null/shuffled/counterfactual, got "
+            "correct/null/shuffled/counterfactual/paraphrase, got "
             f"{condition!r}."
         )
 
@@ -592,12 +597,22 @@ def _resolve_language_intervention(
         task_id=int(cfg.EVALUATION.task_id),
         task_description=task_description,
     )
-    field = (
-        "shuffled_instruction"
-        if condition == "shuffled"
-        else "counterfactual_instruction"
-    )
-    instruction = str(record.get(field, "")).strip()
+    if condition == "paraphrase":
+        validate_language_ood_record(record)
+        variant = cfg.EVALUATION.get("language_ood_variant")
+        if variant in (None, "", "null"):
+            raise ValueError(
+                "Paraphrase evaluation requires EVALUATION.language_ood_variant."
+            )
+        instruction = resolve_paraphrase_instruction(record, str(variant))
+        field = f"paraphrases.{str(variant).strip().casefold()}"
+    else:
+        field = (
+            "shuffled_instruction"
+            if condition == "shuffled"
+            else "counterfactual_instruction"
+        )
+        instruction = str(record.get(field, "")).strip()
     if not instruction:
         raise ValueError(
             f"Manifest line {record.get('_line_number', '?')} has no non-empty "
@@ -1875,6 +1890,32 @@ def run_single_task(
         "policy_guard_episode_diagnostics": [],
         "closed_loop_capture_count": 0,
     }
+    if intervention_record is not None:
+        manifest_value = cfg.EVALUATION.get("language_intervention_manifest")
+        manifest_path = Path(
+            os.path.expanduser(os.path.expandvars(str(manifest_value)))
+        ).resolve()
+        results.update(
+            {
+                "language_intervention_pair_id": intervention_record.get("pair_id"),
+                "language_intervention_manifest": str(manifest_path),
+                "language_intervention_manifest_sha256": sha256_file(manifest_path),
+            }
+        )
+    if instruction_condition == "paraphrase":
+        results.update(
+            {
+                "language_ood_variant": str(
+                    cfg.EVALUATION.get("language_ood_variant")
+                )
+                .strip()
+                .casefold(),
+                "language_ood_canonical_instruction": task_description,
+                "language_ood_policy_training_exact_match": False,
+                "language_ood_source_goal_unchanged": True,
+                "language_ood_prompt_wrapper_unchanged": True,
+            }
+        )
     if eraf_shadow_enabled:
         results["eraf_shadow_audit"] = {
             "enabled": True,

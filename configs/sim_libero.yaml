@@ -39,13 +39,18 @@ EVALUATION:
   rand_device: cpu
   tiled: false
 
-  # Language-intervention condition: correct / null / shuffled / counterfactual.
+  # Language-intervention condition:
+  # correct / null / shuffled / counterfactual / paraphrase.
   # Shuffled keeps the source success predicate (DTL). Counterfactual imports
   # the paired task's goal predicate while keeping the source scene/state (CIS).
   # Counterfactual always requires an audited manifest.
   instruction_condition: correct
   language_intervention_manifest: null
   instruction_override: null
+  # Sentence-level policy-training OOD evaluation. The source environment,
+  # initial state, and success predicate remain unchanged; only the task text
+  # is selected from the audited manifest (near / sequence / goal).
+  language_ood_variant: null
   # Opt-in behavior-level CIS diagnostics. This records source/alternate goal
   # predicates plus per-object grasp and >=4 cm lift events without changing
   # the policy inputs or simulator success predicate.

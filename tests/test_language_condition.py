@@ -11,6 +11,7 @@ class LanguageConditionTest(unittest.TestCase):
         self.assertEqual(normalize_instruction_condition(" Correct "), "correct")
         self.assertEqual(normalize_instruction_condition("NULL"), "null")
         self.assertEqual(normalize_instruction_condition("Shuffled"), "shuffled")
+        self.assertEqual(normalize_instruction_condition(" Paraphrase "), "paraphrase")
 
 
 if __name__ == "__main__":
