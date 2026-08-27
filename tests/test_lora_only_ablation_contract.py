@@ -60,6 +60,20 @@ class LoRAOnlyAblationContractTest(unittest.TestCase):
         )
         self.assertIn("model.policy_guard.enabled=false", source)
 
+    def test_parallel_evaluations_use_distinct_tmux_sessions(self):
+        evaluator = (
+            REPO_ROOT / "scripts/eval_libero_lora_only_ablation.sh"
+        ).read_text(encoding="utf-8")
+        manager = (
+            REPO_ROOT / "experiments/libero/run_libero_parallel_test.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("libero_lora_only_${EXPECTED_STEP}_${CONDITION}", evaluator)
+        self.assertIn('LIBERO_TMUX_SESSION_NAME="${TMUX_SESSION_NAME}"', evaluator)
+        self.assertIn(
+            'SESSION_NAME="${LIBERO_TMUX_SESSION_NAME:-libero_test_v3}"',
+            manager,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

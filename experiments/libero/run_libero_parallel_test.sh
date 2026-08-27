@@ -26,7 +26,7 @@ run_libero_eval() {
     export RUN_ID
     OUTPUT_DIR=${OUTPUT_DIR:-"$ROOT_DIR/evaluate_results/$RUN_ID"}
     export OUTPUT_DIR  # Use run_id as the output subdirectory
-    SESSION_NAME="libero_test_v3"
+    SESSION_NAME="${LIBERO_TMUX_SESSION_NAME:-libero_test_v3}"
     EXP_NAME=${EXP_NAME:-""}
     export EXP_NAME
 

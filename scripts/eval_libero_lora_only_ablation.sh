@@ -30,6 +30,7 @@ CONDITION="${LORA_ONLY_EVAL_CONDITION:-correct}"
 MANIFEST_PATH="${LORA_ONLY_MANIFEST_PATH:-}"
 STATS_PATH="${STATS_PATH:-${DIFFSYNTH_MODEL_BASE_PATH:-./checkpoints}/fastwam_release/libero_uncond_2cam224_dataset_stats.json}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$(pwd)/evaluate_results/${SUITE}_lora_only_no_eraf_bidirectional_${CONDITION}_seed${EVAL_SEED}_trials${NUM_TRIALS}}"
+TMUX_SESSION_NAME="${LIBERO_TMUX_SESSION_NAME:-libero_lora_only_${EXPECTED_STEP}_${CONDITION}_seed${EVAL_SEED}}"
 
 case "${CONDITION}" in
   correct|null|shuffled|counterfactual) ;;
@@ -140,7 +141,9 @@ echo "[FastWAM] LIBERO LoRA-only / no-ERAF evaluation"
 echo "  suite=${SUITE} checkpoint=${LORA_ONLY_CHECKPOINT}"
 echo "  condition=${CONDITION} trials=${NUM_TRIALS} seed=${EVAL_SEED}"
 echo "  output=${OUTPUT_ROOT}"
+echo "  tmux_session=${TMUX_SESSION_NAME}"
 
+LIBERO_TMUX_SESSION_NAME="${TMUX_SESSION_NAME}" \
 EXP_NAME="lora-only-bidirectional-${CONDITION}" "${PYTHON_BIN}" \
   experiments/libero/run_libero_manager.py "${OVERRIDES[@]}"
 
