@@ -1082,11 +1082,11 @@ class PGCERAFModuleTest(unittest.TestCase):
                 "shared_video_action_lora",
             },
         )
-        model.set_training_progress(1500, 15000)
+        model.set_training_progress(1500, 10000)
         self.assertEqual(model._policy_guard_eraf_context_injection_scale(), 0.0)
-        model.set_training_progress(2000, 15000)
+        model.set_training_progress(2000, 10000)
         self.assertEqual(model._policy_guard_eraf_context_injection_scale(), 0.5)
-        model.set_training_progress(2500, 15000)
+        model.set_training_progress(2500, 10000)
         self.assertEqual(model._policy_guard_eraf_context_injection_scale(), 1.0)
         metadata = model._policy_guard_metadata()
         self.assertIs(metadata["eraf_fresh_joint_training"], True)
@@ -1126,7 +1126,7 @@ class PGCERAFModuleTest(unittest.TestCase):
                 v9_bidirectional_supervision=True,
             )
             model.load_checkpoint(base_path)
-            model.save_checkpoint(joint_path, step=15000)
+            model.save_checkpoint(joint_path, step=10000)
 
             restored = tiny_pgc_fastwam(
                 version=9,
@@ -1231,11 +1231,11 @@ class PGCERAFModuleTest(unittest.TestCase):
             self.assertEqual(
                 model._policy_guard_eraf_context_injection_scale(), 1.0
             )
-            model.set_training_progress(0, 15000)
+            model.set_training_progress(0, 10000)
             self.assertEqual(
                 model._policy_guard_eraf_context_injection_scale(), 0.0
             )
-            model.set_training_progress(500, 15000)
+            model.set_training_progress(500, 10000)
             self.assertEqual(
                 model._policy_guard_eraf_context_injection_scale(), 0.5
             )
@@ -1250,7 +1250,7 @@ class PGCERAFModuleTest(unittest.TestCase):
                 "pretrained_eraf_plus_shared_video_action_lora_plus_fresh_"
                 "eraf_action_context_injector",
             )
-            model.save_checkpoint(joint_path, step=15000)
+            model.save_checkpoint(joint_path, step=10000)
 
             restored = tiny_pgc_fastwam(
                 version=9,

@@ -6,12 +6,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ERAFJointTrainingContractTest(unittest.TestCase):
-    def test_launcher_keeps_no_eraf_data_contract_and_runs_15k(self):
+    def test_launcher_keeps_no_eraf_data_contract_and_runs_10k(self):
         source = (
             REPO_ROOT / "scripts/train_libero_eraf_joint_from_scratch.sh"
         ).read_text(encoding="utf-8")
         for contract in (
-            'MAX_STEPS="${ERAF_JOINT_MAX_STEPS:-15000}"',
+            'MAX_STEPS="${ERAF_JOINT_MAX_STEPS:-10000}"',
             "task=libero_eraf_joint_2cam224",
             "offline_native:closed_loop_native:historical_cf:strict_cf 1:1:1:1",
             "data.train.pgc_balance_native_counterfactual=true",
@@ -47,7 +47,7 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
             "context_injection_ramp_steps: 1000",
             "learning_rate: 2.0e-5",
             "pgc_bidirectional_language_supervision_required: true",
-            "max_steps: 15000",
+            "max_steps: 10000",
             "experts: [video, action]",
             "extra_trainable_patterns: []",
         ):
