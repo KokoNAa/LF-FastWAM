@@ -687,6 +687,24 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_action_joint_training = bool(
             eraf_config.get("action_joint_training", False)
         )
+        # Objective-26 normally assumes a fully trained, frozen ERAF.  This
+        # opt-in contract instead starts from the released FastWAM weights,
+        # initializes ERAF from the configured seed, and optimizes ERAF,
+        # its Action-context injector, and the shared Video/Action LoRA in one
+        # run.  It is deliberately separate from the historical V9.26 path so
+        # old checkpoints retain their exact trainable scope and loss flow.
+        self.policy_guard_eraf_fresh_joint_training = bool(
+            eraf_config.get("fresh_joint_training", False)
+        )
+        self.policy_guard_eraf_bidirectional_supervision = bool(
+            eraf_config.get("bidirectional_supervision", False)
+        )
+        self.policy_guard_eraf_context_injection_warmup_steps = int(
+            eraf_config.get("context_injection_warmup_steps", 1500)
+        )
+        self.policy_guard_eraf_context_injection_ramp_steps = int(
+            eraf_config.get("context_injection_ramp_steps", 1000)
+        )
         self.policy_guard_eraf_action_grounding_hidden_dim = int(
             eraf_config.get("action_grounding_hidden_dim", 256)
         )
@@ -1570,6 +1588,40 @@ class FastWAM(torch.nn.Module):
                         "positive grounding_aux_weight so frozen ERAF behavior "
                         "is preserved while Video features adapt."
                     )
+                if min(
+                    self.policy_guard_eraf_context_injection_warmup_steps,
+                    self.policy_guard_eraf_context_injection_ramp_steps,
+                ) < 0:
+                    raise ValueError(
+                        "PGC ERAF context-injection warmup/ramp steps must be "
+                        "non-negative."
+                    )
+                if self.policy_guard_eraf_fresh_joint_training:
+                    if not (
+                        self.policy_guard_eraf_grounding_objective_version >= 26
+                        and self.policy_guard_eraf_training_stage == "action"
+                        and self.policy_guard_eraf_action_joint_training
+                        and self.policy_guard_eraf_completion_only_memory
+                    ):
+                        raise ValueError(
+                            "Fresh ERAF joint training requires objective 26+, "
+                            "the action stage, action_joint_training=true, and "
+                            "completion_only_memory=true."
+                        )
+                    if (
+                        self.policy_guard_eraf_initialization_contract
+                        != "released_base_fresh_eraf"
+                    ):
+                        raise ValueError(
+                            "Fresh ERAF joint training must initialize directly "
+                            "from the released Base with "
+                            "initialization_contract=released_base_fresh_eraf."
+                        )
+                    if not self.policy_guard_eraf_bidirectional_supervision:
+                        raise ValueError(
+                            "Fresh ERAF joint training requires bidirectional "
+                            "source/target language supervision."
+                        )
                 if (
                     self.policy_guard_eraf_grounding_objective_version >= 15
                     and not (
@@ -2368,6 +2420,32 @@ class FastWAM(torch.nn.Module):
             return 0.0
         return float(scale)
 
+    def _policy_guard_eraf_context_injection_scale(self) -> float:
+        """Cold-start a fresh ERAF without perturbing the Action Expert.
+
+        At deployment, and for every historical pretrained-ERAF checkpoint,
+        the injector remains fully active.  Only the explicit fresh-joint
+        training path receives an exact no-injection warmup followed by a
+        linear token-amplitude ramp.
+        """
+        if not self.policy_guard_eraf_fresh_joint_training:
+            return 1.0
+        if not self._policy_guard_training_progress_active:
+            return 1.0
+        step = self._policy_guard_training_step
+        start = self.policy_guard_eraf_context_injection_warmup_steps
+        ramp = self.policy_guard_eraf_context_injection_ramp_steps
+        if step <= start:
+            return 0.0
+        if ramp <= 0 or step >= start + ramp:
+            return 1.0
+        scale = (step - start) / ramp
+        if scale >= 1.0 - 1.0e-12:
+            return 1.0
+        if scale <= 1.0e-12:
+            return 0.0
+        return float(scale)
+
     def _transition_contract_scale(self) -> float:
         progress = self._transition_training_step / self._transition_training_max_steps
         warmup_end = self.transition_contract_warmup_ratio
@@ -2752,10 +2830,17 @@ class FastWAM(torch.nn.Module):
                                 self.policy_guard_eraf_grounding_objective_version
                                 >= 26
                             ):
-                                # ERAF itself and all legacy post-action
-                                # residuals stay frozen. The one deployed path
-                                # updates only shared Video/Action LoRA plus the
-                                # internal ERAF context projection.
+                                # Historical V9.26 keeps ERAF frozen.  The
+                                # explicit fresh-joint contract is the only
+                                # path that opens the newly initialized ERAF
+                                # core alongside the shared Expert LoRA and
+                                # internal context projection.
+                                if self.policy_guard_eraf_fresh_joint_training:
+                                    eraf = self.policy_guard_modules[
+                                        "entity_relation_affordance"
+                                    ]
+                                    eraf.train()
+                                    eraf.requires_grad_(True)
                                 context_injector = self.policy_guard_modules[
                                     "eraf_action_context_injector"
                                 ]
@@ -3959,6 +4044,9 @@ class FastWAM(torch.nn.Module):
                 context=context,
                 context_mask=full_context_mask,
                 goal_queries=routed_goal_queries,
+                external_scale=(
+                    self._policy_guard_eraf_context_injection_scale()
+                ),
             )
             action_pre = self.action_expert.pre_dit(
                 action_tokens=action_tokens,
@@ -8520,11 +8608,11 @@ class FastWAM(torch.nn.Module):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Jointly adapt the one ERAF policy path with shared Expert LoRA.
 
-        ERAF, completion memory, and all legacy post-action residuals remain
-        frozen. Future-video flow and paired wrong-language ranking update the
-        Video LoRA; native/counterfactual action flow and semantic ranking
-        update the Action LoRA and ERAF context injector. The privileged ERAF
-        objective is retained as a backbone-preservation constraint.
+        Historical V9.26 keeps ERAF and completion memory frozen.  The
+        explicit fresh-joint variant instead optimizes a newly initialized
+        ERAF with its privileged labels, while preserving the same four-way
+        data mixture and bidirectional paired-language objectives as the
+        no-ERAF control.  Both variants bypass every post-action residual.
         """
         if not (
             self.policy_guard_enabled
@@ -8545,6 +8633,7 @@ class FastWAM(torch.nn.Module):
         paired_language_valid = inputs["pgc_paired_language_valid"]
         source_context = inputs["pgc_source_context"]
         source_context_mask = inputs["pgc_source_context_mask"]
+        fresh_joint = self.policy_guard_eraf_fresh_joint_training
         if any(
             value is None
             for value in (
@@ -8558,6 +8647,42 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 "PGC V9.26 requires native/counterfactual provenance and "
                 "same-state paired language."
+            )
+
+        correct_context = inputs["context"]
+        correct_context_mask = full_context_mask
+        wrong_context = source_context
+        wrong_context_mask = source_context_mask
+        bidirectional_language_valid = paired_language_valid
+        if fresh_joint:
+            target_context = inputs.get("pgc_target_context")
+            target_context_mask = inputs.get("pgc_target_context_mask")
+            bidirectional_language_valid = inputs.get(
+                "pgc_bidirectional_language_valid"
+            )
+            if any(
+                value is None
+                for value in (
+                    target_context,
+                    target_context_mask,
+                    bidirectional_language_valid,
+                )
+            ):
+                raise ValueError(
+                    "Fresh ERAF joint training requires target language and "
+                    "bidirectional-valid fields."
+                )
+            (
+                correct_context,
+                correct_context_mask,
+                wrong_context,
+                wrong_context_mask,
+            ) = self._select_bidirectional_language_contexts(
+                is_counterfactual=is_counterfactual,
+                source_context=source_context,
+                source_context_mask=source_context_mask,
+                target_context=target_context,
+                target_context_mask=target_context_mask,
             )
 
         batch_size = int(action.shape[0])
@@ -8580,8 +8705,8 @@ class FastWAM(torch.nn.Module):
         video_pre = self.video_expert.pre_dit(
             x=noisy_video,
             timestep=timestep_video,
-            context=inputs["context"],
-            context_mask=full_context_mask,
+            context=correct_context,
+            context_mask=correct_context_mask,
             action=action,
             fuse_vae_embedding_in_latents=inputs[
                 "fuse_vae_embedding_in_latents"
@@ -8635,8 +8760,8 @@ class FastWAM(torch.nn.Module):
         wrong_video_pre = self.video_expert.pre_dit(
             x=noisy_video,
             timestep=timestep_video,
-            context=source_context,
-            context_mask=source_context_mask,
+            context=wrong_context,
+            context_mask=wrong_context_mask,
             action=action,
             fuse_vae_embedding_in_latents=inputs[
                 "fuse_vae_embedding_in_latents"
@@ -8679,16 +8804,44 @@ class FastWAM(torch.nn.Module):
         paired_language_valid = paired_language_valid.to(
             device=action.device, dtype=torch.bool
         )
+        bidirectional_language_valid = torch.as_tensor(
+            bidirectional_language_valid,
+            device=action.device,
+            dtype=torch.bool,
+        )
+        if bidirectional_language_valid.shape != (batch_size,):
+            raise ValueError(
+                "`pgc_bidirectional_language_valid` must be [B], got "
+                f"{tuple(bidirectional_language_valid.shape)}."
+            )
         native_valid = direct_action_valid & ~is_counterfactual
         counterfactual_valid = direct_action_valid & is_counterfactual
-        semantic_valid = counterfactual_valid & paired_language_valid
-        world_language_ranking = self._masked_policy_guard_mean(
-            torch.relu(
-                self.policy_guard_eraf_expert_lora_world_language_margin
-                + correct_video_error.detach()
-                - wrong_video_error
-            ),
-            semantic_valid,
+        source_semantic_valid = torch.zeros_like(native_valid)
+        if fresh_joint:
+            source_semantic_valid = (
+                native_valid & bidirectional_language_valid
+            )
+        target_semantic_valid = (
+            counterfactual_valid
+            & paired_language_valid
+            & bidirectional_language_valid
+        )
+        semantic_valid = source_semantic_valid | target_semantic_valid
+        world_ranking_per_sample = torch.relu(
+            self.policy_guard_eraf_expert_lora_world_language_margin
+            + correct_video_error.detach()
+            - wrong_video_error
+        )
+        source_world_language_ranking = self._masked_policy_guard_mean(
+            world_ranking_per_sample,
+            source_semantic_valid,
+        )
+        target_world_language_ranking = self._masked_policy_guard_mean(
+            world_ranking_per_sample,
+            target_semantic_valid,
+        )
+        world_language_ranking = (
+            source_world_language_ranking + target_world_language_ranking
         )
 
         language_context_len = int(inputs["language_context_len"])
@@ -8710,13 +8863,14 @@ class FastWAM(torch.nn.Module):
                 "phase_safe_memory_state_valid"
             ],
         }
+        wrong_state = target_state if fresh_joint else source_state
         target_queries, _, target_eraf_outputs, target_goal_metrics = (
             self._encode_policy_guard_eraf(
                 final_video_hidden=final_video_hidden,
                 current_visual_hidden=video_pre["tokens"],
                 video_tokens_per_frame=video_tokens_per_frame,
-                context=inputs["context"],
-                context_mask=full_context_mask,
+                context=correct_context,
+                context_mask=correct_context_mask,
                 language_context_len=language_context_len,
                 policy_guard_state=target_state,
                 proprio=inputs.get("proprio_current"),
@@ -8727,10 +8881,10 @@ class FastWAM(torch.nn.Module):
                 final_video_hidden=wrong_video_hidden,
                 current_visual_hidden=wrong_video_pre["tokens"],
                 video_tokens_per_frame=video_tokens_per_frame,
-                context=source_context,
-                context_mask=source_context_mask,
+                context=wrong_context,
+                context_mask=wrong_context_mask,
                 language_context_len=language_context_len,
-                policy_guard_state=source_state,
+                policy_guard_state=wrong_state,
                 proprio=inputs.get("proprio_current"),
             )
         )
@@ -8739,12 +8893,24 @@ class FastWAM(torch.nn.Module):
             target_labels,
             weights=self.policy_guard_eraf_loss_weights,
         )
-        source_eraf_loss, source_eraf_metrics = entity_relation_affordance_loss(
-            source_eraf_outputs,
-            source_labels,
-            weights=self.policy_guard_eraf_loss_weights,
-        )
-        eraf_preservation_loss = target_eraf_loss + 0.5 * source_eraf_loss
+        source_eraf_metrics: dict[str, torch.Tensor] = {}
+        if fresh_joint:
+            # Every row's labels describe its correct instruction: source on
+            # native rows and target on counterfactual rows.  The wrong branch
+            # participates only in same-state ranking and must not receive
+            # contradictory privileged targets.
+            eraf_preservation_loss = target_eraf_loss
+        else:
+            source_eraf_loss, source_eraf_metrics = (
+                entity_relation_affordance_loss(
+                    source_eraf_outputs,
+                    source_labels,
+                    weights=self.policy_guard_eraf_loss_weights,
+                )
+            )
+            eraf_preservation_loss = (
+                target_eraf_loss + 0.5 * source_eraf_loss
+            )
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -8762,8 +8928,8 @@ class FastWAM(torch.nn.Module):
             self._forward_policy_guard_action_from_cache(
                 action_tokens=noisy_action,
                 timestep_action=timestep_action,
-                context=inputs["context"],
-                full_context_mask=full_context_mask,
+                context=correct_context,
+                full_context_mask=correct_context_mask,
                 state_only_context_mask=state_only_context_mask,
                 video_kv_cache=video_kv_cache,
                 video_seq_len=video_seq_len,
@@ -8775,8 +8941,8 @@ class FastWAM(torch.nn.Module):
         wrong_action = self._forward_policy_guard_action_from_cache(
             action_tokens=noisy_action,
             timestep_action=timestep_action,
-            context=inputs["context"],
-            full_context_mask=full_context_mask,
+            context=wrong_context,
+            full_context_mask=wrong_context_mask,
             state_only_context_mask=state_only_context_mask,
             video_kv_cache=video_kv_cache,
             video_seq_len=video_seq_len,
@@ -8806,13 +8972,22 @@ class FastWAM(torch.nn.Module):
         counterfactual_action_loss = self._masked_policy_guard_mean(
             correct_action_error * action_weight, counterfactual_valid
         )
-        wrong_semantic_ranking = self._masked_policy_guard_mean(
-            torch.relu(
-                self.policy_guard_eraf_action_causal_margin
-                + correct_action_error.detach()
-                - wrong_action_error
-            ),
-            semantic_valid,
+        action_ranking_per_sample = torch.relu(
+            self.policy_guard_eraf_action_causal_margin
+            + correct_action_error.detach()
+            - wrong_action_error
+        )
+        source_action_language_ranking = self._masked_policy_guard_mean(
+            action_ranking_per_sample,
+            source_semantic_valid,
+        )
+        target_action_language_ranking = self._masked_policy_guard_mean(
+            action_ranking_per_sample,
+            target_semantic_valid,
+        )
+        wrong_semantic_ranking = (
+            source_action_language_ranking
+            + target_action_language_ranking
         )
 
         lora_terms = [
@@ -8843,10 +9018,22 @@ class FastWAM(torch.nn.Module):
         )
 
         semantic_count = semantic_valid.float().sum().clamp_min(1.0)
+        source_semantic_count = (
+            source_semantic_valid.float().sum().clamp_min(1.0)
+        )
+        target_semantic_count = (
+            target_semantic_valid.float().sum().clamp_min(1.0)
+        )
         metrics: dict[str, torch.Tensor] = {
             "loss_pgc_v926_world_flow": world_flow_loss.detach(),
             "loss_pgc_v926_world_language_ranking": (
                 world_language_ranking.detach()
+            ),
+            "loss_pgc_v926_source_world_language_ranking": (
+                source_world_language_ranking.detach()
+            ),
+            "loss_pgc_v926_target_world_language_ranking": (
+                target_world_language_ranking.detach()
             ),
             "loss_pgc_v926_native_action_flow": native_action_loss.detach(),
             "loss_pgc_v926_counterfactual_action_flow": (
@@ -8855,27 +9042,78 @@ class FastWAM(torch.nn.Module):
             "loss_pgc_v926_wrong_semantic_ranking": (
                 wrong_semantic_ranking.detach()
             ),
+            "loss_pgc_v926_source_action_language_ranking": (
+                source_action_language_ranking.detach()
+            ),
+            "loss_pgc_v926_target_action_language_ranking": (
+                target_action_language_ranking.detach()
+            ),
             "loss_pgc_v926_eraf_preservation": eraf_preservation_loss.detach(),
+            "loss_pgc_v926_eraf_joint_grounding": (
+                target_eraf_loss.detach()
+            ),
             "loss_pgc_v926_lora_regularization": lora_regularization.detach(),
             "pgc_v926_native_fraction": native_valid.float().mean(),
             "pgc_v926_counterfactual_fraction": (
                 counterfactual_valid.float().mean()
             ),
             "pgc_v926_semantic_fraction": semantic_valid.float().mean(),
+            "pgc_v926_source_semantic_fraction": (
+                source_semantic_valid.float().mean()
+            ),
+            "pgc_v926_target_semantic_fraction": (
+                target_semantic_valid.float().mean()
+            ),
+            "pgc_v926_bidirectional_pair_fraction": (
+                bidirectional_language_valid.float().mean()
+            ),
             "pgc_v926_world_wrong_language_worse_rate": (
                 ((wrong_video_error > correct_video_error).float()
                  * semantic_valid.float()).sum()
                 / semantic_count
+            ),
+            "pgc_v926_source_world_wrong_language_worse_rate": (
+                ((wrong_video_error > correct_video_error).float()
+                 * source_semantic_valid.float()).sum()
+                / source_semantic_count
+            ),
+            "pgc_v926_target_world_wrong_language_worse_rate": (
+                ((wrong_video_error > correct_video_error).float()
+                 * target_semantic_valid.float()).sum()
+                / target_semantic_count
             ),
             "pgc_v926_action_wrong_semantics_worse_rate": (
                 ((wrong_action_error > correct_action_error).float()
                  * semantic_valid.float()).sum()
                 / semantic_count
             ),
+            "pgc_v926_source_action_wrong_language_worse_rate": (
+                ((wrong_action_error > correct_action_error).float()
+                 * source_semantic_valid.float()).sum()
+                / source_semantic_count
+            ),
+            "pgc_v926_target_action_wrong_language_worse_rate": (
+                ((wrong_action_error > correct_action_error).float()
+                 * target_semantic_valid.float()).sum()
+                / target_semantic_count
+            ),
             "pgc_v926_action_supervised_fraction": (
                 direct_action_valid.float().mean()
             ),
-            "pgc_v926_eraf_frozen": correct_action_error.new_ones(()),
+            "pgc_v926_eraf_frozen": correct_action_error.new_tensor(
+                float(not fresh_joint)
+            ),
+            "pgc_v926_fresh_eraf_joint_training": (
+                correct_action_error.new_tensor(float(fresh_joint))
+            ),
+            "pgc_v926_bidirectional_supervision_enabled": (
+                correct_action_error.new_tensor(
+                    float(
+                        fresh_joint
+                        and self.policy_guard_eraf_bidirectional_supervision
+                    )
+                )
+            ),
             "pgc_v926_single_eraf_path": correct_action_error.new_ones(()),
             "pgc_v926_post_action_residual_enabled": (
                 correct_action_error.new_zeros(())
@@ -8887,16 +9125,17 @@ class FastWAM(torch.nn.Module):
         }
         metrics.update(injection_metrics)
         metrics.update(target_goal_metrics)
+        wrong_metric_prefix = "wrong" if fresh_joint else "source"
         metrics.update(
             {
-                f"pgc_v9_source_{name.removeprefix('pgc_v9_')}": value
+                f"pgc_v9_{wrong_metric_prefix}_{name.removeprefix('pgc_v9_')}": value
                 for name, value in source_goal_metrics.items()
             }
         )
         metrics.update(target_eraf_metrics)
         metrics.update(
             {
-                f"pgc_v9_source_{name.removeprefix('pgc_v9_')}": value
+                f"pgc_v9_{wrong_metric_prefix}_{name.removeprefix('pgc_v9_')}": value
                 for name, value in source_eraf_metrics.items()
             }
         )
@@ -15293,6 +15532,9 @@ class FastWAM(torch.nn.Module):
             is_v9
             and self.policy_guard_eraf_grounding_objective_version >= 26
         )
+        fresh_eraf_joint = bool(
+            is_v926 and self.policy_guard_eraf_fresh_joint_training
+        )
         uses_target_binder = is_v6 or is_v7
         residual_cap = None
         if is_v3:
@@ -15325,8 +15567,11 @@ class FastWAM(torch.nn.Module):
                 eraf_role_adapter_trainable_scope = (
                     (
                         (
-                            "shared_video_action_lora_plus_eraf_action_context_"
-                            "injector"
+                            "fresh_eraf_plus_shared_video_action_lora_plus_"
+                            "eraf_action_context_injector"
+                            if objective_version >= 26 and fresh_eraf_joint
+                            else "shared_video_action_lora_plus_eraf_action_"
+                            "context_injector"
                             if objective_version >= 26
                             else "eraf_action_context_injector_only"
                             if objective_version >= 25
@@ -15448,7 +15693,10 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "counterfactual_tuning": (
-                "native_and_counterfactual_world_action_joint_lora"
+                "fresh_eraf_native_counterfactual_bidirectional_world_action_"
+                "joint_lora"
+                if fresh_eraf_joint
+                else "native_and_counterfactual_world_action_joint_lora"
                 if is_v926
                 else "counterfactual_only_internal_action_expert_context_conditioning"
                 if is_v9
@@ -15581,7 +15829,9 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_require_direct_counterfactual_actions
             ),
             "policy_protection": (
-                "single_eraf_path_no_candidate_gate"
+                "fresh_eraf_warmup_then_single_path_no_candidate_gate"
+                if fresh_eraf_joint
+                else "single_eraf_path_no_candidate_gate"
                 if is_v926
                 else "single_immutable_base_plus_conservative_hard_gate"
                 if (is_v3 or is_v4)
@@ -16028,11 +16278,36 @@ class FastWAM(torch.nn.Module):
                 if is_v9
                 else None
             ),
+            "eraf_fresh_joint_training": (
+                self.policy_guard_eraf_fresh_joint_training
+                if is_v9
+                else None
+            ),
+            "eraf_bidirectional_supervision": (
+                self.policy_guard_eraf_bidirectional_supervision
+                if is_v9
+                else None
+            ),
+            "eraf_context_injection_warmup_steps": (
+                self.policy_guard_eraf_context_injection_warmup_steps
+                if is_v9
+                else None
+            ),
+            "eraf_context_injection_ramp_steps": (
+                self.policy_guard_eraf_context_injection_ramp_steps
+                if is_v9
+                else None
+            ),
             "eraf_action_joint_contract": (
                 (
                     (
-                        "frozen_eraf_completion_memory_plus_shared_video_action_"
-                        "expert_lora_and_internal_context_injector_single_path"
+                        "fresh_eraf_plus_shared_video_action_expert_lora_"
+                        "bidirectional_joint_training_with_delayed_internal_"
+                        "context_injection_single_path"
+                        if fresh_eraf_joint
+                        else "frozen_eraf_completion_memory_plus_shared_video_"
+                        "action_expert_lora_and_internal_context_injector_"
+                        "single_path"
                         if self.policy_guard_eraf_grounding_objective_version >= 26
                         else "frozen_eraf_and_shared_action_expert_plus_internal_"
                         "context_injector_no_post_action_residual"
@@ -16082,7 +16357,10 @@ class FastWAM(torch.nn.Module):
             "eraf_action_trainable_scope": (
                 (
                     (
-                        "shared_video_action_lora_plus_eraf_action_context_"
+                        "fresh_eraf_plus_shared_video_action_lora_plus_eraf_"
+                        "action_context_injector"
+                        if fresh_eraf_joint
+                        else "shared_video_action_lora_plus_eraf_action_context_"
                         "injector"
                         if self.policy_guard_eraf_grounding_objective_version >= 26
                         else "eraf_action_context_injector_only"
@@ -16119,8 +16397,11 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "eraf_action_context_injection_contract": (
-                "append_bounded_eraf_tokens_to_shared_action_expert_context_"
-                "at_every_denoising_step_no_post_action_residual"
+                "exact_no_injection_warmup_then_append_bounded_eraf_tokens_"
+                "to_shared_action_expert_context_no_post_action_residual"
+                if fresh_eraf_joint
+                else "append_bounded_eraf_tokens_to_shared_action_expert_"
+                "context_at_every_denoising_step_no_post_action_residual"
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 25
                 else None
@@ -16156,9 +16437,14 @@ class FastWAM(torch.nn.Module):
                     "counterfactual_action_flow": (
                         self.policy_guard_eraf_expert_lora_counterfactual_action_weight
                     ),
-                    "eraf_preservation": (
+                    (
+                        "eraf_joint_grounding"
+                        if fresh_eraf_joint
+                        else "eraf_preservation"
+                    ): (
                         self.policy_guard_eraf_grounding_aux_weight
                     ),
+                    "bidirectional_language_ranking": fresh_eraf_joint,
                 }
                 if is_v926
                 else None
@@ -16599,7 +16885,9 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "eraf_geometry_protection_contract": (
-                "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
+                "jointly_trained_fresh_eraf_no_post_action_residual"
+                if fresh_eraf_joint
+                else "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 14
                 else None
@@ -16621,7 +16909,9 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "eraf_phase_safe_memory_warm_start": (
-                "exact_v9_11_geometry"
+                "none_random_seeded_from_released_base"
+                if fresh_eraf_joint
+                else "exact_v9_11_geometry"
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version >= 14
                 else None
@@ -17349,6 +17639,9 @@ class FastWAM(torch.nn.Module):
         )
         saved_eraf_completion_only_memory = bool(
             metadata.get("eraf_completion_only_memory", False)
+        )
+        saved_eraf_fresh_joint_training = bool(
+            metadata.get("eraf_fresh_joint_training", False)
         )
         migrate_v5_to_target_binder = (
             saved_policy_guard_version == 5
@@ -18841,6 +19134,41 @@ class FastWAM(torch.nn.Module):
                                 f"{self.policy_guard_eraf_grounding_objective_version}."
                             )
                         if (
+                            saved_grounding_objective >= 26
+                            and not objective_upgrade
+                        ):
+                            expected_fresh_contract = bool(
+                                self.policy_guard_eraf_fresh_joint_training
+                            )
+                            if (
+                                saved_eraf_fresh_joint_training
+                                != expected_fresh_contract
+                            ):
+                                raise ValueError(
+                                    "PGC V9.26 fresh-joint checkpoint contract "
+                                    "does not match the model configuration."
+                                )
+                            if saved_eraf_fresh_joint_training:
+                                expected_schedule = {
+                                    "eraf_bidirectional_supervision": bool(
+                                        self.policy_guard_eraf_bidirectional_supervision
+                                    ),
+                                    "eraf_context_injection_warmup_steps": int(
+                                        self.policy_guard_eraf_context_injection_warmup_steps
+                                    ),
+                                    "eraf_context_injection_ramp_steps": int(
+                                        self.policy_guard_eraf_context_injection_ramp_steps
+                                    ),
+                                }
+                                for name, expected in expected_schedule.items():
+                                    if metadata.get(name) != expected:
+                                        raise ValueError(
+                                            "Fresh ERAF joint checkpoint "
+                                            f"mismatch: {name}="
+                                            f"{metadata.get(name)!r}, "
+                                            f"expected={expected!r}."
+                                        )
+                        if (
                             saved_grounding_objective >= 15
                             and not objective_upgrade
                         ):
@@ -19833,8 +20161,11 @@ class FastWAM(torch.nn.Module):
                                     "completed"
                                 ),
                                 "eraf_geometry_protection_contract": (
-                                    "frozen_v9_11_no_query_token_anchor_or_heatmap_"
+                                    "jointly_trained_fresh_eraf_no_post_action_"
                                     "residual"
+                                    if saved_eraf_fresh_joint_training
+                                    else "frozen_v9_11_no_query_token_anchor_or_"
+                                    "heatmap_residual"
                                 ),
                                 "eraf_release_transition_contract": (
                                     "release_true_advance_release_false_retry"
@@ -19843,7 +20174,9 @@ class FastWAM(torch.nn.Module):
                                     expected_policy_state_contract
                                 ),
                                 "eraf_phase_safe_memory_warm_start": (
-                                    "exact_v9_11_geometry"
+                                    "none_random_seeded_from_released_base"
+                                    if saved_eraf_fresh_joint_training
+                                    else "exact_v9_11_geometry"
                                 ),
                             }
                             for name, expected in expected_v913_contract.items():
@@ -19861,9 +20194,14 @@ class FastWAM(torch.nn.Module):
                                     )
                                 expected_action_joint_contract = (
                                     (
-                                        "frozen_eraf_completion_memory_plus_shared_"
-                                        "video_action_expert_lora_and_internal_"
-                                        "context_injector_single_path"
+                                        "fresh_eraf_plus_shared_video_action_"
+                                        "expert_lora_bidirectional_joint_training_"
+                                        "with_delayed_internal_context_injection_"
+                                        "single_path"
+                                        if saved_eraf_fresh_joint_training
+                                        else "frozen_eraf_completion_memory_plus_"
+                                        "shared_video_action_expert_lora_and_"
+                                        "internal_context_injector_single_path"
                                         if saved_grounding_objective >= 26
                                         else "frozen_eraf_and_shared_action_expert_plus_"
                                         "internal_context_injector_no_post_action_"
@@ -19917,8 +20255,11 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_action_trainable_scope = (
                                     (
-                                        "shared_video_action_lora_plus_eraf_action_"
-                                        "context_injector"
+                                        "fresh_eraf_plus_shared_video_action_lora_"
+                                        "plus_eraf_action_context_injector"
+                                        if saved_eraf_fresh_joint_training
+                                        else "shared_video_action_lora_plus_eraf_"
+                                        "action_context_injector"
                                         if saved_grounding_objective >= 26
                                         else "eraf_action_context_injector_only"
                                         if saved_grounding_objective >= 25
@@ -19964,8 +20305,11 @@ class FastWAM(torch.nn.Module):
                                     ),
                                     "eraf_role_adapter_trainable_scope": (
                                         (
-                                            "shared_video_action_lora_plus_eraf_"
-                                            "action_context_injector"
+                                            "fresh_eraf_plus_shared_video_action_"
+                                            "lora_plus_eraf_action_context_injector"
+                                            if saved_eraf_fresh_joint_training
+                                            else "shared_video_action_lora_plus_"
+                                            "eraf_action_context_injector"
                                             if saved_grounding_objective >= 26
                                             else "eraf_action_context_injector_only"
                                             if saved_grounding_objective >= 25
@@ -19999,8 +20343,13 @@ class FastWAM(torch.nn.Module):
                                     expected_v914_contract.update(
                                         {
                                             "eraf_action_context_injection_contract": (
+                                                "exact_no_injection_warmup_then_"
                                                 "append_bounded_eraf_tokens_to_shared_"
-                                                "action_expert_context_at_every_"
+                                                "action_expert_context_no_post_action_"
+                                                "residual"
+                                                if saved_eraf_fresh_joint_training
+                                                else "append_bounded_eraf_tokens_to_"
+                                                "shared_action_expert_context_at_every_"
                                                 "denoising_step_no_post_action_residual"
                                             ),
                                             "eraf_post_action_residual_active": False,

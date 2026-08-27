@@ -186,8 +186,11 @@ objective = (
     else 0
 )
 is_v926 = version == 9 and objective >= 26
+fresh_eraf_joint = bool(metadata.get("eraf_fresh_joint_training", False))
 expected_protection = (
-    "single_eraf_path_no_candidate_gate"
+    "fresh_eraf_warmup_then_single_path_no_candidate_gate"
+    if fresh_eraf_joint
+    else "single_eraf_path_no_candidate_gate"
     if is_v926
     else "single_immutable_base_plus_conservative_hard_gate"
     if version >= 3
@@ -206,7 +209,11 @@ expected_tuning = {
     9: "entity_relation_affordance_grounded_paired_action_residual",
 }[version]
 if is_v926:
-    expected_tuning = "native_and_counterfactual_world_action_joint_lora"
+    expected_tuning = (
+        "fresh_eraf_native_counterfactual_bidirectional_world_action_joint_lora"
+        if fresh_eraf_joint
+        else "native_and_counterfactual_world_action_joint_lora"
+    )
 elif version == 9 and objective >= 25:
     expected_tuning = (
         "counterfactual_only_internal_action_expert_context_conditioning"
@@ -371,7 +378,11 @@ if version == 9:
         or metadata.get("eraf_phase_safe_memory_contract")
         != "explicit_cross_replan_pending_holding_retry_completed"
         or metadata.get("eraf_geometry_protection_contract")
-        != "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
+        != (
+            "jointly_trained_fresh_eraf_no_post_action_residual"
+            if fresh_eraf_joint
+            else "frozen_v9_11_no_query_token_anchor_or_heatmap_residual"
+        )
         or metadata.get("eraf_release_transition_contract")
         != "release_true_advance_release_false_retry"
         or metadata.get("eraf_policy_state_contract")
@@ -381,13 +392,20 @@ if version == 9:
             else "explicit_caller_owned_reset_per_episode"
         )
         or metadata.get("eraf_phase_safe_memory_warm_start")
-        != "exact_v9_11_geometry"
+        != (
+            "none_random_seeded_from_released_base"
+            if fresh_eraf_joint
+            else "exact_v9_11_geometry"
+        )
     ):
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_eraf_completion_memory_plus_shared_video_action_expert_"
-            "lora_and_internal_context_injector_single_path"
+            "fresh_eraf_plus_shared_video_action_expert_lora_bidirectional_"
+            "joint_training_with_delayed_internal_context_injection_single_path"
+            if fresh_eraf_joint
+            else "frozen_eraf_completion_memory_plus_shared_video_action_"
+            "expert_lora_and_internal_context_injector_single_path"
             if objective >= 26
             else "frozen_eraf_and_shared_action_expert_plus_internal_context_"
             "injector_no_post_action_residual"
@@ -429,7 +447,10 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
-            "shared_video_action_lora_plus_eraf_action_context_injector"
+            "fresh_eraf_plus_shared_video_action_lora_plus_eraf_action_"
+            "context_injector"
+            if fresh_eraf_joint
+            else "shared_video_action_lora_plus_eraf_action_context_injector"
             if objective >= 26
             else "eraf_action_context_injector_only"
             if objective >= 25
@@ -461,7 +482,10 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
-            "shared_video_action_lora_plus_eraf_action_context_injector"
+            "fresh_eraf_plus_shared_video_action_lora_plus_eraf_action_"
+            "context_injector"
+            if fresh_eraf_joint
+            else "shared_video_action_lora_plus_eraf_action_context_injector"
             if objective >= 26
             else "eraf_action_context_injector_only"
             if objective >= 25
@@ -560,8 +584,13 @@ if version == 9:
         )
     if objective >= 25 and (
         metadata.get("eraf_action_context_injection_contract")
-        != "append_bounded_eraf_tokens_to_shared_action_expert_context_at_"
-        "every_denoising_step_no_post_action_residual"
+        != (
+            "exact_no_injection_warmup_then_append_bounded_eraf_tokens_to_"
+            "shared_action_expert_context_no_post_action_residual"
+            if fresh_eraf_joint
+            else "append_bounded_eraf_tokens_to_shared_action_expert_context_at_"
+            "every_denoising_step_no_post_action_residual"
+        )
         or metadata.get("eraf_post_action_residual_active") is not False
     ):
         raise SystemExit(
@@ -725,6 +754,7 @@ import torch
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 metadata = payload.get("architecture_metadata") or {}
 mapping = {
+    "warm_start_contract": "initialization_contract",
     "eraf_hidden_dim": "hidden_dim",
     "eraf_num_heads": "num_heads",
     "eraf_max_clauses": "max_clauses",
@@ -734,6 +764,12 @@ mapping = {
     "eraf_grounding_aux_weight": "grounding_aux_weight",
     "eraf_completion_only_memory": "completion_only_memory",
     "eraf_action_joint_training": "action_joint_training",
+    "eraf_fresh_joint_training": "fresh_joint_training",
+    "eraf_bidirectional_supervision": "bidirectional_supervision",
+    "eraf_context_injection_warmup_steps": (
+        "context_injection_warmup_steps"
+    ),
+    "eraf_context_injection_ramp_steps": "context_injection_ramp_steps",
     "eraf_action_grounding_hidden_dim": "action_grounding_hidden_dim",
     "eraf_action_grounding_num_heads": "action_grounding_num_heads",
     "eraf_action_grounding_learning_rate": "action_grounding_learning_rate",

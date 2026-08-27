@@ -336,6 +336,13 @@ policy_guard:
     grounding_aux_weight: 0.25
     completion_only_memory: false
     action_joint_training: false
+    # Opt-in clean-start joint run: ERAF is randomly initialized from the run
+    # seed and trained together with the shared Video/Action LoRA.  The
+    # historical objective-26 path keeps this false and retains frozen ERAF.
+    fresh_joint_training: false
+    bidirectional_supervision: false
+    context_injection_warmup_steps: 1500
+    context_injection_ramp_steps: 1000
     action_grounding_hidden_dim: 256
     action_grounding_num_heads: 8
     action_grounding_learning_rate: 1.0e-4

@@ -995,6 +995,160 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
 
 
 class PGCERAFModuleTest(unittest.TestCase):
+    def test_fresh_joint_injector_warmup_is_exactly_no_op(self):
+        module = ERAFActionContextInjector(
+            goal_dim=12,
+            text_dim=10,
+            hidden_dim=8,
+            initial_scale=0.1,
+        )
+        context = torch.randn(2, 5, 10)
+        context_mask = torch.tensor(
+            [[True, True, True, False, False], [True, True, True, True, True]]
+        )
+        augmented, augmented_mask, metrics = module(
+            context=context,
+            context_mask=context_mask,
+            goal_queries=torch.randn(2, 3, 12),
+            external_scale=0.0,
+        )
+        self.assertIs(augmented, context)
+        self.assertIs(augmented_mask, context_mask)
+        self.assertEqual(tuple(augmented.shape), (2, 5, 10))
+        self.assertEqual(
+            float(metrics["pgc_v925_action_context_token_count"]), 0.0
+        )
+        self.assertEqual(
+            float(metrics["pgc_v925_action_context_schedule_scale"]), 0.0
+        )
+
+    def test_fresh_eraf_joint_scope_and_injection_schedule(self):
+        model = tiny_pgc_fastwam(
+            version=9,
+            v9_stage="action",
+            v9_grounding_objective_version=26,
+            v9_initialization_contract="released_base_fresh_eraf",
+            v9_completion_only_memory=True,
+            v9_action_joint_training=True,
+            v9_fresh_joint_training=True,
+            v9_bidirectional_supervision=True,
+            v9_context_injection_warmup_steps=1500,
+            v9_context_injection_ramp_steps=1000,
+        )
+        model.prepare_trainable_parameters()
+        trainable = {
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(
+            any(
+                name.startswith(
+                    "policy_guard_modules.entity_relation_affordance."
+                )
+                for name in trainable
+            )
+        )
+        self.assertTrue(
+            any(
+                name.startswith(
+                    "policy_guard_modules.eraf_action_context_injector."
+                )
+                for name in trainable
+            )
+        )
+        self.assertTrue(
+            any(name.endswith((".lora_A", ".lora_B")) for name in trainable)
+        )
+        self.assertTrue(
+            all(
+                name.endswith((".lora_A", ".lora_B"))
+                or name.startswith(
+                    "policy_guard_modules.entity_relation_affordance."
+                )
+                or name.startswith(
+                    "policy_guard_modules.eraf_action_context_injector."
+                )
+                for name in trainable
+            )
+        )
+        groups = model.policy_guard_optimizer_groups(5.0e-6)
+        group_names = {group["pgc_v9_group"] for group in groups}
+        self.assertEqual(
+            group_names,
+            {
+                "entity_relation_affordance",
+                "eraf_action_context_injector",
+                "shared_video_action_lora",
+            },
+        )
+        model.set_training_progress(1500, 15000)
+        self.assertEqual(model._policy_guard_eraf_context_injection_scale(), 0.0)
+        model.set_training_progress(2000, 15000)
+        self.assertEqual(model._policy_guard_eraf_context_injection_scale(), 0.5)
+        model.set_training_progress(2500, 15000)
+        self.assertEqual(model._policy_guard_eraf_context_injection_scale(), 1.0)
+        metadata = model._policy_guard_metadata()
+        self.assertIs(metadata["eraf_fresh_joint_training"], True)
+        self.assertIs(metadata["eraf_bidirectional_supervision"], True)
+        self.assertEqual(
+            metadata["eraf_action_trainable_scope"],
+            "fresh_eraf_plus_shared_video_action_lora_plus_eraf_action_"
+            "context_injector",
+        )
+        self.assertEqual(
+            metadata["eraf_action_context_injection_contract"],
+            "exact_no_injection_warmup_then_append_bounded_eraf_tokens_to_"
+            "shared_action_expert_context_no_post_action_residual",
+        )
+
+    def test_fresh_eraf_joint_checkpoint_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            joint_path = root / "fresh-joint.pt"
+            released_base = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {
+                    "format": "fastwam_full_v1",
+                    "mot": released_base.mot.state_dict(),
+                },
+                base_path,
+            )
+            model = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=26,
+                v9_initialization_contract="released_base_fresh_eraf",
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+                v9_fresh_joint_training=True,
+                v9_bidirectional_supervision=True,
+            )
+            model.load_checkpoint(base_path)
+            model.save_checkpoint(joint_path, step=15000)
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=26,
+                v9_initialization_contract="released_base_fresh_eraf",
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+                v9_fresh_joint_training=True,
+                v9_bidirectional_supervision=True,
+            )
+            restored.load_checkpoint(joint_path)
+            self.assertTrue(restored.policy_guard_eraf_fresh_joint_training)
+            for name, value in model.policy_guard_modules.state_dict().items():
+                self.assertTrue(
+                    torch.equal(
+                        value,
+                        restored.policy_guard_modules.state_dict()[name],
+                    ),
+                    name,
+                )
+
     def test_v925_action_context_injector_appends_tokens_without_action_residual(self):
         module = ERAFActionContextInjector(
             goal_dim=12,

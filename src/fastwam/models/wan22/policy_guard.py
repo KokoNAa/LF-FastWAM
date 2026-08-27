@@ -2592,6 +2592,7 @@ class ERAFActionContextInjector(nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         goal_queries: torch.Tensor,
+        external_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if context.ndim != 3 or context.shape[-1] != self.text_dim:
             raise ValueError(
@@ -2615,10 +2616,31 @@ class ERAFActionContextInjector(nn.Module):
                 "ERAF action goal queries must have shape "
                 f"[B,Q,{self.goal_dim}]."
             )
+        external_scale = float(external_scale)
+        if not math.isfinite(external_scale) or not 0.0 <= external_scale <= 1.0:
+            raise ValueError(
+                "ERAF action-context external scale must lie in [0, 1]."
+            )
         module_dtype = self.projection[0].weight.dtype
-        scale = torch.sigmoid(self.scale_logit).to(
+        learned_scale = torch.sigmoid(self.scale_logit).to(
             device=goal_queries.device, dtype=module_dtype
         )
+        schedule_scale = goal_queries.new_tensor(
+            external_scale, dtype=module_dtype
+        )
+        scale = learned_scale * schedule_scale
+        if external_scale == 0.0:
+            zero = context.new_zeros((), dtype=torch.float32)
+            return context, context_mask, {
+                "pgc_v925_action_context_token_rms": zero,
+                "pgc_v925_action_context_scale": zero,
+                "pgc_v925_action_context_schedule_scale": zero,
+                "pgc_v925_action_context_learned_scale": (
+                    learned_scale.float()
+                ),
+                "pgc_v925_action_context_token_count": zero,
+                "pgc_v925_post_action_residual_enabled": zero,
+            }
         tokens = torch.tanh(
             self.projection(self.goal_norm(goal_queries.to(module_dtype)))
         ) * scale
@@ -2633,6 +2655,12 @@ class ERAFActionContextInjector(nn.Module):
                 tokens.float().square().mean().sqrt()
             ),
             "pgc_v925_action_context_scale": scale.float(),
+            "pgc_v925_action_context_schedule_scale": (
+                schedule_scale.float()
+            ),
+            "pgc_v925_action_context_learned_scale": (
+                learned_scale.float()
+            ),
             "pgc_v925_action_context_token_count": tokens.new_tensor(
                 float(tokens.shape[1]), dtype=torch.float32
             ),

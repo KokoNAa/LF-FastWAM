@@ -140,6 +140,41 @@ class Wan22Trainer:
                     f"mismatches={mismatches}, "
                     f"closed_loop_native_count={closed_loop_count}."
                 )
+        if bool(
+            getattr(
+                self.model,
+                "policy_guard_eraf_fresh_joint_training",
+                False,
+            )
+        ):
+            required_dataset_contracts = {
+                "pgc_has_counterfactual_data": True,
+                "pgc_balance_native_counterfactual": True,
+                "pgc_entity_relation_supervision_required": True,
+                "pgc_bidirectional_language_supervision_required": True,
+                "pgc_v9_balanced_sampling": True,
+                "pgc_v9_phase_safe_memory": True,
+            }
+            mismatches = {
+                name: bool(getattr(self.train_dataset, name, False))
+                for name, expected in required_dataset_contracts.items()
+                if bool(getattr(self.train_dataset, name, False)) != expected
+            }
+            closed_loop_count = int(
+                getattr(
+                    self.train_dataset,
+                    "pgc_v9_closed_loop_native_dataset_count",
+                    0,
+                )
+            )
+            if mismatches or closed_loop_count != 1:
+                raise ValueError(
+                    "Fresh ERAF joint training requires the exact no-ERAF "
+                    "offline-native/closed-loop-native/historical-CF/strict-CF "
+                    "1:1:1:1 dataset and bidirectional supervision contract; "
+                    f"mismatches={mismatches}, "
+                    f"closed_loop_native_count={closed_loop_count}."
+                )
         if bool(getattr(self.model, "policy_guard_enabled", False)) and bool(
             getattr(
                 self.model,
