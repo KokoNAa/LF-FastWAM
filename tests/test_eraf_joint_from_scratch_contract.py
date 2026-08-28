@@ -6,6 +6,36 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ERAFJointTrainingContractTest(unittest.TestCase):
+    def test_safe_gain_launcher_and_task_preserve_the_control_contract(self):
+        launcher = (REPO_ROOT / "scripts/train_libero_eraf_safe_gain.sh").read_text(
+            encoding="utf-8"
+        )
+        task = (
+            REPO_ROOT / "configs/task/libero_eraf_safe_gain_2cam224.yaml"
+        ).read_text(encoding="utf-8")
+        for contract in (
+            "<no_eraf_lora_checkpoint>",
+            "fastwam_lora_adapter_v1",
+            "task=libero_eraf_safe_gain_2cam224",
+            "pgc_bidirectional_language_supervision_required=true",
+            "pgc_v9_closed_loop_native_dataset_count=1",
+            "ERAF_SAFE_GAIN_MAX_STEPS:-10000",
+        ):
+            self.assertIn(contract, launcher)
+        for contract in (
+            "grounding_objective_version: 27",
+            "pretrained_joint_training: true",
+            "safe_gain_training: true",
+            "grounding_aux_weight: 0.0",
+            "safe_gain_num_tokens: 4",
+            "safe_gain_gate_threshold: 0.80",
+            "safe_gain_non_regression_weight: 2.0",
+            "pgc_bidirectional_language_supervision_required: true",
+            "max_steps: 10000",
+            "experts: [video, action]",
+        ):
+            self.assertIn(contract, task)
+
     def test_launcher_keeps_no_eraf_data_contract_and_runs_10k(self):
         source = (
             REPO_ROOT / "scripts/train_libero_eraf_joint_from_scratch.sh"

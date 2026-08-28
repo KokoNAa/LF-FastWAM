@@ -185,14 +185,18 @@ objective = (
     if version == 9
     else 0
 )
-is_v926 = version == 9 and objective >= 26
+is_v926 = version == 9 and objective == 26
+is_v927 = version == 9 and objective >= 27
+is_v926_plus = is_v926 or is_v927
 fresh_eraf_joint = bool(metadata.get("eraf_fresh_joint_training", False))
 pretrained_eraf_joint = bool(
     metadata.get("eraf_pretrained_joint_training", False)
 )
 end_to_end_eraf_joint = fresh_eraf_joint or pretrained_eraf_joint
 expected_protection = (
-    "pretrained_eraf_ramp_then_single_path_no_candidate_gate"
+    "immutable_no_eraf_fallback_plus_pre_action_gain_gate"
+    if is_v927
+    else "pretrained_eraf_ramp_then_single_path_no_candidate_gate"
     if pretrained_eraf_joint
     else
     "fresh_eraf_warmup_then_single_path_no_candidate_gate"
@@ -215,7 +219,9 @@ expected_tuning = {
     8: "closed_loop_replay_verified_target_acquisition_residual",
     9: "entity_relation_affordance_grounded_paired_action_residual",
 }[version]
-if is_v926:
+if is_v927:
+    expected_tuning = "frozen_baseline_dual_context_bidirectional_safe_gain"
+elif is_v926:
     expected_tuning = (
         "pretrained_eraf_native_counterfactual_bidirectional_world_action_"
         "joint_lora"
@@ -240,13 +246,13 @@ if version >= 3 and any(
     )
 ):
     raise SystemExit("PGC v3+ must not contain an Action-Expert copy or LoRA")
-if is_v926:
+if is_v926_plus:
     if (
         not isinstance(payload.get("eraf_shared_expert_lora"), dict)
         or not payload["eraf_shared_expert_lora"]
         or not isinstance(payload.get("eraf_shared_expert_lora_config"), dict)
     ):
-        raise SystemExit("PGC V9.26 checkpoint lacks shared Expert LoRA")
+        raise SystemExit("PGC V9.26+ checkpoint lacks shared Expert LoRA")
 elif (
     payload.get("eraf_shared_expert_lora") is not None
     or payload.get("eraf_shared_expert_lora_config") is not None
@@ -339,7 +345,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 27)):
+    if objective not in set(range(1, 28)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -394,7 +400,10 @@ if version == 9:
         != "explicit_cross_replan_pending_holding_retry_completed"
         or metadata.get("eraf_geometry_protection_contract")
         != (
-            "jointly_trained_pretrained_eraf_no_post_action_residual"
+            "frozen_complete_pretrained_eraf_bundle_source_compatible_"
+            "video_features"
+            if is_v927
+            else "jointly_trained_pretrained_eraf_no_post_action_residual"
             if pretrained_eraf_joint
             else
             "jointly_trained_fresh_eraf_no_post_action_residual"
@@ -411,7 +420,9 @@ if version == 9:
         )
         or metadata.get("eraf_phase_safe_memory_warm_start")
         != (
-            "eraf_only_exact_v9_13_or_later"
+            "complete_eraf_bundle_exact_v9_13_or_later"
+            if is_v927
+            else "eraf_only_exact_v9_13_or_later"
             if pretrained_eraf_joint
             else
             "none_random_seeded_from_released_base"
@@ -422,6 +433,11 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
+            "frozen_complete_eraf_bundle_plus_frozen_baseline_lora_"
+            "bidirectional_dual_path_training_pre_action_gain_gate_single_"
+            "path_deployment"
+            if is_v927
+            else
             "pretrained_eraf_plus_fresh_shared_video_action_expert_lora_"
             "bidirectional_joint_training_with_ramped_fresh_context_injector_"
             "single_path"
@@ -473,6 +489,10 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
+            "eraf_action_token_compressor_plus_context_injector_plus_gain_"
+            "gate_only"
+            if is_v927
+            else
             "pretrained_eraf_plus_shared_video_action_lora_plus_fresh_eraf_"
             "action_context_injector"
             if pretrained_eraf_joint
@@ -512,6 +532,10 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
+            "frozen_complete_eraf_plus_frozen_baseline_lora_plus_compressor_"
+            "injector_gain_gate"
+            if is_v927
+            else
             "pretrained_eraf_plus_shared_video_action_lora_plus_eraf_action_"
             "context_injector"
             if pretrained_eraf_joint
@@ -619,7 +643,10 @@ if version == 9:
     if objective >= 25 and (
         metadata.get("eraf_action_context_injection_contract")
         != (
-            "exact_no_injection_warmup_then_append_bounded_eraf_tokens_to_"
+            "compressed_bounded_eraf_tokens_selected_before_single_action_"
+            "denoising_exact_raw_fallback"
+            if is_v927
+            else "exact_no_injection_warmup_then_append_bounded_eraf_tokens_to_"
             "shared_action_expert_context_no_post_action_residual"
             if end_to_end_eraf_joint
             else "append_bounded_eraf_tokens_to_shared_action_expert_context_at_"
@@ -631,7 +658,7 @@ if version == 9:
             "PGC internal Action-Expert checkpoint lacks its no-residual "
             "ERAF context-injection contract"
         )
-    if objective >= 26 and (
+    if objective == 26 and (
         metadata.get("eraf_single_path") is not True
         or metadata.get("gate_mode") != "eraf_only"
         or metadata.get("verifier_deployment_role")
@@ -648,6 +675,23 @@ if version == 9:
         raise SystemExit(
             "PGC V9.26 checkpoint lacks its single-path shared Expert-LoRA "
             "contract"
+        )
+    if objective >= 27 and (
+        metadata.get("eraf_single_path") is not True
+        or metadata.get("eraf_safe_gain_training") is not True
+        or metadata.get("eraf_pretrained_scope")
+        != "goal_query_seeds_plus_goal_graph_plus_entity_relation_affordance"
+        or metadata.get("eraf_safe_gain_visual_contract")
+        != "same_video_expert_with_lora_disabled_for_eraf_features"
+        or set(
+            (metadata.get("eraf_shared_expert_lora_config") or {}).get(
+                "experts", []
+            )
+        )
+        != {"video", "action"}
+    ):
+        raise SystemExit(
+            "PGC V9.27 checkpoint lacks its frozen safe-gain contract"
         )
     if pretrained_eraf_joint:
         required_pretrained_provenance = (
@@ -820,11 +864,23 @@ mapping = {
     "eraf_action_joint_training": "action_joint_training",
     "eraf_fresh_joint_training": "fresh_joint_training",
     "eraf_pretrained_joint_training": "pretrained_joint_training",
+    "eraf_safe_gain_training": "safe_gain_training",
     "eraf_bidirectional_supervision": "bidirectional_supervision",
     "eraf_context_injection_warmup_steps": (
         "context_injection_warmup_steps"
     ),
     "eraf_context_injection_ramp_steps": "context_injection_ramp_steps",
+    "eraf_safe_gain_num_tokens": "safe_gain_num_tokens",
+    "eraf_safe_gain_gate_hidden_dim": "safe_gain_gate_hidden_dim",
+    "eraf_safe_gain_gate_threshold": "safe_gain_gate_threshold",
+    "eraf_safe_gain_gate_initial_probability": (
+        "safe_gain_gate_initial_probability"
+    ),
+    "eraf_safe_gain_gate_loss_weight": "safe_gain_gate_loss_weight",
+    "eraf_safe_gain_non_regression_weight": (
+        "safe_gain_non_regression_weight"
+    ),
+    "eraf_safe_gain_margin": "safe_gain_margin",
     "eraf_action_grounding_hidden_dim": "action_grounding_hidden_dim",
     "eraf_action_grounding_num_heads": "action_grounding_num_heads",
     "eraf_action_grounding_learning_rate": "action_grounding_learning_rate",

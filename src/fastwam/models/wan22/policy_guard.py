@@ -2670,6 +2670,121 @@ class ERAFActionContextInjector(nn.Module):
         }
 
 
+class ERAFActionTokenCompressor(nn.Module):
+    """Compress routed ERAF queries into a small clause-token bottleneck."""
+
+    def __init__(self, *, goal_dim: int, num_tokens: int = 4, num_heads: int = 8) -> None:
+        super().__init__()
+        if min(goal_dim, num_tokens, num_heads) <= 0:
+            raise ValueError("ERAF compressor dimensions must be positive.")
+        if goal_dim % num_heads:
+            raise ValueError("ERAF compressor goal_dim must be divisible by heads.")
+        self.goal_dim = int(goal_dim)
+        self.num_tokens = int(num_tokens)
+        self.slot_queries = nn.Parameter(torch.empty(self.num_tokens, self.goal_dim))
+        nn.init.normal_(self.slot_queries, std=1.0 / math.sqrt(self.goal_dim))
+        self.query_norm = nn.LayerNorm(self.goal_dim)
+        self.goal_norm = nn.LayerNorm(self.goal_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=self.goal_dim,
+            num_heads=int(num_heads),
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.output_norm = nn.LayerNorm(self.goal_dim)
+
+    def forward(
+        self, goal_queries: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if goal_queries.ndim != 3 or goal_queries.shape[-1] != self.goal_dim:
+            raise ValueError(
+                "ERAF compressor expects goal queries with shape "
+                f"[B,Q,{self.goal_dim}], got {tuple(goal_queries.shape)}."
+            )
+        slots = self.slot_queries.unsqueeze(0).expand(goal_queries.shape[0], -1, -1)
+        compressed, attention = self.attention(
+            query=self.query_norm(slots),
+            key=self.goal_norm(goal_queries),
+            value=self.goal_norm(goal_queries),
+            need_weights=True,
+            average_attn_weights=True,
+        )
+        compressed = self.output_norm(slots + compressed)
+        probabilities = attention.float().clamp_min(1.0e-8)
+        entropy = -(probabilities * probabilities.log()).sum(dim=-1) / math.log(
+            max(2, int(goal_queries.shape[1]))
+        )
+        return compressed, {
+            "pgc_v927_compressed_token_count": compressed.new_tensor(
+                float(self.num_tokens), dtype=torch.float32
+            ),
+            "pgc_v927_compressor_attention_entropy": entropy.mean(),
+            "pgc_v927_compressed_token_rms": compressed.float().square().mean().sqrt(),
+        }
+
+
+class ERAFGainGate(nn.Module):
+    """Predict whether ERAF conditioning is safer than the raw-language path."""
+
+    def __init__(
+        self,
+        *,
+        goal_dim: int,
+        diagnostic_dim: int,
+        hidden_dim: int = 128,
+        initial_probability: float = 0.10,
+    ) -> None:
+        super().__init__()
+        if min(goal_dim, diagnostic_dim, hidden_dim) <= 0:
+            raise ValueError("ERAF gain-gate dimensions must be positive.")
+        if not 0.0 < float(initial_probability) < 1.0:
+            raise ValueError("ERAF gain-gate initial probability must lie in (0, 1).")
+        self.goal_dim = int(goal_dim)
+        self.diagnostic_dim = int(diagnostic_dim)
+        self.goal_norm = nn.LayerNorm(self.goal_dim)
+        self.diagnostic_norm = nn.LayerNorm(self.diagnostic_dim)
+        self.network = nn.Sequential(
+            nn.Linear(self.goal_dim + self.diagnostic_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.network[-1].weight)
+        initial_logit = math.log(
+            float(initial_probability) / (1.0 - float(initial_probability))
+        )
+        nn.init.constant_(self.network[-1].bias, initial_logit)
+
+    def forward(
+        self,
+        *,
+        compressed_tokens: torch.Tensor,
+        diagnostic_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if compressed_tokens.ndim != 3 or compressed_tokens.shape[-1] != self.goal_dim:
+            raise ValueError(
+                "ERAF gain gate expects compressed tokens with shape "
+                f"[B,K,{self.goal_dim}]."
+            )
+        if diagnostic_features.shape != (
+            compressed_tokens.shape[0],
+            self.diagnostic_dim,
+        ):
+            raise ValueError(
+                "ERAF gain-gate diagnostics must have shape "
+                f"[B,{self.diagnostic_dim}], got {tuple(diagnostic_features.shape)}."
+            )
+        pooled = self.goal_norm(compressed_tokens).mean(dim=1)
+        diagnostics = self.diagnostic_norm(
+            diagnostic_features.to(device=pooled.device, dtype=pooled.dtype)
+        )
+        logits = self.network(torch.cat((pooled, diagnostics), dim=-1)).squeeze(-1)
+        probability = torch.sigmoid(logits.float())
+        return probability, {
+            "pgc_v927_gain_gate_probability": probability.mean(),
+            "pgc_v927_gain_gate_logit": logits.float().mean(),
+        }
+
+
 class PairwiseActionAdvantageVerifier(nn.Module):
     """FP32 temporal verifier that predicts CF advantage over Base directly."""
 

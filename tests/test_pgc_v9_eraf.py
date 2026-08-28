@@ -55,6 +55,8 @@ from fastwam.models.wan22.fastwam import FastWAM
 from fastwam.models.wan22.policy_guard import (
     ClauseSemanticRetentionResidual,
     ERAFActionContextInjector,
+    ERAFActionTokenCompressor,
+    ERAFGainGate,
     HardRoutedERAFPhaseServo,
     PhaseCompatibleERAFWaypointAdapter,
     PhaseConditionedERAFActionBridge,
@@ -995,6 +997,139 @@ class PGCERAFDatasetAuditTest(unittest.TestCase):
 
 
 class PGCERAFModuleTest(unittest.TestCase):
+    def test_v927_compressor_and_gain_gate_are_small_and_conservative(self):
+        compressor = ERAFActionTokenCompressor(
+            goal_dim=12,
+            num_tokens=4,
+            num_heads=2,
+        )
+        gate = ERAFGainGate(
+            goal_dim=12,
+            diagnostic_dim=8,
+            hidden_dim=8,
+            initial_probability=0.1,
+        )
+        compressed, metrics = compressor(torch.randn(3, 32, 12))
+        probability, gate_metrics = gate(
+            compressed_tokens=compressed,
+            diagnostic_features=torch.randn(3, 8),
+        )
+        self.assertEqual(tuple(compressed.shape), (3, 4, 12))
+        self.assertTrue(torch.allclose(probability, torch.full((3,), 0.1), atol=1.0e-6))
+        self.assertEqual(float(metrics["pgc_v927_compressed_token_count"]), 4.0)
+        self.assertIn("pgc_v927_gain_gate_probability", gate_metrics)
+
+    def test_v927_safe_gain_loads_complete_eraf_bundle_and_freezes_policy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_path = root / "base.pt"
+            source_path = root / "v913.pt"
+            safe_path = root / "v927.pt"
+            released = tiny_pgc_fastwam(version=5)
+            torch.save(
+                {"format": "fastwam_full_v1", "mot": released.mot.state_dict()},
+                base_path,
+            )
+            source = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="grounding",
+                v9_grounding_objective_version=14,
+            )
+            source.load_checkpoint(base_path)
+            with torch.no_grad():
+                source.policy_guard_modules["goal_query_seeds"].weight.fill_(0.11)
+                next(source.policy_guard_modules["goal_graph"].parameters()).fill_(0.12)
+                next(
+                    source.policy_guard_modules[
+                        "entity_relation_affordance"
+                    ].parameters()
+                ).fill_(0.13)
+            source.save_checkpoint(source_path, step=7250)
+
+            safe = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=27,
+                v9_initialization_contract="released_base_pretrained_eraf",
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+                v9_pretrained_joint_training=True,
+                v9_safe_gain_training=True,
+                v9_pretrained_checkpoint=str(source_path),
+                v9_bidirectional_supervision=True,
+            )
+            safe.load_checkpoint(base_path)
+            provenance = safe.load_pretrained_eraf_checkpoint(source_path)
+            self.assertEqual(
+                provenance["scope"],
+                "goal_query_seeds_plus_goal_graph_plus_" "entity_relation_affordance",
+            )
+            for module_name in (
+                "goal_query_seeds",
+                "goal_graph",
+                "entity_relation_affordance",
+            ):
+                expected = source.policy_guard_modules[module_name].state_dict()
+                actual = safe.policy_guard_modules[module_name].state_dict()
+                self.assertEqual(expected.keys(), actual.keys())
+                for name in expected:
+                    self.assertTrue(torch.equal(expected[name], actual[name]), name)
+
+            safe.prepare_trainable_parameters()
+            trainable = {
+                name
+                for name, parameter in safe.named_parameters()
+                if parameter.requires_grad
+            }
+            allowed_prefixes = (
+                "policy_guard_modules.eraf_action_token_compressor.",
+                "policy_guard_modules.eraf_action_context_injector.",
+                "policy_guard_modules.eraf_gain_gate.",
+            )
+            self.assertTrue(trainable)
+            self.assertTrue(
+                all(name.startswith(allowed_prefixes) for name in trainable)
+            )
+            self.assertFalse(
+                any(name.endswith((".lora_A", ".lora_B")) for name in trainable)
+            )
+            groups = safe.policy_guard_optimizer_groups(2.0e-5)
+            self.assertEqual(
+                {group["pgc_v9_group"] for group in groups},
+                {
+                    "eraf_action_token_compressor",
+                    "eraf_action_context_injector",
+                    "eraf_gain_gate",
+                },
+            )
+            metadata = safe._policy_guard_metadata()
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 27)
+            self.assertEqual(metadata["gate_mode"], "guarded")
+            self.assertEqual(metadata["eraf_safe_gain_num_tokens"], 2)
+            self.assertEqual(
+                metadata["eraf_action_trainable_scope"],
+                "eraf_action_token_compressor_plus_context_injector_plus_"
+                "gain_gate_only",
+            )
+            safe.save_checkpoint(safe_path, step=10000)
+
+            restored = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=27,
+                v9_initialization_contract="released_base_pretrained_eraf",
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+                v9_pretrained_joint_training=True,
+                v9_safe_gain_training=True,
+                v9_bidirectional_supervision=True,
+            )
+            restored.load_checkpoint(safe_path)
+            self.assertEqual(
+                restored.policy_guard_eraf_pretrained_scope,
+                provenance["scope"],
+            )
+
     def test_fresh_joint_injector_warmup_is_exactly_no_op(self):
         module = ERAFActionContextInjector(
             goal_dim=12,

@@ -47,6 +47,7 @@ def tiny_pgc_fastwam(
     v9_action_joint_training: bool = False,
     v9_fresh_joint_training: bool = False,
     v9_pretrained_joint_training: bool = False,
+    v9_safe_gain_training: bool = False,
     v9_pretrained_checkpoint: str | None = None,
     v9_bidirectional_supervision: bool = False,
     v9_context_injection_warmup_steps: int = 1500,
@@ -192,7 +193,9 @@ def tiny_pgc_fastwam(
                 "temperature": 0.07,
                 "learning_rate": 2.0e-5,
                 "grounding_aux_weight": (
-                    0.25
+                    0.0
+                    if v9_safe_gain_training
+                    else 0.25
                     if v9_grounding_objective_version >= 26
                     else (0.0 if v9_action_joint_training else 0.25)
                 ),
@@ -200,6 +203,7 @@ def tiny_pgc_fastwam(
                 "action_joint_training": v9_action_joint_training,
                 "fresh_joint_training": v9_fresh_joint_training,
                 "pretrained_joint_training": v9_pretrained_joint_training,
+                "safe_gain_training": v9_safe_gain_training,
                 "pretrained_checkpoint": v9_pretrained_checkpoint,
                 "bidirectional_supervision": v9_bidirectional_supervision,
                 "context_injection_warmup_steps": (
@@ -208,6 +212,13 @@ def tiny_pgc_fastwam(
                 "context_injection_ramp_steps": (
                     v9_context_injection_ramp_steps
                 ),
+                "safe_gain_num_tokens": 2,
+                "safe_gain_gate_hidden_dim": 8,
+                "safe_gain_gate_initial_probability": 0.1,
+                "safe_gain_gate_threshold": 0.8,
+                "safe_gain_gate_loss_weight": 1.0,
+                "safe_gain_non_regression_weight": 2.0,
+                "safe_gain_margin": 0.002,
                 "action_grounding_hidden_dim": 8,
                 "action_grounding_num_heads": 2,
                 "action_grounding_learning_rate": 1.0e-4,

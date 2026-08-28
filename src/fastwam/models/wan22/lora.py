@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import math
 import types
+from contextlib import contextmanager
 from typing import Any, Iterable
 
 import torch
@@ -241,3 +242,18 @@ def inject_lora(
                 f"{list(target_modules)}"
             )
     return injected
+
+
+@contextmanager
+def temporarily_disable_lora(module: nn.Module):
+    """Evaluate an injected module through its frozen base weights only."""
+    scaling: list[tuple[nn.Linear, float]] = []
+    for child in module.modules():
+        if isinstance(child, nn.Linear) and hasattr(child, "lora_scaling"):
+            scaling.append((child, float(child.lora_scaling)))
+            child.lora_scaling = 0.0
+    try:
+        yield
+    finally:
+        for child, value in scaling:
+            child.lora_scaling = value
