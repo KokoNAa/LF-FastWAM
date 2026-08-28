@@ -693,6 +693,18 @@ if version == 9:
         raise SystemExit(
             "PGC V9.27 checkpoint lacks its frozen safe-gain contract"
         )
+    if objective >= 28 and (
+        metadata.get("eraf_safe_gain_gate_supervision_contract")
+        != "correct_advantage_bce_plus_wrong_language_rejection_bce_plus_"
+        "positive_pair_logit_margin"
+        or float(metadata.get("eraf_safe_gain_wrong_gate_loss_weight") or 0.0)
+        <= 0.0
+        or float(metadata.get("eraf_safe_gain_gate_ranking_weight") or 0.0) <= 0.0
+        or float(metadata.get("eraf_safe_gain_gate_ranking_margin") or 0.0) <= 0.0
+    ):
+        raise SystemExit(
+            "PGC V9.28 checkpoint lacks bidirectional safe-gain gate supervision"
+        )
     if pretrained_eraf_joint:
         required_pretrained_provenance = (
             "eraf_pretrained_source_checkpoint",
@@ -877,6 +889,11 @@ mapping = {
         "safe_gain_gate_initial_probability"
     ),
     "eraf_safe_gain_gate_loss_weight": "safe_gain_gate_loss_weight",
+    "eraf_safe_gain_wrong_gate_loss_weight": (
+        "safe_gain_wrong_gate_loss_weight"
+    ),
+    "eraf_safe_gain_gate_ranking_weight": "safe_gain_gate_ranking_weight",
+    "eraf_safe_gain_gate_ranking_margin": "safe_gain_gate_ranking_margin",
     "eraf_safe_gain_non_regression_weight": (
         "safe_gain_non_regression_weight"
     ),

@@ -1019,12 +1019,38 @@ class PGCERAFModuleTest(unittest.TestCase):
         self.assertEqual(float(metrics["pgc_v927_compressed_token_count"]), 4.0)
         self.assertIn("pgc_v927_gain_gate_probability", gate_metrics)
 
-    def test_v927_safe_gain_loads_complete_eraf_bundle_and_freezes_policy(self):
+    def test_v928_gate_supervision_rejects_wrong_language_and_separates_pair(self):
+        correct_probability = torch.tensor([0.9, 0.1], requires_grad=True)
+        wrong_probability = torch.tensor([0.8, 0.8], requires_grad=True)
+        (
+            correct_loss,
+            wrong_loss,
+            ranking_loss,
+            ranking_valid,
+        ) = FastWAM._policy_guard_v928_gain_gate_losses(
+            correct_probability=correct_probability,
+            wrong_probability=wrong_probability,
+            gate_target=torch.tensor([1.0, 0.0]),
+            direct_valid=torch.tensor([True, True]),
+            semantic_valid=torch.tensor([True, True]),
+            ranking_margin=1.0,
+        )
+        self.assertGreater(float(wrong_loss), 0.0)
+        self.assertGreater(float(ranking_loss), 0.0)
+        self.assertTrue(torch.equal(ranking_valid, torch.tensor([True, False])))
+
+        total = correct_loss + 0.5 * wrong_loss + ranking_loss
+        total.backward()
+        self.assertLess(float(correct_probability.grad[0]), 0.0)
+        self.assertGreater(float(wrong_probability.grad[0]), 0.0)
+        self.assertGreater(float(wrong_probability.grad[1]), 0.0)
+
+    def test_v928_safe_gain_loads_complete_eraf_bundle_and_freezes_policy(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             base_path = root / "base.pt"
             source_path = root / "v913.pt"
-            safe_path = root / "v927.pt"
+            safe_path = root / "v928.pt"
             released = tiny_pgc_fastwam(version=5)
             torch.save(
                 {"format": "fastwam_full_v1", "mot": released.mot.state_dict()},
@@ -1049,7 +1075,7 @@ class PGCERAFModuleTest(unittest.TestCase):
             safe = tiny_pgc_fastwam(
                 version=9,
                 v9_stage="action",
-                v9_grounding_objective_version=27,
+                v9_grounding_objective_version=28,
                 v9_initialization_contract="released_base_pretrained_eraf",
                 v9_completion_only_memory=True,
                 v9_action_joint_training=True,
@@ -1103,9 +1129,19 @@ class PGCERAFModuleTest(unittest.TestCase):
                 },
             )
             metadata = safe._policy_guard_metadata()
-            self.assertEqual(metadata["eraf_grounding_objective_version"], 27)
+            self.assertEqual(metadata["eraf_grounding_objective_version"], 28)
             self.assertEqual(metadata["gate_mode"], "guarded")
             self.assertEqual(metadata["eraf_safe_gain_num_tokens"], 2)
+            self.assertEqual(
+                metadata["eraf_safe_gain_gate_supervision_contract"],
+                "correct_advantage_bce_plus_wrong_language_rejection_bce_plus_"
+                "positive_pair_logit_margin",
+            )
+            self.assertEqual(
+                metadata["eraf_safe_gain_wrong_gate_loss_weight"], 0.5
+            )
+            self.assertEqual(metadata["eraf_safe_gain_gate_ranking_weight"], 1.0)
+            self.assertEqual(metadata["eraf_safe_gain_gate_ranking_margin"], 1.0)
             self.assertEqual(
                 metadata["eraf_action_trainable_scope"],
                 "eraf_action_token_compressor_plus_context_injector_plus_"
@@ -1116,7 +1152,7 @@ class PGCERAFModuleTest(unittest.TestCase):
             restored = tiny_pgc_fastwam(
                 version=9,
                 v9_stage="action",
-                v9_grounding_objective_version=27,
+                v9_grounding_objective_version=28,
                 v9_initialization_contract="released_base_pretrained_eraf",
                 v9_completion_only_memory=True,
                 v9_action_joint_training=True,

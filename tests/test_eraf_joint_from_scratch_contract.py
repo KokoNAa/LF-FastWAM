@@ -23,12 +23,15 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         ):
             self.assertIn(contract, launcher)
         for contract in (
-            "grounding_objective_version: 27",
+            "grounding_objective_version: 28",
             "pretrained_joint_training: true",
             "safe_gain_training: true",
             "grounding_aux_weight: 0.0",
             "safe_gain_num_tokens: 4",
             "safe_gain_gate_threshold: 0.80",
+            "safe_gain_wrong_gate_loss_weight: 0.5",
+            "safe_gain_gate_ranking_weight: 1.0",
+            "safe_gain_gate_ranking_margin: 1.0",
             "safe_gain_non_regression_weight: 2.0",
             "pgc_bidirectional_language_supervision_required: true",
             "max_steps: 10000",

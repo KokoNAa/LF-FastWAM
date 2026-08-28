@@ -5,7 +5,7 @@ defaults:
   - override /model: fastwam
   - _self_
 
-# V9.27 safe-gain experiment. The launcher resumes the already-trained
+# V9.28 corrected safe-gain experiment. The launcher resumes the already-trained
 # no-ERAF LoRA adapter, imports the complete pretrained ERAF dependency bundle,
 # freezes both, and trains only the 4-token compressor, context injector, and
 # pre-action gain gate. The data mixture and bidirectional supervision are
@@ -31,7 +31,7 @@ model:
     entity_relation_grounding:
       training_stage: action
       initialization_contract: released_base_pretrained_eraf
-      grounding_objective_version: 27
+      grounding_objective_version: 28
       completion_only_memory: true
       action_joint_training: true
       fresh_joint_training: false
@@ -52,6 +52,13 @@ model:
       safe_gain_gate_initial_probability: 0.10
       safe_gain_gate_threshold: 0.80
       safe_gain_gate_loss_weight: 1.0
+      # Wrong same-state language is an explicit gate negative.  A separate
+      # logit margin prevents the correct and wrong gates from collapsing to
+      # the same global admission prior while keeping the frozen one-expert
+      # deployment path unchanged.
+      safe_gain_wrong_gate_loss_weight: 0.5
+      safe_gain_gate_ranking_weight: 1.0
+      safe_gain_gate_ranking_margin: 1.0
       safe_gain_non_regression_weight: 2.0
       safe_gain_margin: 0.002
 

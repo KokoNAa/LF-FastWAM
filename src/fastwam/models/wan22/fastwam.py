@@ -763,6 +763,29 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_safe_gain_gate_loss_weight = float(
             eraf_config.get("safe_gain_gate_loss_weight", 1.0)
         )
+        self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight = float(
+            eraf_config.get(
+                "safe_gain_wrong_gate_loss_weight",
+                (
+                    0.5
+                    if self.policy_guard_eraf_grounding_objective_version >= 28
+                    else 0.0
+                ),
+            )
+        )
+        self.policy_guard_eraf_safe_gain_gate_ranking_weight = float(
+            eraf_config.get(
+                "safe_gain_gate_ranking_weight",
+                (
+                    1.0
+                    if self.policy_guard_eraf_grounding_objective_version >= 28
+                    else 0.0
+                ),
+            )
+        )
+        self.policy_guard_eraf_safe_gain_gate_ranking_margin = float(
+            eraf_config.get("safe_gain_gate_ranking_margin", 1.0)
+        )
         self.policy_guard_eraf_safe_gain_non_regression_weight = float(
             eraf_config.get("safe_gain_non_regression_weight", 2.0)
         )
@@ -1534,10 +1557,11 @@ class FastWAM(torch.nn.Module):
                     25,
                     26,
                     27,
+                    28,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "between 1 and 27 inclusive."
+                        "between 1 and 28 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1734,7 +1758,7 @@ class FastWAM(torch.nn.Module):
                         )
                 if self.policy_guard_eraf_safe_gain_training:
                     if not (
-                        self.policy_guard_eraf_grounding_objective_version == 27
+                        self.policy_guard_eraf_grounding_objective_version >= 27
                         and self.policy_guard_eraf_training_stage == "action"
                         and self.policy_guard_eraf_action_joint_training
                         and self.policy_guard_eraf_completion_only_memory
@@ -1743,7 +1767,7 @@ class FastWAM(torch.nn.Module):
                         and self.policy_guard_eraf_bidirectional_supervision
                     ):
                         raise ValueError(
-                            "ERAF safe-gain training requires objective 27, the "
+                            "ERAF safe-gain training requires objective 27+, the "
                             "action stage, completion-only bidirectional action "
                             "supervision, and a pretrained (not fresh) ERAF."
                         )
@@ -1775,12 +1799,41 @@ class FastWAM(torch.nn.Module):
                         )
                     if min(
                         self.policy_guard_eraf_safe_gain_gate_loss_weight,
+                        self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight,
+                        self.policy_guard_eraf_safe_gain_gate_ranking_weight,
+                        self.policy_guard_eraf_safe_gain_gate_ranking_margin,
                         self.policy_guard_eraf_safe_gain_non_regression_weight,
                         self.policy_guard_eraf_safe_gain_margin,
                     ) < 0.0:
                         raise ValueError(
                             "ERAF safe-gain loss weights and margin must be "
                             "non-negative."
+                        )
+                    if (
+                        self.policy_guard_eraf_grounding_objective_version < 28
+                        and (
+                            self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight
+                            != 0.0
+                            or self.policy_guard_eraf_safe_gain_gate_ranking_weight
+                            != 0.0
+                        )
+                    ):
+                        raise ValueError(
+                            "Bidirectional gain-gate rejection/ranking requires "
+                            "grounding objective 28+."
+                        )
+                    if (
+                        self.policy_guard_eraf_grounding_objective_version >= 28
+                        and min(
+                            self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight,
+                            self.policy_guard_eraf_safe_gain_gate_ranking_weight,
+                            self.policy_guard_eraf_safe_gain_gate_ranking_margin,
+                        )
+                        <= 0.0
+                    ):
+                        raise ValueError(
+                            "PGC V9.28 requires positive wrong-gate rejection "
+                            "and pairwise gate-ranking weights/margin."
                         )
                 if (
                     self.policy_guard_eraf_grounding_objective_version >= 15
@@ -4205,6 +4258,70 @@ class FastWAM(torch.nn.Module):
         metrics = dict(compressor_metrics)
         metrics.update(gate_metrics)
         return compressed, probability, metrics
+
+    @staticmethod
+    def _policy_guard_v928_gain_gate_losses(
+        *,
+        correct_probability: torch.Tensor,
+        wrong_probability: torch.Tensor,
+        gate_target: torch.Tensor,
+        direct_valid: torch.Tensor,
+        semantic_valid: torch.Tensor,
+        ranking_margin: float,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Return correct, wrong-rejection, and paired gate-ranking losses."""
+        expected_shape = tuple(correct_probability.shape)
+        if (
+            correct_probability.ndim != 1
+            or tuple(wrong_probability.shape) != expected_shape
+            or tuple(gate_target.shape) != expected_shape
+            or tuple(direct_valid.shape) != expected_shape
+            or tuple(semantic_valid.shape) != expected_shape
+        ):
+            raise ValueError(
+                "PGC V9.28 gain-gate tensors must share the same [B] shape."
+            )
+        if float(ranking_margin) <= 0.0:
+            raise ValueError("PGC V9.28 gain-gate ranking margin must be positive.")
+
+        correct_clamped = correct_probability.clamp(1.0e-6, 1.0 - 1.0e-6)
+        wrong_clamped = wrong_probability.clamp(1.0e-6, 1.0 - 1.0e-6)
+        correct_gate_bce = F.binary_cross_entropy(
+            correct_clamped,
+            gate_target.to(dtype=correct_clamped.dtype),
+            reduction="none",
+        )
+        correct_gate_loss = FastWAM._masked_policy_guard_mean(
+            correct_gate_bce, direct_valid
+        )
+        wrong_gate_bce = F.binary_cross_entropy(
+            wrong_clamped,
+            torch.zeros_like(wrong_clamped),
+            reduction="none",
+        )
+        wrong_gate_loss = FastWAM._masked_policy_guard_mean(
+            wrong_gate_bce, semantic_valid
+        )
+        correct_gate_logit = torch.logit(correct_clamped)
+        wrong_gate_logit = torch.logit(wrong_clamped)
+        gate_ranking_valid = semantic_valid & gate_target.bool()
+        gate_ranking_per_sample = torch.relu(
+            float(ranking_margin) + wrong_gate_logit - correct_gate_logit
+        )
+        gate_ranking_loss = FastWAM._masked_policy_guard_mean(
+            gate_ranking_per_sample, gate_ranking_valid
+        )
+        return (
+            correct_gate_loss,
+            wrong_gate_loss,
+            gate_ranking_loss,
+            gate_ranking_valid,
+        )
 
     def _encode_policy_guard_target_binding(
         self,
@@ -8912,13 +9029,13 @@ class FastWAM(torch.nn.Module):
         if not (
             self.policy_guard_enabled
             and self.policy_guard_version == 9
-            and self.policy_guard_eraf_grounding_objective_version == 27
+            and self.policy_guard_eraf_grounding_objective_version >= 27
             and self.policy_guard_eraf_safe_gain_training
             and self.policy_guard_eraf_training_stage == "action"
             and self.lora_enabled
         ):
             raise RuntimeError(
-                "ERAF safe-gain training requires PGC V9.27 with a loaded "
+                "ERAF safe-gain training requires PGC V9.27+ with a loaded "
                 "frozen no-ERAF LoRA policy."
             )
         action = inputs["action"]
@@ -9128,7 +9245,7 @@ class FastWAM(torch.nn.Module):
                 },
             )
         )
-        wrong_tokens, _, wrong_safe_metrics = (
+        wrong_tokens, wrong_gate_probability, wrong_safe_metrics = (
             self._policy_guard_eraf_safe_gain_decision(
                 routed_goal_queries=wrong_queries.detach(),
                 eraf_outputs={
@@ -9211,12 +9328,42 @@ class FastWAM(torch.nn.Module):
             correct_error.detach() + self.policy_guard_eraf_safe_gain_margin
             < base_error.detach()
         ).float()
-        gate_bce = F.binary_cross_entropy(
-            gate_probability.clamp(1.0e-6, 1.0 - 1.0e-6),
-            gate_target,
-            reduction="none",
+        # A paired wrong instruction must never receive the same admission
+        # score as a helpful correct instruction.  Restrict the logit margin
+        # to rows where the oracle action-flow comparison says ERAF is useful;
+        # on the remaining rows both paths are conservatively trained off.
+        (
+            correct_gate_loss,
+            wrong_gate_loss,
+            gate_ranking_loss,
+            gate_ranking_valid,
+        ) = self._policy_guard_v928_gain_gate_losses(
+            correct_probability=gate_probability,
+            wrong_probability=wrong_gate_probability,
+            gate_target=gate_target,
+            direct_valid=direct_action_valid,
+            semantic_valid=semantic_valid,
+            ranking_margin=self.policy_guard_eraf_safe_gain_gate_ranking_margin,
         )
-        gate_loss = self._masked_policy_guard_mean(gate_bce, direct_action_valid)
+        corrected_gate_supervision = bool(
+            self.policy_guard_eraf_grounding_objective_version >= 28
+        )
+        if corrected_gate_supervision:
+            gate_objective = (
+                self.policy_guard_eraf_safe_gain_gate_loss_weight
+                * correct_gate_loss
+                + self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight
+                * wrong_gate_loss
+                + self.policy_guard_eraf_safe_gain_gate_ranking_weight
+                * gate_ranking_loss
+            )
+        else:
+            # Keep historical V9.27 checkpoints reproducible.  V9.28 is the
+            # first objective that closes the wrong-language gate gradient.
+            gate_objective = (
+                self.policy_guard_eraf_safe_gain_gate_loss_weight
+                * correct_gate_loss
+            )
         action_objective = self.loss_lambda_action * (
             self.policy_guard_eraf_expert_lora_native_action_weight * native_action_loss
             + self.policy_guard_eraf_expert_lora_counterfactual_action_weight
@@ -9227,7 +9374,7 @@ class FastWAM(torch.nn.Module):
             + self.policy_guard_eraf_action_causal_ranking_weight * ranking_loss
             + self.policy_guard_eraf_safe_gain_non_regression_weight
             * non_regression_loss
-            + self.policy_guard_eraf_safe_gain_gate_loss_weight * gate_loss
+            + gate_objective
         )
 
         direct_count = direct_action_valid.float().sum().clamp_min(1.0)
@@ -9235,6 +9382,9 @@ class FastWAM(torch.nn.Module):
         source_count = source_semantic_valid.float().sum().clamp_min(1.0)
         target_count = target_semantic_valid.float().sum().clamp_min(1.0)
         selected = gate_probability >= (self.policy_guard_eraf_safe_gain_gate_threshold)
+        wrong_selected = wrong_gate_probability >= (
+            self.policy_guard_eraf_safe_gain_gate_threshold
+        )
         positive = gate_target.bool() & direct_action_valid
         negative = ~gate_target.bool() & direct_action_valid
         metrics: dict[str, torch.Tensor] = {
@@ -9246,7 +9396,10 @@ class FastWAM(torch.nn.Module):
             "loss_pgc_v927_source_language_ranking": source_ranking.detach(),
             "loss_pgc_v927_target_language_ranking": target_ranking.detach(),
             "loss_pgc_v927_non_regression": non_regression_loss.detach(),
-            "loss_pgc_v927_gain_gate": gate_loss.detach(),
+            "loss_pgc_v927_gain_gate": gate_objective.detach(),
+            "loss_pgc_v928_correct_gain_gate": correct_gate_loss.detach(),
+            "loss_pgc_v928_wrong_gain_gate": wrong_gate_loss.detach(),
+            "loss_pgc_v928_gain_gate_ranking": gate_ranking_loss.detach(),
             "pgc_v927_eraf_improvement_rate": (
                 (
                     (correct_error < base_error).float() * direct_action_valid.float()
@@ -9284,6 +9437,27 @@ class FastWAM(torch.nn.Module):
             "pgc_v927_gain_gate_true_accept_rate": (
                 (selected & positive).float().sum()
                 / positive.float().sum().clamp_min(1.0)
+            ),
+            "pgc_v928_wrong_gain_gate_selected_rate": (
+                (wrong_selected.float() * semantic_valid.float()).sum()
+                / semantic_count
+            ),
+            "pgc_v928_gain_gate_probability_gap": (
+                (
+                    (gate_probability - wrong_gate_probability)
+                    * semantic_valid.float()
+                ).sum()
+                / semantic_count
+            ),
+            "pgc_v928_gain_gate_pairwise_accuracy": (
+                (
+                    (gate_probability > wrong_gate_probability).float()
+                    * gate_ranking_valid.float()
+                ).sum()
+                / gate_ranking_valid.float().sum().clamp_min(1.0)
+            ),
+            "pgc_v928_gate_corrected_supervision": (
+                correct_error.new_tensor(float(corrected_gate_supervision))
             ),
             "pgc_v927_base_candidate_delta_rms": (
                 (correct_action - base_action).float().square().mean().sqrt()
@@ -16440,6 +16614,10 @@ class FastWAM(torch.nn.Module):
             is_v9
             and self.policy_guard_eraf_grounding_objective_version >= 27
         )
+        is_v928 = bool(
+            is_v9
+            and self.policy_guard_eraf_grounding_objective_version >= 28
+        )
         fresh_eraf_joint = bool(
             is_v926_plus and self.policy_guard_eraf_fresh_joint_training
         )
@@ -17439,6 +17617,29 @@ class FastWAM(torch.nn.Module):
                 if is_v927
                 else None
             ),
+            "eraf_safe_gain_wrong_gate_loss_weight": (
+                self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight
+                if is_v928
+                else None
+            ),
+            "eraf_safe_gain_gate_ranking_weight": (
+                self.policy_guard_eraf_safe_gain_gate_ranking_weight
+                if is_v928
+                else None
+            ),
+            "eraf_safe_gain_gate_ranking_margin": (
+                self.policy_guard_eraf_safe_gain_gate_ranking_margin
+                if is_v928
+                else None
+            ),
+            "eraf_safe_gain_gate_supervision_contract": (
+                "correct_advantage_bce_plus_wrong_language_rejection_bce_plus_"
+                "positive_pair_logit_margin"
+                if is_v928
+                else "correct_advantage_bce_only"
+                if is_v927
+                else None
+            ),
             "eraf_safe_gain_non_regression_weight": (
                 self.policy_guard_eraf_safe_gain_non_regression_weight
                 if is_v927
@@ -17478,6 +17679,21 @@ class FastWAM(torch.nn.Module):
                     ),
                     "gain_gate_weight": (
                         self.policy_guard_eraf_safe_gain_gate_loss_weight
+                    ),
+                    **(
+                        {
+                            "wrong_gain_gate_weight": (
+                                self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight
+                            ),
+                            "gain_gate_pairwise_ranking_weight": (
+                                self.policy_guard_eraf_safe_gain_gate_ranking_weight
+                            ),
+                            "gain_gate_pairwise_ranking_margin": (
+                                self.policy_guard_eraf_safe_gain_gate_ranking_margin
+                            ),
+                        }
+                        if is_v928
+                        else {}
                     ),
                 }
                 if is_v927
@@ -21655,6 +21871,34 @@ class FastWAM(torch.nn.Module):
                                             ),
                                             "eraf_safe_gain_margin": (
                                                 self.policy_guard_eraf_safe_gain_margin
+                                            ),
+                                        }
+                                    )
+                                if saved_grounding_objective >= 28:
+                                    wrong_gate_weight = (
+                                        self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight
+                                    )
+                                    gate_ranking_weight = (
+                                        self.policy_guard_eraf_safe_gain_gate_ranking_weight
+                                    )
+                                    gate_ranking_margin = (
+                                        self.policy_guard_eraf_safe_gain_gate_ranking_margin
+                                    )
+                                    expected_v914_contract.update(
+                                        {
+                                            "eraf_safe_gain_wrong_gate_loss_weight": (
+                                                wrong_gate_weight
+                                            ),
+                                            "eraf_safe_gain_gate_ranking_weight": (
+                                                gate_ranking_weight
+                                            ),
+                                            "eraf_safe_gain_gate_ranking_margin": (
+                                                gate_ranking_margin
+                                            ),
+                                            "eraf_safe_gain_gate_supervision_contract": (
+                                                "correct_advantage_bce_plus_wrong_"
+                                                "language_rejection_bce_plus_positive_"
+                                                "pair_logit_margin"
                                             ),
                                         }
                                     )
