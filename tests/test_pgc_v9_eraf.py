@@ -1097,6 +1097,11 @@ class PGCERAFModuleTest(unittest.TestCase):
             "context_injector",
         )
         self.assertEqual(
+            metadata["eraf_role_adapter_trainable_scope"],
+            "fresh_eraf_plus_shared_video_action_lora_plus_eraf_action_"
+            "context_injector",
+        )
+        self.assertEqual(
             metadata["eraf_action_context_injection_contract"],
             "exact_no_injection_warmup_then_append_bounded_eraf_tokens_to_"
             "shared_action_expert_context_no_post_action_residual",
@@ -1256,6 +1261,11 @@ class PGCERAFModuleTest(unittest.TestCase):
                 metadata["eraf_action_trainable_scope"],
                 "pretrained_eraf_plus_shared_video_action_lora_plus_fresh_"
                 "eraf_action_context_injector",
+            )
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "pretrained_eraf_plus_shared_video_action_lora_plus_eraf_"
+                "action_context_injector",
             )
             model.save_checkpoint(joint_path, step=10000)
 

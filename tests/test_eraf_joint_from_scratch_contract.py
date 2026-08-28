@@ -100,6 +100,25 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         ):
             self.assertIn(contract, source)
 
+    def test_checkpoint_loader_accepts_joint_role_scope_contracts(self):
+        source = (
+            REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"
+        ).read_text(encoding="utf-8")
+        role_scope_validation = source[
+            source.index("saved_action_stage = (") : source.index(
+                'metadata.get("eraf_role_adapter_trainable_scope")',
+                source.index("saved_action_stage = ("),
+            )
+        ]
+        for contract in (
+            "if saved_eraf_pretrained_joint_training",
+            "if saved_eraf_fresh_joint_training",
+            '"pretrained_eraf_plus_shared_video_"',
+            '"fresh_eraf_plus_shared_video_"',
+            '"action_lora_plus_eraf_action_context_"',
+        ):
+            self.assertIn(contract, role_scope_validation)
+
 
 if __name__ == "__main__":
     unittest.main()
