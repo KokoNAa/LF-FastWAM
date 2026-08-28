@@ -839,16 +839,25 @@ def _predict_action_chunk(
             "selected_counterfactual": bool(
                 pred["policy_guard_selected_counterfactual"]
             ),
-            "base_score": float(pred["policy_guard_base_score"]),
-            "counterfactual_score": float(pred["policy_guard_counterfactual_score"]),
-            "score_margin": float(pred["policy_guard_score_margin"]),
             "gate_mode": str(pred["policy_guard_gate_mode"]),
         }
         for source_key, output_key, converter in (
+            ("policy_guard_base_score", "base_score", float),
+            (
+                "policy_guard_counterfactual_score",
+                "counterfactual_score",
+                float,
+            ),
+            ("policy_guard_score_margin", "score_margin", float),
             ("policy_guard_score_space", "score_space", str),
             (
                 "policy_guard_candidate_supported",
                 "candidate_supported",
+                bool,
+            ),
+            (
+                "policy_guard_eraf_single_path",
+                "eraf_single_path",
                 bool,
             ),
             (
@@ -2016,8 +2025,15 @@ def run_single_task(
             {
                 "episode": trial_idx,
                 "decision_count": len(policy_guard_decisions),
+                "single_path_decision_count": sum(
+                    int(item.get("eraf_single_path", False))
+                    for item in policy_guard_decisions
+                ),
                 "override_count": sum(
-                    int(item["selected_counterfactual"])
+                    int(
+                        item["selected_counterfactual"]
+                        and not item.get("eraf_single_path", False)
+                    )
                     for item in policy_guard_decisions
                 ),
                 "decisions": policy_guard_decisions,
@@ -2113,12 +2129,24 @@ def run_single_task(
         for decision in episode["decisions"]
     ]
     results["policy_guard_decision_count"] = len(policy_guard_decisions)
+    results["policy_guard_single_path_decision_count"] = sum(
+        int(item.get("eraf_single_path", False))
+        for item in policy_guard_decisions
+    )
+    results["policy_guard_gated_decision_count"] = (
+        results["policy_guard_decision_count"]
+        - results["policy_guard_single_path_decision_count"]
+    )
     results["policy_guard_override_count"] = sum(
-        int(item["selected_counterfactual"]) for item in policy_guard_decisions
+        int(
+            item["selected_counterfactual"]
+            and not item.get("eraf_single_path", False)
+        )
+        for item in policy_guard_decisions
     )
     results["policy_guard_override_rate"] = float(
         results["policy_guard_override_count"]
-    ) / max(1, results["policy_guard_decision_count"])
+    ) / max(1, results["policy_guard_gated_decision_count"])
     if oracle_phase_servo.enabled:
         episode_servo_records = [
             [
@@ -2131,16 +2159,34 @@ def run_single_task(
         results["eraf_oracle_phase_servo"]["summary"] = (
             summarize_oracle_phase_servo(episode_servo_records)
         )
-    if policy_guard_decisions:
+    base_scores = [
+        item["base_score"]
+        for item in policy_guard_decisions
+        if "base_score" in item
+    ]
+    counterfactual_scores = [
+        item["counterfactual_score"]
+        for item in policy_guard_decisions
+        if "counterfactual_score" in item
+    ]
+    score_margins = [
+        item["score_margin"]
+        for item in policy_guard_decisions
+        if "score_margin" in item
+    ]
+    if base_scores:
         results["policy_guard_base_score_mean"] = float(
-            np.mean([item["base_score"] for item in policy_guard_decisions])
+            np.mean(base_scores)
         )
+    if counterfactual_scores:
         results["policy_guard_counterfactual_score_mean"] = float(
-            np.mean([item["counterfactual_score"] for item in policy_guard_decisions])
+            np.mean(counterfactual_scores)
         )
+    if score_margins:
         results["policy_guard_score_margin_mean"] = float(
-            np.mean([item["score_margin"] for item in policy_guard_decisions])
+            np.mean(score_margins)
         )
+    if policy_guard_decisions:
         score_spaces = sorted(
             {
                 str(item["score_space"])

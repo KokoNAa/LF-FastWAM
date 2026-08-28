@@ -119,6 +119,21 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         ):
             self.assertIn(contract, role_scope_validation)
 
+    def test_evaluator_accepts_eraf_single_path_without_legacy_gate_scores(self):
+        source = (
+            REPO_ROOT / "experiments/libero/eval_libero_single.py"
+        ).read_text(encoding="utf-8")
+        for contract in (
+            '("policy_guard_base_score", "base_score", float)',
+            '"policy_guard_eraf_single_path",',
+            'item.get("eraf_single_path", False)',
+            'if "base_score" in item',
+            'if "counterfactual_score" in item',
+            'if "score_margin" in item',
+            'results["policy_guard_gated_decision_count"]',
+        ):
+            self.assertIn(contract, source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14140,6 +14140,7 @@ class FastWAM(torch.nn.Module):
                 "policy_guard_candidate_delta_rms",
                 "policy_guard_candidate_saturation_fraction",
                 "policy_guard_gate_mode",
+                "policy_guard_eraf_single_path",
                 "policy_guard_base_action",
                 "policy_guard_counterfactual_action",
                 "policy_guard_eraf_diagnostics",
