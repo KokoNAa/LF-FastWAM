@@ -6,6 +6,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ERAFJointTrainingContractTest(unittest.TestCase):
+    def test_safe_gain_objective_version_is_initialized_before_v928_defaults(self):
+        source = (
+            REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"
+        ).read_text(encoding="utf-8")
+        objective_assignment = source.index(
+            "self.policy_guard_eraf_grounding_objective_version = int("
+        )
+        wrong_gate_default = source.index(
+            "self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight = float("
+        )
+        self.assertLess(objective_assignment, wrong_gate_default)
+
     def test_safe_gain_launcher_and_task_preserve_the_control_contract(self):
         launcher = (REPO_ROOT / "scripts/train_libero_eraf_safe_gain.sh").read_text(
             encoding="utf-8"

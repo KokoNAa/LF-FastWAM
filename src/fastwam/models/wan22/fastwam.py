@@ -640,6 +640,9 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_enabled = bool(guard_config.get("enabled", False))
         self.policy_guard_version = int(guard_config.get("version", 2))
         eraf_config = dict(guard_config.get("entity_relation_grounding", {}) or {})
+        self.policy_guard_eraf_grounding_objective_version = int(
+            eraf_config.get("grounding_objective_version", 1)
+        )
         self.policy_guard_eraf_training_stage = str(
             eraf_config.get("training_stage", "grounding")
         ).strip().lower()
@@ -899,9 +902,6 @@ class FastWAM(torch.nn.Module):
         )
         self.policy_guard_eraf_expert_lora_regularization_weight = float(
             eraf_config.get("expert_lora_regularization_weight", 1.0e-6)
-        )
-        self.policy_guard_eraf_grounding_objective_version = int(
-            eraf_config.get("grounding_objective_version", 1)
         )
         gate_aligned_grounding = (
             self.policy_guard_eraf_grounding_objective_version >= 2
