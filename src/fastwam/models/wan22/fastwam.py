@@ -21013,7 +21013,14 @@ class FastWAM(torch.nn.Module):
                                 expected_scope = (
                                     (
                                         (
-                                            "pretrained_eraf_plus_shared_video_"
+                                            "frozen_complete_eraf_plus_frozen_"
+                                            "baseline_lora_plus_compressor_injector_"
+                                            "gain_gate"
+                                            if (
+                                                saved_grounding_objective >= 27
+                                                and saved_eraf_safe_gain_training
+                                            )
+                                            else "pretrained_eraf_plus_shared_video_"
                                             "action_lora_plus_eraf_action_context_"
                                             "injector"
                                             if saved_eraf_pretrained_joint_training
@@ -21112,14 +21119,15 @@ class FastWAM(torch.nn.Module):
                                 )
                             else:
                                 expected_scope = "role_assignment_adapter_only"
-                            if (
-                                metadata.get("eraf_role_adapter_trainable_scope")
-                                != expected_scope
-                            ):
+                            saved_scope = metadata.get(
+                                "eraf_role_adapter_trainable_scope"
+                            )
+                            if saved_scope != expected_scope:
                                 raise ValueError(
                                     "PGC v9 role-adapter checkpoint does not "
                                     "declare its expected trainable scope: "
-                                    f"{expected_scope!r}."
+                                    f"checkpoint={saved_scope!r}, "
+                                    f"expected={expected_scope!r}."
                                 )
                             for metadata_name, expected_value in {
                                 "eraf_role_attention_preservation_weight": (

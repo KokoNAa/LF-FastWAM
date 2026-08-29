@@ -1147,6 +1147,11 @@ class PGCERAFModuleTest(unittest.TestCase):
                 "eraf_action_token_compressor_plus_context_injector_plus_"
                 "gain_gate_only",
             )
+            self.assertEqual(
+                metadata["eraf_role_adapter_trainable_scope"],
+                "frozen_complete_eraf_plus_frozen_baseline_lora_plus_"
+                "compressor_injector_gain_gate",
+            )
             safe.save_checkpoint(safe_path, step=10000)
 
             restored = tiny_pgc_fastwam(

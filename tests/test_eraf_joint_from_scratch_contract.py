@@ -177,11 +177,15 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         role_scope_validation = source[
             source.index("saved_action_stage = (") : source.index(
-                'metadata.get("eraf_role_adapter_trainable_scope")',
+                "saved_scope = metadata.get(",
                 source.index("saved_action_stage = ("),
             )
         ]
         for contract in (
+            "saved_eraf_safe_gain_training",
+            '"frozen_complete_eraf_plus_frozen_"',
+            '"baseline_lora_plus_compressor_injector_"',
+            '"gain_gate"',
             "if saved_eraf_pretrained_joint_training",
             "if saved_eraf_fresh_joint_training",
             '"pretrained_eraf_plus_shared_video_"',
