@@ -145,6 +145,13 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         ):
             self.assertIn(contract, source)
 
+    def test_standard_pgc_evaluator_accepts_v928_objective(self):
+        source = (
+            REPO_ROOT / "scripts/eval_pgc_libero.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("objective not in set(range(1, 29))", source)
+        self.assertIn("if objective >= 28", source)
+
     def test_checkpoint_loader_accepts_joint_role_scope_contracts(self):
         source = (
             REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"
