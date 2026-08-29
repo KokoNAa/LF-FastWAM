@@ -152,6 +152,25 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         self.assertIn("objective not in set(range(1, 29))", source)
         self.assertIn("if objective >= 28", source)
 
+    def test_base_model_schema_declares_safe_gain_metadata_overrides(self):
+        source = (REPO_ROOT / "configs/model/fastwam.yaml").read_text(
+            encoding="utf-8"
+        )
+        for contract in (
+            "safe_gain_training: false",
+            "safe_gain_num_tokens: 4",
+            "safe_gain_gate_hidden_dim: 128",
+            "safe_gain_gate_initial_probability: 0.10",
+            "safe_gain_gate_threshold: 0.80",
+            "safe_gain_gate_loss_weight: 1.0",
+            "safe_gain_wrong_gate_loss_weight: 0.0",
+            "safe_gain_gate_ranking_weight: 0.0",
+            "safe_gain_gate_ranking_margin: 1.0",
+            "safe_gain_non_regression_weight: 2.0",
+            "safe_gain_margin: 0.002",
+        ):
+            self.assertIn(contract, source)
+
     def test_checkpoint_loader_accepts_joint_role_scope_contracts(self):
         source = (
             REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"

@@ -344,10 +344,25 @@ policy_guard:
     # an admitted V9.13+ checkpoint, while the released Base, context injector,
     # and shared Video/Action LoRA all start independently for the new run.
     pretrained_joint_training: false
+    # V9.27+ keeps the no-ERAF policy immutable and admits compressed ERAF
+    # context only through a pre-action gain gate.  These fields live in the
+    # base schema so checkpoint-driven evaluation can restore them under Hydra
+    # struct mode; historical objectives retain the disabled/zero defaults.
+    safe_gain_training: false
     pretrained_checkpoint: null
     bidirectional_supervision: false
     context_injection_warmup_steps: 1500
     context_injection_ramp_steps: 1000
+    safe_gain_num_tokens: 4
+    safe_gain_gate_hidden_dim: 128
+    safe_gain_gate_initial_probability: 0.10
+    safe_gain_gate_threshold: 0.80
+    safe_gain_gate_loss_weight: 1.0
+    safe_gain_wrong_gate_loss_weight: 0.0
+    safe_gain_gate_ranking_weight: 0.0
+    safe_gain_gate_ranking_margin: 1.0
+    safe_gain_non_regression_weight: 2.0
+    safe_gain_margin: 0.002
     action_grounding_hidden_dim: 256
     action_grounding_num_heads: 8
     action_grounding_learning_rate: 1.0e-4
