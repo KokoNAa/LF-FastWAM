@@ -21840,8 +21840,14 @@ class FastWAM(torch.nn.Module):
                                     expected_v914_contract.update(
                                         {
                                             "eraf_single_path": True,
+                                            # This metadata records how the checkpoint
+                                            # was trained. Deployment-time evaluation
+                                            # may deliberately override the gate mode
+                                            # (for example, to force the ERAF path for
+                                            # an ablation) without changing that saved
+                                            # training contract.
                                             "gate_mode": (
-                                                self.policy_guard_gate_mode
+                                                "guarded"
                                                 if saved_grounding_objective >= 27
                                                 else "eraf_only"
                                             ),

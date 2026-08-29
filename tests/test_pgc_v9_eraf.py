@@ -1171,6 +1171,24 @@ class PGCERAFModuleTest(unittest.TestCase):
                 provenance["scope"],
             )
 
+            forced_eraf = tiny_pgc_fastwam(
+                version=9,
+                v9_stage="action",
+                v9_grounding_objective_version=28,
+                v9_initialization_contract="released_base_pretrained_eraf",
+                v9_completion_only_memory=True,
+                v9_action_joint_training=True,
+                v9_pretrained_joint_training=True,
+                v9_safe_gain_training=True,
+                v9_bidirectional_supervision=True,
+            )
+            forced_eraf.policy_guard_gate_mode = "counterfactual"
+            forced_eraf.load_checkpoint(safe_path)
+            self.assertEqual(
+                forced_eraf.policy_guard_gate_mode,
+                "counterfactual",
+            )
+
     def test_fresh_joint_injector_warmup_is_exactly_no_op(self):
         module = ERAFActionContextInjector(
             goal_dim=12,

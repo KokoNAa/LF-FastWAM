@@ -194,6 +194,21 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         ):
             self.assertIn(contract, role_scope_validation)
 
+    def test_safe_gain_checkpoint_contract_is_independent_of_eval_gate_override(self):
+        source = (
+            REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"
+        ).read_text(encoding="utf-8")
+        start = source.index("if saved_grounding_objective >= 26:")
+        gate_contract = source[
+            start : source.index(
+                "if saved_grounding_objective >= 27:",
+                start,
+            )
+        ]
+        self.assertIn('"gate_mode": (', gate_contract)
+        self.assertIn('"guarded"', gate_contract)
+        self.assertNotIn("self.policy_guard_gate_mode", gate_contract)
+
     def test_evaluator_accepts_eraf_single_path_without_legacy_gate_scores(self):
         source = (
             REPO_ROOT / "experiments/libero/eval_libero_single.py"
