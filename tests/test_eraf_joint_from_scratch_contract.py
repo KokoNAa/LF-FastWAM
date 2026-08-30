@@ -145,12 +145,13 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         ):
             self.assertIn(contract, source)
 
-    def test_standard_pgc_evaluator_accepts_v928_objective(self):
+    def test_standard_pgc_evaluator_accepts_v929_objective(self):
         source = (
             REPO_ROOT / "scripts/eval_pgc_libero.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("objective not in set(range(1, 29))", source)
+        self.assertIn("objective not in set(range(1, 30))", source)
         self.assertIn("if objective >= 28", source)
+        self.assertIn("if objective >= 29", source)
 
     def test_base_model_schema_declares_safe_gain_metadata_overrides(self):
         source = (REPO_ROOT / "configs/model/fastwam.yaml").read_text(
@@ -162,14 +163,44 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
             "safe_gain_gate_hidden_dim: 128",
             "safe_gain_gate_initial_probability: 0.10",
             "safe_gain_gate_threshold: 0.80",
+            "safe_gain_deployment_threshold: null",
             "safe_gain_gate_loss_weight: 1.0",
             "safe_gain_wrong_gate_loss_weight: 0.0",
             "safe_gain_gate_ranking_weight: 0.0",
             "safe_gain_gate_ranking_margin: 1.0",
             "safe_gain_non_regression_weight: 2.0",
             "safe_gain_margin: 0.002",
+            "safe_gain_injector_training_steps: 0",
+            "safe_gain_gate_calibration_steps: 0",
+            "safe_gain_noise_levels: 1",
         ):
             self.assertIn(contract, source)
+
+    def test_v929_stages_injector_then_detached_gate_on_closed_loop_cf(self):
+        task = (
+            REPO_ROOT / "configs/task/libero_eraf_safe_gain_v929_2cam224.yaml"
+        ).read_text(encoding="utf-8")
+        launcher = (
+            REPO_ROOT / "scripts/train_libero_eraf_safe_gain_v929.sh"
+        ).read_text(encoding="utf-8")
+        model = (
+            REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"
+        ).read_text(encoding="utf-8")
+        for contract in (
+            "grounding_objective_version: 29",
+            "safe_gain_injector_training_steps: 7000",
+            "safe_gain_gate_calibration_steps: 3000",
+            "safe_gain_noise_levels: 2",
+            "safe_gain_closed_loop_action_weight: 2.0",
+            "safe_gain_closed_loop_non_regression_weight: 4.0",
+            "pgc_v9_safe_gain_counterfactual_replay: true",
+        ):
+            self.assertIn(contract, task)
+        self.assertIn("meta/pgc_v8_closed_loop/index.json", launcher)
+        self.assertIn("migrate_v928_to_v929_rollout_safe_gain", model)
+        self.assertIn('detach_gate_inputs=training_phase == "gate"', model)
+        self.assertIn('if training_phase == "injector":', model)
+        self.assertIn('elif training_phase == "gate":', model)
 
     def test_checkpoint_loader_accepts_joint_role_scope_contracts(self):
         source = (

@@ -339,6 +339,23 @@ class Wan22Trainer:
                         False,
                     )
                 )
+                safe_gain_counterfactual_replay = bool(
+                    getattr(
+                        self.train_dataset,
+                        "pgc_v9_safe_gain_counterfactual_replay",
+                        False,
+                    )
+                )
+                if objective_version >= 29 and not safe_gain_counterfactual_replay:
+                    raise ValueError(
+                        "PGC V9.29 requires the replay-verified closed-loop "
+                        "counterfactual sampling contract."
+                    )
+                if safe_gain_counterfactual_replay and objective_version < 29:
+                    raise ValueError(
+                        "PGC V9.29 replay sampling is invalid for earlier "
+                        "grounding objectives."
+                    )
                 if (
                     objective_version == 13
                     and training_stage == "grounding"

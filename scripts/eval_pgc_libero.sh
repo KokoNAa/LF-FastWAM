@@ -15,6 +15,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-$(pwd)/evaluate_results/pgc_libero_${CONDITION}_seed
 MANIFEST_PATH="${PGC_MANIFEST_PATH:-}"
 GATE_MODE="${PGC_GATE_MODE:-guarded}"
 GATE_THRESHOLD="${PGC_GATE_THRESHOLD:-0.20}"
+SAFE_GAIN_DEPLOYMENT_THRESHOLD="${PGC_SAFE_GAIN_GATE_THRESHOLD:-}"
 MIN_COUNTERFACTUAL_SCORE="${PGC_MIN_COUNTERFACTUAL_SCORE:-0.60}"
 MAX_POLICY_STEPS="${PGC_MAX_POLICY_STEPS:-}"
 CLOSED_LOOP_CAPTURE_DIR="${PGC_CLOSED_LOOP_CAPTURE_DIR:-}"
@@ -64,6 +65,14 @@ done
 if [[ -n "${MAX_POLICY_STEPS}" ]] && ! [[ "${MAX_POLICY_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "PGC_MAX_POLICY_STEPS must be a positive integer when set." >&2
   exit 1
+fi
+if [[ -n "${SAFE_GAIN_DEPLOYMENT_THRESHOLD}" ]]; then
+  "${PYTHON_BIN}" - "${SAFE_GAIN_DEPLOYMENT_THRESHOLD}" <<'PY'
+import sys
+value = float(sys.argv[1])
+if not 0.0 < value <= 1.0:
+    raise SystemExit("PGC_SAFE_GAIN_GATE_THRESHOLD must lie in (0, 1].")
+PY
 fi
 case "${CONDITION}" in
   correct|null|shuffled|counterfactual) ;;
@@ -345,7 +354,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 29)):
+    if objective not in set(range(1, 30)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -693,10 +702,16 @@ if version == 9:
         raise SystemExit(
             "PGC V9.27 checkpoint lacks its frozen safe-gain contract"
         )
+    expected_gate_contract = (
+        "detached_gate_calibration_from_mean_multi_noise_action_advantage_plus_"
+        "wrong_language_rejection_and_positive_pair_logit_margin"
+        if objective >= 29
+        else "correct_advantage_bce_plus_wrong_language_rejection_bce_plus_"
+        "positive_pair_logit_margin"
+    )
     if objective >= 28 and (
         metadata.get("eraf_safe_gain_gate_supervision_contract")
-        != "correct_advantage_bce_plus_wrong_language_rejection_bce_plus_"
-        "positive_pair_logit_margin"
+        != expected_gate_contract
         or float(metadata.get("eraf_safe_gain_wrong_gate_loss_weight") or 0.0)
         <= 0.0
         or float(metadata.get("eraf_safe_gain_gate_ranking_weight") or 0.0) <= 0.0
@@ -705,6 +720,18 @@ if version == 9:
         raise SystemExit(
             "PGC V9.28 checkpoint lacks bidirectional safe-gain gate supervision"
         )
+    if objective >= 29 and (
+        metadata.get("eraf_safe_gain_schedule_contract")
+        != "injector_multinoise_then_detached_gate_calibration"
+        or int(metadata.get("eraf_safe_gain_injector_training_steps") or 0)
+        <= 0
+        or int(metadata.get("eraf_safe_gain_gate_calibration_steps") or 0)
+        <= 0
+        or int(metadata.get("eraf_safe_gain_noise_levels") or 0) < 2
+        or metadata.get("eraf_safe_gain_data_contract")
+        != "offline_native_historical_strict_closed_loop_counterfactual_1_1_1_1"
+    ):
+        raise SystemExit("PGC V9.29 checkpoint lacks rollout-aligned safe-gain contracts")
     if pretrained_eraf_joint:
         required_pretrained_provenance = (
             "eraf_pretrained_source_checkpoint",
@@ -898,6 +925,19 @@ mapping = {
         "safe_gain_non_regression_weight"
     ),
     "eraf_safe_gain_margin": "safe_gain_margin",
+    "eraf_safe_gain_injector_training_steps": (
+        "safe_gain_injector_training_steps"
+    ),
+    "eraf_safe_gain_gate_calibration_steps": (
+        "safe_gain_gate_calibration_steps"
+    ),
+    "eraf_safe_gain_noise_levels": "safe_gain_noise_levels",
+    "eraf_safe_gain_closed_loop_action_weight": (
+        "safe_gain_closed_loop_action_weight"
+    ),
+    "eraf_safe_gain_closed_loop_non_regression_weight": (
+        "safe_gain_closed_loop_non_regression_weight"
+    ),
     "eraf_action_grounding_hidden_dim": "action_grounding_hidden_dim",
     "eraf_action_grounding_num_heads": "action_grounding_num_heads",
     "eraf_action_grounding_learning_rate": "action_grounding_learning_rate",
@@ -1033,6 +1073,11 @@ PY
   while IFS= read -r override; do
     [[ -z "${override}" ]] || EXTRA_OVERRIDES+=("${override}")
   done <<< "${PGC_V9_METADATA_OVERRIDES}"
+  if [[ -n "${SAFE_GAIN_DEPLOYMENT_THRESHOLD}" ]]; then
+    EXTRA_OVERRIDES+=(
+      "model.policy_guard.entity_relation_grounding.safe_gain_deployment_threshold=${SAFE_GAIN_DEPLOYMENT_THRESHOLD}"
+    )
+  fi
   if [[ "${ERAF_DIAGNOSTICS}" == "true" ]]; then
     EXTRA_OVERRIDES+=("EVALUATION.entity_relation_overlay_dir=${ERAF_OVERLAY_DIR}")
   fi

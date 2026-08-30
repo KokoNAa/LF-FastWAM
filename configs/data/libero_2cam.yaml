@@ -117,3 +117,7 @@ train:
   # V9.11 visual geometry on the same four-way closed-loop curriculum.
   pgc_v9_phase_safe_memory: false
   pgc_v9_closed_loop_native_dataset_count: 0
+  # V9.29: keep the closed-loop-native dataset only for recurrent-memory
+  # provenance, but replace its invalid dummy-action rows in optimizer windows
+  # with one replay-verified closed-loop corrective CF dataset.
+  pgc_v9_safe_gain_counterfactual_replay: false

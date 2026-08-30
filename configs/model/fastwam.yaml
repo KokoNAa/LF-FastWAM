@@ -357,12 +357,23 @@ policy_guard:
     safe_gain_gate_hidden_dim: 128
     safe_gain_gate_initial_probability: 0.10
     safe_gain_gate_threshold: 0.80
+    # Optional inference-only threshold. Null preserves the checkpoint's
+    # training threshold; evaluation sweeps may override this without changing
+    # the saved training contract.
+    safe_gain_deployment_threshold: null
     safe_gain_gate_loss_weight: 1.0
     safe_gain_wrong_gate_loss_weight: 0.0
     safe_gain_gate_ranking_weight: 0.0
     safe_gain_gate_ranking_margin: 1.0
     safe_gain_non_regression_weight: 2.0
     safe_gain_margin: 0.002
+    # V9.29 rollout-aligned schedule: first fit the compressor/injector with a
+    # frozen gate, then detach those features and calibrate only the gate.
+    safe_gain_injector_training_steps: 0
+    safe_gain_gate_calibration_steps: 0
+    safe_gain_noise_levels: 1
+    safe_gain_closed_loop_action_weight: 1.0
+    safe_gain_closed_loop_non_regression_weight: 2.0
     action_grounding_hidden_dim: 256
     action_grounding_num_heads: 8
     action_grounding_learning_rate: 1.0e-4

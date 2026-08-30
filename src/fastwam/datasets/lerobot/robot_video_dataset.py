@@ -384,6 +384,58 @@ def build_pgc_v912_sample_plan(
     return sample_indices, group_ids
 
 
+def build_pgc_v929_sample_plan(
+    *,
+    offline_native_indices: list[int],
+    original_counterfactual_indices: list[int],
+    strict_counterfactual_indices: list[int],
+    corrective_counterfactual_indices: list[int],
+    strict_relation_categories: list[str],
+    corrective_pair_categories: list[str],
+) -> tuple[list[int], list[int]]:
+    """Interleave four productive V9.29 action-supervision pools 1:1:1:1.
+
+    V9.28's closed-loop-native pool consists of single observations with dummy
+    actions, so every row is rejected by ``pgc_direct_action_valid``.  V9.29
+    retains that dataset only as the recurrent-memory provenance dependency and
+    replaces it in optimizer windows with replay-verified counterfactual action
+    suffixes.  Strict conflicts are balanced by conflict type and closed-loop
+    rows by audited language-pair identity.
+    """
+    offline = [int(index) for index in offline_native_indices]
+    original = [int(index) for index in original_counterfactual_indices]
+    strict = [int(index) for index in strict_counterfactual_indices]
+    corrective = [int(index) for index in corrective_counterfactual_indices]
+    if not all((offline, original, strict, corrective)):
+        raise ValueError(
+            "PGC V9.29 requires non-empty offline-native, historical-CF, "
+            "strict-CF, and closed-loop corrective-CF pools."
+        )
+    combined = offline + original + strict + corrective
+    if len(set(combined)) != len(combined):
+        raise ValueError("PGC V9.29 sample pools must be disjoint.")
+    strict, _ = _balance_indices_by_category(
+        strict, [str(value) for value in strict_relation_categories]
+    )
+    corrective, _ = _balance_indices_by_category(
+        corrective, [str(value) for value in corrective_pair_categories]
+    )
+    target_count = max(len(offline), len(original), len(strict), len(corrective))
+    groups = [
+        _repeat_indices(offline, target_count),
+        _repeat_indices(original, target_count),
+        _repeat_indices(strict, target_count),
+        _repeat_indices(corrective, target_count),
+    ]
+    sample_indices = [
+        groups[group][position]
+        for position in range(target_count)
+        for group in range(4)
+    ]
+    group_ids = [group for _ in range(target_count) for group in range(4)]
+    return sample_indices, group_ids
+
+
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -426,6 +478,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pgc_v9_closed_loop_rebinding: bool = False,
         pgc_v9_phase_safe_memory: bool = False,
         pgc_v9_closed_loop_native_dataset_count: int = 0,
+        pgc_v9_safe_gain_counterfactual_replay: bool = False,
     ):
         native_dataset_dirs = [str(path) for path in dataset_dirs]
         pgc_counterfactual_dataset_dirs = [
@@ -544,6 +597,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         )
         self.pgc_v9_closed_loop_rebinding = bool(pgc_v9_closed_loop_rebinding)
         self.pgc_v9_phase_safe_memory = bool(pgc_v9_phase_safe_memory)
+        self.pgc_v9_safe_gain_counterfactual_replay = bool(
+            pgc_v9_safe_gain_counterfactual_replay
+        )
         if self.pgc_v9_closed_loop_rebinding and self.pgc_v9_phase_safe_memory:
             raise ValueError(
                 "PGC V9.12 rebinding and V9.13 phase-safe memory are mutually "
@@ -580,6 +636,20 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             raise ValueError(
                 "Closed-loop native datasets require V9.12 rebinding or V9.13 memory."
             )
+        if self.pgc_v9_safe_gain_counterfactual_replay:
+            if not (
+                self.pgc_v9_balanced_sampling
+                and self.pgc_v9_phase_safe_memory
+                and self.pgc_v9_closed_loop_native_dataset_count == 1
+                and self.pgc_offline_counterfactual_dataset_count == 2
+                and len(self.pgc_closed_loop_corrective_dataset_dirs) == 1
+            ):
+                raise ValueError(
+                    "PGC V9.29 replay sampling requires balanced phase-safe "
+                    "memory data with one trailing closed-loop native dataset, "
+                    "exactly [historical, strict] offline CF datasets, and one "
+                    "closed-loop corrective CF dataset."
+                )
         if self.pgc_v9_structured_role_sampling and not self.pgc_v9_balanced_sampling:
             raise ValueError(
                 "PGC v9.4 structured role sampling requires v9 balanced sampling."
@@ -851,7 +921,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 raise ValueError(
                     "PGC v9 balanced sampling requires audited ERAF sidecars."
                 )
-            if self.pgc_has_closed_loop_corrective_data:
+            if (
+                self.pgc_has_closed_loop_corrective_data
+                and not self.pgc_v9_safe_gain_counterfactual_replay
+            ):
                 raise ValueError(
                     "PGC v9 strict sampling cannot mix V8 corrective datasets."
                 )
@@ -871,7 +944,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             strict_start = dataset_offsets[strict_dataset_index]
             original = list(range(original_start, strict_start))
             strict_dataset = underlying[strict_dataset_index]
-            strict = list(range(strict_start, total_frame_count))
+            strict_end = self.pgc_offline_counterfactual_frame_end
+            strict = list(range(strict_start, strict_end))
             episode_column = strict_dataset.hf_dataset["episode_index"]
             strict_categories: list[str] = []
             strict_index = self.pgc_entity_relation_indices[strict_dataset_index]
@@ -985,7 +1059,66 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     original_dataset_index
                 )
                 strict_role_categories = _dataset_pair_categories(strict_dataset_index)
-            if self.pgc_v9_closed_loop_grounding:
+            if self.pgc_v9_safe_gain_counterfactual_replay:
+                offline_native = list(range(self.pgc_offline_native_frame_count))
+                corrective = list(
+                    range(self.pgc_offline_counterfactual_frame_end, total_frame_count)
+                )
+                corrective_pair_categories: list[str] = []
+                corrective_dataset_index = (
+                    self.pgc_native_dataset_count
+                    + self.pgc_offline_counterfactual_dataset_count
+                )
+                corrective_dataset = underlying[corrective_dataset_index]
+                corrective_records = self.pgc_entity_relation_indices[
+                    corrective_dataset_index
+                ]["episodes_by_index"]
+                for raw_episode_index in corrective_dataset.hf_dataset[
+                    "episode_index"
+                ]:
+                    episode_index = int(
+                        torch.as_tensor(raw_episode_index).reshape(-1)[0].item()
+                    )
+                    try:
+                        pair_id = str(
+                            corrective_records[episode_index]["pair_id"]
+                        ).strip()
+                    except KeyError as exc:
+                        raise KeyError(
+                            "PGC V9.29 corrective sidecar does not cover "
+                            f"episode {episode_index}."
+                        ) from exc
+                    if not pair_id:
+                        raise ValueError(
+                            "PGC V9.29 corrective rows require a non-empty pair_id."
+                        )
+                    corrective_pair_categories.append(pair_id)
+                if len(corrective_pair_categories) != len(corrective):
+                    raise ValueError(
+                        "PGC V9.29 corrective pair/frame mismatch: "
+                        f"pairs={len(corrective_pair_categories)} "
+                        f"frames={len(corrective)}."
+                    )
+                (
+                    self._sample_indices,
+                    self.pgc_v9_closed_loop_group_ids,
+                ) = build_pgc_v929_sample_plan(
+                    offline_native_indices=offline_native,
+                    original_counterfactual_indices=original,
+                    strict_counterfactual_indices=strict,
+                    corrective_counterfactual_indices=corrective,
+                    strict_relation_categories=strict_categories,
+                    corrective_pair_categories=corrective_pair_categories,
+                )
+                logger.info(
+                    "PGC V9.29 productive curriculum: offline_native=%d "
+                    "historical_cf=%d strict_cf=%d closed_loop_corrective_cf=%d",
+                    *(
+                        self.pgc_v9_closed_loop_group_ids.count(group)
+                        for group in range(4)
+                    ),
+                )
+            elif self.pgc_v9_closed_loop_grounding:
                 offline_native = list(range(self.pgc_offline_native_frame_count))
                 closed_loop_native = list(
                     range(

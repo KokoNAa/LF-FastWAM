@@ -16,6 +16,7 @@ from fastwam.datasets.lerobot.robot_video_dataset import (
     RobotVideoDataset,
     build_pgc_v96_sample_plan,
     build_pgc_v912_sample_plan,
+    build_pgc_v929_sample_plan,
     build_pgc_v9_sample_indices,
 )
 from fastwam.datasets.lerobot.base_lerobot_dataset import BaseLerobotDataset
@@ -541,6 +542,25 @@ class PGCERAFSamplingTest(unittest.TestCase):
         self.assertEqual(holding, released)
         self.assertEqual(released, next_clause)
         self.assertEqual(sampled[13] + sampled[14], sampled[15])
+
+    def test_v929_replaces_dummy_native_rows_with_balanced_corrective_cf(self):
+        indices, groups = build_pgc_v929_sample_plan(
+            offline_native_indices=[0, 1, 2],
+            original_counterfactual_indices=[10, 11],
+            strict_counterfactual_indices=[20, 21, 22],
+            corrective_counterfactual_indices=[30, 31, 32, 33],
+            strict_relation_categories=["entity", "entity", "relation"],
+            corrective_pair_categories=["a", "a", "a", "b"],
+        )
+        self.assertEqual(len(indices), len(groups))
+        self.assertEqual(set(groups), {0, 1, 2, 3})
+        self.assertEqual(len(set(Counter(groups).values())), 1)
+        for position in range(0, len(groups), 4):
+            self.assertEqual(groups[position : position + 4], [0, 1, 2, 3])
+        sampled = Counter(indices)
+        self.assertEqual(sampled[20] + sampled[21], sampled[22])
+        self.assertEqual(sampled[30] + sampled[31] + sampled[32], sampled[33])
+        self.assertFalse(set(indices) & {3, 4, 5})
 
     def test_v911_mines_only_multiclause_v910_native_failures(self):
         def record(

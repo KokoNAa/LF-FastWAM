@@ -1,0 +1,144 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam
+  - _self_
+
+# V9.29 rollout-aligned safe-gain repair. Warm-start the completed V9.28
+# checkpoint, keep the no-ERAF LoRA and complete ERAF bundle frozen, and train
+# the same single Action Expert path in two non-overlapping stages:
+#   0..6999: compressor + context injector, two diffusion-noise levels;
+#   7000..9999: detached-feature gain-gate calibration only.
+batch_size: 1
+num_workers: 2
+gradient_accumulation_steps: 4
+
+model:
+  mot_checkpoint_mixed_attn: true
+  action_dit_config:
+    use_latent_action_queries: false
+  langforce_mvp:
+    enabled: false
+    enable_prior: false
+    enable_posterior_advantage: false
+  transition_contract:
+    enabled: false
+  policy_guard:
+    enabled: true
+    version: 9
+    gate_mode: guarded
+    entity_relation_grounding:
+      training_stage: action
+      initialization_contract: released_base_pretrained_eraf
+      grounding_objective_version: 29
+      completion_only_memory: true
+      action_joint_training: true
+      fresh_joint_training: false
+      pretrained_joint_training: true
+      safe_gain_training: true
+      pretrained_checkpoint: null
+      bidirectional_supervision: true
+      grounding_aux_weight: 0.0
+      context_injection_warmup_steps: 0
+      context_injection_ramp_steps: 0
+      action_geometry_learning_rate: 2.0e-5
+      action_causal_ranking_weight: 1.0
+      action_causal_margin: 0.01
+      expert_lora_native_action_weight: 1.0
+      expert_lora_counterfactual_action_weight: 1.0
+      safe_gain_num_tokens: 4
+      safe_gain_gate_hidden_dim: 128
+      safe_gain_gate_initial_probability: 0.10
+      # This remains the V9.28 training contract. Deployment sweeps use the
+      # separate runtime-only field and never rewrite checkpoint provenance.
+      safe_gain_gate_threshold: 0.80
+      safe_gain_deployment_threshold: null
+      safe_gain_gate_loss_weight: 1.0
+      safe_gain_wrong_gate_loss_weight: 0.5
+      safe_gain_gate_ranking_weight: 1.0
+      safe_gain_gate_ranking_margin: 1.0
+      safe_gain_non_regression_weight: 2.0
+      safe_gain_margin: 0.002
+      safe_gain_injector_training_steps: 7000
+      safe_gain_gate_calibration_steps: 3000
+      safe_gain_noise_levels: 2
+      safe_gain_closed_loop_action_weight: 2.0
+      safe_gain_closed_loop_non_regression_weight: 4.0
+
+      # Frozen source ERAF diagnostic contract.
+      mask_weight: 1.0
+      attention_mask_weight: 2.0
+      entity_weight: 1.0
+      relation_weight: 1.0
+      anchor_weight: 1.0
+      position_weight: 0.5
+      role_swap_weight: 2.0
+      role_overlap_weight: 1.0
+      role_assignment_weight: 1.0
+      role_assignment_hard_weight: 0.5
+      structured_assignment_weight: 2.0
+      structured_assignment_hard_weight: 1.0
+      multi_clause_consistency_weight: 2.0
+      clause_tuple_assignment_weight: 4.0
+      clause_tuple_hard_weight: 1.0
+      clause_tuple_multi_consistency_weight: 2.0
+      clause_activation_balance_weight: 1.0
+      clause_cardinality_weight: 1.0
+      clause_worst_slot_weight: 2.0
+      clause_adapter_energy_weight: 0.01
+      view_fusion_weight: 2.0
+      view_fusion_energy_weight: 0.01
+      clause_scheduler_weight: 1.0
+      clause_scheduler_energy_weight: 0.01
+      phase_safe_memory_state_weight: 1.0
+      phase_safe_memory_scheduler_weight: 1.0
+      phase_safe_memory_energy_weight: 0.01
+      role_attention_preservation_weight: 0.0
+      role_position_preservation_weight: 0.0
+      role_anchor_preservation_weight: 0.0
+      role_relation_preservation_weight: 0.0
+      role_adapter_energy_weight: 0.01
+  lora:
+    enabled: true
+    rank: 16
+    alpha: 16
+    dropout: 0.05
+    experts: [video, action]
+    extra_trainable_patterns: []
+    paired_language_control:
+      enabled: false
+
+data:
+  train:
+    pretrained_norm_stats: ./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json
+    pgc_counterfactual_dataset_dirs: []
+    pgc_closed_loop_corrective_dataset_dirs: []
+    pgc_counterfactual_oversample_factor: 1
+    pgc_closed_loop_corrective_oversample_factor: 1
+    pgc_balance_native_counterfactual: true
+    pgc_entity_relation_supervision_required: true
+    pgc_entity_relation_sidecar_dirs: []
+    pgc_bidirectional_language_supervision_required: true
+    pgc_v9_balanced_sampling: true
+    pgc_v9_structured_role_sampling: false
+    pgc_v9_hard_role_curriculum: false
+    pgc_v9_hard_role_index_path: null
+    pgc_v9_closed_loop_rebinding: false
+    pgc_v9_phase_safe_memory: true
+    pgc_v9_closed_loop_native_dataset_count: 1
+    pgc_v9_safe_gain_counterfactual_replay: true
+
+learning_rate: 2.0e-5
+# A single cosine schedule would starve the gate after the 7k transition.
+# Constant LR keeps the isolated 3k calibration stage fully trainable.
+lr_scheduler_type: constant
+weight_decay: 1.0e-2
+max_grad_norm: 1.0
+num_epochs: 1
+max_steps: 10000
+log_every: 10
+save_every: 250
+eval_every: 0
+save_training_state: false
+resume: null

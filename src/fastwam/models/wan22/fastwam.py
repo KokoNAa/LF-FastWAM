@@ -760,6 +760,14 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_safe_gain_gate_threshold = float(
             eraf_config.get("safe_gain_gate_threshold", 0.80)
         )
+        raw_deployment_threshold = eraf_config.get(
+            "safe_gain_deployment_threshold", None
+        )
+        self.policy_guard_eraf_safe_gain_deployment_threshold = (
+            self.policy_guard_eraf_safe_gain_gate_threshold
+            if raw_deployment_threshold in (None, "", "null")
+            else float(raw_deployment_threshold)
+        )
         self.policy_guard_eraf_safe_gain_gate_initial_probability = float(
             eraf_config.get("safe_gain_gate_initial_probability", 0.10)
         )
@@ -794,6 +802,21 @@ class FastWAM(torch.nn.Module):
         )
         self.policy_guard_eraf_safe_gain_margin = float(
             eraf_config.get("safe_gain_margin", 0.002)
+        )
+        self.policy_guard_eraf_safe_gain_injector_training_steps = int(
+            eraf_config.get("safe_gain_injector_training_steps", 0)
+        )
+        self.policy_guard_eraf_safe_gain_gate_calibration_steps = int(
+            eraf_config.get("safe_gain_gate_calibration_steps", 0)
+        )
+        self.policy_guard_eraf_safe_gain_noise_levels = int(
+            eraf_config.get("safe_gain_noise_levels", 1)
+        )
+        self.policy_guard_eraf_safe_gain_closed_loop_action_weight = float(
+            eraf_config.get("safe_gain_closed_loop_action_weight", 1.0)
+        )
+        self.policy_guard_eraf_safe_gain_closed_loop_non_regression_weight = float(
+            eraf_config.get("safe_gain_closed_loop_non_regression_weight", 2.0)
         )
         self.policy_guard_eraf_safe_gain_diagnostic_dim = 8
         self.policy_guard_eraf_action_causal_ranking_weight = float(
@@ -1558,10 +1581,11 @@ class FastWAM(torch.nn.Module):
                     26,
                     27,
                     28,
+                    29,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "between 1 and 28 inclusive."
+                        "between 1 and 29 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1791,6 +1815,14 @@ class FastWAM(torch.nn.Module):
                         )
                     if not (
                         0.0
+                        < self.policy_guard_eraf_safe_gain_deployment_threshold
+                        <= 1.0
+                    ):
+                        raise ValueError(
+                            "ERAF safe-gain deployment threshold must lie in (0, 1]."
+                        )
+                    if not (
+                        0.0
                         < self.policy_guard_eraf_safe_gain_gate_initial_probability
                         < 1.0
                     ):
@@ -1835,6 +1867,28 @@ class FastWAM(torch.nn.Module):
                             "PGC V9.28 requires positive wrong-gate rejection "
                             "and pairwise gate-ranking weights/margin."
                         )
+                    if self.policy_guard_eraf_grounding_objective_version >= 29:
+                        if min(
+                            self.policy_guard_eraf_safe_gain_injector_training_steps,
+                            self.policy_guard_eraf_safe_gain_gate_calibration_steps,
+                        ) <= 0:
+                            raise ValueError(
+                                "PGC V9.29 requires positive injector and gate "
+                                "calibration stage lengths."
+                            )
+                        if self.policy_guard_eraf_safe_gain_noise_levels < 2:
+                            raise ValueError(
+                                "PGC V9.29 requires at least two independent "
+                                "diffusion-noise supervision levels."
+                            )
+                        if min(
+                            self.policy_guard_eraf_safe_gain_closed_loop_action_weight,
+                            self.policy_guard_eraf_safe_gain_closed_loop_non_regression_weight,
+                        ) <= 0.0:
+                            raise ValueError(
+                                "PGC V9.29 closed-loop action/non-regression "
+                                "weights must be positive."
+                            )
                 if (
                     self.policy_guard_eraf_grounding_objective_version >= 15
                     and not (
@@ -2597,6 +2651,33 @@ class FastWAM(torch.nn.Module):
         self._policy_guard_training_step = max(0, int(step))
         self._policy_guard_training_max_steps = max(1, int(max_steps))
         self._policy_guard_training_progress_active = True
+        if (
+            self.policy_guard_enabled
+            and self.policy_guard_version == 9
+            and self.policy_guard_eraf_grounding_objective_version >= 29
+            and self._policy_guard_training_max_steps
+            != (
+                self.policy_guard_eraf_safe_gain_injector_training_steps
+                + self.policy_guard_eraf_safe_gain_gate_calibration_steps
+            )
+        ):
+            raise ValueError(
+                "PGC V9.29 max_steps must equal injector_training_steps + "
+                "gate_calibration_steps."
+            )
+
+    def _policy_guard_v929_training_phase(self) -> str:
+        """Return the effective safe-gain optimization phase."""
+        if self.policy_guard_eraf_grounding_objective_version < 29:
+            return "joint"
+        step = (
+            self._policy_guard_training_step
+            if self._policy_guard_training_progress_active
+            else 0
+        )
+        if step < self.policy_guard_eraf_safe_gain_injector_training_steps:
+            return "injector"
+        return "gate"
 
     def _policy_guard_verifier_scale(self) -> float:
         """Delay v3 verifier/alignment until the action residual is useful."""
@@ -4244,6 +4325,7 @@ class FastWAM(torch.nn.Module):
         *,
         routed_goal_queries: torch.Tensor,
         eraf_outputs: Mapping[str, torch.Tensor],
+        detach_gate_inputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if not self.policy_guard_eraf_safe_gain_training:
             raise RuntimeError("ERAF safe-gain decision requires V9.27.")
@@ -4251,9 +4333,11 @@ class FastWAM(torch.nn.Module):
             "eraf_action_token_compressor"
         ](routed_goal_queries)
         diagnostics = self._policy_guard_eraf_gain_features(eraf_outputs)
+        gate_tokens = compressed.detach() if detach_gate_inputs else compressed
+        gate_diagnostics = diagnostics.detach() if detach_gate_inputs else diagnostics
         probability, gate_metrics = self.policy_guard_modules["eraf_gain_gate"](
-            compressed_tokens=compressed,
-            diagnostic_features=diagnostics,
+            compressed_tokens=gate_tokens,
+            diagnostic_features=gate_diagnostics,
         )
         metrics = dict(compressor_metrics)
         metrics.update(gate_metrics)
@@ -9042,6 +9126,7 @@ class FastWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         is_counterfactual = inputs["pgc_is_counterfactual"]
         direct_action_valid = inputs["pgc_direct_action_valid"]
+        is_closed_loop_corrective = inputs.get("pgc_is_closed_loop_corrective")
         paired_language_valid = inputs["pgc_paired_language_valid"]
         source_context = inputs["pgc_source_context"]
         source_context_mask = inputs["pgc_source_context_mask"]
@@ -9077,12 +9162,45 @@ class FastWAM(torch.nn.Module):
             target_context_mask=target_context_mask,
         )
         batch_size = int(action.shape[0])
+        training_phase = self._policy_guard_v929_training_phase()
+        if self.policy_guard_eraf_grounding_objective_version >= 29:
+            injector_active = training_phase == "injector"
+            self.policy_guard_modules["eraf_action_token_compressor"].train(
+                injector_active
+            )
+            self.policy_guard_modules["eraf_action_context_injector"].train(
+                injector_active
+            )
+            self.policy_guard_modules["eraf_gain_gate"].train(
+                training_phase == "gate"
+            )
         direct_action_valid = torch.as_tensor(
             direct_action_valid, device=action.device, dtype=torch.bool
         )
         is_counterfactual = torch.as_tensor(
             is_counterfactual, device=action.device, dtype=torch.bool
         )
+        if self.policy_guard_eraf_grounding_objective_version >= 29:
+            if is_closed_loop_corrective is None:
+                raise ValueError(
+                    "PGC V9.29 requires closed-loop corrective provenance."
+                )
+            is_closed_loop_corrective = torch.as_tensor(
+                is_closed_loop_corrective,
+                device=action.device,
+                dtype=torch.bool,
+            )
+            if is_closed_loop_corrective.shape != (batch_size,):
+                raise ValueError(
+                    "`pgc_is_closed_loop_corrective` must be [B], got "
+                    f"{tuple(is_closed_loop_corrective.shape)}."
+                )
+            if torch.any(is_closed_loop_corrective & ~is_counterfactual):
+                raise ValueError(
+                    "PGC V9.29 corrective rows must be counterfactual."
+                )
+        else:
+            is_closed_loop_corrective = torch.zeros_like(is_counterfactual)
         paired_language_valid = torch.as_tensor(
             paired_language_valid, device=action.device, dtype=torch.bool
         )
@@ -9095,10 +9213,15 @@ class FastWAM(torch.nn.Module):
                 f"{tuple(bidirectional_valid.shape)}."
             )
         native_valid = direct_action_valid & ~is_counterfactual
-        counterfactual_valid = direct_action_valid & is_counterfactual
+        counterfactual_valid = (
+            direct_action_valid & is_counterfactual & ~is_closed_loop_corrective
+        )
+        corrective_valid = direct_action_valid & is_closed_loop_corrective
         source_semantic_valid = native_valid & bidirectional_valid
         target_semantic_valid = (
-            counterfactual_valid & paired_language_valid & bidirectional_valid
+            (counterfactual_valid | corrective_valid)
+            & paired_language_valid
+            & bidirectional_valid
         )
         semantic_valid = source_semantic_valid | target_semantic_valid
 
@@ -9243,6 +9366,7 @@ class FastWAM(torch.nn.Module):
                 eraf_outputs={
                     name: value.detach() for name, value in correct_eraf_outputs.items()
                 },
+                detach_gate_inputs=training_phase == "gate",
             )
         )
         wrong_tokens, wrong_gate_probability, wrong_safe_metrics = (
@@ -9251,41 +9375,43 @@ class FastWAM(torch.nn.Module):
                 eraf_outputs={
                     name: value.detach() for name, value in wrong_eraf_outputs.items()
                 },
+                detach_gate_inputs=training_phase == "gate",
             )
         )
-        correct_action, injection_metrics = (
-            self._forward_policy_guard_action_from_cache(
+        with torch.set_grad_enabled(training_phase != "gate"):
+            correct_action, injection_metrics = (
+                self._forward_policy_guard_action_from_cache(
+                    action_tokens=noisy_action,
+                    timestep_action=timestep_action,
+                    context=correct_context,
+                    full_context_mask=correct_context_mask,
+                    state_only_context_mask=state_only_context_mask,
+                    video_kv_cache=video_kv_cache,
+                    video_seq_len=video_seq_len,
+                    video_tokens_per_frame=video_tokens_per_frame,
+                    routed_goal_queries=correct_tokens,
+                    return_metrics=True,
+                    checkpoint_frozen_action_expert=True,
+                )
+            )
+            wrong_action = self._forward_policy_guard_action_from_cache(
                 action_tokens=noisy_action,
                 timestep_action=timestep_action,
-                context=correct_context,
-                full_context_mask=correct_context_mask,
+                context=wrong_context,
+                full_context_mask=wrong_context_mask,
                 state_only_context_mask=state_only_context_mask,
                 video_kv_cache=video_kv_cache,
                 video_seq_len=video_seq_len,
                 video_tokens_per_frame=video_tokens_per_frame,
-                routed_goal_queries=correct_tokens,
-                return_metrics=True,
+                routed_goal_queries=wrong_tokens,
                 checkpoint_frozen_action_expert=True,
             )
-        )
-        wrong_action = self._forward_policy_guard_action_from_cache(
-            action_tokens=noisy_action,
-            timestep_action=timestep_action,
-            context=wrong_context,
-            full_context_mask=wrong_context_mask,
-            state_only_context_mask=state_only_context_mask,
-            video_kv_cache=video_kv_cache,
-            video_seq_len=video_seq_len,
-            video_tokens_per_frame=video_tokens_per_frame,
-            routed_goal_queries=wrong_tokens,
-            checkpoint_frozen_action_expert=True,
-        )
-        base_error = self._compute_action_loss_per_sample(
+        base_error_first = self._compute_action_loss_per_sample(
             pred_action=base_action,
             target_action=target_action,
             action_is_pad=action_is_pad,
         )
-        correct_error = self._compute_action_loss_per_sample(
+        correct_error_first = self._compute_action_loss_per_sample(
             pred_action=correct_action,
             target_action=target_action,
             action_is_pad=action_is_pad,
@@ -9296,21 +9422,92 @@ class FastWAM(torch.nn.Module):
             action_is_pad=action_is_pad,
         )
         action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
-            device=action.device, dtype=correct_error.dtype
+            device=action.device, dtype=correct_error_first.dtype
         )
         if action_weight.ndim == 0:
             action_weight = action_weight.expand(batch_size)
         else:
             action_weight = action_weight.reshape(batch_size)
+        base_errors = [base_error_first]
+        correct_errors = [correct_error_first]
+        weighted_correct_errors = [correct_error_first * action_weight]
+        for _ in range(1, self.policy_guard_eraf_safe_gain_noise_levels):
+            extra_noise = torch.randn_like(action)
+            extra_timestep = self.train_action_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=action.device,
+                dtype=action.dtype,
+            )
+            extra_noisy_action = self.train_action_scheduler.add_noise(
+                action, extra_noise, extra_timestep
+            )
+            extra_target = self.train_action_scheduler.training_target(
+                action, extra_noise, extra_timestep
+            )
+            with torch.no_grad():
+                extra_base_action = self._predict_action_noise_with_cache(
+                    latents_action=extra_noisy_action,
+                    timestep_action=extra_timestep,
+                    context=correct_context,
+                    context_mask=correct_context_mask,
+                    state_only_context_mask=state_only_context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                )
+            with torch.set_grad_enabled(training_phase != "gate"):
+                extra_correct_action = (
+                    self._forward_policy_guard_action_from_cache(
+                        action_tokens=extra_noisy_action,
+                        timestep_action=extra_timestep,
+                        context=correct_context,
+                        full_context_mask=correct_context_mask,
+                        state_only_context_mask=state_only_context_mask,
+                        video_kv_cache=video_kv_cache,
+                        video_seq_len=video_seq_len,
+                        video_tokens_per_frame=video_tokens_per_frame,
+                        routed_goal_queries=correct_tokens,
+                        checkpoint_frozen_action_expert=True,
+                    )
+                )
+            extra_base_error = self._compute_action_loss_per_sample(
+                pred_action=extra_base_action,
+                target_action=extra_target,
+                action_is_pad=action_is_pad,
+            )
+            extra_correct_error = self._compute_action_loss_per_sample(
+                pred_action=extra_correct_action,
+                target_action=extra_target,
+                action_is_pad=action_is_pad,
+            )
+            extra_weight = self.train_action_scheduler.training_weight(
+                extra_timestep
+            ).to(device=action.device, dtype=extra_correct_error.dtype)
+            if extra_weight.ndim == 0:
+                extra_weight = extra_weight.expand(batch_size)
+            else:
+                extra_weight = extra_weight.reshape(batch_size)
+            base_errors.append(extra_base_error)
+            correct_errors.append(extra_correct_error)
+            weighted_correct_errors.append(extra_correct_error * extra_weight)
+
+        base_error = torch.stack(base_errors, dim=0).mean(dim=0)
+        correct_error = torch.stack(correct_errors, dim=0).mean(dim=0)
+        weighted_correct_error = torch.stack(
+            weighted_correct_errors, dim=0
+        ).mean(dim=0)
         native_action_loss = self._masked_policy_guard_mean(
-            correct_error * action_weight, native_valid
+            weighted_correct_error, native_valid
         )
         counterfactual_action_loss = self._masked_policy_guard_mean(
-            correct_error * action_weight, counterfactual_valid
+            weighted_correct_error, counterfactual_valid
+        )
+        corrective_action_loss = self._masked_policy_guard_mean(
+            weighted_correct_error, corrective_valid
         )
         ranking_per_sample = torch.relu(
             self.policy_guard_eraf_action_causal_margin
-            + correct_error.detach()
+            + correct_error_first.detach()
             - wrong_error
         )
         source_ranking = self._masked_policy_guard_mean(
@@ -9320,9 +9517,21 @@ class FastWAM(torch.nn.Module):
             ranking_per_sample, target_semantic_valid
         )
         ranking_loss = source_ranking + target_ranking
-        non_regression_per_sample = torch.relu(correct_error - base_error.detach())
+        non_regression_per_sample = torch.stack(
+            [
+                torch.relu(candidate - baseline.detach())
+                for candidate, baseline in zip(
+                    correct_errors, base_errors, strict=True
+                )
+            ],
+            dim=0,
+        ).mean(dim=0)
         non_regression_loss = self._masked_policy_guard_mean(
-            non_regression_per_sample, direct_action_valid
+            non_regression_per_sample,
+            direct_action_valid & ~is_closed_loop_corrective,
+        )
+        corrective_non_regression_loss = self._masked_policy_guard_mean(
+            non_regression_per_sample, corrective_valid
         )
         gate_target = (
             correct_error.detach() + self.policy_guard_eraf_safe_gain_margin
@@ -9368,14 +9577,23 @@ class FastWAM(torch.nn.Module):
             self.policy_guard_eraf_expert_lora_native_action_weight * native_action_loss
             + self.policy_guard_eraf_expert_lora_counterfactual_action_weight
             * counterfactual_action_loss
+            + self.policy_guard_eraf_safe_gain_closed_loop_action_weight
+            * corrective_action_loss
         )
-        total = (
+        action_and_protection_objective = (
             action_objective
             + self.policy_guard_eraf_action_causal_ranking_weight * ranking_loss
             + self.policy_guard_eraf_safe_gain_non_regression_weight
             * non_regression_loss
-            + gate_objective
+            + self.policy_guard_eraf_safe_gain_closed_loop_non_regression_weight
+            * corrective_non_regression_loss
         )
+        if training_phase == "injector":
+            total = action_and_protection_objective
+        elif training_phase == "gate":
+            total = gate_objective
+        else:
+            total = action_and_protection_objective + gate_objective
 
         direct_count = direct_action_valid.float().sum().clamp_min(1.0)
         semantic_count = semantic_valid.float().sum().clamp_min(1.0)
@@ -9392,10 +9610,16 @@ class FastWAM(torch.nn.Module):
             "loss_pgc_v927_counterfactual_action_flow": (
                 counterfactual_action_loss.detach()
             ),
+            "loss_pgc_v929_closed_loop_counterfactual_action_flow": (
+                corrective_action_loss.detach()
+            ),
             "loss_pgc_v927_wrong_semantic_ranking": ranking_loss.detach(),
             "loss_pgc_v927_source_language_ranking": source_ranking.detach(),
             "loss_pgc_v927_target_language_ranking": target_ranking.detach(),
             "loss_pgc_v927_non_regression": non_regression_loss.detach(),
+            "loss_pgc_v929_closed_loop_non_regression": (
+                corrective_non_regression_loss.detach()
+            ),
             "loss_pgc_v927_gain_gate": gate_objective.detach(),
             "loss_pgc_v928_correct_gain_gate": correct_gate_loss.detach(),
             "loss_pgc_v928_wrong_gain_gate": wrong_gate_loss.detach(),
@@ -9459,6 +9683,18 @@ class FastWAM(torch.nn.Module):
             "pgc_v928_gate_corrected_supervision": (
                 correct_error.new_tensor(float(corrected_gate_supervision))
             ),
+            "pgc_v929_injector_phase": correct_error.new_tensor(
+                float(training_phase == "injector")
+            ),
+            "pgc_v929_gate_calibration_phase": correct_error.new_tensor(
+                float(training_phase == "gate")
+            ),
+            "pgc_v929_noise_levels": correct_error.new_tensor(
+                float(self.policy_guard_eraf_safe_gain_noise_levels)
+            ),
+            "pgc_v929_closed_loop_corrective_valid_rate": (
+                corrective_valid.float().mean()
+            ),
             "pgc_v927_base_candidate_delta_rms": (
                 (correct_action - base_action).float().square().mean().sqrt()
             ),
@@ -9488,13 +9724,27 @@ class FastWAM(torch.nn.Module):
         detached.update(
             {
                 "loss_video": 0.0,
-                "loss_action": float(action_objective.detach().float().item()),
+                "loss_action": float(
+                    (
+                        action_objective
+                        if training_phase != "gate"
+                        else action_objective.new_zeros(())
+                    )
+                    .detach()
+                    .float()
+                    .item()
+                ),
                 "loss_pgc_action": float(
-                    counterfactual_action_loss.detach().float().item()
+                    (
+                        counterfactual_action_loss
+                        + corrective_action_loss
+                    ).detach().float().item()
                 ),
                 "loss_pgc_v9_eraf": 0.0,
                 "pgc_video_loss_optimization_weight": 0.0,
-                "pgc_action_effective_weight": float(self.loss_lambda_action),
+                "pgc_action_effective_weight": float(
+                    self.loss_lambda_action if training_phase != "gate" else 0.0
+                ),
                 "pgc_v9_grounding_effective_weight": 0.0,
             }
         )
@@ -15383,7 +15633,7 @@ class FastWAM(torch.nn.Module):
                     eraf_safe_gain_selected = True
                 else:
                     eraf_safe_gain_selected = gate_probability >= (
-                        self.policy_guard_eraf_safe_gain_gate_threshold
+                        self.policy_guard_eraf_safe_gain_deployment_threshold
                     )
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
@@ -15508,7 +15758,8 @@ class FastWAM(torch.nn.Module):
                 "policy_guard_base_score": 1.0 - probability,
                 "policy_guard_counterfactual_score": probability,
                 "policy_guard_score_margin": (
-                    probability - self.policy_guard_eraf_safe_gain_gate_threshold
+                    probability
+                    - self.policy_guard_eraf_safe_gain_deployment_threshold
                 ),
                 "policy_guard_score_space": "pre_action_gain_probability",
                 "policy_guard_gate_mode": self.policy_guard_gate_mode,
@@ -16618,6 +16869,10 @@ class FastWAM(torch.nn.Module):
             is_v9
             and self.policy_guard_eraf_grounding_objective_version >= 28
         )
+        is_v929 = bool(
+            is_v9
+            and self.policy_guard_eraf_grounding_objective_version >= 29
+        )
         fresh_eraf_joint = bool(
             is_v926_plus and self.policy_guard_eraf_fresh_joint_training
         )
@@ -17633,6 +17888,10 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "eraf_safe_gain_gate_supervision_contract": (
+                "detached_gate_calibration_from_mean_multi_noise_action_advantage_"
+                "plus_wrong_language_rejection_and_positive_pair_logit_margin"
+                if is_v929
+                else
                 "correct_advantage_bce_plus_wrong_language_rejection_bce_plus_"
                 "positive_pair_logit_margin"
                 if is_v928
@@ -17647,6 +17906,39 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_safe_gain_margin": (
                 self.policy_guard_eraf_safe_gain_margin if is_v927 else None
+            ),
+            "eraf_safe_gain_schedule_contract": (
+                "injector_multinoise_then_detached_gate_calibration"
+                if is_v929
+                else None
+            ),
+            "eraf_safe_gain_injector_training_steps": (
+                self.policy_guard_eraf_safe_gain_injector_training_steps
+                if is_v929
+                else None
+            ),
+            "eraf_safe_gain_gate_calibration_steps": (
+                self.policy_guard_eraf_safe_gain_gate_calibration_steps
+                if is_v929
+                else None
+            ),
+            "eraf_safe_gain_noise_levels": (
+                self.policy_guard_eraf_safe_gain_noise_levels if is_v929 else None
+            ),
+            "eraf_safe_gain_closed_loop_action_weight": (
+                self.policy_guard_eraf_safe_gain_closed_loop_action_weight
+                if is_v929
+                else None
+            ),
+            "eraf_safe_gain_closed_loop_non_regression_weight": (
+                self.policy_guard_eraf_safe_gain_closed_loop_non_regression_weight
+                if is_v929
+                else None
+            ),
+            "eraf_safe_gain_data_contract": (
+                "offline_native_historical_strict_closed_loop_counterfactual_1_1_1_1"
+                if is_v929
+                else None
             ),
             "eraf_safe_gain_visual_contract": (
                 "same_video_expert_with_lora_disabled_for_eraf_features"
@@ -19211,6 +19503,62 @@ class FastWAM(torch.nn.Module):
             and bool(metadata.get("eraf_action_joint_training", False))
             and self.policy_guard_eraf_action_joint_training
         )
+        migrate_v928_to_v929_rollout_safe_gain = (
+            saved_policy_guard_version == 9
+            and int(self.policy_guard_version) == 9
+            and saved_eraf_grounding_objective == 28
+            and self.policy_guard_eraf_grounding_objective_version == 29
+            and self.policy_guard_eraf_training_stage == "action"
+            and metadata.get("eraf_training_stage") == "action"
+            and saved_eraf_completion_only_memory
+            and self.policy_guard_eraf_completion_only_memory
+            and bool(metadata.get("eraf_action_joint_training", False))
+            and self.policy_guard_eraf_action_joint_training
+            and saved_eraf_safe_gain_training
+            and self.policy_guard_eraf_safe_gain_training
+        )
+        if migrate_v928_to_v929_rollout_safe_gain:
+            provenance_fields = {
+                "eraf_pretrained_source_checkpoint": str,
+                "eraf_pretrained_source_sha256": str,
+                "eraf_pretrained_source_objective": int,
+                "eraf_pretrained_source_step": int,
+                "eraf_pretrained_tensor_count": int,
+            }
+            restored_provenance: dict[str, Any] = {}
+            for name, cast in provenance_fields.items():
+                value = metadata.get(name)
+                if value in (None, ""):
+                    raise ValueError(
+                        "PGC V9.28 -> V9.29 warm start is missing ERAF "
+                        f"provenance {name!r}."
+                    )
+                restored_provenance[name] = cast(value)
+            self.policy_guard_eraf_pretrained_source_checkpoint = (
+                restored_provenance["eraf_pretrained_source_checkpoint"]
+            )
+            self.policy_guard_eraf_pretrained_source_sha256 = (
+                restored_provenance["eraf_pretrained_source_sha256"]
+            )
+            self.policy_guard_eraf_pretrained_source_objective = (
+                restored_provenance["eraf_pretrained_source_objective"]
+            )
+            self.policy_guard_eraf_pretrained_source_step = restored_provenance[
+                "eraf_pretrained_source_step"
+            ]
+            self.policy_guard_eraf_pretrained_tensor_count = restored_provenance[
+                "eraf_pretrained_tensor_count"
+            ]
+            restored_scope = str(metadata.get("eraf_pretrained_scope", ""))
+            if restored_scope != (
+                "goal_query_seeds_plus_goal_graph_plus_"
+                "entity_relation_affordance"
+            ):
+                raise ValueError(
+                    "PGC V9.28 -> V9.29 warm start lacks the complete ERAF "
+                    "bundle scope."
+                )
+            self.policy_guard_eraf_pretrained_scope = restored_scope
         if migrate_v914_to_v915_action_grounding:
             expected_v914_warm_start = {
                 "eraf_action_joint_contract": (
@@ -20454,6 +20802,11 @@ class FastWAM(torch.nn.Module):
                                 and self.policy_guard_eraf_grounding_objective_version
                                 == 26
                             )
+                            or (
+                                saved_grounding_objective == 28
+                                and self.policy_guard_eraf_grounding_objective_version
+                                == 29
+                            )
                         )
                         objective_upgrade = objective_upgrade and (
                             (
@@ -20473,6 +20826,7 @@ class FastWAM(torch.nn.Module):
                             or migrate_v921_to_v924_isolated_clause_residual
                             or migrate_v924_to_v925_action_context
                             or migrate_v925_to_v926_shared_expert_lora
+                            or migrate_v928_to_v929_rollout_safe_gain
                         )
                         if (
                             saved_grounding_objective
@@ -21910,9 +22264,42 @@ class FastWAM(torch.nn.Module):
                                                 gate_ranking_margin
                                             ),
                                             "eraf_safe_gain_gate_supervision_contract": (
-                                                "correct_advantage_bce_plus_wrong_"
-                                                "language_rejection_bce_plus_positive_"
+                                                "detached_gate_calibration_from_mean_"
+                                                "multi_noise_action_advantage_plus_"
+                                                "wrong_language_rejection_and_positive_"
                                                 "pair_logit_margin"
+                                                if saved_grounding_objective >= 29
+                                                else "correct_advantage_bce_plus_"
+                                                "wrong_language_rejection_bce_plus_"
+                                                "positive_pair_logit_margin"
+                                            ),
+                                        }
+                                    )
+                                if saved_grounding_objective >= 29:
+                                    expected_v914_contract.update(
+                                        {
+                                            "eraf_safe_gain_schedule_contract": (
+                                                "injector_multinoise_then_detached_"
+                                                "gate_calibration"
+                                            ),
+                                            "eraf_safe_gain_injector_training_steps": (
+                                                self.policy_guard_eraf_safe_gain_injector_training_steps
+                                            ),
+                                            "eraf_safe_gain_gate_calibration_steps": (
+                                                self.policy_guard_eraf_safe_gain_gate_calibration_steps
+                                            ),
+                                            "eraf_safe_gain_noise_levels": (
+                                                self.policy_guard_eraf_safe_gain_noise_levels
+                                            ),
+                                            "eraf_safe_gain_closed_loop_action_weight": (
+                                                self.policy_guard_eraf_safe_gain_closed_loop_action_weight
+                                            ),
+                                            "eraf_safe_gain_closed_loop_non_regression_weight": (
+                                                self.policy_guard_eraf_safe_gain_closed_loop_non_regression_weight
+                                            ),
+                                            "eraf_safe_gain_data_contract": (
+                                                "offline_native_historical_strict_"
+                                                "closed_loop_counterfactual_1_1_1_1"
                                             ),
                                         }
                                     )
@@ -22402,6 +22789,7 @@ class FastWAM(torch.nn.Module):
                 and not migrate_v921_to_v924_isolated_clause_residual
                 and not migrate_v924_to_v925_action_context
                 and not migrate_v925_to_v926_shared_expert_lora
+                and not migrate_v928_to_v929_rollout_safe_gain
             ):
                 optimizer.load_state_dict(payload["optimizer"])
             if migrate_v5_to_target_binder:
