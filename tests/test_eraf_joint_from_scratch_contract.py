@@ -213,6 +213,13 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
             "objective-29 safe-gain training restores a validated full",
         ):
             self.assertIn(contract, trainer)
+        for contract in (
+            "if step < start:",
+            "warmup=0/ramp=0",
+            "must retain a gradient path through the injector at optimizer step 0",
+            "PGC V9.29 produced a non-differentiable optimization loss",
+        ):
+            self.assertIn(contract, model)
 
     def test_checkpoint_loader_accepts_joint_role_scope_contracts(self):
         source = (

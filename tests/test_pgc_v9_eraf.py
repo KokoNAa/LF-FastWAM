@@ -1321,6 +1321,19 @@ class PGCERAFModuleTest(unittest.TestCase):
             "shared_action_expert_context_no_post_action_residual",
         )
 
+    def test_zero_warmup_zero_ramp_injects_from_first_optimizer_step(self):
+        model = SimpleNamespace(
+            policy_guard_eraf_end_to_end_joint_training=True,
+            _policy_guard_training_progress_active=True,
+            _policy_guard_training_step=0,
+            policy_guard_eraf_context_injection_warmup_steps=0,
+            policy_guard_eraf_context_injection_ramp_steps=0,
+        )
+        self.assertEqual(
+            FastWAM._policy_guard_eraf_context_injection_scale(model),
+            1.0,
+        )
+
     def test_fresh_eraf_joint_checkpoint_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

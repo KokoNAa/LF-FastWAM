@@ -2754,9 +2754,14 @@ class FastWAM(torch.nn.Module):
         step = self._policy_guard_training_step
         start = self.policy_guard_eraf_context_injection_warmup_steps
         ramp = self.policy_guard_eraf_context_injection_ramp_steps
-        if step <= start:
+        if step < start:
             return 0.0
-        if ramp <= 0 or step >= start + ramp:
+        # A zero-length ramp means that injection is fully active as soon as
+        # the warmup boundary is reached.  In particular, warmup=0/ramp=0
+        # must retain a gradient path through the injector at optimizer step 0.
+        if ramp <= 0:
+            return 1.0
+        if step >= start + ramp:
             return 1.0
         scale = (step - start) / ramp
         if scale >= 1.0 - 1.0e-12:
@@ -9594,6 +9599,15 @@ class FastWAM(torch.nn.Module):
             total = gate_objective
         else:
             total = action_and_protection_objective + gate_objective
+        if (
+            self.policy_guard_eraf_grounding_objective_version >= 29
+            and (total.numel() != 1 or total.grad_fn is None)
+        ):
+            raise RuntimeError(
+                "PGC V9.29 produced a non-differentiable optimization loss "
+                f"during the {training_phase!r} phase: "
+                f"shape={tuple(total.shape)} requires_grad={total.requires_grad}."
+            )
 
         direct_count = direct_action_valid.float().sum().clamp_min(1.0)
         semantic_count = semantic_valid.float().sum().clamp_min(1.0)
