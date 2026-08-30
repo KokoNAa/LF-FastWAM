@@ -175,18 +175,42 @@ class Wan22Trainer:
                     f"mismatches={mismatches}, "
                     f"closed_loop_native_count={closed_loop_count}."
                 )
-        if bool(
-            getattr(
-                self.model,
-                "policy_guard_eraf_pretrained_joint_training",
-                False,
+        v929_full_policy_resume = bool(self.resume) and (
+            int(getattr(self.model, "policy_guard_version", 0)) == 9
+            and int(
+                getattr(
+                    self.model,
+                    "policy_guard_eraf_grounding_objective_version",
+                    0,
+                )
             )
-        ) and not getattr(
-            self.model, "policy_guard_eraf_pretrained_checkpoint", None
+            == 29
+            and bool(
+                getattr(
+                    self.model,
+                    "policy_guard_eraf_safe_gain_training",
+                    False,
+                )
+            )
+        )
+        if (
+            bool(
+                getattr(
+                    self.model,
+                    "policy_guard_eraf_pretrained_joint_training",
+                    False,
+                )
+            )
+            and not getattr(
+                self.model, "policy_guard_eraf_pretrained_checkpoint", None
+            )
+            and not v929_full_policy_resume
         ):
             raise ValueError(
                 "Pretrained ERAF joint training requires "
-                "entity_relation_grounding.pretrained_checkpoint."
+                "entity_relation_grounding.pretrained_checkpoint unless "
+                "objective-29 safe-gain training restores a validated full "
+                "PGC policy through resume."
             )
         if bool(getattr(self.model, "policy_guard_enabled", False)) and bool(
             getattr(

@@ -186,6 +186,9 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         model = (
             REPO_ROOT / "src/fastwam/models/wan22/fastwam.py"
         ).read_text(encoding="utf-8")
+        trainer = (REPO_ROOT / "src/fastwam/trainer.py").read_text(
+            encoding="utf-8"
+        )
         for contract in (
             "grounding_objective_version: 29",
             "safe_gain_injector_training_steps: 7000",
@@ -201,6 +204,15 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         self.assertIn('detach_gate_inputs=training_phase == "gate"', model)
         self.assertIn('if training_phase == "injector":', model)
         self.assertIn('elif training_phase == "gate":', model)
+        for contract in (
+            "v929_full_policy_resume = bool(self.resume)",
+            'getattr(self.model, "policy_guard_version", 0)',
+            '"policy_guard_eraf_grounding_objective_version"',
+            '"policy_guard_eraf_safe_gain_training"',
+            "and not v929_full_policy_resume",
+            "objective-29 safe-gain training restores a validated full",
+        ):
+            self.assertIn(contract, trainer)
 
     def test_checkpoint_loader_accepts_joint_role_scope_contracts(self):
         source = (
