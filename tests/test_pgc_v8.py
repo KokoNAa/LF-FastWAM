@@ -176,6 +176,8 @@ class PGCV8DataContractTest(unittest.TestCase):
         self.assertIn("stop_on_success=True", builder)
         self.assertIn("counterfactual_goal_verified", builder)
         self.assertIn("_named_site_position", builder)
+        self.assertIn("_goal_satisfied(env, done=done)", builder)
+        self.assertIn("rejected_references", builder)
         self.assertIn("Trying V8 capture", builder)
         self.assertIn("closed_loop_capture_dir", evaluation)
         self.assertIn("_capture_libero_sim_state", evaluation)

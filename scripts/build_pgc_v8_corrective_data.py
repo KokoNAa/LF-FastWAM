@@ -53,6 +53,7 @@ from scripts.build_pgc_libero_data import (  # noqa: E402
     _existing_audits,
     _frame_from_obs,
     _get_inner_env,
+    _goal_satisfied,
     _make_source_env,
     _recover_pending,
     _reset_exact_state,
@@ -341,13 +342,19 @@ def _corrective_contract(
 def _corrective_succeeded(
     tracker: CounterfactualEpisodeTracker,
     *,
+    env: Any,
+    done: bool,
     verification_kind: str,
     target_objects: set[str],
 ) -> bool:
     if verification_kind == "target_lift":
         return _target_lifted(tracker, target_objects)
     if verification_kind == "counterfactual_goal":
-        return bool(tracker.counterfactual_goal_achieved)
+        # The source environment has already had its parsed goal replaced by
+        # the manifest's counterfactual BDDL goal. Match the exact success
+        # oracle used when the reference dataset was admitted; direct
+        # _eval_predicate calls can disagree for articulated fixture states.
+        return bool(_goal_satisfied(env, done=done))
     raise ValueError(
         f"Unsupported corrective verification kind: {verification_kind!r}."
     )
@@ -367,6 +374,8 @@ def _build_reference_bank(
     post_lift_steps: int,
 ) -> list[dict[str, Any]]:
     bank: list[dict[str, Any]] = []
+    rejected_references: list[str] = []
+    accepted_reference_episodes: set[int] = set()
     for audit in reference_audits:
         episode_index = int(audit["episode_index"])
         actions = _episode_actions(reference_dataset, episode_index)
@@ -383,14 +392,18 @@ def _build_reference_bank(
         tracker = _new_tracker(env, record, lift_threshold_m)
         tracker.observe(policy_step=0)
         verification_kind, target_objects = _corrective_contract(tracker, record)
-        if (
-            verification_kind == "counterfactual_goal"
-            and tracker.counterfactual_goal_achieved
+        if verification_kind == "counterfactual_goal" and _goal_satisfied(
+            env, done=False
         ):
-            raise RuntimeError(
-                f"Reference episode {episode_index} starts with the "
-                f"counterfactual goal already satisfied for {record['pair_id']}."
+            reason = "counterfactual goal already satisfied at initial state"
+            rejected_references.append(f"episode={episode_index}: {reason}")
+            LOGGER.warning(
+                "Rejected corrective reference episode=%d pair=%s: %s.",
+                episode_index,
+                record["pair_id"],
+                reason,
             )
+            continue
         trajectory_features: list[np.ndarray] = []
         first_target_acquisition_step: int | None = None
         first_verification_step: int | None = None
@@ -406,6 +419,8 @@ def _build_reference_bank(
                 reference_boundary_event = "grasp_contact"
             corrective_succeeded = _corrective_succeeded(
                 tracker,
+                env=env,
+                done=bool(done),
                 verification_kind=verification_kind,
                 target_objects=target_objects,
             )
@@ -433,10 +448,15 @@ def _build_reference_bank(
                 if verification_kind == "target_lift"
                 else "achieve the counterfactual goal"
             )
-            raise RuntimeError(
-                f"Reference episode {episode_index} never {requested} for pair "
-                f"{record['pair_id']}."
+            reason = f"never {requested}"
+            rejected_references.append(f"episode={episode_index}: {reason}")
+            LOGGER.warning(
+                "Rejected corrective reference episode=%d pair=%s: %s.",
+                episode_index,
+                record["pair_id"],
+                reason,
             )
+            continue
         if reference_boundary_event == "target_lift_fallback":
             LOGGER.warning(
                 "Reference episode %d uses target-lift fallback because the "
@@ -452,6 +472,7 @@ def _build_reference_bank(
             len(actions),
             first_verification_step + int(post_lift_steps),
         )
+        accepted_reference_episodes.add(episode_index)
         for action_index in candidate_indices:
             bank.append(
                 {
@@ -469,7 +490,8 @@ def _build_reference_bank(
             )
     if not bank:
         raise RuntimeError(
-            f"No pre-correction reference actions for {record['pair_id']}."
+            f"No replay-valid pre-correction reference actions for "
+            f"{record['pair_id']}; rejected={rejected_references}."
         )
     suffix_lengths = [len(item["actions"]) for item in bank]
     LOGGER.info(
@@ -477,7 +499,7 @@ def _build_reference_bank(
         "suffix_steps=%d..%d.",
         record["pair_id"],
         bank[0]["verification_kind"],
-        len(reference_audits),
+        len(accepted_reference_episodes),
         len(bank),
         min(suffix_lengths),
         max(suffix_lengths),
@@ -538,10 +560,7 @@ def _replay_for_corrective_success(
             "Corrective replay contract changed between reference and capture: "
             f"{verification_kind!r} != {contract_kind!r}."
         )
-    if (
-        verification_kind == "counterfactual_goal"
-        and tracker.counterfactual_goal_achieved
-    ):
+    if verification_kind == "counterfactual_goal" and _goal_satisfied(env, done=False):
         raise ValueError(
             f"Corrective replay starts with the counterfactual goal already "
             f"satisfied for {record['pair_id']}."
@@ -560,6 +579,8 @@ def _replay_for_corrective_success(
         tracker.observe(policy_step=used_actions)
         if verification_step is None and _corrective_succeeded(
             tracker,
+            env=env,
+            done=bool(done),
             verification_kind=verification_kind,
             target_objects=target_objects,
         ):
