@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Build replay-verified PGC V8 target-acquisition corrections.
+"""Build replay-verified PGC closed-loop corrective trajectories.
 
 The input states are captured at actual PGC closed-loop replanning points. For
-each state, this builder searches pre-grasp action suffixes from the audited PGC
+each state, this builder searches pre-correction action suffixes from the audited PGC
 counterfactual demonstrations, restores the captured simulator state exactly,
-and accepts a suffix only when two independent replays lift the requested
-target. The resulting LeRobot dataset is acquisition-only supervision for the
-frozen-V5 ActionChunkProposal; it is never instruction relabeling.
+and accepts a suffix only when two independent replays either lift a graspable
+target or complete an articulated/fixture counterfactual goal. The resulting
+LeRobot dataset is exact-state action supervision; it is never instruction
+relabeling.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from experiments.libero.counterfactual_diagnostics import (  # noqa: E402
 )
 from experiments.libero.libero_utils import quat2axisangle  # noqa: E402
 from fastwam.datasets.pgc_libero import (  # noqa: E402
-    PGC_CLOSED_LOOP_CORRECTIVE_FORMAT,
+    PGC_CLOSED_LOOP_CORRECTIVE_FORMAT_V2,
     PGC_CLOSED_LOOP_CORRECTIVE_INDEX,
     append_jsonl,
     atomic_write_json,
@@ -159,9 +160,10 @@ def _load_captures(
             ("correct_instruction", "correct_instruction"),
             ("counterfactual_instruction", "counterfactual_instruction"),
         ):
-            if str(record.get(capture_key, "")).strip().casefold() != str(
-                manifest_record[manifest_key]
-            ).strip().casefold():
+            if (
+                str(record.get(capture_key, "")).strip().casefold()
+                != str(manifest_record[manifest_key]).strip().casefold()
+            ):
                 raise ValueError(
                     f"Capture {capture_id} instruction does not match manifest."
                 )
@@ -219,18 +221,72 @@ def _target_object_names(record: Mapping[str, Any]) -> set[str]:
     return names
 
 
+def _named_site_position(inner: Any, name: str) -> np.ndarray | None:
+    model = inner.sim.model
+    candidates = [str(name)]
+    object_sites = getattr(inner, "object_sites_dict", {})
+    site = object_sites.get(str(name)) if isinstance(object_sites, Mapping) else None
+    if site is not None:
+        if isinstance(site, str):
+            candidates.append(site)
+        for attribute in ("name", "site_name"):
+            value = getattr(site, attribute, None)
+            if value:
+                candidates.append(str(value))
+    raw_names = getattr(model, "site_names", ())
+    site_names = [
+        value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        for value in raw_names
+        if value is not None
+    ]
+    suffix_matches = [
+        site_name
+        for site_name in site_names
+        if site_name == str(name) or site_name.endswith(str(name))
+    ]
+    if len(suffix_matches) == 1:
+        candidates.append(suffix_matches[0])
+    for candidate in dict.fromkeys(candidates):
+        try:
+            site_id = int(model.site_name2id(candidate))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        return np.asarray(inner.sim.data.site_xpos[site_id], dtype=np.float64)
+    return None
+
+
+def _entity_position(env: Any, name: str) -> np.ndarray | None:
+    """Resolve movable objects, fixtures, and BDDL region sites structurally."""
+    inner = _get_inner_env(env)
+    body_ids = getattr(inner, "obj_body_id", {})
+    body_id = body_ids.get(name) if isinstance(body_ids, Mapping) else None
+    if body_id is None:
+        try:
+            body_id = int(inner.sim.model.body_name2id(name))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            body_id = None
+    if body_id is not None:
+        return np.asarray(inner.sim.data.body_xpos[int(body_id)], dtype=np.float64)
+    return _named_site_position(inner, name)
+
+
 def _state_feature(
     env: Any,
     obs: Mapping[str, Any],
     target_objects: set[str],
 ) -> np.ndarray:
-    inner = _get_inner_env(env)
     positions = []
+    missing = []
     for name in sorted(target_objects):
-        if name not in inner.obj_body_id:
-            raise KeyError(f"Target object {name!r} is absent from LIBERO env.")
-        positions.append(
-            np.asarray(inner.sim.data.body_xpos[inner.obj_body_id[name]], dtype=np.float64)
+        position = _entity_position(env, name)
+        if position is None:
+            missing.append(name)
+        else:
+            positions.append(position)
+    if missing:
+        raise KeyError(
+            "Corrective target entities have no LIBERO body/site position: "
+            f"{missing}."
         )
     target_position = np.mean(np.stack(positions), axis=0)
     eef_position = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
@@ -269,6 +325,34 @@ def _target_lifted(
     return bool(target_objects & tracker.lifted_objects)
 
 
+def _corrective_contract(
+    tracker: CounterfactualEpisodeTracker,
+    record: Mapping[str, Any],
+) -> tuple[str, set[str]]:
+    graspable = set(tracker.counterfactual_graspable_target_objects)
+    if graspable:
+        return "target_lift", graspable
+    # Open/close/turn-on goals commonly use an articulated fixture or BDDL
+    # region as predicate subject. Such entities are valid to _eval_predicate
+    # even though they are deliberately absent from objects_dict/obj_body_id.
+    return "counterfactual_goal", _target_object_names(record)
+
+
+def _corrective_succeeded(
+    tracker: CounterfactualEpisodeTracker,
+    *,
+    verification_kind: str,
+    target_objects: set[str],
+) -> bool:
+    if verification_kind == "target_lift":
+        return _target_lifted(tracker, target_objects)
+    if verification_kind == "counterfactual_goal":
+        return bool(tracker.counterfactual_goal_achieved)
+    raise ValueError(
+        f"Unsupported corrective verification kind: {verification_kind!r}."
+    )
+
+
 def _build_reference_bank(
     *,
     env: Any,
@@ -282,7 +366,6 @@ def _build_reference_bank(
     index_stride: int,
     post_lift_steps: int,
 ) -> list[dict[str, Any]]:
-    target_objects = _target_object_names(record)
     bank: list[dict[str, Any]] = []
     for audit in reference_audits:
         episode_index = int(audit["episode_index"])
@@ -299,14 +382,21 @@ def _build_reference_bank(
         )
         tracker = _new_tracker(env, record, lift_threshold_m)
         tracker.observe(policy_step=0)
+        verification_kind, target_objects = _corrective_contract(tracker, record)
+        if (
+            verification_kind == "counterfactual_goal"
+            and tracker.counterfactual_goal_achieved
+        ):
+            raise RuntimeError(
+                f"Reference episode {episode_index} starts with the "
+                f"counterfactual goal already satisfied for {record['pair_id']}."
+            )
         trajectory_features: list[np.ndarray] = []
         first_target_acquisition_step: int | None = None
-        first_target_lift_step: int | None = None
+        first_verification_step: int | None = None
         reference_boundary_event: str | None = None
         for action_index, action in enumerate(actions):
-            trajectory_features.append(
-                _state_feature(env, obs, target_objects)
-            )
+            trajectory_features.append(_state_feature(env, obs, target_objects))
             obs, _, done, _ = env.step(np.asarray(action).tolist())
             tracker.observe(policy_step=action_index + 1)
             if first_target_acquisition_step is None and bool(
@@ -314,22 +404,38 @@ def _build_reference_bank(
             ):
                 first_target_acquisition_step = action_index + 1
                 reference_boundary_event = "grasp_contact"
-            target_lifted = _target_lifted(tracker, target_objects)
-            if first_target_lift_step is None and target_lifted:
-                first_target_lift_step = action_index + 1
-            if first_target_acquisition_step is None and target_lifted:
+            corrective_succeeded = _corrective_succeeded(
+                tracker,
+                verification_kind=verification_kind,
+                target_objects=target_objects,
+            )
+            if first_verification_step is None and corrective_succeeded:
+                first_verification_step = action_index + 1
+            if (
+                verification_kind == "target_lift"
+                and first_target_acquisition_step is None
+                and corrective_succeeded
+            ):
                 # Robosuite contact-name heuristics occasionally miss a valid
                 # grasp even though the object is observably lifted. The lift
                 # event is the V8 task predicate and is therefore a safe,
                 # conservative fallback for delimiting candidate starts.
                 first_target_acquisition_step = action_index + 1
                 reference_boundary_event = "target_lift_fallback"
-            if target_lifted or bool(done):
+            if verification_kind == "counterfactual_goal" and corrective_succeeded:
+                first_target_acquisition_step = action_index + 1
+                reference_boundary_event = "counterfactual_goal"
+            if corrective_succeeded or bool(done):
                 break
-        if first_target_acquisition_step is None or first_target_lift_step is None:
+        if first_target_acquisition_step is None or first_verification_step is None:
+            requested = (
+                "lift the target"
+                if verification_kind == "target_lift"
+                else "achieve the counterfactual goal"
+            )
             raise RuntimeError(
-                f"Reference episode {episode_index} never lifts the target for "
-                f"pair {record['pair_id']}."
+                f"Reference episode {episode_index} never {requested} for pair "
+                f"{record['pair_id']}."
             )
         if reference_boundary_event == "target_lift_fallback":
             LOGGER.warning(
@@ -338,36 +444,39 @@ def _build_reference_bank(
                 episode_index,
                 record["pair_id"],
             )
-        last_start = min(
-            first_target_acquisition_step, len(trajectory_features) - 1
-        )
+        last_start = min(first_target_acquisition_step, len(trajectory_features) - 1)
         candidate_indices = list(range(0, last_start + 1, index_stride))
         if last_start not in candidate_indices:
             candidate_indices.append(last_start)
         reference_stop_step = min(
             len(actions),
-            first_target_lift_step + int(post_lift_steps),
+            first_verification_step + int(post_lift_steps),
         )
         for action_index in candidate_indices:
             bank.append(
                 {
                     "episode_index": episode_index,
                     "action_index": int(action_index),
+                    "verification_kind": verification_kind,
+                    "feature_targets": tuple(sorted(target_objects)),
                     "reference_boundary_event": reference_boundary_event,
                     "feature": trajectory_features[action_index],
-                    # V8 repairs target acquisition only. Keeping the full
-                    # placement tail made each failed candidate replay hundreds
-                    # of unnecessary MuJoCo steps and looked like a deadlock.
+                    # Stop shortly after the audited corrective event. Keeping
+                    # a full placement tail made each failed candidate replay
+                    # hundreds of unnecessary MuJoCo steps.
                     "actions": actions[action_index:reference_stop_step],
                 }
             )
     if not bank:
-        raise RuntimeError(f"No pre-grasp reference actions for {record['pair_id']}.")
+        raise RuntimeError(
+            f"No pre-correction reference actions for {record['pair_id']}."
+        )
     suffix_lengths = [len(item["actions"]) for item in bank]
     LOGGER.info(
-        "Built V8 reference bank pair=%s episodes=%d candidates=%d "
+        "Built corrective reference bank pair=%s mode=%s episodes=%d candidates=%d "
         "suffix_steps=%d..%d.",
         record["pair_id"],
+        bank[0]["verification_kind"],
         len(reference_audits),
         len(bank),
         min(suffix_lengths),
@@ -383,9 +492,7 @@ def _rank_candidates(
 ) -> list[dict[str, Any]]:
     ranked = sorted(
         bank,
-        key=lambda item: float(
-            np.mean((feature - np.asarray(item["feature"])) ** 2)
-        ),
+        key=lambda item: float(np.mean((feature - np.asarray(item["feature"])) ** 2)),
     )
     selected: list[dict[str, Any]] = []
     used: dict[int, list[int]] = defaultdict(list)
@@ -405,7 +512,7 @@ def _rank_candidates(
     return selected
 
 
-def _replay_for_target_lift(
+def _replay_for_corrective_success(
     *,
     env: Any,
     record: Mapping[str, Any],
@@ -413,8 +520,9 @@ def _replay_for_target_lift(
     actions: np.ndarray,
     state_atol: float,
     lift_threshold_m: float,
+    verification_kind: str,
     dataset: Any | None = None,
-    stop_on_target_lift: bool = False,
+    stop_on_success: bool = False,
 ) -> dict[str, Any]:
     obs, actual_state = _reset_exact_state(
         env,
@@ -422,10 +530,23 @@ def _replay_for_target_lift(
         state_atol=state_atol,
         settle_steps=0,
     )
-    target_objects = _target_object_names(record)
     tracker = _new_tracker(env, record, lift_threshold_m)
     tracker.observe(policy_step=0)
-    lifted_step = None
+    contract_kind, target_objects = _corrective_contract(tracker, record)
+    if contract_kind != verification_kind:
+        raise ValueError(
+            "Corrective replay contract changed between reference and capture: "
+            f"{verification_kind!r} != {contract_kind!r}."
+        )
+    if (
+        verification_kind == "counterfactual_goal"
+        and tracker.counterfactual_goal_achieved
+    ):
+        raise ValueError(
+            f"Corrective replay starts with the counterfactual goal already "
+            f"satisfied for {record['pair_id']}."
+        )
+    verification_step = None
     used_actions = 0
     for action in np.asarray(actions, dtype=np.float32):
         if dataset is not None:
@@ -437,15 +558,26 @@ def _replay_for_target_lift(
         obs, _, done, _ = env.step(action.tolist())
         used_actions += 1
         tracker.observe(policy_step=used_actions)
-        if lifted_step is None and _target_lifted(tracker, target_objects):
-            lifted_step = used_actions
-            if stop_on_target_lift:
+        if verification_step is None and _corrective_succeeded(
+            tracker,
+            verification_kind=verification_kind,
+            target_objects=target_objects,
+        ):
+            verification_step = used_actions
+            if stop_on_success:
                 break
         if bool(done):
             break
     return {
-        "target_lifted": lifted_step is not None,
-        "lifted_step": lifted_step,
+        "corrective_verified": verification_step is not None,
+        "verification_kind": verification_kind,
+        "verification_step": verification_step,
+        "target_lifted": (
+            verification_kind == "target_lift" and verification_step is not None
+        ),
+        "counterfactual_goal_verified": (
+            verification_kind == "counterfactual_goal" and verification_step is not None
+        ),
         "used_actions": used_actions,
         "actual_initial_state": actual_state,
         "tracker": tracker,
@@ -453,29 +585,50 @@ def _replay_for_target_lift(
 
 
 def _write_v8_index(output: Path, audits: list[dict[str, Any]]) -> None:
-    episodes = [
-        {
-            "episode_index": int(audit["episode_index"]),
-            "pair_id": str(audit["pair_id"]),
-            "capture_id": str(audit["capture_id"]),
-            "capture_state_sha256": str(audit["capture_state_sha256"]),
-            "recorded_action_count": int(audit["recorded_action_count"]),
-            "target_lift_verified": bool(audit["target_lift_verified"]),
-            "target_lift_step": int(audit["target_lift_step"]),
-            "reference_episode_index": int(audit["reference_episode_index"]),
-            "reference_action_index": int(audit["reference_action_index"]),
-            "reference_boundary_event": str(
-                audit["reference_boundary_event"]
-            ),
-            "reference_feature_mse": float(audit["reference_feature_mse"]),
-        }
-        for audit in sorted(audits, key=lambda item: int(item["episode_index"]))
-    ]
+    episodes = []
+    for audit in sorted(audits, key=lambda item: int(item["episode_index"])):
+        verification_kind = str(audit.get("verification_kind", "target_lift"))
+        verification_step = int(
+            audit.get("verification_step", audit.get("target_lift_step", 0))
+        )
+        episodes.append(
+            {
+                "episode_index": int(audit["episode_index"]),
+                "pair_id": str(audit["pair_id"]),
+                "capture_id": str(audit["capture_id"]),
+                "capture_state_sha256": str(audit["capture_state_sha256"]),
+                "recorded_action_count": int(audit["recorded_action_count"]),
+                "corrective_verified": True,
+                "verification_kind": verification_kind,
+                "verification_step": verification_step,
+                "target_lift_verified": bool(
+                    audit.get(
+                        "target_lift_verified", verification_kind == "target_lift"
+                    )
+                ),
+                "counterfactual_goal_verified": bool(
+                    audit.get(
+                        "counterfactual_goal_verified",
+                        verification_kind == "counterfactual_goal",
+                    )
+                ),
+                "target_lift_step": (
+                    verification_step if verification_kind == "target_lift" else None
+                ),
+                "reference_episode_index": int(audit["reference_episode_index"]),
+                "reference_action_index": int(audit["reference_action_index"]),
+                "reference_boundary_event": str(audit["reference_boundary_event"]),
+                "reference_feature_mse": float(audit["reference_feature_mse"]),
+            }
+        )
     atomic_write_json(
         output / PGC_CLOSED_LOOP_CORRECTIVE_INDEX,
         {
-            "format": PGC_CLOSED_LOOP_CORRECTIVE_FORMAT,
-            "acquisition_only": True,
+            "format": PGC_CLOSED_LOOP_CORRECTIVE_FORMAT_V2,
+            "acquisition_only": False,
+            "verification_kinds": sorted(
+                {str(item["verification_kind"]) for item in episodes}
+            ),
             "episode_count": len(episodes),
             "episodes": episodes,
         },
@@ -492,13 +645,12 @@ def _save_episode(
     candidate: Mapping[str, Any],
     initial_state: np.ndarray,
     recorded_action_count: int,
-    target_lift_step: int,
+    verification_kind: str,
+    verification_step: int,
 ) -> dict[str, Any]:
     output = args.output.expanduser().resolve()
     episode_index = int(dataset.meta.total_episodes)
-    state_relpath = (
-        PGC_STATE_DIR / f"v8_episode_{episode_index:06d}.npy"
-    )
+    state_relpath = PGC_STATE_DIR / f"v8_episode_{episode_index:06d}.npy"
     state_path = output / state_relpath
     state_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(state_path, canonical_state_array(initial_state), allow_pickle=False)
@@ -516,19 +668,21 @@ def _save_episode(
         "capture_policy_step": int(capture["policy_step"]),
         "capture_replan_index": int(capture["replan_index"]),
         "capture_record": str(capture["record_path"]),
-        "counterfactual_instruction": str(
-            record["counterfactual_instruction"]
-        ).strip(),
+        "counterfactual_instruction": str(record["counterfactual_instruction"]).strip(),
         "counterfactual_goal_state": record["counterfactual_goal_state"],
-        "counterfactual_goal_satisfied": False,
-        "target_lift_verified": True,
-        "target_lift_step": int(target_lift_step),
+        "counterfactual_goal_satisfied": (verification_kind == "counterfactual_goal"),
+        "corrective_verified": True,
+        "verification_kind": str(verification_kind),
+        "verification_step": int(verification_step),
+        "target_lift_verified": verification_kind == "target_lift",
+        "counterfactual_goal_verified": (verification_kind == "counterfactual_goal"),
+        "target_lift_step": (
+            int(verification_step) if verification_kind == "target_lift" else None
+        ),
         "recorded_action_count": int(recorded_action_count),
         "reference_episode_index": int(candidate["episode_index"]),
         "reference_action_index": int(candidate["action_index"]),
-        "reference_boundary_event": str(
-            candidate["reference_boundary_event"]
-        ),
+        "reference_boundary_event": str(candidate["reference_boundary_event"]),
         "reference_feature_mse": float(candidate["feature_mse"]),
         "collection_method": (
             "exact_closed_loop_state_plus_replay_verified_expert_suffix"
@@ -571,9 +725,7 @@ def _quarantine_empty_incomplete_bootstrap(output: Path) -> Path | None:
     successful_episode_count = None
     if provenance_path.is_file():
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-        successful_episode_count = int(
-            provenance.get("successful_episode_count", -1)
-        )
+        successful_episode_count = int(provenance.get("successful_episode_count", -1))
     if audits or successful_episode_count not in (None, 0):
         raise RuntimeError(
             "Refusing to replace an incomplete V8 dataset that may contain "
@@ -583,9 +735,7 @@ def _quarantine_empty_incomplete_bootstrap(output: Path) -> Path | None:
         )
     suffix = 0
     while True:
-        label = ".bootstrap-incomplete" + (
-            "" if suffix == 0 else f"-{suffix}"
-        )
+        label = ".bootstrap-incomplete" + ("" if suffix == 0 else f"-{suffix}")
         quarantine = output.with_name(output.name + label)
         if not quarantine.exists():
             break
@@ -610,16 +760,10 @@ def _main(args: argparse.Namespace) -> None:
             "evaluation before building V8 data."
         )
     active_records = [
-        record
-        for record in records
-        if str(record["pair_id"]) in captures
+        record for record in records if str(record["pair_id"]) in captures
     ]
-    active_by_pair = {
-        str(record["pair_id"]): record for record in active_records
-    }
-    pairs_without_failed_capture = sorted(
-        set(records_by_pair) - set(active_by_pair)
-    )
+    active_by_pair = {str(record["pair_id"]): record for record in active_records}
+    pairs_without_failed_capture = sorted(set(records_by_pair) - set(active_by_pair))
     for pair_id, record in active_by_pair.items():
         source_goals = {
             json.dumps(
@@ -648,20 +792,15 @@ def _main(args: argparse.Namespace) -> None:
         pair_id = str(audit.get("pair_id", ""))
         if pair_id in active_by_pair:
             references_by_pair[pair_id].append(audit)
-    missing_reference_pairs = sorted(
-        set(active_by_pair) - set(references_by_pair)
-    )
+    missing_reference_pairs = sorted(set(active_by_pair) - set(references_by_pair))
     if missing_reference_pairs:
         raise RuntimeError(
-            "Reference PGC dataset lacks pairs: "
-            + ", ".join(missing_reference_pairs)
+            "Reference PGC dataset lacks pairs: " + ", ".join(missing_reference_pairs)
         )
 
     from fastwam.datasets.lerobot.lerobot.lerobot_dataset import LeRobotDataset
 
-    reference_dataset = LeRobotDataset(
-        repo_id=reference_root.name, root=reference_root
-    )
+    reference_dataset = LeRobotDataset(repo_id=reference_root.name, root=reference_root)
     output = args.output.expanduser().resolve()
     if output.exists() and args.resume:
         _recover_pending(output)
@@ -680,7 +819,8 @@ def _main(args: argparse.Namespace) -> None:
             "collection_method": (
                 "exact_closed_loop_state_plus_replay_verified_expert_suffix"
             ),
-            "acquisition_only": True,
+            "acquisition_only": False,
+            "corrective_verification": "target_lift_or_counterfactual_goal",
             "reference_dataset": str(reference_root),
             "lift_threshold_m": float(args.lift_threshold_m),
             "post_lift_steps": int(args.post_lift_steps),
@@ -697,7 +837,9 @@ def _main(args: argparse.Namespace) -> None:
         pair_id = str(record["pair_id"])
         required = int(args.episodes_per_pair)
         if counts[pair_id] >= required:
-            LOGGER.info("%s already has %d/%d V8 episodes.", pair_id, counts[pair_id], required)
+            LOGGER.info(
+                "%s already has %d/%d V8 episodes.", pair_id, counts[pair_id], required
+            )
             continue
         env = None
         try:
@@ -718,7 +860,9 @@ def _main(args: argparse.Namespace) -> None:
                 index_stride=args.reference_index_stride,
                 post_lift_steps=args.post_lift_steps,
             )
-            ranked_captures: list[tuple[float, dict[str, Any], list[dict[str, Any]]]] = []
+            ranked_captures: list[
+                tuple[float, dict[str, Any], list[dict[str, Any]]]
+            ] = []
             for capture in captures[pair_id][: args.max_captures_per_pair]:
                 if str(capture["capture_id"]) in used_captures:
                     continue
@@ -728,9 +872,7 @@ def _main(args: argparse.Namespace) -> None:
                     state_atol=args.state_atol,
                     settle_steps=0,
                 )
-                feature = _state_feature(
-                    env, obs, _target_object_names(record)
-                )
+                feature = _state_feature(env, obs, set(bank[0]["feature_targets"]))
                 candidates = _rank_candidates(
                     feature, bank, args.max_candidates_per_capture
                 )
@@ -781,40 +923,44 @@ def _main(args: argparse.Namespace) -> None:
                             int(candidate["action_index"]),
                         )
                     suffix = np.asarray(candidate["actions"], dtype=np.float32)
-                    validation = _replay_for_target_lift(
+                    verification_kind = str(candidate["verification_kind"])
+                    validation = _replay_for_corrective_success(
                         env=env,
                         record=record,
                         initial_state=np.asarray(capture["state"]),
                         actions=suffix,
                         state_atol=args.state_atol,
                         lift_threshold_m=args.lift_threshold_m,
-                        stop_on_target_lift=True,
+                        verification_kind=verification_kind,
+                        stop_on_success=True,
                     )
-                    if not validation["target_lifted"]:
+                    if not validation["corrective_verified"]:
                         continue
-                    lifted_step = int(validation["lifted_step"])
+                    verification_step = int(validation["verification_step"])
                     recorded_count = min(
                         len(suffix),
                         max(
                             int(args.min_actions),
-                            lifted_step + int(args.post_lift_steps),
+                            verification_step + int(args.post_lift_steps),
                         ),
                     )
                     if recorded_count < int(args.min_actions):
                         continue
-                    recording = _replay_for_target_lift(
+                    recording = _replay_for_corrective_success(
                         env=env,
                         record=record,
                         initial_state=np.asarray(capture["state"]),
                         actions=suffix[:recorded_count],
                         state_atol=args.state_atol,
                         lift_threshold_m=args.lift_threshold_m,
+                        verification_kind=verification_kind,
                         dataset=dataset,
                     )
-                    if not recording["target_lifted"]:
+                    if not recording["corrective_verified"]:
                         _discard_episode(dataset)
                         failures[pair_id].append(
-                            f"{capture['capture_id']}: nondeterministic target lift"
+                            f"{capture['capture_id']}: nondeterministic "
+                            f"{verification_kind}"
                         )
                         continue
                     actual_recorded_count = int(recording["used_actions"])
@@ -834,7 +980,8 @@ def _main(args: argparse.Namespace) -> None:
                         candidate=candidate,
                         initial_state=np.asarray(capture["state"]),
                         recorded_action_count=actual_recorded_count,
-                        target_lift_step=int(recording["lifted_step"]),
+                        verification_kind=verification_kind,
+                        verification_step=int(recording["verification_step"]),
                     )
                     audits.append(audit)
                     _write_v8_index(output, audits)
@@ -843,14 +990,16 @@ def _main(args: argparse.Namespace) -> None:
                     accepted = True
                     print(
                         f"SAVED V8 episode={audit['episode_index']} pair={pair_id} "
-                        f"capture={capture['capture_id']} actions={actual_recorded_count} "
+                        f"capture={capture['capture_id']} mode={verification_kind} "
+                        f"actions={actual_recorded_count} "
                         f"progress={counts[pair_id]}/{required}",
                         flush=True,
                     )
                     break
                 if not accepted:
                     failures[pair_id].append(
-                        f"{capture['capture_id']}: no expert suffix lifted target"
+                        f"{capture['capture_id']}: no expert suffix passed "
+                        "corrective verification"
                     )
         finally:
             if env is not None:
@@ -865,7 +1014,7 @@ def _main(args: argparse.Namespace) -> None:
         if counts[pair_id] < int(args.episodes_per_pair)
     }
     summary = {
-        "format": PGC_CLOSED_LOOP_CORRECTIVE_FORMAT,
+        "format": PGC_CLOSED_LOOP_CORRECTIVE_FORMAT_V2,
         "output": str(output),
         "successful_episodes": len(audits),
         "corrective_pair_count": len(active_by_pair),

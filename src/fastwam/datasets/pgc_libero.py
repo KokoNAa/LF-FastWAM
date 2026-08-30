@@ -25,6 +25,7 @@ PGC_TARGET_MASK_INDEX = Path("meta/pgc_v7_target_masks/index.json")
 PGC_COMPLETION_PHASE_FORMAT = "pgc_libero_completion_phases_v1"
 PGC_COMPLETION_PHASE_INDEX = Path("meta/pgc_v5_completion_phases.json")
 PGC_CLOSED_LOOP_CORRECTIVE_FORMAT = "pgc_libero_closed_loop_corrective_v1"
+PGC_CLOSED_LOOP_CORRECTIVE_FORMAT_V2 = "pgc_libero_closed_loop_corrective_v2"
 PGC_CLOSED_LOOP_CORRECTIVE_INDEX = Path("meta/pgc_v8_closed_loop/index.json")
 PGC_ENTITY_RELATION_FORMAT = "pgc_libero_entity_relation_v1"
 PGC_ROBOTWIN_ENTITY_RELATION_FORMAT = "pgc_robotwin_entity_relation_v1"
@@ -330,15 +331,12 @@ def load_pgc_completion_phase_index(
 def load_pgc_closed_loop_corrective_index(
     dataset_root: str | Path,
 ) -> dict[int, dict[str, Any]]:
-    """Load the audited V8 closed-loop target-acquisition contract.
+    """Load an audited closed-loop corrective-action contract.
 
-    V8 data are not relabeled offline demonstrations.  Every episode must
-    begin at an exact simulator state captured from a deployed PGC rollout,
-    and its recorded action suffix must have been replay-verified to lift the
-    requested counterfactual target from that exact state.  Keeping this
-    contract in a sidecar lets the ordinary LeRobot action/video schema remain
-    unchanged while preventing unverified rollout states from entering the
-    optimizer.
+    V1 is the original target-acquisition-only contract. V2 keeps that path for
+    graspable goals and additionally admits articulated/fixture tasks only when
+    the requested counterfactual goal is reached in two exact-state replays.
+    Both formats prevent unverified rollout states from entering the optimizer.
     """
     dataset_root = Path(dataset_root).expanduser().resolve()
     index_path = dataset_root / PGC_CLOSED_LOOP_CORRECTIVE_INDEX
@@ -348,12 +346,19 @@ def load_pgc_closed_loop_corrective_index(
             "Run scripts/build_pgc_v8_corrective_data.py first."
         )
     payload = json.loads(index_path.read_text(encoding="utf-8"))
-    if payload.get("format") != PGC_CLOSED_LOOP_CORRECTIVE_FORMAT:
+    format_name = str(payload.get("format", ""))
+    if format_name not in {
+        PGC_CLOSED_LOOP_CORRECTIVE_FORMAT,
+        PGC_CLOSED_LOOP_CORRECTIVE_FORMAT_V2,
+    }:
         raise ValueError(
             f"Unsupported PGC V8 corrective format at {index_path}: "
             f"{payload.get('format')!r}."
         )
-    if payload.get("acquisition_only") is not True:
+    if (
+        format_name == PGC_CLOSED_LOOP_CORRECTIVE_FORMAT
+        and payload.get("acquisition_only") is not True
+    ):
         raise ValueError(
             "PGC V8 corrective data must declare acquisition_only=true."
         )
@@ -401,14 +406,38 @@ def load_pgc_closed_loop_corrective_index(
             raise ValueError(
                 f"PGC V8 episode {episode_index} has no corrective actions."
             )
-        if record.get("target_lift_verified") is not True:
-            raise ValueError(
-                f"PGC V8 episode {episode_index} was not target-lift verified."
+        if format_name == PGC_CLOSED_LOOP_CORRECTIVE_FORMAT:
+            verification_kind = "target_lift"
+            corrective_verified = record.get("target_lift_verified") is True
+            verification_step = int(
+                record.get("target_lift_step", action_count)
             )
-        if reference_boundary_event not in {
-            "grasp_contact",
-            "target_lift_fallback",
-        }:
+            allowed_boundaries = {"grasp_contact", "target_lift_fallback"}
+        else:
+            verification_kind = str(record.get("verification_kind", ""))
+            corrective_verified = record.get("corrective_verified") is True
+            verification_step = int(record.get("verification_step", 0))
+            allowed_boundaries = {
+                "grasp_contact",
+                "target_lift_fallback",
+                "counterfactual_goal",
+            }
+            if verification_kind not in {"target_lift", "counterfactual_goal"}:
+                raise ValueError(
+                    f"PGC corrective episode {episode_index} has invalid "
+                    f"verification_kind={verification_kind!r}."
+                )
+            expected_flag = (
+                "target_lift_verified"
+                if verification_kind == "target_lift"
+                else "counterfactual_goal_verified"
+            )
+            corrective_verified &= record.get(expected_flag) is True
+        if not corrective_verified or verification_step <= 0:
+            raise ValueError(
+                f"PGC corrective episode {episode_index} was not replay-verified."
+            )
+        if reference_boundary_event not in allowed_boundaries:
             raise ValueError(
                 f"PGC V8 episode {episode_index} has no valid reference "
                 "acquisition boundary."
@@ -420,12 +449,37 @@ def load_pgc_closed_loop_corrective_index(
                 f"{pair_id!r} != {pair['pair_id']!r}."
             )
         audit = episode_audits.get(episode_index)
+        audit_verification_kind = (
+            "target_lift"
+            if audit is not None
+            and "verification_kind" not in audit
+            and audit.get("target_lift_verified") is True
+            else str((audit or {}).get("verification_kind", ""))
+        )
+        audit_verification_step = int(
+            (audit or {}).get(
+                "verification_step",
+                (audit or {}).get(
+                    "target_lift_step",
+                    (audit or {}).get("recorded_action_count", 0),
+                ),
+            )
+        )
         if audit is None or (
             str(audit.get("capture_id", "")) != capture_id
             or str(audit.get("capture_state_sha256", "")).lower()
             != state_digest
             or int(audit.get("recorded_action_count", 0)) != action_count
-            or audit.get("target_lift_verified") is not True
+            or audit_verification_kind != verification_kind
+            or audit_verification_step != verification_step
+            or (
+                verification_kind == "target_lift"
+                and audit.get("target_lift_verified") is not True
+            )
+            or (
+                verification_kind == "counterfactual_goal"
+                and audit.get("counterfactual_goal_verified") is not True
+            )
             or str(audit.get("reference_boundary_event", ""))
             != reference_boundary_event
         ):

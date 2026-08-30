@@ -10,6 +10,7 @@ from fastwam.datasets.lerobot.robot_video_dataset import (
 )
 from fastwam.datasets.pgc_libero import (
     PGC_CLOSED_LOOP_CORRECTIVE_FORMAT,
+    PGC_CLOSED_LOOP_CORRECTIVE_FORMAT_V2,
     load_pgc_closed_loop_corrective_index,
     state_sha256,
 )
@@ -115,23 +116,66 @@ class PGCV8DataContractTest(unittest.TestCase):
         self.assertEqual(sum(index == 5 for index in indices), 4)
         self.assertEqual(sum(3 <= index < 5 for index in indices), 2)
 
+    def test_v2_accepts_replay_verified_counterfactual_goal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = self._write_dataset(Path(tmpdir), verified=False)
+            audit_path = dataset / "meta/pgc_episodes.jsonl"
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            audit.update(
+                {
+                    "corrective_verified": True,
+                    "verification_kind": "counterfactual_goal",
+                    "verification_step": 17,
+                    "counterfactual_goal_verified": True,
+                    "reference_boundary_event": "counterfactual_goal",
+                }
+            )
+            audit_path.write_text(json.dumps(audit) + "\n", encoding="utf-8")
+            index_path = dataset / "meta/pgc_v8_closed_loop/index.json"
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            payload.update(
+                {
+                    "format": PGC_CLOSED_LOOP_CORRECTIVE_FORMAT_V2,
+                    "acquisition_only": False,
+                }
+            )
+            payload["episodes"][0].update(
+                {
+                    "corrective_verified": True,
+                    "verification_kind": "counterfactual_goal",
+                    "verification_step": 17,
+                    "counterfactual_goal_verified": True,
+                    "reference_boundary_event": "counterfactual_goal",
+                }
+            )
+            index_path.write_text(json.dumps(payload), encoding="utf-8")
+            index = load_pgc_closed_loop_corrective_index(dataset)
+            self.assertEqual(index[0]["verification_kind"], "counterfactual_goal")
+
+            payload["episodes"][0]["counterfactual_goal_verified"] = False
+            index_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "not replay-verified"):
+                load_pgc_closed_loop_corrective_index(dataset)
+
     def test_v8_pipeline_scripts_preserve_v5_and_verify_rollouts(self):
         train = (REPO_ROOT / "scripts/train_pgc_v8_libero_suite.sh").read_text(
             encoding="utf-8"
         )
-        builder = (
-            REPO_ROOT / "scripts/build_pgc_v8_corrective_data.py"
-        ).read_text(encoding="utf-8")
-        evaluation = (
-            REPO_ROOT / "experiments/libero/eval_libero_single.py"
-        ).read_text(encoding="utf-8")
+        builder = (REPO_ROOT / "scripts/build_pgc_v8_corrective_data.py").read_text(
+            encoding="utf-8"
+        )
+        evaluation = (REPO_ROOT / "experiments/libero/eval_libero_single.py").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("PGC_WARM_START_V5=true", train)
         self.assertIn("PGC_CLOSED_LOOP_TRAIN_PROPOSAL_ONLY=true", train)
         self.assertIn("target_lift_verified", builder)
         self.assertIn("target_lift_fallback", builder)
         self.assertIn("bootstrap-incomplete", builder)
-        self.assertIn("_replay_for_target_lift", builder)
-        self.assertIn("stop_on_target_lift=True", builder)
+        self.assertIn("_replay_for_corrective_success", builder)
+        self.assertIn("stop_on_success=True", builder)
+        self.assertIn("counterfactual_goal_verified", builder)
+        self.assertIn("_named_site_position", builder)
         self.assertIn("Trying V8 capture", builder)
         self.assertIn("closed_loop_capture_dir", evaluation)
         self.assertIn("_capture_libero_sim_state", evaluation)
