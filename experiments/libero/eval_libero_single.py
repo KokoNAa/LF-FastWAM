@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
 
@@ -743,6 +744,7 @@ def _predict_action_chunk(
     model_device: str,
     policy_guard_state: Optional[dict[str, Any]] = None,
     policy_guard_eraf_oracle: Optional[dict[str, Any]] = None,
+    interface_observer=None,
 ) -> tuple[
     np.ndarray,
     dict,
@@ -786,6 +788,8 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    if interface_observer is not None:
+        infer_kwargs["policy_guard_interface_probe"] = interface_observer.probe
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -932,6 +936,11 @@ def _predict_action_chunk(
     action = invert_gripper_action(action)
     if bool(cfg.EVALUATION.get("binarize_gripper", False)):
         action[..., -1] = np.sign(action[..., -1])
+    if interface_observer is not None:
+        interface_observer.finish_replan(
+            pred["eraf_interface_probe"], action_env=action,
+            input_image=image, proprio=proprio, prompt=prompt,
+        )
     return (
         action,
         imgs,
@@ -1224,6 +1233,7 @@ def run_single_episode(
     counterfactual_metadata: Optional[dict[str, Any]] = None,
     eraf_shadow_auditor: Optional[ERAFShadowAuditor] = None,
     eraf_oracle_provider: Optional[ERAFOracleProvider] = None,
+    interface_observer=None,
 ) -> tuple[
     bool,
     list,
@@ -1249,6 +1259,10 @@ def run_single_episode(
 
     env.reset()
     obs = env.set_init_state(initial_state)
+    if interface_observer is not None:
+        if counterfactual_metadata is None:
+            raise ValueError("Interface probe requires counterfactual diagnostics.")
+        interface_observer.begin_episode(episode_idx, policy_instruction)
     counterfactual_tracker = None
     if counterfactual_metadata is not None:
         counterfactual_tracker = CounterfactualEpisodeTracker(
@@ -1426,6 +1440,10 @@ def run_single_episode(
                         "state": _capture_libero_sim_state(env),
                     }
                 )
+            probe_this_replan = interface_observer is not None and interface_observer.before_replan(
+                env=env, obs=obs, metadata=counterfactual_metadata,
+                policy_step=policy_steps_executed, replan_index=inference_replan_index,
+            )
             (
                 action_chunk,
                 imgs,
@@ -1446,6 +1464,7 @@ def run_single_episode(
                 model_device=model_device,
                 policy_guard_state=policy_guard_state.state_for_replan(),
                 policy_guard_eraf_oracle=oracle_policy_input,
+                interface_observer=interface_observer if probe_this_replan else None,
             )
             if oracle_phase_servo.enabled:
                 if oracle_policy_input is None or eraf_oracle_provider is None:
@@ -1569,6 +1588,8 @@ def run_single_episode(
 
         obs, _, done, _ = env.step(pending_actions.pop(0))
         policy_steps_executed += 1
+        if interface_observer is not None:
+            interface_observer.observe_step(env, counterfactual_metadata, policy_steps_executed, terminal=bool(done))
         if counterfactual_tracker is not None:
             counterfactual_tracker.observe(policy_step=policy_steps_executed)
         if visualize_future_video and current_predicted_future_clip is not None:
@@ -1627,6 +1648,9 @@ def run_single_episode(
             break
         t += 1
     pbar.close()
+
+    if interface_observer is not None:
+        interface_observer.observe_step(env, counterfactual_metadata, policy_steps_executed, terminal=True)
 
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr))
@@ -1695,6 +1719,7 @@ def run_single_task(
     input_w: int,
     input_h: int,
     model_device: str,
+    interface_observer=None,
 ) -> dict:
     eraf_shadow_enabled = bool(
         cfg.EVALUATION.get("entity_relation_shadow_audit", False)
@@ -2018,6 +2043,8 @@ def run_single_task(
             ),
             eraf_shadow_auditor=eraf_shadow_auditor,
             eraf_oracle_provider=eraf_oracle_provider,
+            interface_observer=(interface_observer if interface_observer is not None
+                                and trial_idx in interface_observer.trials else None),
         )
         results["inference_latencies_ms"].extend(inference_latencies_ms)
         results["episode_policy_steps"].append(policy_steps_executed)
@@ -2362,20 +2389,36 @@ def eval_single_process(cfg: DictConfig):
     }
 
     logging.info("Running LIBERO evaluation with env_num=1")
-    task_results = run_single_task(
-        task=task,
-        initial_states=initial_states,
-        model=model,
-        processor=processor,
-        cfg=cfg,
-        video_dir=video_dir,
-        predicted_video_dir=predicted_video_dir,
-        action_horizon=action_horizon,
-        input_w=input_w,
-        input_h=input_h,
-        model_device=model_device,
-    )
+    interface_observer = None
+    if cfg.EVALUATION.get("interface_probe") is not None:
+        if (cfg.EVALUATION.instruction_condition != "counterfactual"
+                or not cfg.EVALUATION.get("counterfactual_diagnostics", False)
+                or cfg.EVALUATION.get("visualize_future_video", False)
+                or cfg.EVALUATION.get("entity_relation_oracle", False)
+                or cfg.EVALUATION.get("entity_relation_shadow_audit", False)):
+            raise ValueError("Interface probe requires ordinary CF diagnostics, without oracle/shadow/video inference.")
+        from experiments.libero.eraf_interface_probe import LiberoInterfaceObserver
+        interface_observer = LiberoInterfaceObserver(model, cfg)
+    try:
+        with interface_observer.probe.driver_scope() if interface_observer else nullcontext():
+            task_results = run_single_task(
+                task=task, initial_states=initial_states, model=model,
+                processor=processor, cfg=cfg, video_dir=video_dir,
+                predicted_video_dir=predicted_video_dir, action_horizon=action_horizon,
+                input_w=input_w, input_h=input_h, model_device=model_device,
+                interface_observer=interface_observer,
+            )
+    finally:
+        if interface_observer is not None:
+            interface_observer.close()
     results.update(task_results)
+    if interface_observer is not None:
+        results["interface_probe"] = {
+            **interface_observer.probe.provenance,
+            "probe_trials": sorted(interface_observer.trials),
+            "hybrids_are_prediction_only": True,
+            "latency_includes_diagnostic_predictions": True,
+        }
 
     results["duration"] = time.time() - start_time
     output_dir = Path(cfg.EVALUATION.output_dir) / cfg.EVALUATION.task_suite_name

@@ -1,0 +1,10 @@
+{
+  "suite": "libero_10",
+  "cases": [
+    {"task_id": 3, "trial_id": 1, "group": "common_loss"},
+    {"task_id": 3, "trial_id": 4, "group": "common_loss"},
+    {"task_id": 9, "trial_id": 2, "group": "common_loss"},
+    {"task_id": 5, "trial_id": 1, "group": "common_gain"},
+    {"task_id": 7, "trial_id": 4, "group": "common_gain"}
+  ]
+}

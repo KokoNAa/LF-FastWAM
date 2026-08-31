@@ -56,6 +56,9 @@ EVALUATION:
   # the policy inputs or simulator success predicate.
   counterfactual_diagnostics: false
   counterfactual_lift_threshold_m: 0.04
+  # Standalone diagnostic runner supplies the opt-in same-cache probe settings.
+  # Null keeps the ordinary evaluator and deployment path unchanged.
+  interface_probe: null
   # PGC v9 deployment diagnostics. When enabled, each replanning decision
   # writes ERAF heatmaps/anchors as a compressed NPZ plus a human-readable PNG.
   entity_relation_diagnostics: false

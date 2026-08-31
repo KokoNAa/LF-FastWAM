@@ -15520,8 +15520,18 @@ class FastWAM(torch.nn.Module):
         policy_guard_eraf_audit_variants: Optional[
             Mapping[str, Optional[Mapping[str, Any]]]
         ] = None,
+        policy_guard_interface_probe: Optional[Any] = None,
     ) -> dict[str, Any]:
         self.eval()
+        if policy_guard_interface_probe is not None and (
+            not self.policy_guard_enabled
+            or self.policy_guard_version != 9
+            or not self.policy_guard_eraf_safe_gain_training
+            or self.policy_guard_gate_mode != "counterfactual"
+            or policy_guard_eraf_oracle is not None
+            or policy_guard_eraf_audit_variants is not None
+        ):
+            raise ValueError("Interface probe requires forced safe-gain without oracle/audit variants.")
         if policy_guard_eraf_oracle is not None and not (
             self.policy_guard_enabled and self.policy_guard_version == 9
         ):
@@ -16054,6 +16064,24 @@ class FastWAM(torch.nn.Module):
                 next_policy_state,
                 previous_state=policy_guard_state,
             )
+            if policy_guard_interface_probe is not None:
+                result["eraf_interface_probe"] = policy_guard_interface_probe.run(
+                    initial_noise=policy_guard_initial_action_noise,
+                    routed_goal_queries=policy_guard_goal_queries,
+                    eraf_outputs=self._policy_guard_last_eraf_outputs,
+                    policy_state=policy_guard_state,
+                    forward_kwargs={
+                        "context": context,
+                        "full_context_mask": context_mask,
+                        "state_only_context_mask": state_only_context_mask,
+                        "video_kv_cache": video_kv_cache,
+                        "video_seq_len": video_seq_len,
+                        "video_tokens_per_frame": int(video_pre["meta"]["tokens_per_frame"]),
+                    },
+                    timesteps=infer_timesteps_action,
+                    deltas=infer_deltas_action,
+                    driver_action=result["action"],
+                )
             return result
 
         if eraf_only_action_path:
