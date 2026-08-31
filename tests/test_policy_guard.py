@@ -52,6 +52,9 @@ def tiny_pgc_fastwam(
     v9_bidirectional_supervision: bool = False,
     v9_context_injection_warmup_steps: int = 1500,
     v9_context_injection_ramp_steps: int = 1000,
+    v9_safe_gain_injector_training_steps: int = 0,
+    v9_safe_gain_gate_calibration_steps: int = 0,
+    v9_safe_gain_noise_levels: int = 1,
 ) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
@@ -219,6 +222,9 @@ def tiny_pgc_fastwam(
                 "safe_gain_gate_loss_weight": 1.0,
                 "safe_gain_non_regression_weight": 2.0,
                 "safe_gain_margin": 0.002,
+                "safe_gain_injector_training_steps": v9_safe_gain_injector_training_steps,
+                "safe_gain_gate_calibration_steps": v9_safe_gain_gate_calibration_steps,
+                "safe_gain_noise_levels": v9_safe_gain_noise_levels,
                 "action_grounding_hidden_dim": 8,
                 "action_grounding_num_heads": 2,
                 "action_grounding_learning_rate": 1.0e-4,

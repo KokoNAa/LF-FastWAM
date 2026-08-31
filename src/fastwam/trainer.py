@@ -184,7 +184,7 @@ class Wan22Trainer:
                     0,
                 )
             )
-            == 29
+            in {29, 30}
             and bool(
                 getattr(
                     self.model,

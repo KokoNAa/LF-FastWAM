@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  - libero_eraf_safe_gain_v929_2cam224
+  - _self_
+
+# Short, separate experiment. Keep V9.29 data/ranking/base protection unchanged.
+# The fixed V9.28 interface teacher uses the same frozen Action Expert.
+model:
+  policy_guard:
+    entity_relation_grounding:
+      grounding_objective_version: 30
+      action_geometry_learning_rate: 2.0e-6
+      safe_gain_injector_training_steps: 250
+      safe_gain_gate_calibration_steps: 0
+      preservation_weight: 1.0
+      preservation_margin: 0.0
+
+learning_rate: 2.0e-6
+max_steps: 250
+save_every: 50
+log_every: 10

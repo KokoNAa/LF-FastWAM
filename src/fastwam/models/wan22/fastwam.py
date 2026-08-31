@@ -12,6 +12,7 @@ from PIL import Image
 from fastwam.datasets.pgc_libero import PGC_ENTITY_RELATION_ARRAY_NAMES
 from fastwam.utils.logging_config import get_logger
 
+from . import eraf_preservation as preservation
 from .action_dit import ActionDiT
 from .entity_relation_affordance import (
     ERAFLossWeights,
@@ -812,6 +813,17 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_safe_gain_noise_levels = int(
             eraf_config.get("safe_gain_noise_levels", 1)
         )
+        self.policy_guard_eraf_preservation_weight = float(
+            eraf_config.get("preservation_weight", 1.0)
+        )
+        self.policy_guard_eraf_preservation_margin = float(
+            eraf_config.get("preservation_margin", 0.0)
+        )
+        self.eraf_preservation_teacher = None
+        self.eraf_preservation_provenance = {}
+        self.eraf_preservation_source_state = None
+        self._eraf_preservation_frozen_digest = None
+        self._eraf_preservation_last_audit_step = None
         self.policy_guard_eraf_safe_gain_closed_loop_action_weight = float(
             eraf_config.get("safe_gain_closed_loop_action_weight", 1.0)
         )
@@ -1582,10 +1594,11 @@ class FastWAM(torch.nn.Module):
                     27,
                     28,
                     29,
+                    30,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "between 1 and 29 inclusive."
+                        "between 1 and 30 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1867,11 +1880,23 @@ class FastWAM(torch.nn.Module):
                             "PGC V9.28 requires positive wrong-gate rejection "
                             "and pairwise gate-ranking weights/margin."
                         )
+                    if self.policy_guard_eraf_grounding_objective_version == 30:
+                        if (
+                            self.policy_guard_eraf_safe_gain_injector_training_steps <= 0
+                            or self.policy_guard_eraf_safe_gain_gate_calibration_steps != 0
+                            or not math.isfinite(self.policy_guard_eraf_preservation_weight)
+                            or self.policy_guard_eraf_preservation_weight < 0
+                            or self.policy_guard_eraf_preservation_margin != 0.0
+                        ):
+                            raise ValueError(
+                                "V9.30 requires injector-only training, zero gate steps, "
+                                "nonnegative preservation weight and zero proxy margin."
+                            )
                     if self.policy_guard_eraf_grounding_objective_version >= 29:
                         if min(
                             self.policy_guard_eraf_safe_gain_injector_training_steps,
                             self.policy_guard_eraf_safe_gain_gate_calibration_steps,
-                        ) <= 0:
+                        ) <= 0 and self.policy_guard_eraf_grounding_objective_version != 30:
                             raise ValueError(
                                 "PGC V9.29 requires positive injector and gate "
                                 "calibration stage lengths."
@@ -2668,6 +2693,8 @@ class FastWAM(torch.nn.Module):
 
     def _policy_guard_v929_training_phase(self) -> str:
         """Return the effective safe-gain optimization phase."""
+        if self.policy_guard_eraf_grounding_objective_version == 30:
+            return "injector"
         if self.policy_guard_eraf_grounding_objective_version < 29:
             return "joint"
         step = (
@@ -2678,6 +2705,87 @@ class FastWAM(torch.nn.Module):
         if step < self.policy_guard_eraf_safe_gain_injector_training_steps:
             return "injector"
         return "gate"
+
+    def _v930_assert_optimizer_scope(self, groups=None) -> None:
+        expected = {
+            id(parameter)
+            for name in preservation.INTERFACE_NAMES
+            for parameter in self.policy_guard_modules[name].parameters()
+        }
+        actual = {id(p) for p in self.parameters() if p.requires_grad}
+        if actual != expected:
+            raise RuntimeError(
+                "V9.30 trainable scope must be exactly compressor + injector."
+            )
+        if groups is not None:
+            grouped = [id(p) for group in groups for p in group["params"]]
+            if set(grouped) != expected or len(grouped) != len(expected):
+                raise RuntimeError(
+                    "V9.30 optimizer contains missing, duplicate or frozen parameters."
+                )
+
+    def _v930_frozen_state(self) -> dict[str, torch.Tensor]:
+        # Audit the adapted policy and all sidecars, not a CPU copy of the 5B base.
+        # Base parameters are excluded by the exact optimizer-identity assertion.
+        state = {
+            "guard." + name: value
+            for name, value in self.policy_guard_modules.state_dict().items()
+            if name.split(".", 1)[0] not in preservation.INTERFACE_NAMES
+        }
+        state.update({"lora." + k: v for k, v in self._lora_adapter_state_dict().items()})
+        if self.eraf_preservation_teacher is not None:
+            state.update({
+                "teacher." + k: v
+                for k, v in self.eraf_preservation_teacher.state_dict().items()
+            })
+        return state
+
+    def _v930_audit_frozen(self) -> None:
+        self._v930_assert_optimizer_scope()
+        if (
+            not self.eraf_preservation_provenance
+            or self._eraf_preservation_frozen_digest is None
+        ):
+            raise RuntimeError("V9.30 training requires a loaded and audited V9.28 teacher.")
+        if (
+            preservation.tensor_digest(self._v930_frozen_state())
+            != self._eraf_preservation_frozen_digest
+        ):
+            raise RuntimeError("V9.30 frozen ERAF/GoalGraph/LoRA/gate/teacher tensors changed.")
+
+    def _v930_restore_teacher(self, path, payload):
+        objective = payload["architecture_metadata"]["eraf_grounding_objective_version"]
+        if objective == 28:
+            state = {
+                name: value for name, value in payload["policy_guard"].items()
+                if name.split(".", 1)[0] in preservation.INTERFACE_NAMES
+            }
+            digest = hashlib.sha256()
+            with Path(path).open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            checkpoint_digest = digest.hexdigest()
+            provenance = {
+                "checkpoint": str(Path(path).resolve()),
+                "checkpoint_sha256": checkpoint_digest,
+                "objective": 28, "step": 10000,
+                "teacher_sha256": preservation.tensor_digest(state),
+            }
+        else:
+            state, provenance = preservation.validate_teacher_payload(payload)
+        self.eraf_preservation_provenance = provenance
+        self._eraf_preservation_last_audit_step = None
+        self.eraf_preservation_source_state = {
+            k: v.detach().cpu().clone() for k, v in state.items()
+        }
+        if self.eraf_preservation_teacher is not None:
+            self.eraf_preservation_teacher.load_state_dict(state, strict=True)
+            self.eraf_preservation_teacher.requires_grad_(False).eval()
+            self._v930_assert_optimizer_scope()
+            self._eraf_preservation_frozen_digest = preservation.tensor_digest(
+                self._v930_frozen_state()
+            )
+        logger.info("V9.30 fixed teacher: %s", provenance)
 
     def _policy_guard_verifier_scale(self) -> float:
         """Delay v3 verifier/alignment until the action residual is useful."""
@@ -3018,6 +3126,18 @@ class FastWAM(torch.nn.Module):
 
     def prepare_trainable_parameters(self) -> dict[str, int]:
         """Freeze the base model and expose only configured adapter parameters."""
+        if (
+            self.policy_guard_enabled
+            and self.policy_guard_eraf_grounding_objective_version == 30
+        ):
+            if self.eraf_preservation_teacher is None:
+                self.eraf_preservation_teacher = preservation.FrozenInterfaceTeacher(
+                    self.policy_guard_modules
+                )
+                if self.eraf_preservation_source_state is not None:
+                    self.eraf_preservation_teacher.load_state_dict(
+                        self.eraf_preservation_source_state, strict=True
+                    )
         self.eval()
         self.requires_grad_(False)
         if self.policy_guard_enabled:
@@ -3164,6 +3284,11 @@ class FastWAM(torch.nn.Module):
                                         "eraf_action_context_injector",
                                         "eraf_gain_gate",
                                     ):
+                                        if (
+                                            self.policy_guard_eraf_grounding_objective_version == 30
+                                            and module_name == "eraf_gain_gate"
+                                        ):
+                                            continue
                                         module = self.policy_guard_modules[module_name]
                                         module.train()
                                         module.requires_grad_(True)
@@ -3590,6 +3715,15 @@ class FastWAM(torch.nn.Module):
                 "PGC v9 optimizer groups do not exactly cover the trainable "
                 "sidecars."
             )
+        if self.policy_guard_eraf_grounding_objective_version == 30:
+            self._v930_assert_optimizer_scope(groups)
+            if (
+                self.eraf_preservation_provenance
+                and self._eraf_preservation_frozen_digest is None
+            ):
+                self._eraf_preservation_frozen_digest = preservation.tensor_digest(
+                    self._v930_frozen_state()
+                )
         return groups
 
     def _policy_guard_completion_only_state(
@@ -4539,16 +4673,21 @@ class FastWAM(torch.nn.Module):
         routed_goal_queries: torch.Tensor,
         return_metrics: bool = False,
         checkpoint_frozen_action_expert: bool = False,
+        context_injector: Optional[nn.Module] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if (
             self.policy_guard_version == 9
             and self.policy_guard_eraf_grounding_objective_version >= 25
         ):
+            injector = (
+                context_injector if context_injector is not None
+                else self.policy_guard_modules["eraf_action_context_injector"]
+            )
             (
                 injected_context,
                 injected_context_mask,
                 injection_metrics,
-            ) = self.policy_guard_modules["eraf_action_context_injector"](
+            ) = injector(
                 context=context,
                 context_mask=full_context_mask,
                 goal_queries=routed_goal_queries,
@@ -9168,6 +9307,17 @@ class FastWAM(torch.nn.Module):
         )
         batch_size = int(action.shape[0])
         training_phase = self._policy_guard_v929_training_phase()
+        preserve_v928 = self.policy_guard_eraf_grounding_objective_version == 30
+        if preserve_v928:
+            if self.eraf_preservation_teacher is None or not self.eraf_preservation_provenance:
+                raise RuntimeError("V9.30 cannot train without its fixed V9.28 interface teacher.")
+            self._v930_assert_optimizer_scope()
+            if (
+                (self._policy_guard_training_step <= 1 or self._policy_guard_training_step % 50 == 0)
+                and self._eraf_preservation_last_audit_step != self._policy_guard_training_step
+            ):
+                self._v930_audit_frozen()
+                self._eraf_preservation_last_audit_step = self._policy_guard_training_step
         if self.policy_guard_eraf_grounding_objective_version >= 29:
             injector_active = training_phase == "injector"
             self.policy_guard_modules["eraf_action_token_compressor"].train(
@@ -9436,6 +9586,34 @@ class FastWAM(torch.nn.Module):
         base_errors = [base_error_first]
         correct_errors = [correct_error_first]
         weighted_correct_errors = [correct_error_first * action_weight]
+        preservation_losses = []
+        preservation_coverage = []
+
+        def preserve_draw(student, base, noisy, timestep, target):
+            with torch.no_grad():
+                teacher_tokens, _ = self.eraf_preservation_teacher[
+                    "eraf_action_token_compressor"
+                ](correct_queries.detach())
+                teacher_action = self._forward_policy_guard_action_from_cache(
+                    action_tokens=noisy, timestep_action=timestep,
+                    context=correct_context, full_context_mask=correct_context_mask,
+                    state_only_context_mask=state_only_context_mask,
+                    video_kv_cache=video_kv_cache, video_seq_len=video_seq_len,
+                    video_tokens_per_frame=video_tokens_per_frame,
+                    routed_goal_queries=teacher_tokens,
+                    context_injector=self.eraf_preservation_teacher["eraf_action_context_injector"],
+                )
+            loss, eligible = preservation.preservation_loss(
+                student=student, teacher=teacher_action, target=target, base=base,
+                action_is_pad=action_is_pad, direct_valid=direct_action_valid,
+                corrective=is_closed_loop_corrective,
+                margin=self.policy_guard_eraf_preservation_margin,
+            )
+            preservation_losses.append(loss)
+            preservation_coverage.append(eligible.float().mean())
+
+        if preserve_v928:
+            preserve_draw(correct_action, base_action, noisy_action, timestep_action, target_action)
         for _ in range(1, self.policy_guard_eraf_safe_gain_noise_levels):
             extra_noise = torch.randn_like(action)
             extra_timestep = self.train_action_scheduler.sample_training_t(
@@ -9495,6 +9673,8 @@ class FastWAM(torch.nn.Module):
             base_errors.append(extra_base_error)
             correct_errors.append(extra_correct_error)
             weighted_correct_errors.append(extra_correct_error * extra_weight)
+            if preserve_v928:
+                preserve_draw(extra_correct_action, extra_base_action, extra_noisy_action, extra_timestep, extra_target)
 
         base_error = torch.stack(base_errors, dim=0).mean(dim=0)
         correct_error = torch.stack(correct_errors, dim=0).mean(dim=0)
@@ -9599,6 +9779,9 @@ class FastWAM(torch.nn.Module):
             total = gate_objective
         else:
             total = action_and_protection_objective + gate_objective
+        if preserve_v928:
+            preservation_objective = torch.stack(preservation_losses).mean()
+            total = total + self.policy_guard_eraf_preservation_weight * preservation_objective
         if (
             self.policy_guard_eraf_grounding_objective_version >= 29
             and (total.numel() != 1 or total.grad_fn is None)
@@ -9719,6 +9902,14 @@ class FastWAM(torch.nn.Module):
             "pgc_v927_post_action_residual_enabled": correct_error.new_zeros(()),
             "pgc_base_policy_frozen": correct_error.new_ones(()),
         }
+        if preserve_v928:
+            metrics.update({
+                "loss_pgc_v930_teacher_preservation": preservation_objective.detach(),
+                "pgc_v930_preservation_effective_weight": total.new_tensor(self.policy_guard_eraf_preservation_weight),
+                "pgc_v930_teacher_proxy_coverage": torch.stack(preservation_coverage).mean(),
+                "pgc_v930_gate_optimization_weight": total.new_zeros(()),
+                "pgc_v930_frozen_scope_verified": total.new_ones(()),
+            })
         metrics.update(safe_metrics)
         metrics.update(injection_metrics)
         metrics.update(correct_goal_metrics)
@@ -16887,6 +17078,7 @@ class FastWAM(torch.nn.Module):
             is_v9
             and self.policy_guard_eraf_grounding_objective_version >= 29
         )
+        is_v930 = is_v9 and self.policy_guard_eraf_grounding_objective_version == 30
         fresh_eraf_joint = bool(
             is_v926_plus and self.policy_guard_eraf_fresh_joint_training
         )
@@ -16929,6 +17121,7 @@ class FastWAM(torch.nn.Module):
                     (
                         (
                             (
+                                preservation.ROLE_SCOPE if is_v930 else
                                 "frozen_complete_eraf_plus_frozen_baseline_lora_"
                                 "plus_compressor_injector_gain_gate"
                                 if is_v927
@@ -17798,6 +17991,7 @@ class FastWAM(torch.nn.Module):
             "eraf_action_trainable_scope": (
                 (
                     (
+                        preservation.ACTION_SCOPE if is_v930 else
                         "eraf_action_token_compressor_plus_context_injector_"
                         "plus_gain_gate_only"
                         if is_v927
@@ -17902,6 +18096,7 @@ class FastWAM(torch.nn.Module):
                 else None
             ),
             "eraf_safe_gain_gate_supervision_contract": (
+                preservation.GATE_CONTRACT if is_v930 else
                 "detached_gate_calibration_from_mean_multi_noise_action_advantage_"
                 "plus_wrong_language_rejection_and_positive_pair_logit_margin"
                 if is_v929
@@ -17922,6 +18117,7 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_eraf_safe_gain_margin if is_v927 else None
             ),
             "eraf_safe_gain_schedule_contract": (
+                preservation.SCHEDULE if is_v930 else
                 "injector_multinoise_then_detached_gate_calibration"
                 if is_v929
                 else None
@@ -17959,6 +18155,10 @@ class FastWAM(torch.nn.Module):
                 if is_v927
                 else None
             ),
+            "eraf_preservation_contract": preservation.PRESERVATION_CONTRACT if is_v930 else None,
+            "eraf_preservation_weight": self.policy_guard_eraf_preservation_weight if is_v930 else None,
+            "eraf_preservation_margin": self.policy_guard_eraf_preservation_margin if is_v930 else None,
+            "eraf_preservation_source": dict(self.eraf_preservation_provenance) if is_v930 else None,
             "eraf_post_action_residual_active": (
                 False
                 if is_v9
@@ -17984,14 +18184,17 @@ class FastWAM(torch.nn.Module):
                         self.policy_guard_eraf_safe_gain_non_regression_weight
                     ),
                     "gain_gate_weight": (
+                        0.0 if is_v930 else
                         self.policy_guard_eraf_safe_gain_gate_loss_weight
                     ),
                     **(
                         {
                             "wrong_gain_gate_weight": (
+                                0.0 if is_v930 else
                                 self.policy_guard_eraf_safe_gain_wrong_gate_loss_weight
                             ),
                             "gain_gate_pairwise_ranking_weight": (
+                                0.0 if is_v930 else
                                 self.policy_guard_eraf_safe_gain_gate_ranking_weight
                             ),
                             "gain_gate_pairwise_ranking_margin": (
@@ -18925,6 +19128,15 @@ class FastWAM(torch.nn.Module):
                 "step": step,
                 "torch_dtype": str(self.torch_dtype),
             }
+            if self.policy_guard_eraf_grounding_objective_version == 30:
+                if self.eraf_preservation_teacher is None:
+                    raise ValueError("V9.30 training checkpoint requires its initialized fixed teacher.")
+                self._v930_audit_frozen()
+                payload["eraf_preservation_teacher"] = {
+                    "state_dict": self.eraf_preservation_source_state,
+                    "provenance": dict(self.eraf_preservation_provenance),
+                }
+                preservation.validate_teacher_payload(payload)
             if self.policy_guard_version == 6:
                 payload["target_prototype_bank"] = (
                     self._policy_guard_target_prototype_state_dict()
@@ -19258,6 +19470,20 @@ class FastWAM(torch.nn.Module):
         saved_eraf_completion_only_memory = bool(
             metadata.get("eraf_completion_only_memory", False)
         )
+        if self.policy_guard_eraf_grounding_objective_version == 30:
+            if saved_eraf_grounding_objective not in {28, 30}:
+                raise ValueError("V9.30 must initialize from V9.28 step10000, not V9.29/joint ERAF.")
+            if saved_eraf_grounding_objective == 28 and payload.get("step") != 10000:
+                raise ValueError("V9.30 requires the V9.28 step10000 teacher checkpoint.")
+            if saved_eraf_grounding_objective == 30:
+                preservation.validate_teacher_payload(payload)
+                for key, expected in {
+                    "eraf_preservation_contract": preservation.PRESERVATION_CONTRACT,
+                    "eraf_preservation_weight": self.policy_guard_eraf_preservation_weight,
+                    "eraf_preservation_margin": self.policy_guard_eraf_preservation_margin,
+                }.items():
+                    if metadata.get(key) != expected:
+                        raise ValueError(f"V9.30 checkpoint contract mismatch: {key}.")
         saved_eraf_fresh_joint_training = bool(
             metadata.get("eraf_fresh_joint_training", False)
         )
@@ -19521,7 +19747,7 @@ class FastWAM(torch.nn.Module):
             saved_policy_guard_version == 9
             and int(self.policy_guard_version) == 9
             and saved_eraf_grounding_objective == 28
-            and self.policy_guard_eraf_grounding_objective_version == 29
+            and self.policy_guard_eraf_grounding_objective_version in {29, 30}
             and self.policy_guard_eraf_training_stage == "action"
             and metadata.get("eraf_training_stage") == "action"
             and saved_eraf_completion_only_memory
@@ -20819,7 +21045,7 @@ class FastWAM(torch.nn.Module):
                             or (
                                 saved_grounding_objective == 28
                                 and self.policy_guard_eraf_grounding_objective_version
-                                == 29
+                                in {29, 30}
                             )
                         )
                         objective_upgrade = objective_upgrade and (
@@ -21381,6 +21607,7 @@ class FastWAM(torch.nn.Module):
                                 expected_scope = (
                                     (
                                         (
+                                            preservation.ROLE_SCOPE if saved_grounding_objective == 30 else
                                             "frozen_complete_eraf_plus_frozen_"
                                             "baseline_lora_plus_compressor_injector_"
                                             "gain_gate"
@@ -22080,6 +22307,7 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_action_trainable_scope = (
                                     (
+                                        preservation.ACTION_SCOPE if saved_grounding_objective == 30 else
                                         "eraf_action_token_compressor_plus_context_"
                                         "injector_plus_gain_gate_only"
                                         if saved_grounding_objective >= 27
@@ -22139,6 +22367,7 @@ class FastWAM(torch.nn.Module):
                                     ),
                                     "eraf_role_adapter_trainable_scope": (
                                         (
+                                            preservation.ROLE_SCOPE if saved_grounding_objective == 30 else
                                             "frozen_complete_eraf_plus_frozen_"
                                             "baseline_lora_plus_compressor_injector_"
                                             "gain_gate"
@@ -22278,6 +22507,7 @@ class FastWAM(torch.nn.Module):
                                                 gate_ranking_margin
                                             ),
                                             "eraf_safe_gain_gate_supervision_contract": (
+                                                preservation.GATE_CONTRACT if saved_grounding_objective == 30 else
                                                 "detached_gate_calibration_from_mean_"
                                                 "multi_noise_action_advantage_plus_"
                                                 "wrong_language_rejection_and_positive_"
@@ -22293,6 +22523,7 @@ class FastWAM(torch.nn.Module):
                                     expected_v914_contract.update(
                                         {
                                             "eraf_safe_gain_schedule_contract": (
+                                                preservation.SCHEDULE if saved_grounding_objective == 30 else
                                                 "injector_multinoise_then_detached_"
                                                 "gate_calibration"
                                             ),
@@ -23391,9 +23622,12 @@ class FastWAM(torch.nn.Module):
             "fastwam_policy_guard_v8",
             "fastwam_policy_guard_v9",
         }:
-            return self._load_policy_guard_checkpoint(
+            result = self._load_policy_guard_checkpoint(
                 str(path), payload, optimizer=optimizer
             )
+            if self.policy_guard_eraf_grounding_objective_version == 30:
+                self._v930_restore_teacher(path, payload)
+            return result
         if payload.get("format") == "fastwam_lora_adapter_v1":
             return self._load_lora_adapter(str(path), payload, optimizer=optimizer)
 

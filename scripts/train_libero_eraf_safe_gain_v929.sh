@@ -38,8 +38,24 @@ MAX_STEPS="${ERAF_SAFE_GAIN_MAX_STEPS:-10000}"
 SIDE_MODULE_LEARNING_RATE="${ERAF_SAFE_GAIN_LEARNING_RATE:-2.0e-5}"
 GRADIENT_ACCUMULATION_STEPS="${ERAF_SAFE_GAIN_GRADIENT_ACCUMULATION_STEPS:-4}"
 SAVE_EVERY="${ERAF_SAFE_GAIN_SAVE_EVERY:-250}"
+VARIANT="${ERAF_SAFE_GAIN_VARIANT:-v929}"
+VARIANT_OVERRIDES=()
+case "${VARIANT}" in
+  v929) ;;
+  v930)
+    if ! [[ "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || (( MAX_STEPS > 500 )); then
+      echo "V9.30 is a short 1..500-step probe; evaluate before extending training." >&2
+      exit 1
+    fi
+    VARIANT_OVERRIDES+=(
+      "model.policy_guard.entity_relation_grounding.safe_gain_injector_training_steps=${MAX_STEPS}"
+      "model.policy_guard.entity_relation_grounding.preservation_weight=${ERAF_PRESERVATION_WEIGHT:-1.0}"
+    )
+    ;;
+  *) echo "Unsupported safe-gain variant: ${VARIANT}" >&2; exit 1 ;;
+esac
 
-if [[ "${MAX_STEPS}" != "10000" ]]; then
+if [[ "${VARIANT}" == v929 && "${MAX_STEPS}" != "10000" ]]; then
   echo "PGC V9.29 has a fixed 7000+3000=10000-step schedule." >&2
   exit 1
 fi
@@ -189,16 +205,25 @@ SIDECAR_JSON="$(json_array \
   "${HISTORICAL_CF_SIDECAR}" "${STRICT_CF_SIDECAR}" \
   "${CLOSED_LOOP_CF_SIDECAR}")"
 
-RUN_TAG="${RUN_TAG:-${SUITE}-eraf-safe-gain-rollout-repair-10k-seed${TRAIN_SEED}-v929}"
-echo "[FastWAM] LIBERO V9.29 rollout-aligned ERAF safe-gain training"
+if [[ "${VARIANT}" == v929 ]]; then
+  RUN_TAG="${RUN_TAG:-${SUITE}-eraf-safe-gain-rollout-repair-10k-seed${TRAIN_SEED}-v929}"
+else
+  RUN_TAG="${RUN_TAG:-${SUITE}-eraf-safe-gain-${VARIANT}-${MAX_STEPS}-seed${TRAIN_SEED}}"
+fi
+echo "[FastWAM] LIBERO ${VARIANT} ERAF safe-gain training"
 echo "  warm_start=${V928_CHECKPOINT}"
 echo "  productive_mix=offline-native:historical-CF:strict-CF:closed-loop-CF=1:1:1:1"
-echo "  schedule=injector-multinoise[0,7000)+detached-gate[7000,10000)"
+if [[ "${VARIANT}" == v930 ]]; then
+  echo "  schedule=injector-only ${MAX_STEPS}; fixed V9.28 teacher; gate excluded from optimizer"
+  echo "  preservation=teacher-no-worse-than-base proxy on noncorrective rows; not rollout safety"
+else
+  echo "  schedule=injector-multinoise[0,7000)+detached-gate[7000,10000)"
+fi
 echo "  frozen=no-ERAF-Video/Action-LoRA+GoalGraph+complete-ERAF"
 echo "  deployment=one pre-action gate then one Action Expert denoising path"
 
-RUN_ID="eraf-safe-gain-v929-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
-  task=libero_eraf_safe_gain_v929_2cam224 \
+RUN_ID="eraf-safe-gain-${VARIANT}-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
+  "task=libero_eraf_safe_gain_${VARIANT}_2cam224" \
   "resume=${V928_CHECKPOINT}" \
   "data.train.dataset_dirs=${NATIVE_JSON}" \
   "data.train.pgc_counterfactual_dataset_dirs=${CF_JSON}" \
@@ -226,4 +251,5 @@ RUN_ID="eraf-safe-gain-v929-${RUN_TAG}" exec bash scripts/train_zero1.sh "${NPRO
   "learning_rate=${SIDE_MODULE_LEARNING_RATE}" \
   "gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}" \
   "save_every=${SAVE_EVERY}" \
-  save_training_state=false
+  save_training_state=false \
+  "${VARIANT_OVERRIDES[@]}"
