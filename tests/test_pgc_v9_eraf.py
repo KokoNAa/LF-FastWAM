@@ -2679,6 +2679,7 @@ class PGCERAFModuleTest(unittest.TestCase):
             "context": torch.randn(batch_size, 6, 10),
             "context_mask": torch.ones(batch_size, 6, dtype=torch.bool),
             "pgc_is_counterfactual": torch.tensor([False, True]),
+            "pgc_corrective_verification_kind": torch.tensor([0, 2]),
             "pgc_direct_action_valid": torch.ones(batch_size, dtype=torch.bool),
             "pgc_goal_id": torch.tensor([1, 2]),
             "pgc_source_context": torch.randn(batch_size, 6, 10),
@@ -2718,6 +2719,10 @@ class PGCERAFModuleTest(unittest.TestCase):
             )
 
         inputs = model.build_inputs(sample)
+        self.assertTrue(torch.equal(
+            inputs["pgc_corrective_verification_kind"],
+            sample["pgc_corrective_verification_kind"],
+        ))
         for prefix in ("", "source_"):
             self.assertEqual(
                 inputs[

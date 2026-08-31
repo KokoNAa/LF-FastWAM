@@ -744,6 +744,8 @@ if version == 9:
             PRESERVATION_CONTRACT, validate_teacher_payload,
         )
         validate_teacher_payload(payload)
+        from fastwam.utils.cf_ablation import checkpoint_mode
+        checkpoint_mode(metadata)
         if (metadata.get("eraf_preservation_contract") != PRESERVATION_CONTRACT
             or metadata.get("eraf_preservation_weight") is None
             or float(metadata["eraf_preservation_weight"]) < 0
@@ -951,6 +953,7 @@ mapping = {
     "eraf_safe_gain_noise_levels": "safe_gain_noise_levels",
     "eraf_preservation_weight": "preservation_weight",
     "eraf_preservation_margin": "preservation_margin",
+    "eraf_cf_ablation": "cf_ablation",
     "eraf_safe_gain_closed_loop_action_weight": (
         "safe_gain_closed_loop_action_weight"
     ),

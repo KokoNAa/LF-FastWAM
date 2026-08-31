@@ -194,6 +194,13 @@ if (( VISIBLE_GPU_COUNT < NPROC_PER_NODE )); then
   exit 1
 fi
 
+# Reuse the exact checkpoint/data/sidecar/CUDA preflight for config-cloned
+# V9.30 ablations, without reconstructing or starting their training configs.
+if [[ "${ERAF_SAFE_GAIN_PREFLIGHT_ONLY:-0}" == 1 ]]; then
+  echo "PASS: V9.28 warm checkpoint, dataset bindings, sidecars and CUDA preflight"
+  exit 0
+fi
+
 json_array() {
   "${PYTHON_BIN}" -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"
 }

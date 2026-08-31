@@ -97,8 +97,9 @@ class PGCV8DataContractTest(unittest.TestCase):
             )
             self.assertEqual(set(index), {0})
             self.assertEqual(index[0]["recorded_action_count"], 24)
+            self.assertEqual(index[0]["verification_kind"], "target_lift")
         with tempfile.TemporaryDirectory() as tmpdir:
-            with self.assertRaisesRegex(ValueError, "not target-lift verified"):
+            with self.assertRaisesRegex(ValueError, "not (target-lift verified|replay-verified)"):
                 load_pgc_closed_loop_corrective_index(
                     self._write_dataset(Path(tmpdir), verified=False)
                 )

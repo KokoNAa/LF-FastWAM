@@ -374,6 +374,8 @@ policy_guard:
     safe_gain_noise_levels: 1
     preservation_weight: 1.0
     preservation_margin: 0.0
+    # Training-only V9.30 numerator masks; inference still has one Action Expert.
+    cf_ablation: none
     safe_gain_closed_loop_action_weight: 1.0
     safe_gain_closed_loop_non_regression_weight: 2.0
     action_grounding_hidden_dim: 256

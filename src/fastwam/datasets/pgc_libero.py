@@ -516,6 +516,9 @@ def load_pgc_closed_loop_corrective_index(
             )
         capture_ids.add(capture_id)
         indexed[episode_index] = dict(record)
+        # V1 has no explicit kind in the JSON; normalize only after its
+        # acquisition-only contract and matching action audit passed validation.
+        indexed[episode_index]["verification_kind"] = verification_kind
     return indexed
 
 

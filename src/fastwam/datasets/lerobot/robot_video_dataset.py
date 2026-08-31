@@ -8,6 +8,7 @@ import time
 import numpy as np
 import traceback
 import torch
+from fastwam.utils.cf_ablation import CorrectiveVerification, verification_code
 import torchvision.transforms.functional as transforms_F
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -2126,6 +2127,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             self.pgc_native_dataset_count
             + self.pgc_offline_counterfactual_dataset_count
         )
+        pgc_corrective_verification_kind = int(CorrectiveVerification.NONE)
         pgc_source_task = str(task)
         pgc_target_task = str(task)
         pgc_pair_valid = False
@@ -2190,6 +2192,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                         f"frame={frame_index} actions="
                         f"{corrective_record['recorded_action_count']}."
                     )
+                pgc_corrective_verification_kind = verification_code(
+                    corrective_record["verification_kind"]
+                )
             if self.pgc_completion_phase_supervision_required:
                 if frame_index < 0:
                     raise KeyError("PGC completion supervision requires frame_index.")
@@ -2366,6 +2371,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             ),
             "pgc_is_closed_loop_corrective": torch.tensor(
                 pgc_is_closed_loop_corrective, dtype=torch.bool
+            ),
+            "pgc_corrective_verification_kind": torch.tensor(
+                pgc_corrective_verification_kind, dtype=torch.long
             ),
             "pgc_is_eraf_closed_loop": torch.tensor(
                 pgc_is_eraf_closed_loop, dtype=torch.bool

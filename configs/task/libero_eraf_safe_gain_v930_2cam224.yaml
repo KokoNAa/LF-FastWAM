@@ -15,6 +15,7 @@ model:
       safe_gain_gate_calibration_steps: 0
       preservation_weight: 1.0
       preservation_margin: 0.0
+      cf_ablation: none
 
 learning_rate: 2.0e-6
 max_steps: 250

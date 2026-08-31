@@ -17,7 +17,7 @@ from fastwam.models.wan22 import eraf_preservation as preservation
 from test_policy_guard import tiny_pgc_fastwam
 
 
-def model_for(objective=30, source=None):
+def model_for(objective=30, source=None, ablation="none"):
     return tiny_pgc_fastwam(
         version=9,
         v9_stage="action",
@@ -34,6 +34,7 @@ def model_for(objective=30, source=None):
         v9_safe_gain_injector_training_steps=250 if objective == 30 else 0,
         v9_safe_gain_gate_calibration_steps=0,
         v9_safe_gain_noise_levels=2 if objective == 30 else 1,
+        v9_cf_ablation=ablation,
     )
 
 
@@ -263,8 +264,14 @@ def test_rejects_v929_and_wrong_v928_step(warm_checkpoint, tmp_path):
         model_for().load_checkpoint(path)
 
 
-def test_real_action_forward_backward_and_eval_preflight(warm_checkpoint, tmp_path):
-    student = model_for()
+@pytest.mark.parametrize("ablation,all_lift", [
+    ("none", False),
+    ("mask_lift_corrective", False),
+    ("mask_corrective_ranking", False),
+    ("mask_lift_corrective", True),
+])
+def test_real_action_forward_backward_and_eval_preflight(warm_checkpoint, tmp_path, ablation, all_lift):
+    student = model_for(ablation=ablation)
     student.prepare_trainable_parameters()
     student.load_checkpoint(warm_checkpoint)
     groups = student.policy_guard_optimizer_groups(2e-6)
@@ -278,7 +285,8 @@ def test_real_action_forward_backward_and_eval_preflight(warm_checkpoint, tmp_pa
         "input_latents": torch.randn(batch, 2, 1, 2, 2),
         "fuse_vae_embedding_in_latents": True,
         "pgc_is_counterfactual": torch.tensor([False, True, True, True]),
-        "pgc_is_closed_loop_corrective": torch.tensor([False, False, False, True]),
+        "pgc_is_closed_loop_corrective": torch.tensor([False, False, True, True]),
+        "pgc_corrective_verification_kind": torch.tensor([0, 0, 1, 2]),
         "pgc_direct_action_valid": torch.ones(batch, dtype=torch.bool),
         "pgc_paired_language_valid": torch.ones(batch, dtype=torch.bool),
         "pgc_bidirectional_language_valid": torch.ones(batch, dtype=torch.bool),
@@ -288,6 +296,10 @@ def test_real_action_forward_backward_and_eval_preflight(warm_checkpoint, tmp_pa
         "pgc_target_context_mask": mask,
         "language_context_len": 3,
     }
+    if all_lift:
+        inputs["pgc_is_counterfactual"].fill_(True)
+        inputs["pgc_is_closed_loop_corrective"].fill_(True)
+        inputs["pgc_corrective_verification_kind"].fill_(1)
     labels = {
         "phase_safe_memory_previous_state_ids": torch.zeros(
             batch, clauses, dtype=torch.long
@@ -319,6 +331,10 @@ def test_real_action_forward_backward_and_eval_preflight(warm_checkpoint, tmp_pa
             "_encode_policy_guard_eraf",
             return_value=(queries, None, eraf_outputs, {}),
         ),
+        patch.object(
+            student, "_forward_policy_guard_action_from_cache",
+            wraps=student._forward_policy_guard_action_from_cache,
+        ) as action_path,
     ):
         loss, metrics = student._training_loss_policy_guard_v927_safe_gain(
             inputs=inputs,
@@ -326,14 +342,29 @@ def test_real_action_forward_backward_and_eval_preflight(warm_checkpoint, tmp_pa
             state_only_context_mask=torch.zeros_like(mask),
         )
     assert torch.isfinite(loss) and loss.requires_grad
+    # correct + wrong + two teacher draws + second correct-noise draw, even
+    # when the whole microbatch contributes zero gradient in ablation A.
+    assert action_path.call_count == 5
     assert metrics["loss_pgc_v930_teacher_preservation"] == pytest.approx(0, abs=1e-8)
     assert metrics["pgc_v930_gate_optimization_weight"] == 0
+    if ablation == "mask_lift_corrective":
+        for component in ("action", "ranking", "nonregression"):
+            assert metrics[f"loss_pgc_v930_cf_lift_{component}_used"] == 0
+    if ablation == "mask_corrective_ranking":
+        for kind in ("lift", "goal"):
+            assert metrics[f"loss_pgc_v930_cf_{kind}_ranking_used"] == 0
+            assert metrics[f"loss_pgc_v930_cf_{kind}_action_used"] == metrics[f"loss_pgc_v930_cf_{kind}_action_raw"]
+    if all_lift:
+        assert loss.item() == 0
     loss.backward()
     for name in preservation.INTERFACE_NAMES:
-        assert any(
-            p.grad is not None and p.grad.abs().sum() > 0
-            for p in student.policy_guard_modules[name].parameters()
-        )
+        if all_lift:
+            assert all(p.grad is None or p.grad.abs().sum() == 0 for p in student.policy_guard_modules[name].parameters())
+        else:
+            assert any(
+                p.grad is not None and p.grad.abs().sum() > 0
+                for p in student.policy_guard_modules[name].parameters()
+            )
     assert all(
         p.grad is None
         for p in student.policy_guard_modules["eraf_gain_gate"].parameters()
@@ -349,7 +380,7 @@ def test_real_action_forward_backward_and_eval_preflight(warm_checkpoint, tmp_pa
     validator = next(
         block for block in blocks if "evaluation_inference_steps =" in block
     )
-    env = {**os.environ, "PYTHONPATH": str(root / "src")}
+    env = {**os.environ, "PYTHONPATH": str(root / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")}
     result = subprocess.run(
         [sys.executable, "-c", validator, str(saved), "2", "full"],
         env=env,
@@ -368,6 +399,7 @@ def test_real_action_forward_backward_and_eval_preflight(warm_checkpoint, tmp_pa
     )
     assert result.returncode == 0, result.stderr
     overrides = result.stdout.splitlines()
+    assert f"model.policy_guard.entity_relation_grounding.cf_ablation={ablation}" in overrides
     assert (
         "model.policy_guard.entity_relation_grounding.preservation_weight=1.0"
         in overrides
@@ -385,3 +417,9 @@ def test_real_action_forward_backward_and_eval_preflight(warm_checkpoint, tmp_pa
         evaluation.model.policy_guard.entity_relation_grounding.safe_gain_gate_calibration_steps
         == 0
     )
+    assert evaluation.model.policy_guard.entity_relation_grounding.cf_ablation == ablation
+    reloaded = model_for(ablation=ablation)
+    reloaded.load_checkpoint(saved)
+    if ablation != "none":
+        with pytest.raises(ValueError, match="eraf_cf_ablation"):
+            model_for().load_checkpoint(saved)

@@ -7,14 +7,14 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 
-def launch_spec(config_path, gpus, environ):
+def launch_spec(config_path, gpus, environ, *, source_objective=29):
     if gpus < 1:
         raise ValueError("GPU count must be positive.")
     cfg = OmegaConf.load(config_path)
     eraf = cfg.model.policy_guard.entity_relation_grounding
-    if eraf.grounding_objective_version != 29 or not eraf.safe_gain_training:
+    if eraf.grounding_objective_version != source_objective or not eraf.safe_gain_training:
         raise ValueError(
-            "Source config must be the completed V9.29 training run's config.yaml."
+            f"Source config must be the completed V9.{source_objective} training run's config.yaml."
         )
     data = cfg.data.train
     native = list(data.dataset_dirs)

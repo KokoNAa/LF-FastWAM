@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from fastwam.datasets.pgc_libero import PGC_ENTITY_RELATION_ARRAY_NAMES
+from fastwam.utils import cf_ablation
 from fastwam.utils.logging_config import get_logger
 
 from . import eraf_preservation as preservation
@@ -819,6 +820,17 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_preservation_margin = float(
             eraf_config.get("preservation_margin", 0.0)
         )
+        self.policy_guard_eraf_cf_ablation = cf_ablation.validate_mode(
+            eraf_config.get("cf_ablation", "none")
+        )
+        if (
+            self.policy_guard_eraf_cf_ablation != "none"
+            and (
+                self.policy_guard_eraf_grounding_objective_version != 30
+                or not self.policy_guard_eraf_safe_gain_training
+            )
+        ):
+            raise ValueError("CF loss ablations require the V9.30 frozen-gate teacher contract.")
         self.eraf_preservation_teacher = None
         self.eraf_preservation_provenance = {}
         self.eraf_preservation_source_state = None
@@ -9380,6 +9392,19 @@ class FastWAM(torch.nn.Module):
         )
         semantic_valid = source_semantic_valid | target_semantic_valid
 
+        # Never alter the sampler, validity masks, reduction denominators, or
+        # forward/noise schedule. Only the loss NUMERATORS are ablated.
+        action_multiplier = torch.ones_like(direct_action_valid)
+        ranking_multiplier = torch.ones_like(direct_action_valid)
+        if preserve_v928:
+            action_multiplier, ranking_multiplier, verification_kind = (
+                cf_ablation.loss_multipliers(
+                    self.policy_guard_eraf_cf_ablation,
+                    is_closed_loop_corrective,
+                    inputs.get("pgc_corrective_verification_kind"),
+                )
+            )
+
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
@@ -9688,7 +9713,7 @@ class FastWAM(torch.nn.Module):
             weighted_correct_error, counterfactual_valid
         )
         corrective_action_loss = self._masked_policy_guard_mean(
-            weighted_correct_error, corrective_valid
+            weighted_correct_error * action_multiplier, corrective_valid
         )
         ranking_per_sample = torch.relu(
             self.policy_guard_eraf_action_causal_margin
@@ -9699,7 +9724,7 @@ class FastWAM(torch.nn.Module):
             ranking_per_sample, source_semantic_valid
         )
         target_ranking = self._masked_policy_guard_mean(
-            ranking_per_sample, target_semantic_valid
+            ranking_per_sample * ranking_multiplier, target_semantic_valid
         )
         ranking_loss = source_ranking + target_ranking
         non_regression_per_sample = torch.stack(
@@ -9716,7 +9741,7 @@ class FastWAM(torch.nn.Module):
             direct_action_valid & ~is_closed_loop_corrective,
         )
         corrective_non_regression_loss = self._masked_policy_guard_mean(
-            non_regression_per_sample, corrective_valid
+            non_regression_per_sample * action_multiplier, corrective_valid
         )
         gate_target = (
             correct_error.detach() + self.policy_guard_eraf_safe_gain_margin
@@ -9909,7 +9934,32 @@ class FastWAM(torch.nn.Module):
                 "pgc_v930_teacher_proxy_coverage": torch.stack(preservation_coverage).mean(),
                 "pgc_v930_gate_optimization_weight": total.new_zeros(()),
                 "pgc_v930_frozen_scope_verified": total.new_ones(()),
+                "pgc_v930_cf_action_kept_fraction": self._masked_policy_guard_mean(
+                    action_multiplier.float(), corrective_valid
+                ),
+                "pgc_v930_cf_ranking_kept_fraction": self._masked_policy_guard_mean(
+                    ranking_multiplier.float(), target_semantic_valid & is_closed_loop_corrective
+                ),
             })
+            for label, kind_id in (
+                ("lift", cf_ablation.CorrectiveVerification.TARGET_LIFT),
+                ("goal", cf_ablation.CorrectiveVerification.COUNTERFACTUAL_GOAL),
+            ):
+                kind_valid = corrective_valid & (verification_kind == kind_id)
+                metrics[f"pgc_v930_cf_{label}_valid_rate"] = kind_valid.float().mean()
+                # These are diagnostics, not extra terms in the objective.
+                for name, values, multiplier in (
+                    ("action", weighted_correct_error, action_multiplier),
+                    ("ranking", ranking_per_sample, ranking_multiplier),
+                    ("nonregression", non_regression_per_sample, action_multiplier),
+                ):
+                    valid = kind_valid & target_semantic_valid if name == "ranking" else kind_valid
+                    metrics[f"loss_pgc_v930_cf_{label}_{name}_raw"] = (
+                        self._masked_policy_guard_mean(values, valid).detach()
+                    )
+                    metrics[f"loss_pgc_v930_cf_{label}_{name}_used"] = (
+                        self._masked_policy_guard_mean(values * multiplier, valid).detach()
+                    )
         metrics.update(safe_metrics)
         metrics.update(injection_metrics)
         metrics.update(correct_goal_metrics)
@@ -13769,6 +13819,9 @@ class FastWAM(torch.nn.Module):
             "pgc_is_counterfactual": pgc_is_counterfactual,
             "pgc_is_closed_loop_corrective": (
                 pgc_is_closed_loop_corrective
+            ),
+            "pgc_corrective_verification_kind": sample.get(
+                "pgc_corrective_verification_kind"
             ),
             "pgc_direct_action_valid": pgc_direct_action_valid,
             "pgc_goal_id": pgc_goal_id,
@@ -18159,6 +18212,8 @@ class FastWAM(torch.nn.Module):
             "eraf_preservation_weight": self.policy_guard_eraf_preservation_weight if is_v930 else None,
             "eraf_preservation_margin": self.policy_guard_eraf_preservation_margin if is_v930 else None,
             "eraf_preservation_source": dict(self.eraf_preservation_provenance) if is_v930 else None,
+            "eraf_cf_ablation": self.policy_guard_eraf_cf_ablation if is_v930 else None,
+            "eraf_cf_ablation_contract": cf_ablation.CONTRACT if is_v930 else None,
             "eraf_post_action_residual_active": (
                 False
                 if is_v9
@@ -19477,6 +19532,8 @@ class FastWAM(torch.nn.Module):
                 raise ValueError("V9.30 requires the V9.28 step10000 teacher checkpoint.")
             if saved_eraf_grounding_objective == 30:
                 preservation.validate_teacher_payload(payload)
+                if cf_ablation.checkpoint_mode(metadata) != self.policy_guard_eraf_cf_ablation:
+                    raise ValueError("V9.30 checkpoint contract mismatch: eraf_cf_ablation.")
                 for key, expected in {
                     "eraf_preservation_contract": preservation.PRESERVATION_CONTRACT,
                     "eraf_preservation_weight": self.policy_guard_eraf_preservation_weight,
