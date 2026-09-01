@@ -236,7 +236,7 @@ def test_v931_runner_clones_actual_b_config_and_only_adds_declared_objective(tmp
     OmegaConf.save(source, source_path)
     loaded = module.load_v930_b(source_path)
     output = tmp_path / "v931"
-    derived = module.training_config(loaded, output)
+    derived = module.training_config(loaded, output, 3)
     derived_eraf = derived.model.policy_guard.entity_relation_grounding
     assert derived.resume == loaded.resume
     assert derived.data == loaded.data
@@ -252,6 +252,10 @@ def test_v931_runner_clones_actual_b_config_and_only_adds_declared_objective(tmp
     assert module.training_command(output, 3, derived)[0:3] == [
         "bash", "scripts/train_zero1.sh", "3"
     ]
+    four_gpu = module.training_config(loaded, tmp_path / "v931-4gpu", 4)
+    assert four_gpu.batch_size == 1
+    assert four_gpu.gradient_accumulation_steps == 3
+    assert 4 * four_gpu.batch_size * four_gpu.gradient_accumulation_steps == 12
 
 
 def test_migration_optimizer_freeze_and_teacher_roundtrip(warm_checkpoint, tmp_path):

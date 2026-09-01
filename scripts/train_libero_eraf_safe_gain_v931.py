@@ -35,6 +35,7 @@ FULL_GOAL_WEIGHTS = {
     "full_goal_context_preservation_weight": 1.0,
     "full_goal_preservation_margin": 0.0,
 }
+TARGET_EFFECTIVE_BATCH_SIZE = 12
 
 
 def file_sha256(path):
@@ -67,6 +68,8 @@ def load_v930_b(config_path):
         or int(eraf.safe_gain_gate_calibration_steps) != 0
         or int(eraf.safe_gain_noise_levels) < 2
         or float(cfg.learning_rate) != 2.0e-6
+        or 3 * int(cfg.batch_size) * int(cfg.gradient_accumulation_steps)
+        != TARGET_EFFECTIVE_BATCH_SIZE
         or not cfg.data.train.pgc_v9_safe_gain_counterfactual_replay
     ):
         raise ValueError(
@@ -75,8 +78,21 @@ def load_v930_b(config_path):
     return cfg
 
 
-def training_config(source, output_dir):
+def training_config(source, output_dir, gpus=3):
     cfg = OmegaConf.create(OmegaConf.to_container(source, resolve=True))
+    per_accumulation_batch = int(gpus) * int(cfg.batch_size)
+    if (
+        gpus < 1
+        or per_accumulation_batch <= 0
+        or TARGET_EFFECTIVE_BATCH_SIZE % per_accumulation_batch
+    ):
+        raise ValueError(
+            f"Cannot preserve effective batch {TARGET_EFFECTIVE_BATCH_SIZE} with "
+            f"gpus={gpus} and per-GPU batch={cfg.batch_size}."
+        )
+    cfg.gradient_accumulation_steps = (
+        TARGET_EFFECTIVE_BATCH_SIZE // per_accumulation_batch
+    )
     eraf = cfg.model.policy_guard.entity_relation_grounding
     eraf.grounding_objective_version = 31
     eraf.cf_ablation = "mask_corrective_ranking"
@@ -111,12 +127,14 @@ def main():
     parser.add_argument(
         "config", type=Path, help="actual completed V9.30-B run-root/config.yaml"
     )
-    parser.add_argument("gpus", type=int, help="must be 3 to preserve effective batch 12")
+    parser.add_argument(
+        "gpus", type=int, help="GPU count; accumulation is adjusted to keep batch 12"
+    )
     parser.add_argument("run_tag", help="new unique directory name, no slashes")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if args.gpus != 3:
-        parser.error("The matched V9.31 probe requires exactly 3 GPUs (effective batch 12).")
+    if args.gpus < 1:
+        parser.error("GPU count must be positive.")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.run_tag):
         parser.error("run_tag must be a plain unique directory name.")
     if os.environ.get("NNODES", "1") != "1":
@@ -129,7 +147,7 @@ def main():
     root = repo / "runs/libero_eraf_safe_gain_v931_2cam224" / args.run_tag
     if root.exists():
         raise FileExistsError(f"Refusing to overwrite an existing run: {root}")
-    cfg = training_config(source, root)
+    cfg = training_config(source, root, args.gpus)
     command = training_command(root, args.gpus, cfg)
     plan = {
         "contract": preservation.SELECTIVE_FULL_GOAL_CONTRACT,
@@ -139,7 +157,13 @@ def main():
         "output": str(root),
         "gpus": args.gpus,
         "effective_batch_size": (
-            args.gpus * int(source.batch_size) * int(source.gradient_accumulation_steps)
+            args.gpus * int(cfg.batch_size) * int(cfg.gradient_accumulation_steps)
+        ),
+        "source_gradient_accumulation_steps": int(
+            source.gradient_accumulation_steps
+        ),
+        "derived_gradient_accumulation_steps": int(
+            cfg.gradient_accumulation_steps
         ),
         "seed": int(source.seed),
         "steps": int(source.max_steps),
@@ -148,7 +172,7 @@ def main():
         "full_goal_weights": FULL_GOAL_WEIGHTS,
         "command": command,
     }
-    if plan["effective_batch_size"] != 12:
+    if plan["effective_batch_size"] != TARGET_EFFECTIVE_BATCH_SIZE:
         raise ValueError(
             "Resolved V9.30-B config no longer yields the audited effective batch 12."
         )
