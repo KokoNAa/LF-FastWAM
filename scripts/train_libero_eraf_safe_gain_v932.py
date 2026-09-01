@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Run the matched verified-ranking experiments from warm V9.28.
 
-The input is the exact resolved V9.30-B config used by V9.31. Derived objectives
-keep its data, optimizer, seed, effective batch, frozen teacher, full-goal
-preservation and trainable scope. Objectives 32--35 use the 25/50 diagnostic
-schedule; V9.36--V9.37 use a shorter 25-step schedule with early checkpoints.
+The input is the resolved V9.30 preservation template.  Newer artifacts record
+the V9.30-B ``mask_corrective_ranking`` mode explicitly; the original server
+artifact predates that field and is accepted only when the field is absent.
+Derived objectives write their own loss mode explicitly and keep the template's
+data, optimizer, seed, effective batch, frozen teacher, full-goal preservation
+and trainable scope. Objectives 32--35 use the 25/50 diagnostic schedule;
+V9.36--V9.37 use a shorter 25-step schedule with early checkpoints.
 """
 
 import argparse
@@ -43,6 +46,8 @@ SUPPORTED_OBJECTIVES = frozenset({32, 33, 34, 35, 36, 37})
 PAIRED_SEMANTIC_CONTRAST_WEIGHT = 0.1
 PAIRED_SEMANTIC_CONTRAST_MARGIN = 0.1
 PAIRED_SEMANTIC_NON_VIOLATION_WEIGHT = 0.5
+EXPLICIT_V930_B_SOURCE_CONTRACT = "explicit_mask_corrective_ranking"
+LEGACY_V930_TEMPLATE_SOURCE_CONTRACT = "legacy_unrecorded_cf_ablation"
 
 
 def ranking_gradient_contract(objective):
@@ -69,20 +74,28 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+def source_cf_ablation_contract(eraf):
+    if "cf_ablation" not in eraf:
+        return LEGACY_V930_TEMPLATE_SOURCE_CONTRACT
+    if str(eraf.cf_ablation) == "mask_corrective_ranking":
+        return EXPLICIT_V930_B_SOURCE_CONTRACT
+    raise ValueError(
+        "V9.30 source cf_ablation must be explicitly mask_corrective_ranking "
+        "or absent in the legacy server template."
+    )
+
+
 def load_v930_b(config_path):
     register_default_resolvers()
     cfg = OmegaConf.create(
         OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
     )
     eraf = cfg.model.policy_guard.entity_relation_grounding
-    if (
-        int(eraf.grounding_objective_version) != 30
-        or not eraf.safe_gain_training
-        or eraf.get("cf_ablation", "none") != "mask_corrective_ranking"
-    ):
+    if int(eraf.grounding_objective_version) != 30 or not eraf.safe_gain_training:
         raise ValueError(
-            "Source must be the completed V9.30-B mask_corrective_ranking config.yaml."
+            "Source must be the completed V9.30 preservation config.yaml."
         )
+    source_cf_ablation_contract(eraf)
     if (
         not cfg.get("resume")
         or cfg.get("weight_only_start_step") not in (None, 0)
@@ -96,7 +109,8 @@ def load_v930_b(config_path):
         or not cfg.data.train.pgc_v9_safe_gain_counterfactual_replay
     ):
         raise ValueError(
-            "Expected the fresh 250-step V9.30-B run with its V9.28 resume and data recipe."
+            "Expected the fresh 250-step V9.30 preservation run with its "
+            "V9.28 resume and data recipe."
         )
     return cfg
 
@@ -165,7 +179,7 @@ def main(*, objective=32):
     version_slug = f"v9{objective}"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "config", type=Path, help="actual completed V9.30-B run-root/config.yaml"
+        "config", type=Path, help="actual completed V9.30 run-root/config.yaml"
     )
     parser.add_argument(
         "gpus", type=int, help="GPU count; accumulation is adjusted to keep batch 12"
@@ -197,8 +211,11 @@ def main(*, objective=32):
             "target_lift": {"action": True, "ranking": False},
             "counterfactual_goal": {"action": True, "ranking": True},
         },
-        "source_v930_b_config": str(source_path),
-        "source_v930_b_config_sha256": file_sha256(source_path),
+        "source_v930_template_config": str(source_path),
+        "source_v930_template_config_sha256": file_sha256(source_path),
+        "source_v930_cf_ablation_contract": source_cf_ablation_contract(
+            source.model.policy_guard.entity_relation_grounding
+        ),
         "warm_v928_checkpoint": str(Path(source.resume).resolve()),
         "output": str(root),
         "gpus": args.gpus,
@@ -252,7 +269,7 @@ def main(*, objective=32):
     }
     if plan["effective_batch_size"] != TARGET_EFFECTIVE_BATCH_SIZE:
         raise ValueError(
-            "Resolved V9.30-B config no longer yields the audited effective batch 12."
+            "Resolved V9.30 config no longer yields the audited effective batch 12."
         )
     print(json.dumps(plan, indent=2), flush=True)
     if args.dry_run:

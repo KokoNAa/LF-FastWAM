@@ -428,6 +428,58 @@ def test_v932_runner_keeps_batch_and_builds_25_50_schedule(tmp_path):
     assert module.SAVE_STEPS == (25, 50)
 
 
+def test_v932_runner_accepts_legacy_server_template_without_cf_ablation(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    path = root / "scripts/train_libero_eraf_safe_gain_v932.py"
+    spec = importlib.util.spec_from_file_location("legacy_v930_launch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with initialize_config_dir(config_dir=str(root / "configs"), version_base=None):
+        source = compose(
+            config_name="train",
+            overrides=["task=libero_eraf_safe_gain_v930_2cam224"],
+        )
+    OmegaConf.set_struct(source, False)
+    eraf = source.model.policy_guard.entity_relation_grounding
+    del eraf.cf_ablation
+    source.resume = str(tmp_path / "v928/step_010000.pt")
+    source.batch_size = 1
+    source.gradient_accumulation_steps = 4
+    source_path = tmp_path / "legacy-config.yaml"
+    OmegaConf.save(source, source_path)
+
+    loaded = module.load_v930_b(source_path)
+    assert module.source_cf_ablation_contract(
+        loaded.model.policy_guard.entity_relation_grounding
+    ) == module.LEGACY_V930_TEMPLATE_SOURCE_CONTRACT
+    derived = module.training_config(loaded, tmp_path / "v937", 4, objective=37)
+    assert derived.model.policy_guard.entity_relation_grounding.cf_ablation == (
+        "mask_lift_ranking"
+    )
+
+
+def test_v932_runner_rejects_explicit_non_b_source_mode(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    path = root / "scripts/train_libero_eraf_safe_gain_v932.py"
+    spec = importlib.util.spec_from_file_location("invalid_v930_launch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with initialize_config_dir(config_dir=str(root / "configs"), version_base=None):
+        source = compose(
+            config_name="train",
+            overrides=["task=libero_eraf_safe_gain_v930_2cam224"],
+        )
+    source.model.policy_guard.entity_relation_grounding.cf_ablation = "none"
+    source.resume = str(tmp_path / "v928/step_010000.pt")
+    source.batch_size = 1
+    source.gradient_accumulation_steps = 4
+    source_path = tmp_path / "invalid-config.yaml"
+    OmegaConf.save(source, source_path)
+
+    with pytest.raises(ValueError, match="explicitly mask_corrective_ranking"):
+        module.load_v930_b(source_path)
+
+
 def test_v933_runner_reuses_v932_workflow_with_new_objective(tmp_path):
     root = Path(__file__).resolve().parents[1]
     path = root / "scripts/train_libero_eraf_safe_gain_v932.py"
