@@ -112,9 +112,12 @@ def delta_metrics(value, reference):
 
 
 class InterfaceProbe:
-    def __init__(self, model, warm_path, candidate_path, driver="new_new", atol=1e-5):
-        if driver not in ("old_old", "new_new"):
-            raise ValueError("Driver must be old_old or new_new; hybrids are prediction-only.")
+    def __init__(self, model, warm_path, candidate_path, driver="new_new", atol=1e-5,
+                 allow_hybrid_driver=False):
+        if driver not in COMBINATIONS:
+            raise ValueError(f"Unknown interface driver: {driver!r}.")
+        if driver not in ("old_old", "new_new") and not allow_hybrid_driver:
+            raise ValueError("Hybrid drivers require an explicit causal-rollout opt-in.")
         if model.training or getattr(model, "policy_guard_action_expert", None) is not None:
             raise ValueError("Probe requires eval mode and one shared Action Expert.")
         if not getattr(model, "policy_guard_eraf_safe_gain_training", False) or model.policy_guard_gate_mode != "counterfactual":
@@ -130,6 +133,8 @@ class InterfaceProbe:
             "candidate_checkpoint": str(Path(candidate_path).resolve()),
             "candidate_sha256": file_sha256(candidate_path),
             "driver": driver, "driver_repeat_atol": atol,
+            "driver_is_hybrid": driver not in ("old_old", "new_new"),
+            "hybrid_driver_explicitly_enabled": bool(allow_hybrid_driver),
         })
         self.model, self.driver, self.atol = model, driver, float(atol)
         self.expert = model.action_expert

@@ -33,7 +33,13 @@ def observe_simulator(env, metadata):
 class LiberoInterfaceObserver:
     def __init__(self, model, cfg):
         options = cfg.EVALUATION.interface_probe
-        self.probe = InterfaceProbe(model, options.warm_checkpoint, cfg.ckpt, options.driver)
+        self.probe = InterfaceProbe(
+            model,
+            options.warm_checkpoint,
+            cfg.ckpt,
+            options.driver,
+            allow_hybrid_driver=bool(options.get("execute_hybrid_driver", False)),
+        )
         self.trials = {int(x) for x in options.trials}
         self.stride = int(options.stride_replans)
         if self.stride < 1:
@@ -45,7 +51,8 @@ class LiberoInterfaceObserver:
         self.pending = None
         self.write({"kind": "provenance", **self.probe.provenance,
                     "task_id": int(cfg.EVALUATION.task_id), "probe_trials": sorted(self.trials),
-                    "stride_replans": self.stride, "privileged_observer_only": True})
+                    "stride_replans": self.stride, "privileged_observer_only": True,
+                    "executed_driver": str(options.driver)})
 
     def write(self, record):
         self.records.write(json.dumps(record, allow_nan=False) + "\n")

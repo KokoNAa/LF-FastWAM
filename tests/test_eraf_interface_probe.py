@@ -20,6 +20,8 @@ from fastwam.models.wan22.eraf_preservation import INTERFACE_NAMES, tensor_diges
 from experiments.libero.eraf_interface_probe import observe_simulator
 from scripts.eval_libero_eraf_interface_probe import job_config, load_cases, summarize
 from scripts import eval_libero_eraf_interface_probe as runner
+from scripts.eval_libero_eraf_interface_hybrids import build_summary as build_hybrid_summary
+from scripts import eval_libero_eraf_interface_hybrids as hybrid_runner
 from test_eraf_v930_preservation import model_for, warm_checkpoint
 
 
@@ -110,6 +112,61 @@ def test_scope_and_rng_restore_after_exception(candidate, warm_checkpoint):
     assert random.getstate() == py_state
     assert np.array_equal(np.random.get_state()[1], np_state[1])
     assert torch.equal(torch.random.get_rng_state(), torch_state)
+
+
+@pytest.mark.parametrize("driver", ["new_old", "old_new"])
+def test_explicit_hybrid_driver_executes_matching_same_cache_variant(
+    candidate, warm_checkpoint, driver
+):
+    model, path = candidate
+    with pytest.raises(ValueError, match="explicit causal-rollout"):
+        InterfaceProbe(model, warm_checkpoint, path, driver)
+    diagnostic = InterfaceProbe(model, warm_checkpoint, path, "new_new")
+    hybrid = InterfaceProbe(
+        model, warm_checkpoint, path, driver, allow_hybrid_driver=True
+    )
+    inputs, encode_goal = inference_fixture(model)
+    gate_dim = model.policy_guard_modules["eraf_gain_gate"].diagnostic_dim
+    patches = (
+        patch.object(
+            model,
+            "_encode_input_image_latents_tensor",
+            return_value=torch.zeros(1, 2, 1, 2, 2),
+        ),
+        patch.object(model, "_encode_policy_guard_goal", side_effect=encode_goal),
+        patch.object(
+            model,
+            "_policy_guard_eraf_gain_features",
+            return_value=torch.zeros(1, gate_dim),
+        ),
+    )
+    with diagnostic.driver_scope(), patches[0], patches[1], patches[2]:
+        diagnosed = model.infer_action(
+            **inputs, policy_guard_interface_probe=diagnostic
+        )
+    expected = torch.from_numpy(
+        diagnosed["eraf_interface_probe"]["arrays"][
+            f"{driver}/action_normalized"
+        ]
+    )
+    with (
+        hybrid.driver_scope(),
+        patch.object(
+            model,
+            "_encode_input_image_latents_tensor",
+            return_value=torch.zeros(1, 2, 1, 2, 2),
+        ),
+        patch.object(model, "_encode_policy_guard_goal", side_effect=encode_goal),
+        patch.object(
+            model,
+            "_policy_guard_eraf_gain_features",
+            return_value=torch.zeros(1, gate_dim),
+        ),
+    ):
+        actual = model.infer_action(**inputs)["action"]
+    assert torch.equal(expected, actual)
+    assert hybrid.provenance["driver_is_hybrid"]
+    assert hybrid.provenance["hybrid_driver_explicitly_enabled"]
 
 
 @pytest.mark.parametrize("part", ["guard", "lora", "teacher", "base"])
@@ -232,3 +289,93 @@ def test_runner_dry_run_and_warm_calibration_barrier(candidate, warm_checkpoint,
     output.mkdir(exist_ok=True)
     with pytest.raises(FileExistsError, match="overwrite"):
         runner.main()
+
+
+def test_hybrid_summary_scores_losses_and_gains(tmp_path):
+    plan = {
+        "suite": "libero_10",
+        "trials_per_task": 5,
+        "manifest_sha256": "a" * 64,
+        "jobs": [],
+        "cases": [
+            {"task_id": 3, "trial_id": 1, "group": "common_loss",
+             "warm_success": True, "candidate_success": False},
+            {"task_id": 5, "trial_id": 1, "group": "common_gain",
+             "warm_success": False, "candidate_success": True},
+        ],
+    }
+    successes = {
+        ("new_old", 3): [1], ("new_old", 5): [1],
+        ("old_new", 3): [], ("old_new", 5): [1],
+    }
+    for driver in ("new_old", "old_new"):
+        for task in (3, 5):
+            name = f"{driver}_task{task}"
+            plan["jobs"].append({
+                "name": name, "driver": driver, "task_id": task,
+                "warm_success_trials": [1] if task == 3 else [],
+                "candidate_success_trials": [] if task == 3 else [1],
+            })
+            suite = tmp_path / name / "libero_10"
+            suite.mkdir(parents=True)
+            result = {
+                "task_suite": "libero_10", "task_id": task,
+                "total_episodes": 5, "success_episodes": successes[(driver, task)],
+                "language_intervention_manifest_sha256": "a" * 64,
+                "interface_probe": {
+                    "executed_driver": driver, "executed_driver_is_hybrid": True,
+                    "probe_trials": [], "latency_includes_diagnostic_predictions": False,
+                },
+            }
+            (suite / f"gpu0_task{task}_results.json").write_text(json.dumps(result))
+    summary = build_hybrid_summary(tmp_path, plan)
+    assert summary["driver_scores"]["new_old"] == {
+        "common_loss_recovered": 1, "common_loss_total": 1,
+        "common_gain_retained": 1, "common_gain_total": 1,
+    }
+    assert summary["driver_scores"]["old_new"]["common_loss_recovered"] == 0
+    assert summary["driver_scores"]["old_new"]["common_gain_retained"] == 1
+
+
+def test_hybrid_runner_dry_plan_writes_nothing(
+    candidate, warm_checkpoint, tmp_path, monkeypatch, capsys
+):
+    _, candidate_path = candidate
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text("{}\n")
+    digest = file_sha256(manifest)
+    warm_results, candidate_results = tmp_path / "warm", tmp_path / "candidate"
+    for root, successes in ((warm_results, [1]), (candidate_results, [])):
+        root.mkdir()
+        (root / "gpu0_task3_results.json").write_text(json.dumps({
+            "task_suite": "libero_10", "task_id": 3, "total_episodes": 5,
+            "success_episodes": successes,
+            "language_intervention_manifest_sha256": digest,
+        }))
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps({
+        "suite": "libero_10",
+        "cases": [{"task_id": 3, "trial_id": 1, "group": "common_loss"}],
+    }))
+    config = tmp_path / "manager_config.yaml"
+    OmegaConf.save(OmegaConf.create({
+        "ckpt": str(candidate_path),
+        "model": {"policy_guard": {"gate_mode": "counterfactual",
+                  "entity_relation_grounding": {"grounding_objective_version": 30}}},
+        "EVALUATION": {"instruction_condition": "counterfactual",
+                       "counterfactual_diagnostics": True, "num_trials": 5,
+                       "language_intervention_manifest": str(manifest)},
+        "MULTIRUN": {"task_suite_names": ["libero_10"]},
+    }), config)
+    output = tmp_path / "hybrid"
+    monkeypatch.setattr(sys, "argv", [
+        "hybrid", "--source-config", str(config),
+        "--warm-checkpoint", str(warm_checkpoint),
+        "--warm-results", str(warm_results),
+        "--candidate-results", str(candidate_results),
+        "--cases", str(cases), "--output", str(output), "--gpus", "0", "1", "2",
+    ])
+    hybrid_runner.main()
+    printed = capsys.readouterr().out
+    assert "PLAN ONLY" in printed and '"episodes": 10' in printed
+    assert not output.exists()

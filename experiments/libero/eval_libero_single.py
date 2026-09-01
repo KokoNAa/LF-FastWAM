@@ -2416,8 +2416,14 @@ def eval_single_process(cfg: DictConfig):
         results["interface_probe"] = {
             **interface_observer.probe.provenance,
             "probe_trials": sorted(interface_observer.trials),
-            "hybrids_are_prediction_only": True,
-            "latency_includes_diagnostic_predictions": True,
+            "executed_driver": interface_observer.probe.driver,
+            "executed_driver_is_hybrid": bool(
+                interface_observer.probe.provenance["driver_is_hybrid"]
+            ),
+            "non_driver_variants_are_prediction_only": True,
+            "latency_includes_diagnostic_predictions": bool(
+                interface_observer.trials
+            ),
         }
 
     results["duration"] = time.time() - start_time
