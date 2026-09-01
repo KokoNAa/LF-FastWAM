@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - libero_eraf_safe_gain_v935_2cam224
+  - _self_
+
+# V9.36 applies semantic contrast only when the detached, already-routed
+# positive-only action-ranking hinge is active. The existing target-lift
+# ranking mask remains authoritative, and no task identity enters the route.
+model:
+  policy_guard:
+    entity_relation_grounding:
+      grounding_objective_version: 36
+      safe_gain_injector_training_steps: 25
+
+max_steps: 25
+save_every: 5

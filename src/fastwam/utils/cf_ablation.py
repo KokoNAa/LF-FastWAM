@@ -25,6 +25,10 @@ UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT = (
 PAIRED_SEMANTIC_CONTRAST_CONTRACT = (
     "same_state_bidirectional_injected_context_to_frozen_language_hinge_v1"
 )
+ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT = (
+    "same_state_bidirectional_injected_context_hinge_on_detached_used_action_"
+    "ranking_violation_v1"
+)
 
 
 def validate_mode(mode):
@@ -101,7 +105,7 @@ def routed_causal_ranking_per_sample(
     corrective = torch.as_tensor(corrective, device=correct_error.device).bool()
     if corrective.shape != correct_error.shape:
         raise ValueError("Corrective ranking mask must share error shape [B].")
-    if objective in {34, 35}:
+    if objective in {34, 35, 36}:
         return causal_ranking_per_sample(
             margin,
             correct_error,
@@ -187,6 +191,35 @@ def paired_semantic_contrast_per_sample(
         deployed.new_tensor(margin) + wrong_similarity - correct_similarity
     )
     return loss, correct_similarity, wrong_similarity
+
+
+def action_violation_semantic_mask(
+    semantic_valid,
+    ranking_multiplier,
+    ranking_per_sample,
+):
+    """Select detached, routed action-ranking violations for V9.36."""
+
+    import torch
+
+    semantic_valid = torch.as_tensor(
+        semantic_valid, device=ranking_per_sample.device
+    ).bool()
+    ranking_multiplier = torch.as_tensor(
+        ranking_multiplier, device=ranking_per_sample.device
+    ).bool()
+    if (
+        semantic_valid.shape != ranking_per_sample.shape
+        or ranking_multiplier.shape != ranking_per_sample.shape
+    ):
+        raise ValueError(
+            "Semantic validity, ranking route and ranking loss must share [B]."
+        )
+    return (
+        semantic_valid
+        & ranking_multiplier
+        & (ranking_per_sample.detach() > 0)
+    )
 
 
 def loss_multipliers(mode, corrective, verification_kind=None):

@@ -69,7 +69,7 @@ def test_causal_ranking_has_exactly_one_trainable_side(positive_only):
         assert wrong.grad.tolist() == [-1.0]
 
 
-@pytest.mark.parametrize("objective", [33, 34, 35])
+@pytest.mark.parametrize("objective", [33, 34, 35, 36])
 def test_routed_ranking_gradient_contract(objective):
     correct = torch.tensor([2.0, 2.0], requires_grad=True)
     wrong = torch.tensor([1.0, 1.0], requires_grad=True)
@@ -81,7 +81,7 @@ def test_routed_ranking_gradient_contract(objective):
         corrective=torch.tensor([False, True]),
     ).sum()
     loss.backward()
-    if objective in {34, 35}:
+    if objective in {34, 35, 36}:
         assert correct.grad.tolist() == [1.0, 1.0]
         assert wrong.grad is None
     else:
@@ -133,6 +133,17 @@ def test_paired_semantic_contrast_rejects_unsafe_margin(margin):
         ablation.paired_semantic_contrast_per_sample(
             tokens, tokens, mask, tokens, mask, margin=margin
         )
+
+
+def test_action_violation_semantic_mask_is_detached_and_respects_route():
+    ranking = torch.tensor([0.2, 0.3, 0.0, 0.4], requires_grad=True)
+    selected = ablation.action_violation_semantic_mask(
+        torch.tensor([True, True, True, False]),
+        torch.tensor([True, False, True, True]),
+        ranking,
+    )
+    assert selected.tolist() == [True, False, False, False]
+    assert not selected.requires_grad
 
 
 @pytest.mark.parametrize("kind", [None, [0, 0], [0, 9], [0, 1.0], [[0, 1]]])

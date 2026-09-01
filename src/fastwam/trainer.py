@@ -26,7 +26,7 @@ from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_s
 logger = get_logger(__name__)
 
 
-SAFE_GAIN_FULL_POLICY_RESUME_OBJECTIVES = frozenset({29, 30, 31, 32, 33, 34, 35})
+SAFE_GAIN_FULL_POLICY_RESUME_OBJECTIVES = frozenset({29, 30, 31, 32, 33, 34, 35, 36})
 
 
 def _is_safe_gain_full_policy_resume(model, resume) -> bool:

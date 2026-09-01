@@ -3,7 +3,8 @@
 
 The input is the exact resolved V9.30-B config used by V9.31. Derived objectives
 keep its data, optimizer, seed, effective batch, frozen teacher, full-goal
-preservation and trainable scope. The 50-step schedule saves steps 25 and 50.
+preservation and trainable scope. Objectives 32--35 use the 25/50 diagnostic
+schedule; V9.36 uses a shorter 25-step schedule with early checkpoints.
 """
 
 import argparse
@@ -38,17 +39,25 @@ FULL_GOAL_WEIGHTS = {
 TARGET_EFFECTIVE_BATCH_SIZE = 12
 MAX_STEPS = 50
 SAVE_STEPS = (25, 50)
-SUPPORTED_OBJECTIVES = frozenset({32, 33, 34, 35})
+SUPPORTED_OBJECTIVES = frozenset({32, 33, 34, 35, 36})
 PAIRED_SEMANTIC_CONTRAST_WEIGHT = 0.1
 PAIRED_SEMANTIC_CONTRAST_MARGIN = 0.1
 
 
 def ranking_gradient_contract(objective):
-    if objective in {34, 35}:
+    if objective in {34, 35, 36}:
         return cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
     if objective == 33:
         return cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
     return "legacy_detached_correct_error_wrong_error_gradient"
+
+
+def max_steps_for_objective(objective):
+    return 25 if objective == 36 else MAX_STEPS
+
+
+def save_steps_for_objective(objective):
+    return (10, 15, 20, 25) if objective == 36 else SAVE_STEPS
 
 
 def file_sha256(path):
@@ -93,7 +102,7 @@ def load_v930_b(config_path):
 
 def training_config(source, output_dir, gpus=3, *, objective=32):
     if objective not in SUPPORTED_OBJECTIVES:
-        raise ValueError("Verified ranking runner supports V9.32 through V9.35.")
+        raise ValueError("Verified ranking runner supports V9.32 through V9.36.")
     cfg = OmegaConf.create(OmegaConf.to_container(source, resolve=True))
     per_accumulation_batch = int(gpus) * int(cfg.batch_size)
     if (
@@ -108,15 +117,16 @@ def training_config(source, output_dir, gpus=3, *, objective=32):
     cfg.gradient_accumulation_steps = (
         TARGET_EFFECTIVE_BATCH_SIZE // per_accumulation_batch
     )
-    cfg.max_steps = MAX_STEPS
-    cfg.save_every = SAVE_STEPS[0]
+    max_steps = max_steps_for_objective(objective)
+    cfg.max_steps = max_steps
+    cfg.save_every = 5 if objective == 36 else SAVE_STEPS[0]
     eraf = cfg.model.policy_guard.entity_relation_grounding
     eraf.grounding_objective_version = objective
     eraf.cf_ablation = "mask_lift_ranking"
-    eraf.safe_gain_injector_training_steps = MAX_STEPS
+    eraf.safe_gain_injector_training_steps = max_steps
     for name, value in FULL_GOAL_WEIGHTS.items():
         eraf[name] = value
-    if objective == 35:
+    if objective in {35, 36}:
         eraf.paired_semantic_contrast_weight = PAIRED_SEMANTIC_CONTRAST_WEIGHT
         eraf.paired_semantic_contrast_margin = PAIRED_SEMANTIC_CONTRAST_MARGIN
     cfg.output_dir = str(Path(output_dir).resolve())
@@ -145,7 +155,7 @@ def training_command(run_dir, gpus, cfg, *, objective=32):
 
 def main(*, objective=32):
     if objective not in SUPPORTED_OBJECTIVES:
-        raise ValueError("Verified ranking runner supports V9.32 through V9.35.")
+        raise ValueError("Verified ranking runner supports V9.32 through V9.36.")
     version = f"V9.{objective}"
     version_slug = f"v9{objective}"
     parser = argparse.ArgumentParser(description=__doc__)
@@ -173,6 +183,8 @@ def main(*, objective=32):
     if root.exists():
         raise FileExistsError(f"Refusing to overwrite an existing run: {root}")
     cfg = training_config(source, root, args.gpus, objective=objective)
+    max_steps = max_steps_for_objective(objective)
+    save_steps = save_steps_for_objective(objective)
     command = training_command(root, args.gpus, cfg, objective=objective)
     plan = {
         "contract": preservation.SELECTIVE_FULL_GOAL_CONTRACT,
@@ -196,19 +208,27 @@ def main(*, objective=32):
         ),
         "seed": int(source.seed),
         "steps": int(cfg.max_steps),
-        "save_steps": list(SAVE_STEPS),
+        "save_steps": list(save_steps),
         "learning_rate": float(source.learning_rate),
         "cf_ablation": "mask_lift_ranking",
         "ranking_gradient_contract": ranking_gradient_contract(objective),
         "paired_semantic_contrast": (
             {
-                "contract": cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT,
+                "contract": (
+                    cf_ablation.ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT
+                    if objective == 36
+                    else cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
+                ),
                 "weight": PAIRED_SEMANTIC_CONTRAST_WEIGHT,
                 "margin": PAIRED_SEMANTIC_CONTRAST_MARGIN,
-                "validity": "all_bidirectional_semantic_pairs",
+                "validity": (
+                    "detached_used_positive_action_ranking_violation_only"
+                    if objective == 36
+                    else "all_bidirectional_semantic_pairs"
+                ),
                 "trainable": "compressor_plus_context_injector_only",
             }
-            if objective == 35
+            if objective in {35, 36}
             else None
         ),
         "full_goal_weights": FULL_GOAL_WEIGHTS,
@@ -230,7 +250,7 @@ def main(*, objective=32):
         "ERAF_SAFE_GAIN_PREFLIGHT_ONLY": "1",
         "PYTHON_BIN": sys.executable,
         "PATH": str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", ""),
-        "ERAF_SAFE_GAIN_MAX_STEPS": str(MAX_STEPS),
+        "ERAF_SAFE_GAIN_MAX_STEPS": str(max_steps),
     })
     subprocess.run(preflight, env=env, check=True)
     env.pop("ERAF_SAFE_GAIN_PREFLIGHT_ONLY")
@@ -260,13 +280,13 @@ def main(*, objective=32):
     env["RUN_ID"] = args.run_tag
     subprocess.run(command, env=env, check=True)
 
-    checkpoint = root / "checkpoints/weights/step_000050.pt"
+    checkpoint = root / "checkpoints/weights" / f"step_{max_steps:06d}.pt"
     import torch
 
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     metadata = payload.get("architecture_metadata") or {}
     if (
-        payload.get("step") != MAX_STEPS
+        payload.get("step") != max_steps
         or metadata.get("eraf_grounding_objective_version") != objective
         or cf_ablation.checkpoint_mode(metadata) != "mask_lift_ranking"
         or metadata.get("eraf_selective_full_goal_preservation_contract")
@@ -279,15 +299,19 @@ def main(*, objective=32):
             != cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
         )
         or (
-            objective in {34, 35}
+            objective in {34, 35, 36}
             and metadata.get("eraf_paired_ranking_gradient_contract")
             != cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
         )
         or (
-            objective == 35
+            objective in {35, 36}
             and (
                 metadata.get("eraf_paired_semantic_contrast_contract")
-                != cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
+                != (
+                    cf_ablation.ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT
+                    if objective == 36
+                    else cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
+                )
                 or metadata.get("eraf_paired_semantic_contrast_weight")
                 != PAIRED_SEMANTIC_CONTRAST_WEIGHT
                 or metadata.get("eraf_paired_semantic_contrast_margin")
@@ -299,7 +323,7 @@ def main(*, objective=32):
             f"Final {version} checkpoint contract mismatch: {checkpoint}"
         )
     preservation.validate_teacher_payload(payload)
-    for step in SAVE_STEPS:
+    for step in save_steps:
         expected = root / "checkpoints/weights" / f"step_{step:06d}.pt"
         if not expected.is_file():
             raise FileNotFoundError(

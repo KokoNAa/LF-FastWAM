@@ -844,7 +844,7 @@ class FastWAM(torch.nn.Module):
         if (
             self.policy_guard_eraf_cf_ablation != "none"
             and (
-                self.policy_guard_eraf_grounding_objective_version not in {30, 31, 32, 33, 34, 35}
+                self.policy_guard_eraf_grounding_objective_version not in {30, 31, 32, 33, 34, 35, 36}
                 or not self.policy_guard_eraf_safe_gain_training
             )
         ):
@@ -1630,10 +1630,11 @@ class FastWAM(torch.nn.Module):
                     33,
                     34,
                     35,
+                    36,
                 }:
                     raise ValueError(
                         "PGC v9 ERAF grounding_objective_version must be "
-                        "between 1 and 35 inclusive."
+                        "between 1 and 36 inclusive."
                     )
                 if min(
                     self.policy_guard_eraf_loss_weights.role_assignment,
@@ -1915,7 +1916,7 @@ class FastWAM(torch.nn.Module):
                             "PGC V9.28 requires positive wrong-gate rejection "
                             "and pairwise gate-ranking weights/margin."
                         )
-                    if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35}:
+                    if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35, 36}:
                         if (
                             self.policy_guard_eraf_safe_gain_injector_training_steps <= 0
                             or self.policy_guard_eraf_safe_gain_gate_calibration_steps != 0
@@ -1927,7 +1928,7 @@ class FastWAM(torch.nn.Module):
                                 "V9.30 requires injector-only training, zero gate steps, "
                                 "nonnegative preservation weight and zero proxy margin."
                             )
-                    if self.policy_guard_eraf_grounding_objective_version in {31, 32, 33, 34, 35}:
+                    if self.policy_guard_eraf_grounding_objective_version in {31, 32, 33, 34, 35, 36}:
                         selective_weights = (
                             self.policy_guard_eraf_full_goal_action_preservation_weight,
                             self.policy_guard_eraf_full_goal_token_preservation_weight,
@@ -1937,7 +1938,7 @@ class FastWAM(torch.nn.Module):
                             self.policy_guard_eraf_cf_ablation
                             != (
                                 "mask_lift_ranking"
-                                if self.policy_guard_eraf_grounding_objective_version in {32, 33, 34, 35}
+                                if self.policy_guard_eraf_grounding_objective_version in {32, 33, 34, 35, 36}
                                 else "mask_corrective_ranking"
                             )
                             or min(selective_weights) <= 0.0
@@ -1949,7 +1950,7 @@ class FastWAM(torch.nn.Module):
                                 "mask, positive full-goal action/token/context preservation "
                                 "weights and zero proxy margin."
                             )
-                    if self.policy_guard_eraf_grounding_objective_version == 35:
+                    if self.policy_guard_eraf_grounding_objective_version in {35, 36}:
                         if (
                             not math.isfinite(
                                 self.policy_guard_eraf_paired_semantic_contrast_weight
@@ -1960,18 +1961,18 @@ class FastWAM(torch.nn.Module):
                             < 2.0
                         ):
                             raise ValueError(
-                                "V9.35 requires positive finite paired semantic "
+                                "V9.35+ requires positive finite paired semantic "
                                 "contrast weight and margin in (0,2)."
                             )
                     elif self.policy_guard_eraf_paired_semantic_contrast_weight != 0.0:
                         raise ValueError(
-                            "Paired semantic contrast is restricted to PGC V9.35."
+                            "Paired semantic contrast is restricted to PGC V9.35+."
                         )
                     if self.policy_guard_eraf_grounding_objective_version >= 29:
                         if min(
                             self.policy_guard_eraf_safe_gain_injector_training_steps,
                             self.policy_guard_eraf_safe_gain_gate_calibration_steps,
-                        ) <= 0 and self.policy_guard_eraf_grounding_objective_version not in {30, 31, 32, 33, 34, 35}:
+                        ) <= 0 and self.policy_guard_eraf_grounding_objective_version not in {30, 31, 32, 33, 34, 35, 36}:
                             raise ValueError(
                                 "PGC V9.29 requires positive injector and gate "
                                 "calibration stage lengths."
@@ -2768,7 +2769,7 @@ class FastWAM(torch.nn.Module):
 
     def _policy_guard_v929_training_phase(self) -> str:
         """Return the effective safe-gain optimization phase."""
-        if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35}:
+        if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35, 36}:
             return "injector"
         if self.policy_guard_eraf_grounding_objective_version < 29:
             return "joint"
@@ -3203,7 +3204,7 @@ class FastWAM(torch.nn.Module):
         """Freeze the base model and expose only configured adapter parameters."""
         if (
             self.policy_guard_enabled
-            and self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35}
+            and self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35, 36}
         ):
             if self.eraf_preservation_teacher is None:
                 self.eraf_preservation_teacher = preservation.FrozenInterfaceTeacher(
@@ -3360,7 +3361,7 @@ class FastWAM(torch.nn.Module):
                                         "eraf_gain_gate",
                                     ):
                                         if (
-                                            self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35}
+                                            self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35, 36}
                                             and module_name == "eraf_gain_gate"
                                         ):
                                             continue
@@ -3790,7 +3791,7 @@ class FastWAM(torch.nn.Module):
                 "PGC v9 optimizer groups do not exactly cover the trainable "
                 "sidecars."
             )
-        if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35}:
+        if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35, 36}:
             self._v930_assert_optimizer_scope(groups)
             if (
                 self.eraf_preservation_provenance
@@ -9382,9 +9383,9 @@ class FastWAM(torch.nn.Module):
         )
         batch_size = int(action.shape[0])
         training_phase = self._policy_guard_v929_training_phase()
-        preserve_v928 = self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35}
+        preserve_v928 = self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35, 36}
         selective_full_goal_preservation = (
-            self.policy_guard_eraf_grounding_objective_version in {31, 32, 33, 34, 35}
+            self.policy_guard_eraf_grounding_objective_version in {31, 32, 33, 34, 35, 36}
         )
         if preserve_v928:
             if self.eraf_preservation_teacher is None or not self.eraf_preservation_provenance:
@@ -9894,11 +9895,12 @@ class FastWAM(torch.nn.Module):
         semantic_wrong_similarity = correct_error_first.new_zeros(
             (batch_size,)
         )
+        semantic_contrast_valid = torch.zeros_like(semantic_valid)
         semantic_contrast_loss = correct_error_first.sum() * 0.0
-        if self.policy_guard_eraf_grounding_objective_version == 35:
+        if self.policy_guard_eraf_grounding_objective_version in {35, 36}:
             if student_interface_context is None:
                 raise RuntimeError(
-                    "V9.35 requires the deployed student interface context."
+                    "V9.35+ requires the deployed student interface context."
                 )
             (
                 semantic_contrast_per_sample,
@@ -9912,9 +9914,22 @@ class FastWAM(torch.nn.Module):
                 wrong_context_mask[:, :language_context_len],
                 margin=self.policy_guard_eraf_paired_semantic_contrast_margin,
             )
+            semantic_contrast_valid = semantic_valid
+            if self.policy_guard_eraf_grounding_objective_version == 36:
+                # Only repair pairs whose *used* positive-only action-ranking
+                # hinge is still active. Both the violation decision and the
+                # existing target-lift route are detached, so this cannot
+                # introduce a second action path or a task-specific shortcut.
+                semantic_contrast_valid = (
+                    cf_ablation.action_violation_semantic_mask(
+                        semantic_valid,
+                        ranking_multiplier,
+                        ranking_per_sample,
+                    )
+                )
             semantic_contrast_loss = self._masked_policy_guard_mean(
                 semantic_contrast_per_sample,
-                semantic_valid,
+                semantic_contrast_valid,
             )
         non_regression_per_sample = torch.stack(
             [
@@ -9987,7 +10002,7 @@ class FastWAM(torch.nn.Module):
             + self.policy_guard_eraf_safe_gain_closed_loop_non_regression_weight
             * corrective_non_regression_loss
         )
-        if self.policy_guard_eraf_grounding_objective_version == 35:
+        if self.policy_guard_eraf_grounding_objective_version in {35, 36}:
             action_and_protection_objective = (
                 action_and_protection_objective
                 + self.policy_guard_eraf_paired_semantic_contrast_weight
@@ -10033,6 +10048,7 @@ class FastWAM(torch.nn.Module):
 
         direct_count = direct_action_valid.float().sum().clamp_min(1.0)
         semantic_count = semantic_valid.float().sum().clamp_min(1.0)
+        semantic_contrast_count = semantic_contrast_valid.float().sum()
         source_count = source_semantic_valid.float().sum().clamp_min(1.0)
         target_count = target_semantic_valid.float().sum().clamp_min(1.0)
         selected = gate_probability >= (self.policy_guard_eraf_safe_gain_gate_threshold)
@@ -10083,6 +10099,15 @@ class FastWAM(torch.nn.Module):
             ),
             "pgc_v935_semantic_contrast_margin": correct_error.new_tensor(
                 self.policy_guard_eraf_paired_semantic_contrast_margin
+            ),
+            "loss_pgc_v936_action_violation_gated_semantic_contrast": (
+                semantic_contrast_loss.detach()
+            ),
+            "pgc_v936_semantic_action_violation_fraction": (
+                semantic_contrast_count / semantic_count
+            ),
+            "pgc_v936_semantic_action_violation_count": (
+                semantic_contrast_count
             ),
             "loss_pgc_v927_non_regression": non_regression_loss.detach(),
             "loss_pgc_v929_closed_loop_non_regression": (
@@ -17449,7 +17474,7 @@ class FastWAM(torch.nn.Module):
         is_v930 = is_v9 and self.policy_guard_eraf_grounding_objective_version == 30
         is_selective_full_goal = bool(
             is_v9
-            and self.policy_guard_eraf_grounding_objective_version in {31, 32, 33, 34, 35}
+            and self.policy_guard_eraf_grounding_objective_version in {31, 32, 33, 34, 35, 36}
         )
         is_preservation = is_v930 or is_selective_full_goal
         fresh_eraf_joint = bool(
@@ -18543,11 +18568,14 @@ class FastWAM(torch.nn.Module):
             "eraf_paired_ranking_gradient_contract": (
                 cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
                 if is_v9
-                and self.policy_guard_eraf_grounding_objective_version in {34, 35}
+                and self.policy_guard_eraf_grounding_objective_version in {34, 35, 36}
                 else None
             ),
             "eraf_paired_semantic_contrast_contract": (
-                cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
+                cf_ablation.ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT
+                if is_v9
+                and self.policy_guard_eraf_grounding_objective_version == 36
+                else cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
                 if is_v9
                 and self.policy_guard_eraf_grounding_objective_version == 35
                 else None
@@ -18555,13 +18583,13 @@ class FastWAM(torch.nn.Module):
             "eraf_paired_semantic_contrast_weight": (
                 self.policy_guard_eraf_paired_semantic_contrast_weight
                 if is_v9
-                and self.policy_guard_eraf_grounding_objective_version == 35
+                and self.policy_guard_eraf_grounding_objective_version in {35, 36}
                 else None
             ),
             "eraf_paired_semantic_contrast_margin": (
                 self.policy_guard_eraf_paired_semantic_contrast_margin
                 if is_v9
-                and self.policy_guard_eraf_grounding_objective_version == 35
+                and self.policy_guard_eraf_grounding_objective_version in {35, 36}
                 else None
             ),
             "eraf_selective_full_goal_preservation_contract": (
@@ -19554,7 +19582,7 @@ class FastWAM(torch.nn.Module):
                 "step": step,
                 "torch_dtype": str(self.torch_dtype),
             }
-            if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35}:
+            if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35, 36}:
                 if self.eraf_preservation_teacher is None:
                     raise ValueError("Preservation checkpoint requires its initialized fixed teacher.")
                 self._v930_audit_frozen()
@@ -19897,7 +19925,7 @@ class FastWAM(torch.nn.Module):
             metadata.get("eraf_completion_only_memory", False)
         )
         preservation_objective = self.policy_guard_eraf_grounding_objective_version
-        if preservation_objective in {30, 31, 32, 33, 34, 35}:
+        if preservation_objective in {30, 31, 32, 33, 34, 35, 36}:
             if saved_eraf_grounding_objective not in {28, preservation_objective}:
                 raise ValueError(
                     f"V9.{preservation_objective} must initialize from V9.28 "
@@ -19918,7 +19946,7 @@ class FastWAM(torch.nn.Module):
                     "eraf_preservation_weight": self.policy_guard_eraf_preservation_weight,
                     "eraf_preservation_margin": self.policy_guard_eraf_preservation_margin,
                 }
-                if preservation_objective in {31, 32, 33, 34, 35}:
+                if preservation_objective in {31, 32, 33, 34, 35, 36}:
                     expected_contract.update({
                         "eraf_selective_full_goal_preservation_contract": (
                             preservation.SELECTIVE_FULL_GOAL_CONTRACT
@@ -19940,14 +19968,16 @@ class FastWAM(torch.nn.Module):
                     expected_contract[
                         "eraf_corrective_ranking_gradient_contract"
                     ] = cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
-                if preservation_objective in {34, 35}:
+                if preservation_objective in {34, 35, 36}:
                     expected_contract[
                         "eraf_paired_ranking_gradient_contract"
                     ] = cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
-                if preservation_objective == 35:
+                if preservation_objective in {35, 36}:
                     expected_contract.update({
                         "eraf_paired_semantic_contrast_contract": (
-                            cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
+                            cf_ablation.ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT
+                            if preservation_objective == 36
+                            else cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
                         ),
                         "eraf_paired_semantic_contrast_weight": (
                             self.policy_guard_eraf_paired_semantic_contrast_weight
@@ -20224,7 +20254,7 @@ class FastWAM(torch.nn.Module):
             saved_policy_guard_version == 9
             and int(self.policy_guard_version) == 9
             and saved_eraf_grounding_objective == 28
-            and self.policy_guard_eraf_grounding_objective_version in {29, 30, 31, 32, 33, 34, 35}
+            and self.policy_guard_eraf_grounding_objective_version in {29, 30, 31, 32, 33, 34, 35, 36}
             and self.policy_guard_eraf_training_stage == "action"
             and metadata.get("eraf_training_stage") == "action"
             and saved_eraf_completion_only_memory
@@ -21522,7 +21552,7 @@ class FastWAM(torch.nn.Module):
                             or (
                                 saved_grounding_objective == 28
                                 and self.policy_guard_eraf_grounding_objective_version
-                                in {29, 30, 31, 32, 33, 34, 35}
+                                in {29, 30, 31, 32, 33, 34, 35, 36}
                             )
                         )
                         objective_upgrade = objective_upgrade and (
@@ -22084,7 +22114,7 @@ class FastWAM(torch.nn.Module):
                                 expected_scope = (
                                     (
                                         (
-                                            preservation.ROLE_SCOPE if saved_grounding_objective in {30, 31, 32, 33, 34, 35} else
+                                            preservation.ROLE_SCOPE if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36} else
                                             "frozen_complete_eraf_plus_frozen_"
                                             "baseline_lora_plus_compressor_injector_"
                                             "gain_gate"
@@ -22784,7 +22814,7 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_action_trainable_scope = (
                                     (
-                                        preservation.ACTION_SCOPE if saved_grounding_objective in {30, 31, 32, 33, 34, 35} else
+                                        preservation.ACTION_SCOPE if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36} else
                                         "eraf_action_token_compressor_plus_context_"
                                         "injector_plus_gain_gate_only"
                                         if saved_grounding_objective >= 27
@@ -22844,7 +22874,7 @@ class FastWAM(torch.nn.Module):
                                     ),
                                     "eraf_role_adapter_trainable_scope": (
                                         (
-                                            preservation.ROLE_SCOPE if saved_grounding_objective in {30, 31, 32, 33, 34, 35} else
+                                            preservation.ROLE_SCOPE if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36} else
                                             "frozen_complete_eraf_plus_frozen_"
                                             "baseline_lora_plus_compressor_injector_"
                                             "gain_gate"
@@ -22984,7 +23014,7 @@ class FastWAM(torch.nn.Module):
                                                 gate_ranking_margin
                                             ),
                                             "eraf_safe_gain_gate_supervision_contract": (
-                                                preservation.GATE_CONTRACT if saved_grounding_objective in {30, 31, 32, 33, 34, 35} else
+                                                preservation.GATE_CONTRACT if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36} else
                                                 "detached_gate_calibration_from_mean_"
                                                 "multi_noise_action_advantage_plus_"
                                                 "wrong_language_rejection_and_positive_"
@@ -23000,7 +23030,7 @@ class FastWAM(torch.nn.Module):
                                     expected_v914_contract.update(
                                         {
                                             "eraf_safe_gain_schedule_contract": (
-                                                preservation.SCHEDULE if saved_grounding_objective in {30, 31, 32, 33, 34, 35} else
+                                                preservation.SCHEDULE if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36} else
                                                 "injector_multinoise_then_detached_"
                                                 "gate_calibration"
                                             ),
@@ -24102,7 +24132,7 @@ class FastWAM(torch.nn.Module):
             result = self._load_policy_guard_checkpoint(
                 str(path), payload, optimizer=optimizer
             )
-            if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35}:
+            if self.policy_guard_eraf_grounding_objective_version in {30, 31, 32, 33, 34, 35, 36}:
                 self._v930_restore_teacher(path, payload)
             return result
         if payload.get("format") == "fastwam_lora_adapter_v1":

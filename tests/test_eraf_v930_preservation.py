@@ -34,19 +34,19 @@ def model_for(objective=30, source=None, ablation="none"):
         v9_bidirectional_supervision=True,
         v9_context_injection_warmup_steps=0,
         v9_context_injection_ramp_steps=0,
-        v9_safe_gain_injector_training_steps=250 if objective in {30, 31, 32, 33, 34, 35} else 0,
+        v9_safe_gain_injector_training_steps=250 if objective in {30, 31, 32, 33, 34, 35, 36} else 0,
         v9_safe_gain_gate_calibration_steps=0,
-        v9_safe_gain_noise_levels=2 if objective in {30, 31, 32, 33, 34, 35} else 1,
+        v9_safe_gain_noise_levels=2 if objective in {30, 31, 32, 33, 34, 35, 36} else 1,
         v9_cf_ablation=ablation,
-        v9_full_goal_action_preservation_weight=1.0 if objective in {31, 32, 33, 34, 35} else 0.0,
-        v9_full_goal_token_preservation_weight=0.1 if objective in {31, 32, 33, 34, 35} else 0.0,
-        v9_full_goal_context_preservation_weight=1.0 if objective in {31, 32, 33, 34, 35} else 0.0,
-        v9_paired_semantic_contrast_weight=0.1 if objective == 35 else 0.0,
+        v9_full_goal_action_preservation_weight=1.0 if objective in {31, 32, 33, 34, 35, 36} else 0.0,
+        v9_full_goal_token_preservation_weight=0.1 if objective in {31, 32, 33, 34, 35, 36} else 0.0,
+        v9_full_goal_context_preservation_weight=1.0 if objective in {31, 32, 33, 34, 35, 36} else 0.0,
+        v9_paired_semantic_contrast_weight=0.1 if objective in {35, 36} else 0.0,
         v9_paired_semantic_contrast_margin=0.1,
     )
 
 
-@pytest.mark.parametrize("objective", [29, 30, 31, 32, 33, 34, 35])
+@pytest.mark.parametrize("objective", [29, 30, 31, 32, 33, 34, 35, 36])
 def test_safe_gain_full_policy_resume_accepts_supported_objectives(objective):
     model = SimpleNamespace(
         policy_guard_version=9,
@@ -266,6 +266,23 @@ def test_v935_hydra_adds_bidirectional_semantic_contrast():
     assert cfg.save_every == 25
 
 
+def test_v936_hydra_gates_semantics_and_shortens_early_stop_schedule():
+    with initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "configs"),
+        version_base=None,
+    ):
+        cfg = compose(
+            config_name="train", overrides=["task=libero_eraf_safe_gain_v936_2cam224"]
+        )
+    eraf = cfg.model.policy_guard.entity_relation_grounding
+    assert eraf.grounding_objective_version == 36
+    assert eraf.cf_ablation == "mask_lift_ranking"
+    assert eraf.paired_semantic_contrast_weight == pytest.approx(0.1)
+    assert eraf.paired_semantic_contrast_margin == pytest.approx(0.1)
+    assert eraf.safe_gain_injector_training_steps == cfg.max_steps == 25
+    assert cfg.save_every == 5
+
+
 def test_source_config_launcher_reuses_exact_bindings(tmp_path):
     root = Path(__file__).resolve().parents[1]
     path = root / "scripts/train_libero_eraf_safe_gain_v930_from_config.py"
@@ -481,6 +498,35 @@ def test_v935_runner_adds_portable_semantic_contrast_contract(tmp_path):
         module.ranking_gradient_contract(35)
         == ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
     )
+
+
+def test_v936_runner_uses_gated_semantics_and_early_checkpoints(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    path = root / "scripts/train_libero_eraf_safe_gain_v932.py"
+    spec = importlib.util.spec_from_file_location("gated_semantic_launch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with initialize_config_dir(config_dir=str(root / "configs"), version_base=None):
+        source = compose(
+            config_name="train",
+            overrides=["task=libero_eraf_safe_gain_v930_2cam224"],
+        )
+    eraf = source.model.policy_guard.entity_relation_grounding
+    eraf.cf_ablation = "mask_corrective_ranking"
+    source.resume = str(tmp_path / "v928/step_010000.pt")
+    source.batch_size = 1
+    source.gradient_accumulation_steps = 4
+    derived = module.training_config(source, tmp_path / "v936", 4, objective=36)
+    command = module.training_command(
+        tmp_path / "v936", 4, derived, objective=36
+    )
+    derived_eraf = derived.model.policy_guard.entity_relation_grounding
+    assert derived_eraf.grounding_objective_version == 36
+    assert derived_eraf.safe_gain_injector_training_steps == derived.max_steps == 25
+    assert derived.save_every == 5
+    assert module.save_steps_for_objective(36) == (10, 15, 20, 25)
+    assert derived.gradient_accumulation_steps == 3
+    assert command[-1] == "v936_train"
 
 
 def test_migration_optimizer_freeze_and_teacher_roundtrip(warm_checkpoint, tmp_path):
@@ -710,6 +756,33 @@ def test_v935_roundtrip_records_bidirectional_semantic_contrast_contract(
     resumed._v930_audit_frozen()
 
 
+def test_v936_roundtrip_records_action_violation_gated_semantic_contract(
+    warm_checkpoint, tmp_path
+):
+    model = model_for(36, ablation="mask_lift_ranking")
+    model.prepare_trainable_parameters()
+    model.load_checkpoint(warm_checkpoint)
+    path = tmp_path / "v936.pt"
+    model.save_checkpoint(path, step=25)
+    payload = torch.load(path, weights_only=False)
+    metadata = payload["architecture_metadata"]
+    assert metadata["eraf_grounding_objective_version"] == 36
+    assert (
+        metadata["eraf_paired_ranking_gradient_contract"]
+        == ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
+    )
+    assert (
+        metadata["eraf_paired_semantic_contrast_contract"]
+        == ablation.ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT
+    )
+    assert metadata["eraf_paired_semantic_contrast_weight"] == pytest.approx(0.1)
+    assert metadata["eraf_paired_semantic_contrast_margin"] == pytest.approx(0.1)
+    resumed = model_for(36, ablation="mask_lift_ranking")
+    resumed.prepare_trainable_parameters()
+    resumed.load_checkpoint(path)
+    resumed._v930_audit_frozen()
+
+
 @pytest.mark.parametrize("objective,ablation,all_lift", [
     (30, "none", False),
     (30, "mask_lift_corrective", False),
@@ -720,6 +793,7 @@ def test_v935_roundtrip_records_bidirectional_semantic_contrast_contract(
     (33, "mask_lift_ranking", False),
     (34, "mask_lift_ranking", False),
     (35, "mask_lift_ranking", False),
+    (36, "mask_lift_ranking", False),
 ])
 def test_real_action_forward_backward_and_eval_preflight(
     warm_checkpoint, tmp_path, objective, ablation, all_lift
@@ -800,17 +874,20 @@ def test_real_action_forward_backward_and_eval_preflight(
     assert action_path.call_count == 5
     assert metrics["loss_pgc_v930_teacher_preservation"] == pytest.approx(0, abs=1e-8)
     assert metrics["pgc_v930_gate_optimization_weight"] == 0
-    if objective in {31, 32, 33, 34, 35}:
+    if objective in {31, 32, 33, 34, 35, 36}:
         assert "loss_pgc_v931_full_goal_action_preservation" in metrics
         assert "loss_pgc_v931_full_goal_token_preservation" in metrics
         assert "loss_pgc_v931_full_goal_context_preservation" in metrics
         assert metrics["pgc_v931_target_lift_preservation_rate"] == 0
-    if objective == 35:
+    if objective in {35, 36}:
         assert torch.isfinite(
             torch.as_tensor(metrics["loss_pgc_v935_paired_semantic_contrast"])
         )
         assert metrics["pgc_v935_semantic_contrast_weight"] == pytest.approx(0.1)
         assert metrics["pgc_v935_semantic_contrast_margin"] == pytest.approx(0.1)
+    if objective == 36:
+        assert 0 <= metrics["pgc_v936_semantic_action_violation_fraction"] <= 1
+        assert metrics["pgc_v936_semantic_action_violation_count"] >= 0
     if ablation == "mask_lift_corrective":
         for component in ("action", "ranking", "nonregression"):
             assert metrics[f"loss_pgc_v930_cf_lift_{component}_used"] == 0
@@ -873,7 +950,7 @@ def test_real_action_forward_backward_and_eval_preflight(
         "model.policy_guard.entity_relation_grounding.preservation_weight=1.0"
         in overrides
     )
-    if objective == 35:
+    if objective in {35, 36}:
         assert (
             "model.policy_guard.entity_relation_grounding."
             "paired_semantic_contrast_weight=0.1"

@@ -149,7 +149,7 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         source = (
             REPO_ROOT / "scripts/eval_pgc_libero.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("objective not in set(range(1, 36))", source)
+        self.assertIn("objective not in set(range(1, 37))", source)
         self.assertIn("if objective >= 28", source)
         self.assertIn("if objective >= 29", source)
 
@@ -205,7 +205,7 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         self.assertIn('if training_phase == "injector":', model)
         self.assertIn('elif training_phase == "gate":', model)
         for contract in (
-            "SAFE_GAIN_FULL_POLICY_RESUME_OBJECTIVES = frozenset({29, 30, 31, 32, 33, 34, 35})",
+            "SAFE_GAIN_FULL_POLICY_RESUME_OBJECTIVES = frozenset({29, 30, 31, 32, 33, 34, 35, 36})",
             "safe_gain_full_policy_resume = _is_safe_gain_full_policy_resume(",
             'getattr(model, "policy_guard_version", 0)',
             '"policy_guard_eraf_grounding_objective_version"',
