@@ -34,17 +34,17 @@ def model_for(objective=30, source=None, ablation="none"):
         v9_bidirectional_supervision=True,
         v9_context_injection_warmup_steps=0,
         v9_context_injection_ramp_steps=0,
-        v9_safe_gain_injector_training_steps=250 if objective in {30, 31, 32} else 0,
+        v9_safe_gain_injector_training_steps=250 if objective in {30, 31, 32, 33} else 0,
         v9_safe_gain_gate_calibration_steps=0,
-        v9_safe_gain_noise_levels=2 if objective in {30, 31, 32} else 1,
+        v9_safe_gain_noise_levels=2 if objective in {30, 31, 32, 33} else 1,
         v9_cf_ablation=ablation,
-        v9_full_goal_action_preservation_weight=1.0 if objective in {31, 32} else 0.0,
-        v9_full_goal_token_preservation_weight=0.1 if objective in {31, 32} else 0.0,
-        v9_full_goal_context_preservation_weight=1.0 if objective in {31, 32} else 0.0,
+        v9_full_goal_action_preservation_weight=1.0 if objective in {31, 32, 33} else 0.0,
+        v9_full_goal_token_preservation_weight=0.1 if objective in {31, 32, 33} else 0.0,
+        v9_full_goal_context_preservation_weight=1.0 if objective in {31, 32, 33} else 0.0,
     )
 
 
-@pytest.mark.parametrize("objective", [29, 30, 31, 32])
+@pytest.mark.parametrize("objective", [29, 30, 31, 32, 33])
 def test_safe_gain_full_policy_resume_accepts_supported_objectives(objective):
     model = SimpleNamespace(
         policy_guard_version=9,
@@ -217,6 +217,21 @@ def test_v932_hydra_changes_only_verified_ranking_route_and_short_schedule():
     assert cfg.save_every == 25
 
 
+def test_v933_hydra_keeps_v932_route_and_selects_positive_gradient():
+    with initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "configs"),
+        version_base=None,
+    ):
+        cfg = compose(
+            config_name="train", overrides=["task=libero_eraf_safe_gain_v933_2cam224"]
+        )
+    eraf = cfg.model.policy_guard.entity_relation_grounding
+    assert eraf.grounding_objective_version == 33
+    assert eraf.cf_ablation == "mask_lift_ranking"
+    assert eraf.safe_gain_injector_training_steps == cfg.max_steps == 50
+    assert cfg.save_every == 25
+
+
 def test_source_config_launcher_reuses_exact_bindings(tmp_path):
     root = Path(__file__).resolve().parents[1]
     path = root / "scripts/train_libero_eraf_safe_gain_v930_from_config.py"
@@ -341,6 +356,33 @@ def test_v932_runner_keeps_batch_and_builds_25_50_schedule(tmp_path):
     assert derived_eraf.grounding_objective_version == 32
     assert derived_eraf.cf_ablation == "mask_lift_ranking"
     assert module.SAVE_STEPS == (25, 50)
+
+
+def test_v933_runner_reuses_v932_workflow_with_new_objective(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    path = root / "scripts/train_libero_eraf_safe_gain_v932.py"
+    spec = importlib.util.spec_from_file_location("verified_ranking_launch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with initialize_config_dir(config_dir=str(root / "configs"), version_base=None):
+        source = compose(
+            config_name="train",
+            overrides=["task=libero_eraf_safe_gain_v930_2cam224"],
+        )
+    eraf = source.model.policy_guard.entity_relation_grounding
+    eraf.cf_ablation = "mask_corrective_ranking"
+    source.resume = str(tmp_path / "v928/step_010000.pt")
+    source.batch_size = 1
+    source.gradient_accumulation_steps = 4
+    derived = module.training_config(source, tmp_path / "v933", 4, objective=33)
+    command = module.training_command(
+        tmp_path / "v933", 4, derived, objective=33
+    )
+    derived_eraf = derived.model.policy_guard.entity_relation_grounding
+    assert derived_eraf.grounding_objective_version == 33
+    assert derived_eraf.cf_ablation == "mask_lift_ranking"
+    assert derived.gradient_accumulation_steps == 3
+    assert command[-1] == "v933_train"
 
 
 def test_migration_optimizer_freeze_and_teacher_roundtrip(warm_checkpoint, tmp_path):
@@ -500,6 +542,27 @@ def test_v932_roundtrip_records_selective_ranking_mode(warm_checkpoint, tmp_path
     resumed._v930_audit_frozen()
 
 
+def test_v933_roundtrip_records_positive_only_gradient_contract(
+    warm_checkpoint, tmp_path
+):
+    model = model_for(33, ablation="mask_lift_ranking")
+    model.prepare_trainable_parameters()
+    model.load_checkpoint(warm_checkpoint)
+    path = tmp_path / "v933.pt"
+    model.save_checkpoint(path, step=50)
+    payload = torch.load(path, weights_only=False)
+    metadata = payload["architecture_metadata"]
+    assert metadata["eraf_grounding_objective_version"] == 33
+    assert (
+        metadata["eraf_corrective_ranking_gradient_contract"]
+        == ablation.POSITIVE_ONLY_RANKING_CONTRACT
+    )
+    resumed = model_for(33, ablation="mask_lift_ranking")
+    resumed.prepare_trainable_parameters()
+    resumed.load_checkpoint(path)
+    resumed._v930_audit_frozen()
+
+
 @pytest.mark.parametrize("objective,ablation,all_lift", [
     (30, "none", False),
     (30, "mask_lift_corrective", False),
@@ -507,6 +570,7 @@ def test_v932_roundtrip_records_selective_ranking_mode(warm_checkpoint, tmp_path
     (30, "mask_lift_corrective", True),
     (31, "mask_corrective_ranking", False),
     (32, "mask_lift_ranking", False),
+    (33, "mask_lift_ranking", False),
 ])
 def test_real_action_forward_backward_and_eval_preflight(
     warm_checkpoint, tmp_path, objective, ablation, all_lift
@@ -587,7 +651,7 @@ def test_real_action_forward_backward_and_eval_preflight(
     assert action_path.call_count == 5
     assert metrics["loss_pgc_v930_teacher_preservation"] == pytest.approx(0, abs=1e-8)
     assert metrics["pgc_v930_gate_optimization_weight"] == 0
-    if objective in {31, 32}:
+    if objective in {31, 32, 33}:
         assert "loss_pgc_v931_full_goal_action_preservation" in metrics
         assert "loss_pgc_v931_full_goal_token_preservation" in metrics
         assert "loss_pgc_v931_full_goal_context_preservation" in metrics

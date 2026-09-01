@@ -82,7 +82,9 @@ def load_v930_b(config_path):
     return cfg
 
 
-def training_config(source, output_dir, gpus=3):
+def training_config(source, output_dir, gpus=3, *, objective=32):
+    if objective not in {32, 33}:
+        raise ValueError("Verified full-goal ranking runner supports V9.32 or V9.33.")
     cfg = OmegaConf.create(OmegaConf.to_container(source, resolve=True))
     per_accumulation_batch = int(gpus) * int(cfg.batch_size)
     if (
@@ -100,13 +102,13 @@ def training_config(source, output_dir, gpus=3):
     cfg.max_steps = MAX_STEPS
     cfg.save_every = SAVE_STEPS[0]
     eraf = cfg.model.policy_guard.entity_relation_grounding
-    eraf.grounding_objective_version = 32
+    eraf.grounding_objective_version = objective
     eraf.cf_ablation = "mask_lift_ranking"
     eraf.safe_gain_injector_training_steps = MAX_STEPS
     for name, value in FULL_GOAL_WEIGHTS.items():
         eraf[name] = value
     cfg.output_dir = str(Path(output_dir).resolve())
-    cfg.wandb.name = "v932_verified_full_goal_ranking"
+    cfg.wandb.name = f"v9{objective}_verified_full_goal_ranking"
     cfg.hydra = {
         "job": {"chdir": False},
         "run": {"dir": "."},
@@ -115,7 +117,7 @@ def training_config(source, output_dir, gpus=3):
     return cfg
 
 
-def training_command(run_dir, gpus, cfg):
+def training_command(run_dir, gpus, cfg, *, objective=32):
     return [
         "bash",
         "scripts/train_zero1.sh",
@@ -125,11 +127,15 @@ def training_command(run_dir, gpus, cfg):
         "--config-path",
         str(Path(run_dir).resolve()),
         "--config-name",
-        "v932_train",
+        f"v9{objective}_train",
     ]
 
 
-def main():
+def main(*, objective=32):
+    if objective not in {32, 33}:
+        raise ValueError("Verified full-goal ranking runner supports V9.32 or V9.33.")
+    version = f"V9.{objective}"
+    version_slug = f"v9{objective}"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "config", type=Path, help="actual completed V9.30-B run-root/config.yaml"
@@ -151,11 +157,11 @@ def main():
     os.chdir(repo)
     source_path = args.config.expanduser().resolve()
     source = load_v930_b(source_path)
-    root = repo / "runs/libero_eraf_safe_gain_v932_2cam224" / args.run_tag
+    root = repo / f"runs/libero_eraf_safe_gain_{version_slug}_2cam224" / args.run_tag
     if root.exists():
         raise FileExistsError(f"Refusing to overwrite an existing run: {root}")
-    cfg = training_config(source, root, args.gpus)
-    command = training_command(root, args.gpus, cfg)
+    cfg = training_config(source, root, args.gpus, objective=objective)
+    command = training_command(root, args.gpus, cfg, objective=objective)
     plan = {
         "contract": preservation.SELECTIVE_FULL_GOAL_CONTRACT,
         "ranking_route": {
@@ -181,6 +187,11 @@ def main():
         "save_steps": list(SAVE_STEPS),
         "learning_rate": float(source.learning_rate),
         "cf_ablation": "mask_lift_ranking",
+        "corrective_ranking_gradient_contract": (
+            cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
+            if objective == 33
+            else "legacy_detached_correct_error_wrong_error_gradient"
+        ),
         "full_goal_weights": FULL_GOAL_WEIGHTS,
         "command": command,
     }
@@ -212,7 +223,7 @@ def main():
     counts = Counter(record["verification_kind"] for record in records.values())
     if not counts["counterfactual_goal"] or not counts["target_lift"]:
         raise ValueError(
-            "V9.32 requires audited counterfactual_goal and target_lift rows so "
+            f"{version} requires audited counterfactual_goal and target_lift rows so "
             "both branches of the selective ranking route are exercised."
         )
     index_path = corrective_dataset / "meta/pgc_v8_closed_loop/index.json"
@@ -222,7 +233,7 @@ def main():
         "warm_v928_checkpoint_sha256": file_sha256(source.resume),
     })
     root.mkdir(parents=True, exist_ok=False)
-    OmegaConf.save(cfg, root / "v932_train.yaml")
+    OmegaConf.save(cfg, root / f"{version_slug}_train.yaml")
     (root / "experiment.json").write_text(
         json.dumps(plan, indent=2) + "\n", encoding="utf-8"
     )
@@ -237,19 +248,28 @@ def main():
     metadata = payload.get("architecture_metadata") or {}
     if (
         payload.get("step") != MAX_STEPS
-        or metadata.get("eraf_grounding_objective_version") != 32
+        or metadata.get("eraf_grounding_objective_version") != objective
         or cf_ablation.checkpoint_mode(metadata) != "mask_lift_ranking"
         or metadata.get("eraf_selective_full_goal_preservation_contract")
         != preservation.SELECTIVE_FULL_GOAL_CONTRACT
         or metadata.get("eraf_preservation_source", {}).get("checkpoint_sha256")
         != plan["warm_v928_checkpoint_sha256"]
+        or (
+            objective == 33
+            and metadata.get("eraf_corrective_ranking_gradient_contract")
+            != cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
+        )
     ):
-        raise RuntimeError(f"Final V9.32 checkpoint contract mismatch: {checkpoint}")
+        raise RuntimeError(
+            f"Final {version} checkpoint contract mismatch: {checkpoint}"
+        )
     preservation.validate_teacher_payload(payload)
     for step in SAVE_STEPS:
         expected = root / "checkpoints/weights" / f"step_{step:06d}.pt"
         if not expected.is_file():
-            raise FileNotFoundError(f"Missing required V9.32 checkpoint: {expected}")
+            raise FileNotFoundError(
+                f"Missing required {version} checkpoint: {expected}"
+            )
     print(f"[TRAIN_DONE] checkpoint={checkpoint}; evaluation not started", flush=True)
 
 

@@ -16,6 +16,9 @@ MODES = (
     "mask_lift_ranking",
 )
 CONTRACT = "cf_loss_numerator_masks_v1_same_samples_forwards_and_denominators"
+POSITIVE_ONLY_RANKING_CONTRACT = (
+    "counterfactual_goal_correct_error_gradient_with_detached_wrong_error_threshold"
+)
 
 
 def validate_mode(mode):
@@ -45,6 +48,29 @@ def checkpoint_mode(metadata):
     if metadata.get("eraf_cf_ablation_contract") != CONTRACT:
         raise ValueError("CF ablation checkpoint contract mismatch.")
     return mode
+
+
+def causal_ranking_per_sample(margin, correct_error, wrong_error, *, positive_only):
+    """Return a causal margin with exactly one prediction side trainable.
+
+    Historical ranking raises the wrong-language error around a detached
+    correct-language anchor. Positive-only ranking instead lowers the correct
+    error around a detached wrong-language threshold, avoiding destructive
+    gradients through a shared wrong-language interface.
+    """
+
+    import torch
+
+    if correct_error.shape != wrong_error.shape:
+        raise ValueError("Correct/wrong ranking errors must share shape [B].")
+    margin = torch.as_tensor(
+        margin,
+        device=correct_error.device,
+        dtype=correct_error.dtype,
+    )
+    if positive_only:
+        return torch.relu(margin + correct_error - wrong_error.detach())
+    return torch.relu(margin + correct_error.detach() - wrong_error)
 
 
 def loss_multipliers(mode, corrective, verification_kind=None):

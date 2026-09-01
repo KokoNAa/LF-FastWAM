@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - libero_eraf_safe_gain_v932_2cam224
+  - _self_
+
+# V9.33 retains V9.32 sample/loss routing but reverses the gradient side of
+# verified full-goal ranking: wrong error is a detached threshold and only the
+# correct target-language action error is optimized.
+model:
+  policy_guard:
+    entity_relation_grounding:
+      grounding_objective_version: 33

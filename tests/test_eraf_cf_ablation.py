@@ -50,6 +50,25 @@ def test_multipliers_preserve_denominators_and_gradient_isolation(mode, actions,
     assert ranking.grad.tolist() == pytest.approx([0, 1 / 3, ranks[2] / 3, ranks[3] / 3])
 
 
+@pytest.mark.parametrize("positive_only", [False, True])
+def test_causal_ranking_has_exactly_one_trainable_side(positive_only):
+    correct = torch.tensor([2.0], requires_grad=True)
+    wrong = torch.tensor([1.0], requires_grad=True)
+    loss = ablation.causal_ranking_per_sample(
+        0.5,
+        correct,
+        wrong,
+        positive_only=positive_only,
+    ).sum()
+    loss.backward()
+    if positive_only:
+        assert correct.grad.tolist() == [1.0]
+        assert wrong.grad is None
+    else:
+        assert correct.grad is None
+        assert wrong.grad.tolist() == [-1.0]
+
+
 @pytest.mark.parametrize("kind", [None, [0, 0], [0, 9], [0, 1.0], [[0, 1]]])
 def test_bad_or_missing_verification_fails_closed(kind):
     with pytest.raises(ValueError):
