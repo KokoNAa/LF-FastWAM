@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from fastwam.models.wan22 import eraf_preservation as preservation
+from fastwam.trainer import _is_safe_gain_full_policy_resume
 from test_policy_guard import tiny_pgc_fastwam
 
 
@@ -39,6 +41,36 @@ def model_for(objective=30, source=None, ablation="none"):
         v9_full_goal_token_preservation_weight=0.1 if objective == 31 else 0.0,
         v9_full_goal_context_preservation_weight=1.0 if objective == 31 else 0.0,
     )
+
+
+@pytest.mark.parametrize("objective", [29, 30, 31])
+def test_safe_gain_full_policy_resume_accepts_supported_objectives(objective):
+    model = SimpleNamespace(
+        policy_guard_version=9,
+        policy_guard_eraf_grounding_objective_version=objective,
+        policy_guard_eraf_safe_gain_training=True,
+    )
+    assert _is_safe_gain_full_policy_resume(model, "/tmp/full-policy.pt")
+
+
+@pytest.mark.parametrize(
+    ("objective", "resume", "version", "safe_gain"),
+    [
+        (28, "/tmp/full-policy.pt", 9, True),
+        (31, None, 9, True),
+        (31, "/tmp/full-policy.pt", 8, True),
+        (31, "/tmp/full-policy.pt", 9, False),
+    ],
+)
+def test_safe_gain_full_policy_resume_rejects_invalid_contracts(
+    objective, resume, version, safe_gain
+):
+    model = SimpleNamespace(
+        policy_guard_version=version,
+        policy_guard_eraf_grounding_objective_version=objective,
+        policy_guard_eraf_safe_gain_training=safe_gain,
+    )
+    assert not _is_safe_gain_full_policy_resume(model, resume)
 
 
 @pytest.fixture

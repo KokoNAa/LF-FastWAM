@@ -205,12 +205,13 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         self.assertIn('if training_phase == "injector":', model)
         self.assertIn('elif training_phase == "gate":', model)
         for contract in (
-            "v929_full_policy_resume = bool(self.resume)",
-            'getattr(self.model, "policy_guard_version", 0)',
+            "SAFE_GAIN_FULL_POLICY_RESUME_OBJECTIVES = frozenset({29, 30, 31})",
+            "safe_gain_full_policy_resume = _is_safe_gain_full_policy_resume(",
+            'getattr(model, "policy_guard_version", 0)',
             '"policy_guard_eraf_grounding_objective_version"',
             '"policy_guard_eraf_safe_gain_training"',
-            "and not v929_full_policy_resume",
-            "objective-29 safe-gain training restores a validated full",
+            "and not safe_gain_full_policy_resume",
+            "objective-29+ safe-gain training restores a validated full",
         ):
             self.assertIn(contract, trainer)
         for contract in (

@@ -26,6 +26,32 @@ from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_s
 logger = get_logger(__name__)
 
 
+SAFE_GAIN_FULL_POLICY_RESUME_OBJECTIVES = frozenset({29, 30, 31})
+
+
+def _is_safe_gain_full_policy_resume(model, resume) -> bool:
+    """Return whether ``resume`` is the complete safe-gain policy warm start."""
+
+    return bool(resume) and (
+        int(getattr(model, "policy_guard_version", 0)) == 9
+        and int(
+            getattr(
+                model,
+                "policy_guard_eraf_grounding_objective_version",
+                0,
+            )
+        )
+        in SAFE_GAIN_FULL_POLICY_RESUME_OBJECTIVES
+        and bool(
+            getattr(
+                model,
+                "policy_guard_eraf_safe_gain_training",
+                False,
+            )
+        )
+    )
+
+
 class Wan22Trainer:
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
@@ -175,23 +201,9 @@ class Wan22Trainer:
                     f"mismatches={mismatches}, "
                     f"closed_loop_native_count={closed_loop_count}."
                 )
-        v929_full_policy_resume = bool(self.resume) and (
-            int(getattr(self.model, "policy_guard_version", 0)) == 9
-            and int(
-                getattr(
-                    self.model,
-                    "policy_guard_eraf_grounding_objective_version",
-                    0,
-                )
-            )
-            in {29, 30}
-            and bool(
-                getattr(
-                    self.model,
-                    "policy_guard_eraf_safe_gain_training",
-                    False,
-                )
-            )
+        safe_gain_full_policy_resume = _is_safe_gain_full_policy_resume(
+            self.model,
+            self.resume,
         )
         if (
             bool(
@@ -204,12 +216,12 @@ class Wan22Trainer:
             and not getattr(
                 self.model, "policy_guard_eraf_pretrained_checkpoint", None
             )
-            and not v929_full_policy_resume
+            and not safe_gain_full_policy_resume
         ):
             raise ValueError(
                 "Pretrained ERAF joint training requires "
                 "entity_relation_grounding.pretrained_checkpoint unless "
-                "objective-29 safe-gain training restores a validated full "
+                "objective-29+ safe-gain training restores a validated full "
                 "PGC policy through resume."
             )
         if bool(getattr(self.model, "policy_guard_enabled", False)) and bool(
