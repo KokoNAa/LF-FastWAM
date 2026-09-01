@@ -56,6 +56,10 @@ def tiny_pgc_fastwam(
     v9_safe_gain_gate_calibration_steps: int = 0,
     v9_safe_gain_noise_levels: int = 1,
     v9_cf_ablation: str = "none",
+    v9_full_goal_action_preservation_weight: float = 0.0,
+    v9_full_goal_token_preservation_weight: float = 0.0,
+    v9_full_goal_context_preservation_weight: float = 0.0,
+    v9_full_goal_preservation_margin: float = 0.0,
 ) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
@@ -227,6 +231,16 @@ def tiny_pgc_fastwam(
                 "safe_gain_gate_calibration_steps": v9_safe_gain_gate_calibration_steps,
                 "safe_gain_noise_levels": v9_safe_gain_noise_levels,
                 "cf_ablation": v9_cf_ablation,
+                "full_goal_action_preservation_weight": (
+                    v9_full_goal_action_preservation_weight
+                ),
+                "full_goal_token_preservation_weight": (
+                    v9_full_goal_token_preservation_weight
+                ),
+                "full_goal_context_preservation_weight": (
+                    v9_full_goal_context_preservation_weight
+                ),
+                "full_goal_preservation_margin": v9_full_goal_preservation_margin,
                 "action_grounding_hidden_dim": 8,
                 "action_grounding_num_heads": 2,
                 "action_grounding_learning_rate": 1.0e-4,

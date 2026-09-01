@@ -149,7 +149,7 @@ class ERAFJointTrainingContractTest(unittest.TestCase):
         source = (
             REPO_ROOT / "scripts/eval_pgc_libero.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("objective not in set(range(1, 31))", source)
+        self.assertIn("objective not in set(range(1, 32))", source)
         self.assertIn("if objective >= 28", source)
         self.assertIn("if objective >= 29", source)
 

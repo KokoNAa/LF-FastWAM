@@ -374,6 +374,12 @@ policy_guard:
     safe_gain_noise_levels: 1
     preservation_weight: 1.0
     preservation_margin: 0.0
+    # V9.31 adds these only on audited full-goal corrective rows where the
+    # fixed V9.28 teacher is no worse than Base under identical diffusion noise.
+    full_goal_action_preservation_weight: 0.0
+    full_goal_token_preservation_weight: 0.0
+    full_goal_context_preservation_weight: 0.0
+    full_goal_preservation_margin: 0.0
     # Training-only V9.30 numerator masks; inference still has one Action Expert.
     cf_ablation: none
     safe_gain_closed_loop_action_weight: 1.0

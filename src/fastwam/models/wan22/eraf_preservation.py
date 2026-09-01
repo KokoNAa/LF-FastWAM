@@ -19,6 +19,10 @@ GATE_CONTRACT = "frozen_v928_gate_no_optimization"
 PRESERVATION_CONTRACT = (
     "same_noise_teacher_flow_on_noncorrective_teacher_no_worse_than_base_proxy"
 )
+SELECTIVE_FULL_GOAL_CONTRACT = (
+    "same_noise_v928_teacher_no_worse_than_base_on_audited_full_goal_corrective_"
+    "action_token_and_context_interface"
+)
 
 
 def tensor_digest(state: Mapping[str, torch.Tensor]) -> str:
@@ -53,10 +57,13 @@ def preservation_loss(
     direct_valid,
     corrective,
     margin=0.0,
+    candidate_mask=None,
 ):
     """Proxy eligibility is NOT a rollout-success label or a safety guarantee.
 
-    Corrective rows explicitly target old failures and are not distilled.
+    By default, corrective rows explicitly target old failures and are not
+    distilled.  A caller may supply an explicit ``candidate_mask`` for a
+    separately audited subset (V9.31 uses only full-goal corrective rows).
     All-pad rows are excluded; the empty-mask result remains differentiable.
     """
     valid_steps = ~action_is_pad.bool()
@@ -67,10 +74,20 @@ def preservation_loss(
         squared = (prediction.float() - reference.float()).square().mean(dim=-1)
         return (squared * weights).sum(dim=1) / count
 
+    if candidate_mask is None:
+        candidate_mask = ~corrective.bool()
+    else:
+        candidate_mask = torch.as_tensor(
+            candidate_mask, device=student.device, dtype=torch.bool
+        )
+        if candidate_mask.shape != direct_valid.shape:
+            raise ValueError(
+                "Preservation candidate_mask must share the [B] validity shape."
+            )
     with torch.no_grad():
         eligible = (
             direct_valid.bool()
-            & ~corrective.bool()
+            & candidate_mask
             & valid_steps.any(dim=1)
             & (error(teacher, target) <= error(base, target) + margin)
         )
@@ -79,10 +96,25 @@ def preservation_loss(
     return loss, eligible
 
 
+def interface_preservation_loss(*, student, teacher, eligible):
+    """Return a differentiable per-sample interface MSE on audited rows only."""
+    if student.shape != teacher.shape or student.ndim < 2:
+        raise ValueError(
+            "Student and teacher interface tensors must share shape [B,...]."
+        )
+    eligible = torch.as_tensor(eligible, device=student.device, dtype=torch.bool)
+    if eligible.shape != (student.shape[0],):
+        raise ValueError("Interface preservation eligibility must have shape [B].")
+    per_sample = (
+        student.float().sub(teacher.detach().float()).square().flatten(1).mean(dim=1)
+    )
+    return (per_sample * eligible).sum() / eligible.sum().clamp_min(1)
+
+
 def validate_teacher_payload(payload):
     teacher = payload.get("eraf_preservation_teacher")
     if not isinstance(teacher, dict):
-        raise ValueError("V9.30 checkpoint is missing its fixed V9.28 teacher.")
+        raise ValueError("Preservation checkpoint is missing its fixed V9.28 teacher.")
     provenance = teacher.get("provenance", {})
     state = teacher.get("state_dict", {})
     checkpoint_sha = str(provenance.get("checkpoint_sha256", ""))
@@ -103,5 +135,5 @@ def validate_teacher_payload(payload):
         or not state
         or tensor_digest(state) != provenance.get("teacher_sha256")
     ):
-        raise ValueError("Invalid V9.30 teacher provenance or tensor checksum.")
+        raise ValueError("Invalid preservation teacher provenance or tensor checksum.")
     return state, dict(provenance)

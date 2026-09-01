@@ -354,7 +354,7 @@ if version == 9:
         or bool(metadata.get("eraf_use_anchors", True)) != use_anchors
     ):
         raise SystemExit("PGC v9 checkpoint lacks or mismatches its ERAF contract")
-    if objective not in set(range(1, 31)):
+    if objective not in set(range(1, 32)):
         raise SystemExit(
             f"PGC v9 checkpoint has invalid grounding objective {objective}"
         )
@@ -499,7 +499,7 @@ if version == 9:
     expected_action_trainable_scope = (
         (
             "eraf_action_token_compressor_plus_context_injector_only"
-            if objective == 30 else
+            if objective in {30, 31} else
             "eraf_action_token_compressor_plus_context_injector_plus_gain_"
             "gate_only"
             if is_v927
@@ -544,7 +544,7 @@ if version == 9:
     expected_role_trainable_scope = (
         (
             "frozen_eraf_baseline_lora_and_gate_plus_compressor_injector"
-            if objective == 30 else
+            if objective in {30, 31} else
             "frozen_complete_eraf_plus_frozen_baseline_lora_plus_compressor_"
             "injector_gain_gate"
             if is_v927
@@ -707,7 +707,7 @@ if version == 9:
             "PGC V9.27 checkpoint lacks its frozen safe-gain contract"
         )
     expected_gate_contract = (
-        "frozen_v928_gate_no_optimization" if objective == 30 else
+        "frozen_v928_gate_no_optimization" if objective in {30, 31} else
         "detached_gate_calibration_from_mean_multi_noise_action_advantage_plus_"
         "wrong_language_rejection_and_positive_pair_logit_margin"
         if objective >= 29
@@ -727,21 +727,22 @@ if version == 9:
         )
     if objective >= 29 and (
         metadata.get("eraf_safe_gain_schedule_contract")
-        != ("injector_only_with_frozen_v928_teacher_and_gate" if objective == 30
+        != ("injector_only_with_frozen_v928_teacher_and_gate" if objective in {30, 31}
             else "injector_multinoise_then_detached_gate_calibration")
         or int(metadata.get("eraf_safe_gain_injector_training_steps") or 0)
         <= 0
         or (int(metadata.get("eraf_safe_gain_gate_calibration_steps") or 0) != 0
-            if objective == 30 else
+            if objective in {30, 31} else
             int(metadata.get("eraf_safe_gain_gate_calibration_steps") or 0) <= 0)
         or int(metadata.get("eraf_safe_gain_noise_levels") or 0) < 2
         or metadata.get("eraf_safe_gain_data_contract")
         != "offline_native_historical_strict_closed_loop_counterfactual_1_1_1_1"
     ):
         raise SystemExit("PGC V9.29 checkpoint lacks rollout-aligned safe-gain contracts")
-    if objective == 30:
+    if objective in {30, 31}:
         from fastwam.models.wan22.eraf_preservation import (
-            PRESERVATION_CONTRACT, validate_teacher_payload,
+            PRESERVATION_CONTRACT, SELECTIVE_FULL_GOAL_CONTRACT,
+            validate_teacher_payload,
         )
         validate_teacher_payload(payload)
         from fastwam.utils.cf_ablation import checkpoint_mode
@@ -750,7 +751,18 @@ if version == 9:
             or metadata.get("eraf_preservation_weight") is None
             or float(metadata["eraf_preservation_weight"]) < 0
             or metadata.get("eraf_preservation_margin") != 0.0):
-            raise SystemExit("V9.30 checkpoint lacks its teacher preservation contract")
+            raise SystemExit("Preservation checkpoint lacks its fixed-teacher contract")
+        if objective == 31 and (
+            metadata.get("eraf_selective_full_goal_preservation_contract")
+            != SELECTIVE_FULL_GOAL_CONTRACT
+            or min(
+                float(metadata.get("eraf_full_goal_action_preservation_weight") or 0),
+                float(metadata.get("eraf_full_goal_token_preservation_weight") or 0),
+                float(metadata.get("eraf_full_goal_context_preservation_weight") or 0),
+            ) <= 0
+            or metadata.get("eraf_full_goal_preservation_margin") != 0.0
+        ):
+            raise SystemExit("V9.31 checkpoint lacks selective full-goal preservation")
     if pretrained_eraf_joint:
         required_pretrained_provenance = (
             "eraf_pretrained_source_checkpoint",
@@ -954,6 +966,16 @@ mapping = {
     "eraf_preservation_weight": "preservation_weight",
     "eraf_preservation_margin": "preservation_margin",
     "eraf_cf_ablation": "cf_ablation",
+    "eraf_full_goal_action_preservation_weight": (
+        "full_goal_action_preservation_weight"
+    ),
+    "eraf_full_goal_token_preservation_weight": (
+        "full_goal_token_preservation_weight"
+    ),
+    "eraf_full_goal_context_preservation_weight": (
+        "full_goal_context_preservation_weight"
+    ),
+    "eraf_full_goal_preservation_margin": "full_goal_preservation_margin",
     "eraf_safe_gain_closed_loop_action_weight": (
         "safe_gain_closed_loop_action_weight"
     ),

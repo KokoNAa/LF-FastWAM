@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - libero_eraf_safe_gain_v930_2cam224
+  - _self_
+
+# V9.31 starts from the untouched V9.28 warm checkpoint. It keeps V9.30-B's
+# full action supervision and masked corrective ranking, while selectively
+# preserving the V9.28 interface only on audited counterfactual_goal rows where
+# the fixed teacher is no worse than Base under the same diffusion noise.
+model:
+  policy_guard:
+    entity_relation_grounding:
+      grounding_objective_version: 31
+      cf_ablation: mask_corrective_ranking
+      full_goal_action_preservation_weight: 1.0
+      full_goal_token_preservation_weight: 0.1
+      full_goal_context_preservation_weight: 1.0
+      full_goal_preservation_margin: 0.0
