@@ -380,6 +380,10 @@ policy_guard:
     full_goal_token_preservation_weight: 0.0
     full_goal_context_preservation_weight: 0.0
     full_goal_preservation_margin: 0.0
+    # V9.35 trains the deployed injected ERAF context against detached
+    # correct/wrong language anchors. Disabled for every earlier objective.
+    paired_semantic_contrast_weight: 0.0
+    paired_semantic_contrast_margin: 0.1
     # Training-only V9.30 numerator masks; inference still has one Action Expert.
     cf_ablation: none
     safe_gain_closed_loop_action_weight: 1.0

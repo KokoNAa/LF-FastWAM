@@ -873,6 +873,17 @@ def test_real_action_forward_backward_and_eval_preflight(
         "model.policy_guard.entity_relation_grounding.preservation_weight=1.0"
         in overrides
     )
+    if objective == 35:
+        assert (
+            "model.policy_guard.entity_relation_grounding."
+            "paired_semantic_contrast_weight=0.1"
+            in overrides
+        )
+        assert (
+            "model.policy_guard.entity_relation_grounding."
+            "paired_semantic_contrast_margin=0.1"
+            in overrides
+        )
     with initialize_config_dir(config_dir=str(root / "configs"), version_base=None):
         evaluation = compose(
             config_name="sim_libero",

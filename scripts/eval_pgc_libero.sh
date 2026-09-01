@@ -1023,6 +1023,12 @@ mapping = {
         "full_goal_context_preservation_weight"
     ),
     "eraf_full_goal_preservation_margin": "full_goal_preservation_margin",
+    "eraf_paired_semantic_contrast_weight": (
+        "paired_semantic_contrast_weight"
+    ),
+    "eraf_paired_semantic_contrast_margin": (
+        "paired_semantic_contrast_margin"
+    ),
     "eraf_safe_gain_closed_loop_action_weight": (
         "safe_gain_closed_loop_action_weight"
     ),
