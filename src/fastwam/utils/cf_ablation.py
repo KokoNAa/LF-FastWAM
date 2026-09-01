@@ -19,6 +19,9 @@ CONTRACT = "cf_loss_numerator_masks_v1_same_samples_forwards_and_denominators"
 POSITIVE_ONLY_RANKING_CONTRACT = (
     "counterfactual_goal_correct_error_gradient_with_detached_wrong_error_threshold"
 )
+UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT = (
+    "all_paired_language_correct_error_gradient_with_detached_wrong_error_threshold"
+)
 
 
 def validate_mode(mode):
@@ -71,6 +74,52 @@ def causal_ranking_per_sample(margin, correct_error, wrong_error, *, positive_on
     if positive_only:
         return torch.relu(margin + correct_error - wrong_error.detach())
     return torch.relu(margin + correct_error.detach() - wrong_error)
+
+
+def routed_causal_ranking_per_sample(
+    margin,
+    correct_error,
+    wrong_error,
+    *,
+    objective,
+    corrective,
+):
+    """Route the one-sided ranking gradient without changing sample validity.
+
+    V9.33 protects only closed-loop corrective rows and preserves the historical
+    negative-side gradient elsewhere. V9.34 removes that remaining conflict:
+    every semantic source/target pair lowers its correct-language action error,
+    and the wrong-language error is a detached threshold. The caller still owns
+    semantic validity and target-lift numerator masks.
+    """
+
+    import torch
+
+    corrective = torch.as_tensor(corrective, device=correct_error.device).bool()
+    if corrective.shape != correct_error.shape:
+        raise ValueError("Corrective ranking mask must share error shape [B].")
+    if objective == 34:
+        return causal_ranking_per_sample(
+            margin,
+            correct_error,
+            wrong_error,
+            positive_only=True,
+        )
+    legacy = causal_ranking_per_sample(
+        margin,
+        correct_error,
+        wrong_error,
+        positive_only=False,
+    )
+    if objective != 33:
+        return legacy
+    positive = causal_ranking_per_sample(
+        margin,
+        correct_error,
+        wrong_error,
+        positive_only=True,
+    )
+    return torch.where(corrective, positive, legacy)
 
 
 def loss_multipliers(mode, corrective, verification_kind=None):

@@ -69,6 +69,37 @@ def test_causal_ranking_has_exactly_one_trainable_side(positive_only):
         assert wrong.grad.tolist() == [-1.0]
 
 
+@pytest.mark.parametrize("objective", [33, 34])
+def test_routed_ranking_gradient_contract(objective):
+    correct = torch.tensor([2.0, 2.0], requires_grad=True)
+    wrong = torch.tensor([1.0, 1.0], requires_grad=True)
+    loss = ablation.routed_causal_ranking_per_sample(
+        0.5,
+        correct,
+        wrong,
+        objective=objective,
+        corrective=torch.tensor([False, True]),
+    ).sum()
+    loss.backward()
+    if objective == 34:
+        assert correct.grad.tolist() == [1.0, 1.0]
+        assert wrong.grad is None
+    else:
+        assert correct.grad.tolist() == [0.0, 1.0]
+        assert wrong.grad.tolist() == [-1.0, 0.0]
+
+
+def test_routed_ranking_rejects_wrong_corrective_shape():
+    with pytest.raises(ValueError, match="Corrective ranking mask"):
+        ablation.routed_causal_ranking_per_sample(
+            0.5,
+            torch.ones(2),
+            torch.ones(2),
+            objective=34,
+            corrective=torch.ones(2, 1),
+        )
+
+
 @pytest.mark.parametrize("kind", [None, [0, 0], [0, 9], [0, 1.0], [[0, 1]]])
 def test_bad_or_missing_verification_fails_closed(kind):
     with pytest.raises(ValueError):

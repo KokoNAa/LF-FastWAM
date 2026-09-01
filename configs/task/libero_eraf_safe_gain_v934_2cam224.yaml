@@ -1,0 +1,14 @@
+# @package _global_
+
+defaults:
+  - libero_eraf_safe_gain_v933_2cam224
+  - _self_
+
+# V9.34 keeps V9.33 data, masks, preservation, optimizer and schedule. It
+# removes the remaining legacy negative-side action-ranking gradient from every
+# semantic source/target pair; wrong-language error is always a detached
+# threshold while ranking lowers correct-language action error.
+model:
+  policy_guard:
+    entity_relation_grounding:
+      grounding_objective_version: 34

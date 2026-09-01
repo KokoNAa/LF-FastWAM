@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Run the V9.32 verified full-goal ranking experiment from warm V9.28.
+"""Run the matched verified-ranking experiments from warm V9.28.
 
-The input is the exact resolved V9.30-B config used by V9.31. V9.32 keeps its
-data, optimizer, seed, effective batch, frozen teacher, full-goal preservation
-and trainable scope. Only the corrective ranking route and 50-step diagnostic
-schedule change: target_lift keeps action but masks ranking, while verified
-counterfactual_goal keeps both.
+The input is the exact resolved V9.30-B config used by V9.31. Derived objectives
+keep its data, optimizer, seed, effective batch, frozen teacher, full-goal
+preservation and trainable scope. The 50-step schedule saves steps 25 and 50.
 """
 
 import argparse
@@ -40,6 +38,15 @@ FULL_GOAL_WEIGHTS = {
 TARGET_EFFECTIVE_BATCH_SIZE = 12
 MAX_STEPS = 50
 SAVE_STEPS = (25, 50)
+SUPPORTED_OBJECTIVES = frozenset({32, 33, 34})
+
+
+def ranking_gradient_contract(objective):
+    if objective == 34:
+        return cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
+    if objective == 33:
+        return cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
+    return "legacy_detached_correct_error_wrong_error_gradient"
 
 
 def file_sha256(path):
@@ -83,8 +90,8 @@ def load_v930_b(config_path):
 
 
 def training_config(source, output_dir, gpus=3, *, objective=32):
-    if objective not in {32, 33}:
-        raise ValueError("Verified full-goal ranking runner supports V9.32 or V9.33.")
+    if objective not in SUPPORTED_OBJECTIVES:
+        raise ValueError("Verified ranking runner supports V9.32 through V9.34.")
     cfg = OmegaConf.create(OmegaConf.to_container(source, resolve=True))
     per_accumulation_batch = int(gpus) * int(cfg.batch_size)
     if (
@@ -132,8 +139,8 @@ def training_command(run_dir, gpus, cfg, *, objective=32):
 
 
 def main(*, objective=32):
-    if objective not in {32, 33}:
-        raise ValueError("Verified full-goal ranking runner supports V9.32 or V9.33.")
+    if objective not in SUPPORTED_OBJECTIVES:
+        raise ValueError("Verified ranking runner supports V9.32 through V9.34.")
     version = f"V9.{objective}"
     version_slug = f"v9{objective}"
     parser = argparse.ArgumentParser(description=__doc__)
@@ -187,11 +194,7 @@ def main(*, objective=32):
         "save_steps": list(SAVE_STEPS),
         "learning_rate": float(source.learning_rate),
         "cf_ablation": "mask_lift_ranking",
-        "corrective_ranking_gradient_contract": (
-            cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
-            if objective == 33
-            else "legacy_detached_correct_error_wrong_error_gradient"
-        ),
+        "ranking_gradient_contract": ranking_gradient_contract(objective),
         "full_goal_weights": FULL_GOAL_WEIGHTS,
         "command": command,
     }
@@ -258,6 +261,11 @@ def main(*, objective=32):
             objective == 33
             and metadata.get("eraf_corrective_ranking_gradient_contract")
             != cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
+        )
+        or (
+            objective == 34
+            and metadata.get("eraf_paired_ranking_gradient_contract")
+            != cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
         )
     ):
         raise RuntimeError(
