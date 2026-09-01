@@ -1,6 +1,8 @@
 import unittest
+from collections import Counter
 
 from fastwam.training_progress import optimizer_step_to_sampler_position
+from fastwam.utils.samplers import ResumableEpochSampler
 
 
 class WeightOnlyResumePositionTest(unittest.TestCase):
@@ -38,6 +40,30 @@ class WeightOnlyResumePositionTest(unittest.TestCase):
                 num_processes=1,
                 gradient_accumulation_steps=1,
                 optimizer_step=-1,
+            )
+
+
+class ClosedLoopCurriculumSamplerTest(unittest.TestCase):
+    def test_four_ranks_three_accumulations_balance_global_window(self):
+        class Dataset:
+            pgc_v9_closed_loop_group_ids = [0, 1, 2, 3] * 12
+
+            def __len__(self):
+                return len(self.pgc_v9_closed_loop_group_ids)
+
+        dataset = Dataset()
+        sampler = ResumableEpochSampler(
+            dataset=dataset,
+            seed=42,
+            batch_size=1,
+            num_processes=4,
+            gradient_accumulation_steps=3,
+        )
+        labels = [dataset.pgc_v9_closed_loop_group_ids[index] for index in sampler]
+        for start in range(0, len(labels), 12):
+            self.assertEqual(
+                Counter(labels[start : start + 12]),
+                Counter({0: 3, 1: 3, 2: 3, 3: 3}),
             )
 
 

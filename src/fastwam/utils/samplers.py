@@ -80,11 +80,11 @@ class ResumableEpochSampler(Sampler[int]):
                 * self.num_processes
                 * self.gradient_accumulation_steps
             )
-            if global_window % 4 or self.gradient_accumulation_steps % 4:
+            if global_window % 4:
                 raise ValueError(
-                    f"{curriculum_name} requires gradient accumulation divisible by 4 "
-                    "so every rank and global optimizer window sees all four "
-                    "curriculum groups."
+                    f"{curriculum_name} requires the global optimizer window "
+                    "to be divisible by 4 so its all-reduced gradient sees all "
+                    "four curriculum groups equally."
                 )
             grouped_positions = {
                 group: [
@@ -102,8 +102,10 @@ class ResumableEpochSampler(Sampler[int]):
 
             # The dataset builder gives every group equal cardinality. Build a
             # rank-aware optimizer-window schedule: group=(microstep+rank+
-            # local_batch_slot)%4. Thus every rank sees all four groups over
-            # four microsteps, and their global aggregate is also exactly 1:1.
+            # local_batch_slot)%4. The all-reduced global gradient is exactly
+            # 1:1 across the four groups. When accumulation is a multiple of
+            # four, each rank is locally 1:1 too; that stronger property is not
+            # required when the ranks already cover all groups together.
             group_size = len(grouped_positions[0])
             if any(len(values) != group_size for values in grouped_positions.values()):
                 raise ValueError(
