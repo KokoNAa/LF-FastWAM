@@ -63,7 +63,7 @@ def preservation_loss(
 
     By default, corrective rows explicitly target old failures and are not
     distilled.  A caller may supply an explicit ``candidate_mask`` for a
-    separately audited subset (V9.31 uses only full-goal corrective rows).
+    separately audited subset (V9.31+ uses only full-goal corrective rows).
     All-pad rows are excluded; the empty-mask result remains differentiable.
     """
     valid_steps = ~action_is_pad.bool()

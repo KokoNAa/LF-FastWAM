@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
     ("none", [1, 1, 1, 1], [1, 1, 1, 1]),
     ("mask_lift_corrective", [1, 1, 0, 1], [1, 1, 0, 1]),
     ("mask_corrective_ranking", [1, 1, 1, 1], [1, 1, 0, 0]),
+    ("mask_lift_ranking", [1, 1, 1, 1], [1, 1, 0, 1]),
 ])
 def test_multipliers_preserve_denominators_and_gradient_isolation(mode, actions, ranks):
     corrective = torch.tensor([0, 0, 1, 1]).bool()

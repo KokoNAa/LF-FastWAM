@@ -9,7 +9,12 @@ class CorrectiveVerification(IntEnum):
     COUNTERFACTUAL_GOAL = 2
 
 
-MODES = ("none", "mask_lift_corrective", "mask_corrective_ranking")
+MODES = (
+    "none",
+    "mask_lift_corrective",
+    "mask_corrective_ranking",
+    "mask_lift_ranking",
+)
 CONTRACT = "cf_loss_numerator_masks_v1_same_samples_forwards_and_denominators"
 
 
@@ -77,4 +82,9 @@ def loss_multipliers(mode, corrective, verification_kind=None):
         ranking = action
     elif mode == "mask_corrective_ranking":
         ranking = ~corrective
+    elif mode == "mask_lift_ranking":
+        # Partial target-lift verification supports action acquisition but is
+        # not evidence that the full source/target goal ordering is correct.
+        # Full counterfactual-goal rows retain both action and ranking losses.
+        ranking = kind != CorrectiveVerification.TARGET_LIFT
     return action, ranking, kind

@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - libero_eraf_safe_gain_v931_2cam224
+  - _self_
+
+# V9.32 changes only the verified corrective ranking route. Partial target-lift
+# rows retain action acquisition but cannot supervise full source/target goal
+# ordering. Audited counterfactual-goal rows retain both action and ranking.
+model:
+  policy_guard:
+    entity_relation_grounding:
+      grounding_objective_version: 32
+      cf_ablation: mask_lift_ranking
+      safe_gain_injector_training_steps: 50
+
+max_steps: 50
+save_every: 25

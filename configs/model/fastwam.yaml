@@ -374,7 +374,7 @@ policy_guard:
     safe_gain_noise_levels: 1
     preservation_weight: 1.0
     preservation_margin: 0.0
-    # V9.31 adds these only on audited full-goal corrective rows where the
+    # V9.31+ objectives add these only on audited full-goal corrective rows where the
     # fixed V9.28 teacher is no worse than Base under identical diffusion noise.
     full_goal_action_preservation_weight: 0.0
     full_goal_token_preservation_weight: 0.0

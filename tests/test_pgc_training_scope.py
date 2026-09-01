@@ -244,7 +244,7 @@ class PolicyGuardTrainingScopeTest(unittest.TestCase):
             '"action_expert_imitation_weight"',
             source,
         )
-        self.assertIn("set(range(1, 32))", source)
+        self.assertIn("set(range(1, 33))", source)
         self.assertIn(
             '"frozen_v921_expert_adapter_plus_isolated_clause_semantic_"',
             source,
