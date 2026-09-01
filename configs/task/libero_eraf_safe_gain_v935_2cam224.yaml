@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - libero_eraf_safe_gain_v934_2cam224
+  - _self_
+
+# V9.35 retains universal positive-only action ranking and adds a portable,
+# same-state bidirectional semantic hinge on the exact ERAF context tokens sent
+# to the single frozen Action Expert. Language embeddings are detached anchors.
+model:
+  policy_guard:
+    entity_relation_grounding:
+      grounding_objective_version: 35
+      paired_semantic_contrast_weight: 0.1
+      paired_semantic_contrast_margin: 0.1

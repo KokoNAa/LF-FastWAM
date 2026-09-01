@@ -38,11 +38,13 @@ FULL_GOAL_WEIGHTS = {
 TARGET_EFFECTIVE_BATCH_SIZE = 12
 MAX_STEPS = 50
 SAVE_STEPS = (25, 50)
-SUPPORTED_OBJECTIVES = frozenset({32, 33, 34})
+SUPPORTED_OBJECTIVES = frozenset({32, 33, 34, 35})
+PAIRED_SEMANTIC_CONTRAST_WEIGHT = 0.1
+PAIRED_SEMANTIC_CONTRAST_MARGIN = 0.1
 
 
 def ranking_gradient_contract(objective):
-    if objective == 34:
+    if objective in {34, 35}:
         return cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
     if objective == 33:
         return cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
@@ -91,7 +93,7 @@ def load_v930_b(config_path):
 
 def training_config(source, output_dir, gpus=3, *, objective=32):
     if objective not in SUPPORTED_OBJECTIVES:
-        raise ValueError("Verified ranking runner supports V9.32 through V9.34.")
+        raise ValueError("Verified ranking runner supports V9.32 through V9.35.")
     cfg = OmegaConf.create(OmegaConf.to_container(source, resolve=True))
     per_accumulation_batch = int(gpus) * int(cfg.batch_size)
     if (
@@ -114,6 +116,9 @@ def training_config(source, output_dir, gpus=3, *, objective=32):
     eraf.safe_gain_injector_training_steps = MAX_STEPS
     for name, value in FULL_GOAL_WEIGHTS.items():
         eraf[name] = value
+    if objective == 35:
+        eraf.paired_semantic_contrast_weight = PAIRED_SEMANTIC_CONTRAST_WEIGHT
+        eraf.paired_semantic_contrast_margin = PAIRED_SEMANTIC_CONTRAST_MARGIN
     cfg.output_dir = str(Path(output_dir).resolve())
     cfg.wandb.name = f"v9{objective}_verified_full_goal_ranking"
     cfg.hydra = {
@@ -140,7 +145,7 @@ def training_command(run_dir, gpus, cfg, *, objective=32):
 
 def main(*, objective=32):
     if objective not in SUPPORTED_OBJECTIVES:
-        raise ValueError("Verified ranking runner supports V9.32 through V9.34.")
+        raise ValueError("Verified ranking runner supports V9.32 through V9.35.")
     version = f"V9.{objective}"
     version_slug = f"v9{objective}"
     parser = argparse.ArgumentParser(description=__doc__)
@@ -195,6 +200,17 @@ def main(*, objective=32):
         "learning_rate": float(source.learning_rate),
         "cf_ablation": "mask_lift_ranking",
         "ranking_gradient_contract": ranking_gradient_contract(objective),
+        "paired_semantic_contrast": (
+            {
+                "contract": cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT,
+                "weight": PAIRED_SEMANTIC_CONTRAST_WEIGHT,
+                "margin": PAIRED_SEMANTIC_CONTRAST_MARGIN,
+                "validity": "all_bidirectional_semantic_pairs",
+                "trainable": "compressor_plus_context_injector_only",
+            }
+            if objective == 35
+            else None
+        ),
         "full_goal_weights": FULL_GOAL_WEIGHTS,
         "command": command,
     }
@@ -263,9 +279,20 @@ def main(*, objective=32):
             != cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
         )
         or (
-            objective == 34
+            objective in {34, 35}
             and metadata.get("eraf_paired_ranking_gradient_contract")
             != cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
+        )
+        or (
+            objective == 35
+            and (
+                metadata.get("eraf_paired_semantic_contrast_contract")
+                != cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
+                or metadata.get("eraf_paired_semantic_contrast_weight")
+                != PAIRED_SEMANTIC_CONTRAST_WEIGHT
+                or metadata.get("eraf_paired_semantic_contrast_margin")
+                != PAIRED_SEMANTIC_CONTRAST_MARGIN
+            )
         )
     ):
         raise RuntimeError(

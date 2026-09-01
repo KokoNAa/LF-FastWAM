@@ -69,7 +69,7 @@ def test_causal_ranking_has_exactly_one_trainable_side(positive_only):
         assert wrong.grad.tolist() == [-1.0]
 
 
-@pytest.mark.parametrize("objective", [33, 34])
+@pytest.mark.parametrize("objective", [33, 34, 35])
 def test_routed_ranking_gradient_contract(objective):
     correct = torch.tensor([2.0, 2.0], requires_grad=True)
     wrong = torch.tensor([1.0, 1.0], requires_grad=True)
@@ -81,7 +81,7 @@ def test_routed_ranking_gradient_contract(objective):
         corrective=torch.tensor([False, True]),
     ).sum()
     loss.backward()
-    if objective == 34:
+    if objective in {34, 35}:
         assert correct.grad.tolist() == [1.0, 1.0]
         assert wrong.grad is None
     else:
@@ -97,6 +97,41 @@ def test_routed_ranking_rejects_wrong_corrective_shape():
             torch.ones(2),
             objective=34,
             corrective=torch.ones(2, 1),
+        )
+
+
+def test_paired_semantic_contrast_only_trains_deployed_context():
+    injected = torch.tensor(
+        [[[1.0, 1.0], [1.0, 1.0]]], requires_grad=True
+    )
+    correct = torch.tensor([[[1.0, 0.0], [1.0, 0.0]]], requires_grad=True)
+    wrong = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]], requires_grad=True)
+    mask = torch.ones(1, 2, dtype=torch.bool)
+    loss, correct_similarity, wrong_similarity = (
+        ablation.paired_semantic_contrast_per_sample(
+            injected,
+            correct,
+            mask,
+            wrong,
+            mask,
+            margin=0.1,
+        )
+    )
+    assert correct_similarity.item() == pytest.approx(2**-0.5)
+    assert wrong_similarity.item() == pytest.approx(2**-0.5)
+    loss.sum().backward()
+    assert injected.grad is not None and injected.grad.abs().sum() > 0
+    assert correct.grad is None
+    assert wrong.grad is None
+
+
+@pytest.mark.parametrize("margin", [0.0, 2.0])
+def test_paired_semantic_contrast_rejects_unsafe_margin(margin):
+    tokens = torch.ones(1, 1, 2)
+    mask = torch.ones(1, 1, dtype=torch.bool)
+    with pytest.raises(ValueError, match="margin"):
+        ablation.paired_semantic_contrast_per_sample(
+            tokens, tokens, mask, tokens, mask, margin=margin
         )
 
 

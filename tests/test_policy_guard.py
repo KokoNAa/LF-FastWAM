@@ -60,6 +60,8 @@ def tiny_pgc_fastwam(
     v9_full_goal_token_preservation_weight: float = 0.0,
     v9_full_goal_context_preservation_weight: float = 0.0,
     v9_full_goal_preservation_margin: float = 0.0,
+    v9_paired_semantic_contrast_weight: float = 0.0,
+    v9_paired_semantic_contrast_margin: float = 0.1,
 ) -> FastWAM:
     video = WanVideoDiT(
         hidden_dim=16,
@@ -241,6 +243,12 @@ def tiny_pgc_fastwam(
                     v9_full_goal_context_preservation_weight
                 ),
                 "full_goal_preservation_margin": v9_full_goal_preservation_margin,
+                "paired_semantic_contrast_weight": (
+                    v9_paired_semantic_contrast_weight
+                ),
+                "paired_semantic_contrast_margin": (
+                    v9_paired_semantic_contrast_margin
+                ),
                 "action_grounding_hidden_dim": 8,
                 "action_grounding_num_heads": 2,
                 "action_grounding_learning_rate": 1.0e-4,

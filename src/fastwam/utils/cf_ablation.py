@@ -22,6 +22,9 @@ POSITIVE_ONLY_RANKING_CONTRACT = (
 UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT = (
     "all_paired_language_correct_error_gradient_with_detached_wrong_error_threshold"
 )
+PAIRED_SEMANTIC_CONTRAST_CONTRACT = (
+    "same_state_bidirectional_injected_context_to_frozen_language_hinge_v1"
+)
 
 
 def validate_mode(mode):
@@ -98,7 +101,7 @@ def routed_causal_ranking_per_sample(
     corrective = torch.as_tensor(corrective, device=correct_error.device).bool()
     if corrective.shape != correct_error.shape:
         raise ValueError("Corrective ranking mask must share error shape [B].")
-    if objective == 34:
+    if objective in {34, 35}:
         return causal_ranking_per_sample(
             margin,
             correct_error,
@@ -120,6 +123,70 @@ def routed_causal_ranking_per_sample(
         positive_only=True,
     )
     return torch.where(corrective, positive, legacy)
+
+
+def paired_semantic_contrast_per_sample(
+    injected_context,
+    correct_language,
+    correct_language_mask,
+    wrong_language,
+    wrong_language_mask,
+    *,
+    margin,
+):
+    """Contrast the deployed ERAF context against frozen language anchors.
+
+    Only ``injected_context`` remains trainable. Correct/wrong text embeddings
+    are detached anchors, so the loss cannot update either language encoding or
+    the wrong action path. Masks use the FastWAM convention ``True == valid``.
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    if injected_context.ndim != 3 or injected_context.shape[1] == 0:
+        raise ValueError("Injected ERAF context must be non-empty [B,T,D].")
+    if (
+        correct_language.ndim != 3
+        or wrong_language.ndim != 3
+        or correct_language.shape[0] != injected_context.shape[0]
+        or wrong_language.shape[0] != injected_context.shape[0]
+        or correct_language.shape[2] != injected_context.shape[2]
+        or wrong_language.shape[2] != injected_context.shape[2]
+    ):
+        raise ValueError("Injected context and language anchors must share [B,D].")
+    for name, language, mask in (
+        ("correct", correct_language, correct_language_mask),
+        ("wrong", wrong_language, wrong_language_mask),
+    ):
+        if mask.shape != language.shape[:2] or mask.dtype != torch.bool:
+            raise ValueError(f"{name} language mask must be boolean [B,L].")
+        if not bool(mask.any(dim=1).all()):
+            raise ValueError(f"{name} language anchor cannot be empty.")
+    margin = float(margin)
+    if not 0.0 < margin < 2.0:
+        raise ValueError("Paired semantic contrast margin must lie in (0,2).")
+
+    def masked_mean(language, mask):
+        weights = mask.to(device=language.device, dtype=torch.float32).unsqueeze(-1)
+        return (
+            (language.float() * weights).sum(dim=1)
+            / weights.sum(dim=1).clamp_min(1.0)
+        )
+
+    deployed = F.normalize(injected_context.float().mean(dim=1), dim=-1)
+    correct_anchor = F.normalize(
+        masked_mean(correct_language, correct_language_mask).detach(), dim=-1
+    )
+    wrong_anchor = F.normalize(
+        masked_mean(wrong_language, wrong_language_mask).detach(), dim=-1
+    )
+    correct_similarity = (deployed * correct_anchor).sum(dim=-1)
+    wrong_similarity = (deployed * wrong_anchor).sum(dim=-1)
+    loss = torch.relu(
+        deployed.new_tensor(margin) + wrong_similarity - correct_similarity
+    )
+    return loss, correct_similarity, wrong_similarity
 
 
 def loss_multipliers(mode, corrective, verification_kind=None):
