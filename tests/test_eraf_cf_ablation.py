@@ -69,7 +69,7 @@ def test_causal_ranking_has_exactly_one_trainable_side(positive_only):
         assert wrong.grad.tolist() == [-1.0]
 
 
-@pytest.mark.parametrize("objective", [33, 34, 35, 36])
+@pytest.mark.parametrize("objective", [33, 34, 35, 36, 37])
 def test_routed_ranking_gradient_contract(objective):
     correct = torch.tensor([2.0, 2.0], requires_grad=True)
     wrong = torch.tensor([1.0, 1.0], requires_grad=True)
@@ -81,7 +81,7 @@ def test_routed_ranking_gradient_contract(objective):
         corrective=torch.tensor([False, True]),
     ).sum()
     loss.backward()
-    if objective in {34, 35, 36}:
+    if objective in {34, 35, 36, 37}:
         assert correct.grad.tolist() == [1.0, 1.0]
         assert wrong.grad is None
     else:
@@ -144,6 +144,34 @@ def test_action_violation_semantic_mask_is_detached_and_respects_route():
     )
     assert selected.tolist() == [True, False, False, False]
     assert not selected.requires_grad
+
+
+def test_action_violation_semantic_weights_interpolate_without_route_gradient():
+    ranking = torch.tensor([0.2, 0.3, 0.0, 0.4], requires_grad=True)
+    weights = ablation.action_violation_semantic_weights(
+        torch.tensor([True, True, True, False]),
+        torch.tensor([True, False, True, True]),
+        ranking,
+        non_violation_weight=0.5,
+    )
+    assert weights.tolist() == [1.0, 0.5, 0.5, 0.0]
+    assert not weights.requires_grad
+
+    semantic_loss = torch.ones(4, requires_grad=True)
+    (semantic_loss * weights).sum().backward()
+    assert semantic_loss.grad.tolist() == [1.0, 0.5, 0.5, 0.0]
+    assert ranking.grad is None
+
+
+@pytest.mark.parametrize("weight", [-0.1, 0.0, 1.0, 1.1, float("nan")])
+def test_action_violation_semantic_weights_reject_unsafe_interpolation(weight):
+    with pytest.raises(ValueError, match="non-violation weight"):
+        ablation.action_violation_semantic_weights(
+            torch.tensor([True]),
+            torch.tensor([True]),
+            torch.tensor([0.1]),
+            non_violation_weight=weight,
+        )
 
 
 @pytest.mark.parametrize("kind", [None, [0, 0], [0, 9], [0, 1.0], [[0, 1]]])

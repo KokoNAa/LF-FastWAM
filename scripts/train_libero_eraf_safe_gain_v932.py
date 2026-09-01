@@ -4,7 +4,7 @@
 The input is the exact resolved V9.30-B config used by V9.31. Derived objectives
 keep its data, optimizer, seed, effective batch, frozen teacher, full-goal
 preservation and trainable scope. Objectives 32--35 use the 25/50 diagnostic
-schedule; V9.36 uses a shorter 25-step schedule with early checkpoints.
+schedule; V9.36--V9.37 use a shorter 25-step schedule with early checkpoints.
 """
 
 import argparse
@@ -39,13 +39,14 @@ FULL_GOAL_WEIGHTS = {
 TARGET_EFFECTIVE_BATCH_SIZE = 12
 MAX_STEPS = 50
 SAVE_STEPS = (25, 50)
-SUPPORTED_OBJECTIVES = frozenset({32, 33, 34, 35, 36})
+SUPPORTED_OBJECTIVES = frozenset({32, 33, 34, 35, 36, 37})
 PAIRED_SEMANTIC_CONTRAST_WEIGHT = 0.1
 PAIRED_SEMANTIC_CONTRAST_MARGIN = 0.1
+PAIRED_SEMANTIC_NON_VIOLATION_WEIGHT = 0.5
 
 
 def ranking_gradient_contract(objective):
-    if objective in {34, 35, 36}:
+    if objective in {34, 35, 36, 37}:
         return cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
     if objective == 33:
         return cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
@@ -53,11 +54,11 @@ def ranking_gradient_contract(objective):
 
 
 def max_steps_for_objective(objective):
-    return 25 if objective == 36 else MAX_STEPS
+    return 25 if objective in {36, 37} else MAX_STEPS
 
 
 def save_steps_for_objective(objective):
-    return (10, 15, 20, 25) if objective == 36 else SAVE_STEPS
+    return (10, 15, 20, 25) if objective in {36, 37} else SAVE_STEPS
 
 
 def file_sha256(path):
@@ -102,7 +103,7 @@ def load_v930_b(config_path):
 
 def training_config(source, output_dir, gpus=3, *, objective=32):
     if objective not in SUPPORTED_OBJECTIVES:
-        raise ValueError("Verified ranking runner supports V9.32 through V9.36.")
+        raise ValueError("Verified ranking runner supports V9.32 through V9.37.")
     cfg = OmegaConf.create(OmegaConf.to_container(source, resolve=True))
     per_accumulation_batch = int(gpus) * int(cfg.batch_size)
     if (
@@ -119,16 +120,20 @@ def training_config(source, output_dir, gpus=3, *, objective=32):
     )
     max_steps = max_steps_for_objective(objective)
     cfg.max_steps = max_steps
-    cfg.save_every = 5 if objective == 36 else SAVE_STEPS[0]
+    cfg.save_every = 5 if objective in {36, 37} else SAVE_STEPS[0]
     eraf = cfg.model.policy_guard.entity_relation_grounding
     eraf.grounding_objective_version = objective
     eraf.cf_ablation = "mask_lift_ranking"
     eraf.safe_gain_injector_training_steps = max_steps
     for name, value in FULL_GOAL_WEIGHTS.items():
         eraf[name] = value
-    if objective in {35, 36}:
+    if objective in {35, 36, 37}:
         eraf.paired_semantic_contrast_weight = PAIRED_SEMANTIC_CONTRAST_WEIGHT
         eraf.paired_semantic_contrast_margin = PAIRED_SEMANTIC_CONTRAST_MARGIN
+    if objective == 37:
+        eraf.paired_semantic_non_violation_weight = (
+            PAIRED_SEMANTIC_NON_VIOLATION_WEIGHT
+        )
     cfg.output_dir = str(Path(output_dir).resolve())
     cfg.wandb.name = f"v9{objective}_verified_full_goal_ranking"
     cfg.hydra = {
@@ -155,7 +160,7 @@ def training_command(run_dir, gpus, cfg, *, objective=32):
 
 def main(*, objective=32):
     if objective not in SUPPORTED_OBJECTIVES:
-        raise ValueError("Verified ranking runner supports V9.32 through V9.36.")
+        raise ValueError("Verified ranking runner supports V9.32 through V9.37.")
     version = f"V9.{objective}"
     version_slug = f"v9{objective}"
     parser = argparse.ArgumentParser(description=__doc__)
@@ -215,6 +220,9 @@ def main(*, objective=32):
         "paired_semantic_contrast": (
             {
                 "contract": (
+                    cf_ablation.SOFT_ACTION_VIOLATION_SEMANTIC_CONTRAST_CONTRACT
+                    if objective == 37
+                    else
                     cf_ablation.ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT
                     if objective == 36
                     else cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
@@ -222,13 +230,21 @@ def main(*, objective=32):
                 "weight": PAIRED_SEMANTIC_CONTRAST_WEIGHT,
                 "margin": PAIRED_SEMANTIC_CONTRAST_MARGIN,
                 "validity": (
+                    "soft_detached_used_action_ranking_violation_weight"
+                    if objective == 37
+                    else
                     "detached_used_positive_action_ranking_violation_only"
                     if objective == 36
                     else "all_bidirectional_semantic_pairs"
                 ),
+                "non_violation_weight": (
+                    PAIRED_SEMANTIC_NON_VIOLATION_WEIGHT
+                    if objective == 37
+                    else None
+                ),
                 "trainable": "compressor_plus_context_injector_only",
             }
-            if objective in {35, 36}
+            if objective in {35, 36, 37}
             else None
         ),
         "full_goal_weights": FULL_GOAL_WEIGHTS,
@@ -299,15 +315,18 @@ def main(*, objective=32):
             != cf_ablation.POSITIVE_ONLY_RANKING_CONTRACT
         )
         or (
-            objective in {34, 35, 36}
+            objective in {34, 35, 36, 37}
             and metadata.get("eraf_paired_ranking_gradient_contract")
             != cf_ablation.UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT
         )
         or (
-            objective in {35, 36}
+            objective in {35, 36, 37}
             and (
                 metadata.get("eraf_paired_semantic_contrast_contract")
                 != (
+                    cf_ablation.SOFT_ACTION_VIOLATION_SEMANTIC_CONTRAST_CONTRACT
+                    if objective == 37
+                    else
                     cf_ablation.ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT
                     if objective == 36
                     else cf_ablation.PAIRED_SEMANTIC_CONTRAST_CONTRACT
@@ -316,6 +335,11 @@ def main(*, objective=32):
                 != PAIRED_SEMANTIC_CONTRAST_WEIGHT
                 or metadata.get("eraf_paired_semantic_contrast_margin")
                 != PAIRED_SEMANTIC_CONTRAST_MARGIN
+                or (
+                    objective == 37
+                    and metadata.get("eraf_paired_semantic_non_violation_weight")
+                    != PAIRED_SEMANTIC_NON_VIOLATION_WEIGHT
+                )
             )
         )
     ):

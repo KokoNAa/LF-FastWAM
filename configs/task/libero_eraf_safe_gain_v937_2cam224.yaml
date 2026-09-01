@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - libero_eraf_safe_gain_v936_2cam224
+  - _self_
+
+# V9.37 interpolates between V9.35 and V9.36 without task-specific routing:
+# semantically valid pairs with a detached, routed positive-only action-ranking
+# violation receive unit weight; all other valid pairs retain half weight.
+model:
+  policy_guard:
+    entity_relation_grounding:
+      grounding_objective_version: 37
+      paired_semantic_non_violation_weight: 0.5
+      safe_gain_injector_training_steps: 25
+
+max_steps: 25
+save_every: 5

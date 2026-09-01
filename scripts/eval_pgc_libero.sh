@@ -499,7 +499,7 @@ if version == 9:
     expected_action_trainable_scope = (
         (
             "eraf_action_token_compressor_plus_context_injector_only"
-            if objective in {30, 31, 32, 33, 34, 35, 36} else
+            if objective in {30, 31, 32, 33, 34, 35, 36, 37} else
             "eraf_action_token_compressor_plus_context_injector_plus_gain_"
             "gate_only"
             if is_v927
@@ -544,7 +544,7 @@ if version == 9:
     expected_role_trainable_scope = (
         (
             "frozen_eraf_baseline_lora_and_gate_plus_compressor_injector"
-            if objective in {30, 31, 32, 33, 34, 35, 36} else
+            if objective in {30, 31, 32, 33, 34, 35, 36, 37} else
             "frozen_complete_eraf_plus_frozen_baseline_lora_plus_compressor_"
             "injector_gain_gate"
             if is_v927
@@ -707,7 +707,7 @@ if version == 9:
             "PGC V9.27 checkpoint lacks its frozen safe-gain contract"
         )
     expected_gate_contract = (
-        "frozen_v928_gate_no_optimization" if objective in {30, 31, 32, 33, 34, 35, 36} else
+        "frozen_v928_gate_no_optimization" if objective in {30, 31, 32, 33, 34, 35, 36, 37} else
         "detached_gate_calibration_from_mean_multi_noise_action_advantage_plus_"
         "wrong_language_rejection_and_positive_pair_logit_margin"
         if objective >= 29
@@ -727,19 +727,19 @@ if version == 9:
         )
     if objective >= 29 and (
         metadata.get("eraf_safe_gain_schedule_contract")
-        != ("injector_only_with_frozen_v928_teacher_and_gate" if objective in {30, 31, 32, 33, 34, 35, 36}
+        != ("injector_only_with_frozen_v928_teacher_and_gate" if objective in {30, 31, 32, 33, 34, 35, 36, 37}
             else "injector_multinoise_then_detached_gate_calibration")
         or int(metadata.get("eraf_safe_gain_injector_training_steps") or 0)
         <= 0
         or (int(metadata.get("eraf_safe_gain_gate_calibration_steps") or 0) != 0
-            if objective in {30, 31, 32, 33, 34, 35, 36} else
+            if objective in {30, 31, 32, 33, 34, 35, 36, 37} else
             int(metadata.get("eraf_safe_gain_gate_calibration_steps") or 0) <= 0)
         or int(metadata.get("eraf_safe_gain_noise_levels") or 0) < 2
         or metadata.get("eraf_safe_gain_data_contract")
         != "offline_native_historical_strict_closed_loop_counterfactual_1_1_1_1"
     ):
         raise SystemExit("PGC V9.29 checkpoint lacks rollout-aligned safe-gain contracts")
-    if objective in {30, 31, 32, 33, 34, 35, 36}:
+    if objective in {30, 31, 32, 33, 34, 35, 36, 37}:
         from fastwam.models.wan22.eraf_preservation import (
             PRESERVATION_CONTRACT, SELECTIVE_FULL_GOAL_CONTRACT,
             validate_teacher_payload,
@@ -760,12 +760,13 @@ if version == 9:
             34: "mask_lift_ranking",
             35: "mask_lift_ranking",
             36: "mask_lift_ranking",
+            37: "mask_lift_ranking",
         }[objective]
         if expected_mode is not None and mode != expected_mode:
             raise SystemExit(
                 f"V9.{objective} checkpoint has incompatible CF loss routing {mode!r}"
             )
-        if objective in {31, 32, 33, 34, 35, 36} and (
+        if objective in {31, 32, 33, 34, 35, 36, 37} and (
             metadata.get("eraf_selective_full_goal_preservation_contract")
             != SELECTIVE_FULL_GOAL_CONTRACT
             or min(
@@ -787,7 +788,7 @@ if version == 9:
                 raise SystemExit(
                     "V9.33 checkpoint lacks positive-only corrective ranking"
                 )
-        if objective in {34, 35, 36}:
+        if objective in {34, 35, 36, 37}:
             from fastwam.utils.cf_ablation import (
                 UNIVERSAL_POSITIVE_ONLY_RANKING_CONTRACT,
             )
@@ -798,13 +799,16 @@ if version == 9:
                 raise SystemExit(
                     f"V9.{objective} checkpoint lacks universal positive-only paired ranking"
                 )
-        if objective in {35, 36}:
+        if objective in {35, 36, 37}:
             from fastwam.utils.cf_ablation import (
                 ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT,
                 PAIRED_SEMANTIC_CONTRAST_CONTRACT,
+                SOFT_ACTION_VIOLATION_SEMANTIC_CONTRAST_CONTRACT,
             )
             expected_semantic_contract = (
-                ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT
+                SOFT_ACTION_VIOLATION_SEMANTIC_CONTRAST_CONTRACT
+                if objective == 37
+                else ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT
                 if objective == 36
                 else PAIRED_SEMANTIC_CONTRAST_CONTRACT
             )
@@ -818,6 +822,16 @@ if version == 9:
             ):
                 raise SystemExit(
                     f"V9.{objective} checkpoint lacks paired semantic contrast contract"
+                )
+            if objective == 37 and (
+                float(
+                    metadata.get("eraf_paired_semantic_non_violation_weight")
+                    or 0
+                )
+                != 0.5
+            ):
+                raise SystemExit(
+                    "V9.37 checkpoint lacks soft semantic non-violation weight"
                 )
     if pretrained_eraf_joint:
         required_pretrained_provenance = (
@@ -1037,6 +1051,9 @@ mapping = {
     ),
     "eraf_paired_semantic_contrast_margin": (
         "paired_semantic_contrast_margin"
+    ),
+    "eraf_paired_semantic_non_violation_weight": (
+        "paired_semantic_non_violation_weight"
     ),
     "eraf_safe_gain_closed_loop_action_weight": (
         "safe_gain_closed_loop_action_weight"

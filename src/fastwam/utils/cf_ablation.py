@@ -29,6 +29,10 @@ ACTION_VIOLATION_GATED_SEMANTIC_CONTRAST_CONTRACT = (
     "same_state_bidirectional_injected_context_hinge_on_detached_used_action_"
     "ranking_violation_v1"
 )
+SOFT_ACTION_VIOLATION_SEMANTIC_CONTRAST_CONTRACT = (
+    "same_state_bidirectional_injected_context_hinge_soft_weighted_by_detached_"
+    "used_action_ranking_violation_v1"
+)
 
 
 def validate_mode(mode):
@@ -105,7 +109,7 @@ def routed_causal_ranking_per_sample(
     corrective = torch.as_tensor(corrective, device=correct_error.device).bool()
     if corrective.shape != correct_error.shape:
         raise ValueError("Corrective ranking mask must share error shape [B].")
-    if objective in {34, 35, 36}:
+    if objective in {34, 35, 36, 37}:
         return causal_ranking_per_sample(
             margin,
             correct_error,
@@ -220,6 +224,45 @@ def action_violation_semantic_mask(
         & ranking_multiplier
         & (ranking_per_sample.detach() > 0)
     )
+
+
+def action_violation_semantic_weights(
+    semantic_valid,
+    ranking_multiplier,
+    ranking_per_sample,
+    *,
+    non_violation_weight,
+):
+    """Softly retain semantics outside detached action-ranking violations.
+
+    V9.37 gives active, routed action-ranking violations unit weight and keeps a
+    fixed fractional weight on every other semantically valid pair.  The route
+    is computed by :func:`action_violation_semantic_mask`, so task identity and
+    gradients through the routing decision remain unavailable.
+    """
+
+    import torch
+
+    non_violation_weight = float(non_violation_weight)
+    if not 0.0 < non_violation_weight < 1.0:
+        raise ValueError(
+            "Semantic non-violation weight must lie strictly between 0 and 1."
+        )
+    semantic_valid = torch.as_tensor(
+        semantic_valid, device=ranking_per_sample.device
+    ).bool()
+    violation = action_violation_semantic_mask(
+        semantic_valid,
+        ranking_multiplier,
+        ranking_per_sample,
+    )
+    weights = torch.full_like(
+        ranking_per_sample,
+        non_violation_weight,
+        dtype=torch.float32,
+    )
+    weights = torch.where(violation, torch.ones_like(weights), weights)
+    return weights * semantic_valid.to(dtype=weights.dtype)
 
 
 def loss_multipliers(mode, corrective, verification_kind=None):

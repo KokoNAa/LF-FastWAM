@@ -384,6 +384,7 @@ policy_guard:
     # correct/wrong language anchors. Disabled for every earlier objective.
     paired_semantic_contrast_weight: 0.0
     paired_semantic_contrast_margin: 0.1
+    paired_semantic_non_violation_weight: 0.5
     # Training-only V9.30 numerator masks; inference still has one Action Expert.
     cf_ablation: none
     safe_gain_closed_loop_action_weight: 1.0
