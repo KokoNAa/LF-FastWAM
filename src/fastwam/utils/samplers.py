@@ -111,12 +111,14 @@ class ResumableEpochSampler(Sampler[int]):
                 raise ValueError(
                     f"{curriculum_name} curriculum groups must have equal cardinality."
                 )
-            window_groups = [
-                (microstep + process + batch_slot) % 4
-                for microstep in range(self.gradient_accumulation_steps)
-                for process in range(self.num_processes)
-                for batch_slot in range(self.batch_size)
-            ]
+            # ``BatchSamplerShard`` consumes the global sequence in
+            # microstep-major, then process-major, then local-batch order.
+            # Cycling the flattened slots is balanced for every valid global
+            # optimizer-window size, including 2 ranks x 6 accumulation
+            # steps.  Rotating each coordinate independently is only balanced
+            # for some factorizations (for example 4x3 and 3x4) and made the
+            # same effective batch fail when expressed as 2x6.
+            window_groups = [slot % 4 for slot in range(global_window)]
             per_group_per_window = global_window // 4
             if any(
                 window_groups.count(group) != per_group_per_window
