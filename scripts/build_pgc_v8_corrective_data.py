@@ -221,6 +221,79 @@ def _load_captures(
     return dict(captures)
 
 
+def _sample_captures_across_episodes(
+    captures: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Preserve episode diversity and early/late states under a capture cap."""
+    if limit <= 0:
+        raise ValueError("Capture sample limit must be positive.")
+    if len(captures) <= limit:
+        return list(captures)
+
+    grouped: dict[tuple[str, int, int], list[dict[str, Any]]] = defaultdict(list)
+    for capture in captures:
+        namespace = str(capture.get("capture_namespace", "")).strip()
+        if not namespace:
+            namespace = str(Path(str(capture.get("record_path", ""))).parent)
+        key = (
+            namespace,
+            int(capture.get("task_id", -1)),
+            int(capture.get("trial_index", -1)),
+        )
+        grouped[key].append(capture)
+    for values in grouped.values():
+        values.sort(
+            key=lambda item: (
+                int(item.get("replan_index", 0)),
+                str(item.get("capture_id", "")),
+            )
+        )
+
+    keys = sorted(grouped)
+    quotas = {key: 0 for key in keys}
+    remaining = limit
+    while remaining > 0:
+        progressed = False
+        for key in keys:
+            if remaining == 0:
+                break
+            if quotas[key] >= len(grouped[key]):
+                continue
+            quotas[key] += 1
+            remaining -= 1
+            progressed = True
+        if not progressed:
+            break
+
+    selected: list[dict[str, Any]] = []
+    for key in keys:
+        values = grouped[key]
+        quota = quotas[key]
+        if quota == 0:
+            continue
+        if quota == 1:
+            indices = [len(values) - 1]
+        else:
+            indices = [
+                round(offset * (len(values) - 1) / (quota - 1))
+                for offset in range(quota)
+            ]
+        selected.extend(values[index] for index in indices)
+    selected.sort(
+        key=lambda item: (
+            int(item.get("policy_step", 0)),
+            str(item.get("capture_id", "")),
+        )
+    )
+    if len(selected) != min(limit, len(captures)):
+        raise RuntimeError(
+            "Episode-balanced capture sampling produced an invalid count: "
+            f"{len(selected)} != {min(limit, len(captures))}."
+        )
+    return selected
+
+
 def _episode_actions(dataset: Any, episode_index: int) -> np.ndarray:
     episode = dataset.get_episode_data(int(episode_index))
     actions = episode.get("action")
@@ -907,6 +980,9 @@ def _main(args: argparse.Namespace) -> None:
             "closed_loop_capture_roots": [
                 str(path.expanduser().resolve()) for path in args.captures
             ],
+            "capture_sampling_strategy": (
+                "episode_balanced_temporal_coverage_v1"
+            ),
             "lift_threshold_m": float(args.lift_threshold_m),
             "post_lift_steps": int(args.post_lift_steps),
         }
@@ -949,7 +1025,11 @@ def _main(args: argparse.Namespace) -> None:
             ranked_captures: list[
                 tuple[float, dict[str, Any], list[dict[str, Any]]]
             ] = []
-            for capture in captures[pair_id][: args.max_captures_per_pair]:
+            sampled_captures = _sample_captures_across_episodes(
+                captures[pair_id],
+                args.max_captures_per_pair,
+            )
+            for capture in sampled_captures:
                 if str(capture["capture_id"]) in used_captures:
                     continue
                 obs, _ = _reset_exact_state(

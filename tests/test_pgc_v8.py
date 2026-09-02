@@ -26,6 +26,37 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PGCV8DataContractTest(unittest.TestCase):
+    def test_capture_cap_preserves_episode_and_temporal_coverage(self):
+        captures = []
+        for trial in range(4):
+            for replan in range(10):
+                captures.append(
+                    {
+                        "capture_namespace": "seed43",
+                        "task_id": 6,
+                        "trial_index": trial,
+                        "replan_index": replan,
+                        "policy_step": replan * 5,
+                        "capture_id": f"trial{trial}_replan{replan}",
+                    }
+                )
+        selected = corrective_builder._sample_captures_across_episodes(
+            captures, 12
+        )
+        self.assertEqual(len(selected), 12)
+        replans_by_trial = {
+            trial: sorted(
+                int(item["replan_index"])
+                for item in selected
+                if int(item["trial_index"]) == trial
+            )
+            for trial in range(4)
+        }
+        self.assertEqual(
+            replans_by_trial,
+            {0: [0, 4, 9], 1: [0, 4, 9], 2: [0, 4, 9], 3: [0, 4, 9]},
+        )
+
     def test_full_goal_capture_keeps_failed_post_lift_states(self):
         self.assertFalse(
             should_persist_closed_loop_capture(
