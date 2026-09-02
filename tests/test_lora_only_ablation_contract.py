@@ -59,6 +59,13 @@ class LoRAOnlyAblationContractTest(unittest.TestCase):
             source,
         )
         self.assertIn("model.policy_guard.enabled=false", source)
+        self.assertIn(
+            'if [[ "${CONDITION}" == "counterfactual" ]]', source
+        )
+        self.assertIn(
+            'OVERRIDES+=("EVALUATION.counterfactual_diagnostics=true")',
+            source,
+        )
 
     def test_parallel_evaluations_use_distinct_tmux_sessions(self):
         evaluator = (

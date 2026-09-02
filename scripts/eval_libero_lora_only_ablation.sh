@@ -136,6 +136,13 @@ OVERRIDES=(
 if [[ -n "${MANIFEST_PATH}" ]]; then
   OVERRIDES+=("EVALUATION.language_intervention_manifest=${MANIFEST_PATH}")
 fi
+if [[ "${CONDITION}" == "counterfactual" ]]; then
+  # The success-rate report does not require behavior diagnostics, but the
+  # matched no-ERAF/ERAF ablation does: without this field the completed
+  # rollout JSON cannot distinguish source-directed failures, target
+  # placement failures, and no-object failures for the post-run summary.
+  OVERRIDES+=("EVALUATION.counterfactual_diagnostics=true")
+fi
 
 echo "[FastWAM] LIBERO LoRA-only / no-ERAF evaluation"
 echo "  suite=${SUITE} checkpoint=${LORA_ONLY_CHECKPOINT}"
