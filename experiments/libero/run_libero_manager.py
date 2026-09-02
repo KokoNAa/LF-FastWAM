@@ -10,7 +10,11 @@ from libero.libero import benchmark
 from omegaconf import DictConfig, OmegaConf
 
 
-def create_task_file(output_file: Path, task_suite_names: list[str]) -> Path:
+def create_task_file(
+    output_file: Path,
+    task_suite_names: list[str],
+    task_ids: list[int] | None = None,
+) -> Path:
     benchmark_dict = benchmark.get_benchmark_dict()
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -19,9 +23,26 @@ def create_task_file(output_file: Path, task_suite_names: list[str]) -> Path:
         for suite_name in task_suite_names:
             task_suite = benchmark_dict[suite_name]()
             n_tasks = int(task_suite.n_tasks)
+            selected_task_ids = (
+                list(range(n_tasks)) if task_ids is None else list(task_ids)
+            )
+            if len(selected_task_ids) != len(set(selected_task_ids)):
+                raise ValueError(f"Task IDs contain duplicates: {selected_task_ids}.")
+            invalid_task_ids = sorted(
+                {
+                    task_id
+                    for task_id in selected_task_ids
+                    if not 0 <= task_id < n_tasks
+                }
+            )
+            if invalid_task_ids:
+                raise ValueError(
+                    f"Task IDs {invalid_task_ids} are invalid for {suite_name} "
+                    f"with {n_tasks} tasks."
+                )
             print(f"\n{suite_name}:")
-            print(f"- Number of tasks: {n_tasks}")
-            for task_id in range(n_tasks):
+            print(f"- Number of selected tasks: {len(selected_task_ids)}/{n_tasks}")
+            for task_id in selected_task_ids:
                 f.write(f"{suite_name},{task_id}\n")
                 total_tasks += 1
 
@@ -139,7 +160,17 @@ def main(cfg: DictConfig):
         task_file = Path(os.path.expanduser(os.path.expandvars(str(task_file_cfg))))
     else:
         task_file = output_dir / "tasks.txt"
-    task_file = create_task_file(task_file, list(manager.task_suite_names))
+    configured_task_ids = manager.get("task_ids")
+    task_ids = (
+        None
+        if configured_task_ids is None
+        else [int(task_id) for task_id in configured_task_ids]
+    )
+    task_file = create_task_file(
+        task_file,
+        list(manager.task_suite_names),
+        task_ids=task_ids,
+    )
 
     OmegaConf.save(config=cfg, f=str(output_dir / "manager_config.yaml"))
 

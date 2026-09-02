@@ -1044,6 +1044,26 @@ def _state_sha256(state: np.ndarray) -> str:
     return _canonical_state_sha256(state)
 
 
+def _should_persist_closed_loop_capture(
+    *,
+    stage_policy: str,
+    episode_category: str,
+    target_objects: set[str],
+    lifted_objects: set[str],
+) -> bool:
+    """Select failed rollout states for acquisition or full-goal repair."""
+    if stage_policy not in {"pre_target_acquisition", "all_replans"}:
+        raise ValueError(
+            "EVALUATION.closed_loop_capture_stage_policy must be "
+            "pre_target_acquisition or all_replans."
+        )
+    if episode_category == "counterfactual_goal_success":
+        return False
+    if stage_policy == "pre_target_acquisition":
+        return not bool(target_objects & lifted_objects)
+    return True
+
+
 def _write_closed_loop_capture_records(
     *,
     cfg: DictConfig,
@@ -1061,9 +1081,18 @@ def _write_closed_loop_capture_records(
         return 0
     target_objects = set(counterfactual_diagnostics["counterfactual_target_objects"])
     lifted_objects = set(counterfactual_diagnostics["lifted_objects"])
-    if target_objects & lifted_objects:
-        # V8 first repairs target acquisition. States from episodes that already
-        # lifted the requested target belong to a later completion stage.
+    stage_policy = str(
+        cfg.EVALUATION.get(
+            "closed_loop_capture_stage_policy", "pre_target_acquisition"
+        )
+    )
+    episode_category = str(counterfactual_diagnostics["category"])
+    if not _should_persist_closed_loop_capture(
+        stage_policy=stage_policy,
+        episode_category=episode_category,
+        target_objects=target_objects,
+        lifted_objects=lifted_objects,
+    ):
         return 0
 
     suite_name = str(cfg.EVALUATION.task_suite_name)
@@ -1077,10 +1106,15 @@ def _write_closed_loop_capture_records(
     trial_dir.mkdir(parents=True, exist_ok=True)
     initial_state = np.asarray(initial_state).copy()
     written = 0
+    capture_namespace = str(
+        cfg.EVALUATION.get("closed_loop_capture_namespace", "")
+    ).strip()
+    namespace_prefix = f"{capture_namespace}_" if capture_namespace else ""
     for item in captured_states:
         replan_index = int(item["replan_index"])
         capture_id = (
-            f"{suite_name}_task{task_id:02d}_trial{episode_idx:03d}_"
+            f"{namespace_prefix}{suite_name}_task{task_id:02d}_"
+            f"trial{episode_idx:03d}_"
             f"replan{replan_index:04d}"
         )
         state = np.asarray(item["state"]).copy()
@@ -1109,6 +1143,8 @@ def _write_closed_loop_capture_records(
                 "counterfactual_goal_state"
             ],
             "episode_category": str(counterfactual_diagnostics["category"]),
+            "capture_stage_policy": stage_policy,
+            "capture_namespace": capture_namespace,
             "target_objects": sorted(target_objects),
             "grasped_objects": counterfactual_diagnostics["grasped_objects"],
             "lifted_objects": counterfactual_diagnostics["lifted_objects"],
@@ -1333,6 +1369,16 @@ def run_single_episode(
     capture_max_states = int(
         cfg.EVALUATION.get("closed_loop_capture_max_states_per_episode", 12)
     )
+    capture_stage_policy = str(
+        cfg.EVALUATION.get(
+            "closed_loop_capture_stage_policy", "pre_target_acquisition"
+        )
+    )
+    if capture_stage_policy not in {"pre_target_acquisition", "all_replans"}:
+        raise ValueError(
+            "PGC closed-loop capture stage policy must be "
+            "pre_target_acquisition or all_replans."
+        )
     if capture_stride_replans <= 0 or capture_max_states <= 0:
         raise ValueError("PGC closed-loop capture stride/max states must be positive.")
     if closed_loop_capture_enabled and counterfactual_tracker is None:
@@ -1418,7 +1464,10 @@ def run_single_episode(
                     "state": _capture_libero_sim_state(env),
                 }
             capture_before_interaction = True
-            if counterfactual_tracker is not None:
+            if (
+                capture_stage_policy == "pre_target_acquisition"
+                and counterfactual_tracker is not None
+            ):
                 targets = counterfactual_tracker.counterfactual_target_objects
                 capture_before_interaction = not bool(
                     targets

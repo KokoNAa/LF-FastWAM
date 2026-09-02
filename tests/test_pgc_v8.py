@@ -23,6 +23,36 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PGCV8DataContractTest(unittest.TestCase):
+    def test_full_goal_capture_keeps_failed_post_lift_states(self):
+        from experiments.libero.eval_libero_single import (
+            _should_persist_closed_loop_capture,
+        )
+
+        self.assertFalse(
+            _should_persist_closed_loop_capture(
+                stage_policy="pre_target_acquisition",
+                episode_category="target_object_manipulated_placement_failure",
+                target_objects={"mug_1"},
+                lifted_objects={"mug_1"},
+            )
+        )
+        self.assertTrue(
+            _should_persist_closed_loop_capture(
+                stage_policy="all_replans",
+                episode_category="target_object_manipulated_placement_failure",
+                target_objects={"mug_1"},
+                lifted_objects={"mug_1"},
+            )
+        )
+        self.assertFalse(
+            _should_persist_closed_loop_capture(
+                stage_policy="all_replans",
+                episode_category="counterfactual_goal_success",
+                target_objects={"mug_1"},
+                lifted_objects={"mug_1"},
+            )
+        )
+
     def test_full_goal_policy_does_not_downgrade_graspable_goals(self):
         class Tracker:
             counterfactual_graspable_target_objects = {"mug_1"}
@@ -211,6 +241,9 @@ class PGCV8DataContractTest(unittest.TestCase):
         evaluation = (REPO_ROOT / "experiments/libero/eval_libero_single.py").read_text(
             encoding="utf-8"
         )
+        eval_launcher = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("PGC_WARM_START_V5=true", train)
         self.assertIn("PGC_CLOSED_LOOP_TRAIN_PROPOSAL_ONLY=true", train)
         self.assertIn("target_lift_verified", builder)
@@ -227,6 +260,10 @@ class PGCV8DataContractTest(unittest.TestCase):
         self.assertIn("Trying V8 capture", builder)
         self.assertIn("closed_loop_capture_dir", evaluation)
         self.assertIn("_capture_libero_sim_state", evaluation)
+        self.assertIn("closed_loop_capture_stage_policy", evaluation)
+        self.assertIn("PGC_CLOSED_LOOP_CAPTURE_STAGE_POLICY", eval_launcher)
+        self.assertIn("PGC_EVAL_TASK_IDS", eval_launcher)
+        self.assertIn('action="append"', builder)
 
 
 if __name__ == "__main__":

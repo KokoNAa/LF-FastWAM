@@ -70,7 +70,16 @@ def _parse_args() -> argparse.Namespace:
         description="Build exact-state, replay-verified PGC V8 corrections."
     )
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--captures", type=Path, required=True)
+    parser.add_argument(
+        "--captures",
+        type=Path,
+        required=True,
+        action="append",
+        help=(
+            "Root containing closed-loop capture JSON/NPZ files. Repeat this "
+            "option to merge independently collected capture batches."
+        ),
+    )
     parser.add_argument("--reference-dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--suite", required=True)
@@ -144,59 +153,64 @@ def _capture_digest(state: np.ndarray) -> str:
 
 
 def _load_captures(
-    root: Path,
+    roots: list[Path],
     records_by_pair: Mapping[str, Mapping[str, Any]],
     suite_name: str,
 ) -> dict[str, list[dict[str, Any]]]:
-    root = root.expanduser().resolve()
+    if not roots:
+        raise ValueError("At least one closed-loop capture root is required.")
     captures: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen: set[str] = set()
-    for record_path in sorted(root.rglob("*.json")):
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        if record.get("format") != "pgc_libero_closed_loop_capture_v1":
-            continue
-        capture_id = str(record.get("capture_id", "")).strip()
-        pair_id = str(record.get("pair_id", "")).strip()
-        if not capture_id or capture_id in seen:
-            raise ValueError(f"Invalid/duplicate capture ID at {record_path}.")
-        if pair_id not in records_by_pair:
-            raise ValueError(
-                f"Capture {capture_id} references unknown pair {pair_id!r}."
-            )
-        manifest_record = records_by_pair[pair_id]
-        if str(record.get("task_suite_name")) != suite_name or int(
-            record.get("task_id", -1)
-        ) != int(manifest_record["task_id"]):
-            raise ValueError(f"Capture {capture_id} source task changed.")
-        for capture_key, manifest_key in (
-            ("correct_instruction", "correct_instruction"),
-            ("counterfactual_instruction", "counterfactual_instruction"),
-        ):
-            if (
-                str(record.get(capture_key, "")).strip().casefold()
-                != str(manifest_record[manifest_key]).strip().casefold()
-            ):
+    for raw_root in roots:
+        root = raw_root.expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Closed-loop capture root not found: {root}")
+        for record_path in sorted(root.rglob("*.json")):
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            if record.get("format") != "pgc_libero_closed_loop_capture_v1":
+                continue
+            capture_id = str(record.get("capture_id", "")).strip()
+            pair_id = str(record.get("pair_id", "")).strip()
+            if not capture_id or capture_id in seen:
+                raise ValueError(f"Invalid/duplicate capture ID at {record_path}.")
+            if pair_id not in records_by_pair:
                 raise ValueError(
-                    f"Capture {capture_id} instruction does not match manifest."
+                    f"Capture {capture_id} references unknown pair {pair_id!r}."
                 )
-        state_path = Path(str(record.get("state_file", "")))
-        if state_path.is_absolute() or ".." in state_path.parts:
-            raise ValueError(f"Capture {capture_id} has unsafe state path.")
-        state_path = record_path.parent / state_path
-        if not state_path.is_file():
-            raise FileNotFoundError(f"Missing capture state: {state_path}")
-        with np.load(state_path, allow_pickle=False) as payload:
-            state = np.asarray(payload["simulator_state"]).copy()
-        actual_digest = _capture_digest(state)
-        if actual_digest != str(record.get("capture_state_sha256", "")):
-            raise ValueError(
-                f"Capture state digest changed for {capture_id}: {actual_digest}."
-            )
-        normalized = dict(record)
-        normalized["state"] = state
-        normalized["record_path"] = str(record_path)
-        captures[pair_id].append(normalized)
-        seen.add(capture_id)
+            manifest_record = records_by_pair[pair_id]
+            if str(record.get("task_suite_name")) != suite_name or int(
+                record.get("task_id", -1)
+            ) != int(manifest_record["task_id"]):
+                raise ValueError(f"Capture {capture_id} source task changed.")
+            for capture_key, manifest_key in (
+                ("correct_instruction", "correct_instruction"),
+                ("counterfactual_instruction", "counterfactual_instruction"),
+            ):
+                if (
+                    str(record.get(capture_key, "")).strip().casefold()
+                    != str(manifest_record[manifest_key]).strip().casefold()
+                ):
+                    raise ValueError(
+                        f"Capture {capture_id} instruction does not match manifest."
+                    )
+            state_path = Path(str(record.get("state_file", "")))
+            if state_path.is_absolute() or ".." in state_path.parts:
+                raise ValueError(f"Capture {capture_id} has unsafe state path.")
+            state_path = record_path.parent / state_path
+            if not state_path.is_file():
+                raise FileNotFoundError(f"Missing capture state: {state_path}")
+            with np.load(state_path, allow_pickle=False) as payload:
+                state = np.asarray(payload["simulator_state"]).copy()
+            actual_digest = _capture_digest(state)
+            if actual_digest != str(record.get("capture_state_sha256", "")):
+                raise ValueError(
+                    f"Capture state digest changed for {capture_id}: {actual_digest}."
+                )
+            normalized = dict(record)
+            normalized["state"] = state
+            normalized["record_path"] = str(record_path)
+            captures[pair_id].append(normalized)
+            seen.add(capture_id)
     for pair_id, values in captures.items():
         values.sort(
             key=lambda item: (
@@ -890,6 +904,9 @@ def _main(args: argparse.Namespace) -> None:
             "corrective_verification": "target_lift_or_counterfactual_goal",
             "corrective_verification_policy": args.verification_policy,
             "reference_dataset": str(reference_root),
+            "closed_loop_capture_roots": [
+                str(path.expanduser().resolve()) for path in args.captures
+            ],
             "lift_threshold_m": float(args.lift_threshold_m),
             "post_lift_steps": int(args.post_lift_steps),
         }

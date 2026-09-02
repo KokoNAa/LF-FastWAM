@@ -11,6 +11,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 PGC_CHECKPOINT="${PGC_CHECKPOINT:?Set PGC_CHECKPOINT to a PGC-FastWAM checkpoint}"
 STATS_PATH="${STATS_PATH:-${DIFFSYNTH_MODEL_BASE_PATH:-./checkpoints}/fastwam_release/libero_uncond_2cam224_dataset_stats.json}"
 SUITES="${PGC_EVAL_SUITES:-[libero_spatial,libero_object,libero_goal,libero_10]}"
+TASK_IDS="${PGC_EVAL_TASK_IDS:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$(pwd)/evaluate_results/pgc_libero_${CONDITION}_seed${EVAL_SEED}_trials${NUM_TRIALS}}"
 MANIFEST_PATH="${PGC_MANIFEST_PATH:-}"
 GATE_MODE="${PGC_GATE_MODE:-guarded}"
@@ -21,6 +22,8 @@ MAX_POLICY_STEPS="${PGC_MAX_POLICY_STEPS:-}"
 CLOSED_LOOP_CAPTURE_DIR="${PGC_CLOSED_LOOP_CAPTURE_DIR:-}"
 CLOSED_LOOP_CAPTURE_STRIDE="${PGC_CLOSED_LOOP_CAPTURE_STRIDE_REPLANS:-1}"
 CLOSED_LOOP_CAPTURE_MAX_STATES="${PGC_CLOSED_LOOP_CAPTURE_MAX_STATES_PER_EPISODE:-12}"
+CLOSED_LOOP_CAPTURE_STAGE_POLICY="${PGC_CLOSED_LOOP_CAPTURE_STAGE_POLICY:-pre_target_acquisition}"
+CLOSED_LOOP_CAPTURE_NAMESPACE="${PGC_CLOSED_LOOP_CAPTURE_NAMESPACE:-}"
 ERAF_CLOSED_LOOP_CAPTURE_DIR="${PGC_ERAF_CLOSED_LOOP_CAPTURE_DIR:-}"
 ERAF_CLOSED_LOOP_CAPTURE_STRIDE="${PGC_ERAF_CLOSED_LOOP_CAPTURE_STRIDE_REPLANS:-1}"
 ERAF_CLOSED_LOOP_CAPTURE_MAX_STATES="${PGC_ERAF_CLOSED_LOOP_CAPTURE_MAX_STATES_PER_EPISODE:-48}"
@@ -968,6 +971,13 @@ EXTRA_OVERRIDES=(
   # Action LoRA or V9.26 shared Video/Action LoRA before restoring tensors.
   "model.lora.enabled=false"
 )
+if [[ -n "${TASK_IDS}" ]]; then
+  if ! [[ "${TASK_IDS}" =~ ^\[[0-9]+(,[0-9]+)*\]$ ]]; then
+    echo "PGC_EVAL_TASK_IDS must look like [6,7] with no spaces." >&2
+    exit 1
+  fi
+  EXTRA_OVERRIDES+=("+MULTIRUN.task_ids=${TASK_IDS}")
+fi
 if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
   EXTRA_OVERRIDES+=(
     "model.policy_guard.entity_relation_grounding.training_stage=${PGC_V9_TRAINING_STAGE}"
@@ -1267,10 +1277,23 @@ if [[ -n "${CLOSED_LOOP_CAPTURE_DIR}" ]]; then
     echo "PGC capture stride/max states must be positive integers." >&2
     exit 1
   fi
+  case "${CLOSED_LOOP_CAPTURE_STAGE_POLICY}" in
+    pre_target_acquisition|all_replans) ;;
+    *)
+      echo "PGC_CLOSED_LOOP_CAPTURE_STAGE_POLICY must be pre_target_acquisition or all_replans." >&2
+      exit 1
+      ;;
+  esac
+  if [[ ! "${CLOSED_LOOP_CAPTURE_NAMESPACE}" =~ ^[A-Za-z0-9._-]*$ ]]; then
+    echo "PGC_CLOSED_LOOP_CAPTURE_NAMESPACE contains unsupported characters." >&2
+    exit 1
+  fi
   EXTRA_OVERRIDES+=(
     "+EVALUATION.closed_loop_capture_dir=${CLOSED_LOOP_CAPTURE_DIR}"
     "+EVALUATION.closed_loop_capture_stride_replans=${CLOSED_LOOP_CAPTURE_STRIDE}"
     "+EVALUATION.closed_loop_capture_max_states_per_episode=${CLOSED_LOOP_CAPTURE_MAX_STATES}"
+    "+EVALUATION.closed_loop_capture_stage_policy=${CLOSED_LOOP_CAPTURE_STAGE_POLICY}"
+    "+EVALUATION.closed_loop_capture_namespace=${CLOSED_LOOP_CAPTURE_NAMESPACE}"
   )
 fi
 if [[ -n "${ERAF_CLOSED_LOOP_CAPTURE_DIR}" ]]; then
@@ -1297,10 +1320,15 @@ fi
 echo "[PGC-FastWAM] LIBERO ${CONDITION} evaluation"
 echo "  checkpoint=${PGC_CHECKPOINT}"
 echo "  suites=${SUITES} trials=${NUM_TRIALS}"
+echo "  task_ids=${TASK_IDS:-all}"
 echo "  gate=${GATE_MODE} margin=${GATE_THRESHOLD} min_cf=${MIN_COUNTERFACTUAL_SCORE}"
 echo "  max_policy_steps=${MAX_POLICY_STEPS:-suite_default}"
 echo "  output=${OUTPUT_ROOT}"
 echo "  closed_loop_capture=${CLOSED_LOOP_CAPTURE_DIR:-disabled}"
+if [[ -n "${CLOSED_LOOP_CAPTURE_DIR}" ]]; then
+  echo "  closed_loop_capture_stage_policy=${CLOSED_LOOP_CAPTURE_STAGE_POLICY}"
+  echo "  closed_loop_capture_namespace=${CLOSED_LOOP_CAPTURE_NAMESPACE:-disabled}"
+fi
 echo "  eraf_phase_capture=${ERAF_CLOSED_LOOP_CAPTURE_DIR:-disabled}"
 if [[ "${PGC_CHECKPOINT_VERSION}" == "9" ]]; then
   echo "  v9_ablation=${V9_ABLATION} eraf_diagnostics=${ERAF_DIAGNOSTICS}"
