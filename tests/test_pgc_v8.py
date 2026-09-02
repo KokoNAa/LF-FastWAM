@@ -5,6 +5,9 @@ from pathlib import Path
 
 import numpy as np
 
+from scripts import build_pgc_v8_corrective_data as corrective_builder
+from scripts.audit_pgc_corrective_coverage import build_coverage_report
+
 from fastwam.datasets.lerobot.robot_video_dataset import (
     build_pgc_v8_sample_indices,
 )
@@ -20,6 +23,46 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PGCV8DataContractTest(unittest.TestCase):
+    def test_full_goal_policy_does_not_downgrade_graspable_goals(self):
+        class Tracker:
+            counterfactual_graspable_target_objects = {"mug_1"}
+
+        record = {
+            "pair_id": "object_00_to_01",
+            "counterfactual_goal_state": [["On", "mug_1", "plate_1"]],
+        }
+        legacy = corrective_builder._corrective_contract(
+            Tracker(), record, "phase_boundary"
+        )
+        full_goal = corrective_builder._corrective_contract(
+            Tracker(), record, "full_goal"
+        )
+        self.assertEqual(legacy, ("target_lift", {"mug_1"}))
+        self.assertEqual(full_goal, ("counterfactual_goal", {"mug_1"}))
+
+    def test_behavior_driven_coverage_requires_verified_full_goals(self):
+        records = [
+            {"pair_id": "pair_0", "task_id": 0},
+            {"pair_id": "pair_1", "task_id": 1},
+            {"pair_id": "pair_2", "task_id": 2},
+        ]
+        indexed = {
+            0: {"pair_id": "pair_0", "verification_kind": "target_lift"},
+            1: {"pair_id": "pair_1", "verification_kind": "counterfactual_goal"},
+            2: {"pair_id": "pair_1", "verification_kind": "counterfactual_goal"},
+        }
+        report = build_coverage_report(
+            records,
+            indexed,
+            required_task_ids={0, 1},
+            minimum_full_goal_per_pair=2,
+        )
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["missing_required_pairs"], ["pair_0"])
+        self.assertFalse(report["pairs"][0]["satisfied"])
+        self.assertTrue(report["pairs"][1]["satisfied"])
+        self.assertTrue(report["pairs"][2]["satisfied"])
+
     def _write_dataset(self, root: Path, *, verified: bool = True) -> Path:
         dataset = root / "v8"
         meta = dataset / "meta"
@@ -176,6 +219,8 @@ class PGCV8DataContractTest(unittest.TestCase):
         self.assertIn("_replay_for_corrective_success", builder)
         self.assertIn("stop_on_success=True", builder)
         self.assertIn("counterfactual_goal_verified", builder)
+        self.assertIn("--verification-policy", builder)
+        self.assertIn('"full_goal"', builder)
         self.assertIn("_named_site_position", builder)
         self.assertIn("_goal_satisfied(env, done=done)", builder)
         self.assertIn("rejected_references", builder)

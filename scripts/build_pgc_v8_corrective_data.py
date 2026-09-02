@@ -2,12 +2,13 @@
 """Build replay-verified PGC closed-loop corrective trajectories.
 
 The input states are captured at actual PGC closed-loop replanning points. For
-each state, this builder searches pre-correction action suffixes from the audited PGC
-counterfactual demonstrations, restores the captured simulator state exactly,
-and accepts a suffix only when two independent replays either lift a graspable
-target or complete an articulated/fixture counterfactual goal. The resulting
-LeRobot dataset is exact-state action supervision; it is never instruction
-relabeling.
+each state, this builder searches pre-correction action suffixes from the audited
+PGC counterfactual demonstrations, restores the captured simulator state
+exactly, and accepts a suffix only when two independent replays satisfy the
+selected verification policy. ``phase_boundary`` preserves the historical
+target-lift contract for graspable goals; ``full_goal`` requires the complete
+counterfactual environment goal for every pair. The resulting LeRobot dataset
+is exact-state action supervision; it is never instruction relabeling.
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ from scripts.build_pgc_libero_data import (  # noqa: E402
 
 
 LOGGER = logging.getLogger("pgc_v8_corrective_data")
+VERIFICATION_POLICIES = ("phase_boundary", "full_goal")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -77,6 +79,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-candidates-per-capture", type=int, default=20)
     parser.add_argument("--reference-index-stride", type=int, default=1)
     parser.add_argument("--post-lift-steps", type=int, default=8)
+    parser.add_argument(
+        "--verification-policy",
+        choices=VERIFICATION_POLICIES,
+        default="phase_boundary",
+        help=(
+            "phase_boundary keeps legacy target-lift supervision for graspable "
+            "goals; full_goal requires replay-verified terminal CF success"
+        ),
+    )
     parser.add_argument("--min-actions", type=int, default=12)
     parser.add_argument("--lift-threshold-m", type=float, default=0.04)
     parser.add_argument("--state-atol", type=float, default=1.0e-7)
@@ -329,8 +340,19 @@ def _target_lifted(
 def _corrective_contract(
     tracker: CounterfactualEpisodeTracker,
     record: Mapping[str, Any],
+    verification_policy: str = "phase_boundary",
 ) -> tuple[str, set[str]]:
+    if verification_policy not in VERIFICATION_POLICIES:
+        raise ValueError(
+            f"Unsupported verification policy {verification_policy!r}; "
+            f"expected one of {VERIFICATION_POLICIES}."
+        )
     graspable = set(tracker.counterfactual_graspable_target_objects)
+    if verification_policy == "full_goal":
+        # State matching should remain centered on the manipulated objects,
+        # not on a distant receptacle/region. Goal verification itself uses
+        # the exact counterfactual environment oracle below.
+        return "counterfactual_goal", graspable or _target_object_names(record)
     if graspable:
         return "target_lift", graspable
     # Open/close/turn-on goals commonly use an articulated fixture or BDDL
@@ -372,6 +394,7 @@ def _build_reference_bank(
     lift_threshold_m: float,
     index_stride: int,
     post_lift_steps: int,
+    verification_policy: str = "phase_boundary",
 ) -> list[dict[str, Any]]:
     bank: list[dict[str, Any]] = []
     rejected_references: list[str] = []
@@ -391,7 +414,11 @@ def _build_reference_bank(
         )
         tracker = _new_tracker(env, record, lift_threshold_m)
         tracker.observe(policy_step=0)
-        verification_kind, target_objects = _corrective_contract(tracker, record)
+        verification_kind, target_objects = _corrective_contract(
+            tracker,
+            record,
+            verification_policy,
+        )
         if verification_kind == "counterfactual_goal" and _goal_satisfied(
             env, done=False
         ):
@@ -554,7 +581,16 @@ def _replay_for_corrective_success(
     )
     tracker = _new_tracker(env, record, lift_threshold_m)
     tracker.observe(policy_step=0)
-    contract_kind, target_objects = _corrective_contract(tracker, record)
+    replay_policy = (
+        "full_goal"
+        if verification_kind == "counterfactual_goal"
+        else "phase_boundary"
+    )
+    contract_kind, target_objects = _corrective_contract(
+        tracker,
+        record,
+        replay_policy,
+    )
     if contract_kind != verification_kind:
         raise ValueError(
             "Corrective replay contract changed between reference and capture: "
@@ -835,6 +871,16 @@ def _main(args: argparse.Namespace) -> None:
             "V8 LeRobot/audit count mismatch: "
             f"{dataset.meta.total_episodes} != {len(audits)}."
         )
+    saved_verification_policy = provenance.get(
+        "corrective_verification_policy",
+        "phase_boundary",
+    )
+    if audits and saved_verification_policy != args.verification_policy:
+        raise ValueError(
+            "Cannot resume corrective data with a different verification "
+            f"policy: {saved_verification_policy!r} != "
+            f"{args.verification_policy!r}."
+        )
     provenance.update(
         {
             "collection_method": (
@@ -842,6 +888,7 @@ def _main(args: argparse.Namespace) -> None:
             ),
             "acquisition_only": False,
             "corrective_verification": "target_lift_or_counterfactual_goal",
+            "corrective_verification_policy": args.verification_policy,
             "reference_dataset": str(reference_root),
             "lift_threshold_m": float(args.lift_threshold_m),
             "post_lift_steps": int(args.post_lift_steps),
@@ -880,6 +927,7 @@ def _main(args: argparse.Namespace) -> None:
                 lift_threshold_m=args.lift_threshold_m,
                 index_stride=args.reference_index_stride,
                 post_lift_steps=args.post_lift_steps,
+                verification_policy=args.verification_policy,
             )
             ranked_captures: list[
                 tuple[float, dict[str, Any], list[dict[str, Any]]]
@@ -1039,6 +1087,7 @@ def _main(args: argparse.Namespace) -> None:
         "output": str(output),
         "successful_episodes": len(audits),
         "corrective_pair_count": len(active_by_pair),
+        "verification_policy": args.verification_policy,
         "pairs_without_failed_capture": pairs_without_failed_capture,
         "episodes_per_pair": dict(sorted(counts.items())),
         "missing_episodes_per_pair": dict(sorted(missing.items())),
