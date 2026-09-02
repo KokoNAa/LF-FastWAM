@@ -274,6 +274,9 @@ class PGCV8DataContractTest(unittest.TestCase):
         eval_launcher = (REPO_ROOT / "scripts/eval_pgc_libero.sh").read_text(
             encoding="utf-8"
         )
+        gap_capture_launcher = (
+            REPO_ROOT / "scripts/launch_libero_full_goal_gap_capture.sh"
+        ).read_text(encoding="utf-8")
         self.assertIn("PGC_WARM_START_V5=true", train)
         self.assertIn("PGC_CLOSED_LOOP_TRAIN_PROPOSAL_ONLY=true", train)
         self.assertIn("target_lift_verified", builder)
@@ -294,6 +297,10 @@ class PGCV8DataContractTest(unittest.TestCase):
         self.assertIn("PGC_CLOSED_LOOP_CAPTURE_STAGE_POLICY", eval_launcher)
         self.assertIn("PGC_EVAL_TASK_IDS", eval_launcher)
         self.assertIn('action="append"', builder)
+        self.assertIn('LIBERO_TMUX_SESSION_NAME="$PRIMARY_SESSION"', gap_capture_launcher)
+        self.assertIn('LIBERO_TMUX_SESSION_NAME="$FOCUS_SESSION"', gap_capture_launcher)
+        self.assertIn("validate_visible_gpus primary", gap_capture_launcher)
+        self.assertIn("validate_visible_gpus focus", gap_capture_launcher)
 
 
 if __name__ == "__main__":
