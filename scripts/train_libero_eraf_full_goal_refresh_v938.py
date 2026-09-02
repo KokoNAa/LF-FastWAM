@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Train the V9.38 data-only full-goal corrective refresh.
+"""Train the V9.38 full-goal corrective refresh for 50 clean steps.
 
 V9.38 intentionally keeps the deployed V9.37 model/loss contract and the
-fixed V9.28 teacher.  Its only experimental variable is replacing the old
-mixed 30-episode corrective pool with a replay-verified 35-episode pool that
-contains five complete counterfactual-goal trajectories for every observed
-source-directed failure pair.
+fixed V9.28 teacher.  It replaces the old mixed 30-episode corrective pool
+with a replay-verified 35-episode pool that contains five complete
+counterfactual-goal trajectories for every observed source-directed failure
+pair, and runs a clean 50-step optimization from the same V9.28 start.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ try:
         TARGET_EFFECTIVE_BATCH_SIZE,
         file_sha256,
         load_v930_b,
-        save_steps_for_objective,
         source_cf_ablation_contract,
         training_command,
         training_config,
@@ -48,7 +47,6 @@ except ModuleNotFoundError:
         TARGET_EFFECTIVE_BATCH_SIZE,
         file_sha256,
         load_v930_b,
-        save_steps_for_objective,
         source_cf_ablation_contract,
         training_command,
         training_config,
@@ -57,6 +55,9 @@ except ModuleNotFoundError:
 
 MODEL_OBJECTIVE = 37
 METHOD_VERSION = "V9.38"
+MAX_STEPS = 50
+SAVE_EVERY = 5
+REQUIRED_SAVE_STEPS = (10, 15, 20, 25, 30, 35, 40, 45, 50)
 EXPECTED_EPISODES = 35
 EXPECTED_PAIRS = 7
 EXPECTED_EPISODES_PER_PAIR = 5
@@ -170,7 +171,12 @@ def refreshed_config(source, output_dir: Path, dataset: Path, sidecar: Path, gpu
     sidecars[-1] = str(sidecar.resolve())
     cfg.data.train.pgc_entity_relation_sidecar_dirs = sidecars
     cfg = training_config(cfg, output_dir, gpus, objective=MODEL_OBJECTIVE)
-    cfg.wandb.name = "v938_full_goal_coverage_refresh"
+    cfg.max_steps = MAX_STEPS
+    cfg.save_every = SAVE_EVERY
+    cfg.model.policy_guard.entity_relation_grounding.safe_gain_injector_training_steps = (
+        MAX_STEPS
+    )
+    cfg.wandb.name = "v938_full_goal_coverage_refresh_50steps"
     return cfg
 
 
@@ -203,11 +209,11 @@ def main() -> None:
         raise FileExistsError(f"Refusing to overwrite an existing run: {root}")
     cfg = refreshed_config(source, root, dataset, sidecar, args.gpus)
     command = training_command(root, args.gpus, cfg, objective=MODEL_OBJECTIVE)
-    save_steps = save_steps_for_objective(MODEL_OBJECTIVE)
+    save_steps = REQUIRED_SAVE_STEPS
     plan = {
         "method_version": METHOD_VERSION,
         "model_objective_version": MODEL_OBJECTIVE,
-        "change_scope": "data_only_full_goal_corrective_refresh",
+        "change_scope": "full_goal_corrective_refresh_50_step_horizon",
         "warm_v928_checkpoint": str(Path(source.resume).resolve()),
         "source_v930_template_config": str(source_path),
         "source_v930_template_config_sha256": file_sha256(source_path),
@@ -263,13 +269,13 @@ def main() -> None:
     env["RUN_ID"] = args.run_tag
     subprocess.run(command, env=env, check=True)
 
-    checkpoint = root / "checkpoints/weights/step_000025.pt"
+    checkpoint = root / "checkpoints/weights/step_000050.pt"
     import torch
 
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     metadata = payload.get("architecture_metadata") or {}
     if (
-        payload.get("step") != 25
+        payload.get("step") != MAX_STEPS
         or metadata.get("eraf_grounding_objective_version") != MODEL_OBJECTIVE
         or metadata.get("eraf_paired_semantic_contrast_contract")
         != cf_ablation.SOFT_ACTION_VIOLATION_SEMANTIC_CONTRAST_CONTRACT

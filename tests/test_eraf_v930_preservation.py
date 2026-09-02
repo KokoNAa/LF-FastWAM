@@ -768,7 +768,11 @@ def test_v938_refresh_changes_only_corrective_binding(tmp_path):
     assert derived.data.train.pgc_entity_relation_sidecar_dirs[-1] == str(
         sidecar.resolve()
     )
-    assert derived.max_steps == 25
+    assert derived.max_steps == 50
+    assert derived.save_every == 5
+    derived_eraf = derived.model.policy_guard.entity_relation_grounding
+    assert derived_eraf.safe_gain_injector_training_steps == 50
+    assert module.REQUIRED_SAVE_STEPS == (10, 15, 20, 25, 30, 35, 40, 45, 50)
     assert 4 * derived.batch_size * derived.gradient_accumulation_steps == 12
 
 
