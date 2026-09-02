@@ -189,7 +189,13 @@ def control_config(
     sidecars[-1] = str(sidecar.resolve())
     cfg.data.train.pgc_entity_relation_sidecar_dirs = sidecars
     cfg.data.train.pgc_v9_safe_gain_counterfactual_replay = True
-    cfg.model.policy_guard.enabled = False
+    # Do not retain dormant ERAF training flags from the V9.30 template.  In
+    # particular, ``safe_gain_training=true`` changes the LoRA checkpoint
+    # loader contract even when ``policy_guard.enabled=false``: it rewrites
+    # the saved no-ERAF paired-language flags before reconfiguring LoRA.  A
+    # no-ERAF control must therefore remove the complete inherited guard
+    # subtree rather than merely disabling its top-level forward switch.
+    cfg.model.policy_guard = OmegaConf.create({"enabled": False})
     cfg.model.lora = OmegaConf.create(
         OmegaConf.to_container(OmegaConf.create(lora_config), resolve=True)
     )

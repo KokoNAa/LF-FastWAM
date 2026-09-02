@@ -46,7 +46,12 @@ def source_config(tmp_path):
             "model": {
                 "policy_guard": {
                     "enabled": True,
-                    "entity_relation_grounding": {},
+                    "entity_relation_grounding": {
+                        "safe_gain_training": True,
+                        "action_joint_training": True,
+                        "pretrained_joint_training": True,
+                        "bidirectional_supervision": True,
+                    },
                 },
                 "lora": {"enabled": False},
             },
@@ -86,6 +91,9 @@ def test_no_eraf_full_goal_control_is_data_matched_and_eraf_free(tmp_path):
         gpus=3,
     )
     assert cfg.model.policy_guard.enabled is False
+    assert OmegaConf.to_container(cfg.model.policy_guard, resolve=True) == {
+        "enabled": False
+    }
     assert cfg.model.lora.enabled is True
     assert cfg.model.lora.paired_language_control.enabled is True
     assert cfg.model.lora.paired_language_control.bidirectional_supervision is True
@@ -115,6 +123,25 @@ def test_no_eraf_full_goal_control_rejects_nonformal_lora():
         assert "formal bidirectional" in str(error)
     else:
         raise AssertionError("Expected nonformal LoRA config to be rejected.")
+
+
+def test_no_eraf_full_goal_control_preserves_batch_twelve_on_four_gpus(tmp_path):
+    module = load_runner()
+    cfg = module.control_config(
+        source_config(tmp_path),
+        tmp_path / "output-4gpu",
+        tmp_path / "step_008500.pt",
+        formal_lora(),
+        tmp_path / "full-goal",
+        tmp_path / "full-goal-sidecar",
+        gpus=4,
+    )
+    assert cfg.batch_size == 1
+    assert cfg.gradient_accumulation_steps == 3
+    assert 4 * cfg.batch_size * cfg.gradient_accumulation_steps == 12
+    assert OmegaConf.to_container(cfg.model.policy_guard, resolve=True) == {
+        "enabled": False
+    }
 
 
 def test_no_eraf_full_goal_control_records_exact_policy_identity_audit():
