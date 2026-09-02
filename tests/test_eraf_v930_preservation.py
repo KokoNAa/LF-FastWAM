@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -628,6 +629,147 @@ def test_v937_runner_uses_soft_semantics_and_early_checkpoints(tmp_path):
     assert module.save_steps_for_objective(37) == (10, 15, 20, 25)
     assert derived.gradient_accumulation_steps == 3
     assert command[-1] == "v937_train"
+
+
+def test_v938_refresh_requires_complete_full_goal_binding(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    path = root / "scripts/train_libero_eraf_full_goal_refresh_v938.py"
+    spec = importlib.util.spec_from_file_location("v938_refresh", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    reference = tmp_path / "reference-sidecar"
+    reference.mkdir()
+    workspace_min = [-0.8, -0.8, 0.0]
+    workspace_max = [0.8, 0.8, 1.2]
+    (reference / "index.json").write_text(
+        json.dumps({"workspace_min": workspace_min, "workspace_max": workspace_max})
+    )
+    source = OmegaConf.create(
+        {
+            "data": {
+                "train": {
+                    "pgc_entity_relation_sidecar_dirs": [
+                        str(reference),
+                        str(tmp_path / "sidecar1"),
+                        str(tmp_path / "sidecar2"),
+                        str(tmp_path / "sidecar3"),
+                        str(tmp_path / "old-corrective-sidecar"),
+                    ]
+                }
+            }
+        }
+    )
+
+    dataset = tmp_path / "full-goal"
+    index_path = dataset / "meta/pgc_v8_closed_loop/index.json"
+    index_path.parent.mkdir(parents=True)
+    episodes = [
+        {
+            "episode_index": episode,
+            "pair_id": f"pair-{episode // 5}",
+            "corrective_verified": True,
+            "verification_kind": "counterfactual_goal",
+            "counterfactual_goal_verified": True,
+        }
+        for episode in range(35)
+    ]
+    index_path.write_text(
+        json.dumps(
+            {
+                "format": module.CORRECTIVE_FORMAT,
+                "acquisition_only": False,
+                "episode_count": 35,
+                "episodes": episodes,
+            }
+        )
+    )
+    coverage_path = dataset / "meta/v938_full_goal_coverage.json"
+    coverage_path.write_text(
+        json.dumps(
+            {
+                "format": "pgc_corrective_full_goal_coverage_v1",
+                "dataset": str(dataset.resolve()),
+                "minimum_full_goal_per_pair": 5,
+                "required_pair_count": 7,
+                "covered_required_pair_count": 7,
+                "missing_required_pairs": [],
+                "complete": True,
+            }
+        )
+    )
+    sidecar = tmp_path / "full-goal-sidecar"
+    sidecar.mkdir()
+    (sidecar / "index.json").write_text(
+        json.dumps(
+            {
+                "format": module.SIDECAR_FORMAT,
+                "dataset": str(dataset.resolve()),
+                "dataset_kind": "counterfactual",
+                "dataset_action_convention": module.ACTION_CONVENTION,
+                "simulator_replay_action_transform": module.REPLAY_TRANSFORM,
+                "episode_count": 35,
+                "episodes": [{"episode_index": i} for i in range(35)],
+                "workspace_min": workspace_min,
+                "workspace_max": workspace_max,
+            }
+        )
+    )
+
+    binding = module.validate_full_goal_binding(source, dataset, sidecar)
+    assert binding["pair_counts"] == {f"pair-{i}": 5 for i in range(7)}
+    assert binding["dataset"] == str(dataset.resolve())
+    assert binding["sidecar"] == str(sidecar.resolve())
+
+    episodes[-1]["verification_kind"] = "target_lift"
+    index_path.write_text(
+        json.dumps(
+            {
+                "format": module.CORRECTIVE_FORMAT,
+                "acquisition_only": False,
+                "episode_count": 35,
+                "episodes": episodes,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="exactly 35"):
+        module.validate_full_goal_binding(source, dataset, sidecar)
+
+
+def test_v938_refresh_changes_only_corrective_binding(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    path = root / "scripts/train_libero_eraf_full_goal_refresh_v938.py"
+    spec = importlib.util.spec_from_file_location("v938_refresh_config", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with initialize_config_dir(config_dir=str(root / "configs"), version_base=None):
+        source = compose(
+            config_name="train",
+            overrides=["task=libero_eraf_safe_gain_v930_2cam224"],
+        )
+    source.batch_size = 1
+    source.gradient_accumulation_steps = 4
+    source.data.train.pgc_closed_loop_corrective_dataset_dirs = ["old-corrective"]
+    source.data.train.pgc_entity_relation_sidecar_dirs = [
+        f"sidecar-{i}" for i in range(5)
+    ]
+    dataset = tmp_path / "full-goal"
+    sidecar = tmp_path / "full-goal-sidecar"
+    derived = module.refreshed_config(
+        source, tmp_path / "v938", dataset, sidecar, gpus=4
+    )
+    assert derived.model.policy_guard.entity_relation_grounding.grounding_objective_version == 37
+    assert derived.data.train.pgc_closed_loop_corrective_dataset_dirs == [
+        str(dataset.resolve())
+    ]
+    assert list(derived.data.train.pgc_entity_relation_sidecar_dirs[:-1]) == [
+        f"sidecar-{i}" for i in range(4)
+    ]
+    assert derived.data.train.pgc_entity_relation_sidecar_dirs[-1] == str(
+        sidecar.resolve()
+    )
+    assert derived.max_steps == 25
+    assert 4 * derived.batch_size * derived.gradient_accumulation_steps == 12
 
 
 def test_migration_optimizer_freeze_and_teacher_roundtrip(warm_checkpoint, tmp_path):
