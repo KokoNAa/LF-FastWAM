@@ -16,6 +16,26 @@ COUNTERFACTUAL_BEHAVIOR_CATEGORIES = (
 )
 
 
+def should_persist_closed_loop_capture(
+    *,
+    stage_policy: str,
+    episode_category: str,
+    target_objects: set[str],
+    lifted_objects: set[str],
+) -> bool:
+    """Select failed rollout states for acquisition or full-goal repair."""
+    if stage_policy not in {"pre_target_acquisition", "all_replans"}:
+        raise ValueError(
+            "closed-loop capture stage policy must be "
+            "pre_target_acquisition or all_replans."
+        )
+    if episode_category == "counterfactual_goal_success":
+        return False
+    if stage_policy == "pre_target_acquisition":
+        return not bool(target_objects & lifted_objects)
+    return True
+
+
 def goal_subjects(goal_state: Sequence[Sequence[Any]]) -> set[str]:
     """Return the subject entity of each simple LIBERO goal predicate."""
     subjects: set[str] = set()

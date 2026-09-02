@@ -7,6 +7,9 @@ import numpy as np
 
 from scripts import build_pgc_v8_corrective_data as corrective_builder
 from scripts.audit_pgc_corrective_coverage import build_coverage_report
+from experiments.libero.counterfactual_diagnostics import (
+    should_persist_closed_loop_capture,
+)
 
 from fastwam.datasets.lerobot.robot_video_dataset import (
     build_pgc_v8_sample_indices,
@@ -24,12 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 class PGCV8DataContractTest(unittest.TestCase):
     def test_full_goal_capture_keeps_failed_post_lift_states(self):
-        from experiments.libero.eval_libero_single import (
-            _should_persist_closed_loop_capture,
-        )
-
         self.assertFalse(
-            _should_persist_closed_loop_capture(
+            should_persist_closed_loop_capture(
                 stage_policy="pre_target_acquisition",
                 episode_category="target_object_manipulated_placement_failure",
                 target_objects={"mug_1"},
@@ -37,7 +36,7 @@ class PGCV8DataContractTest(unittest.TestCase):
             )
         )
         self.assertTrue(
-            _should_persist_closed_loop_capture(
+            should_persist_closed_loop_capture(
                 stage_policy="all_replans",
                 episode_category="target_object_manipulated_placement_failure",
                 target_objects={"mug_1"},
@@ -45,7 +44,7 @@ class PGCV8DataContractTest(unittest.TestCase):
             )
         )
         self.assertFalse(
-            _should_persist_closed_loop_capture(
+            should_persist_closed_loop_capture(
                 stage_policy="all_replans",
                 episode_category="counterfactual_goal_success",
                 target_objects={"mug_1"},

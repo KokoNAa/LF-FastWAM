@@ -40,6 +40,7 @@ from experiments.libero.init_state_utils import load_libero_task_init_states
 from experiments.libero.counterfactual_diagnostics import (
     CounterfactualEpisodeTracker,
     empty_behavior_counts,
+    should_persist_closed_loop_capture,
 )
 from experiments.libero.eraf_shadow_audit import (
     ERAFOracleProvider,
@@ -1044,26 +1045,6 @@ def _state_sha256(state: np.ndarray) -> str:
     return _canonical_state_sha256(state)
 
 
-def _should_persist_closed_loop_capture(
-    *,
-    stage_policy: str,
-    episode_category: str,
-    target_objects: set[str],
-    lifted_objects: set[str],
-) -> bool:
-    """Select failed rollout states for acquisition or full-goal repair."""
-    if stage_policy not in {"pre_target_acquisition", "all_replans"}:
-        raise ValueError(
-            "EVALUATION.closed_loop_capture_stage_policy must be "
-            "pre_target_acquisition or all_replans."
-        )
-    if episode_category == "counterfactual_goal_success":
-        return False
-    if stage_policy == "pre_target_acquisition":
-        return not bool(target_objects & lifted_objects)
-    return True
-
-
 def _write_closed_loop_capture_records(
     *,
     cfg: DictConfig,
@@ -1087,7 +1068,7 @@ def _write_closed_loop_capture_records(
         )
     )
     episode_category = str(counterfactual_diagnostics["category"])
-    if not _should_persist_closed_loop_capture(
+    if not should_persist_closed_loop_capture(
         stage_policy=stage_policy,
         episode_category=episode_category,
         target_objects=target_objects,
