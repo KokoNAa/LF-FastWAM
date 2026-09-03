@@ -205,8 +205,11 @@ pretrained_eraf_joint = bool(
     metadata.get("eraf_pretrained_joint_training", False)
 )
 end_to_end_eraf_joint = fresh_eraf_joint or pretrained_eraf_joint
+lora_joint = bool(metadata.get("eraf_safe_gain_lora_joint_training", False))
 expected_protection = (
-    "immutable_no_eraf_fallback_plus_pre_action_gain_gate"
+    "jointly_adapted_no_eraf_fallback_plus_pre_action_gain_gate"
+    if lora_joint
+    else "immutable_no_eraf_fallback_plus_pre_action_gain_gate"
     if is_v927
     else "pretrained_eraf_ramp_then_single_path_no_candidate_gate"
     if pretrained_eraf_joint
@@ -232,7 +235,11 @@ expected_tuning = {
     9: "entity_relation_affordance_grounded_paired_action_residual",
 }[version]
 if is_v927:
-    expected_tuning = "frozen_baseline_dual_context_bidirectional_safe_gain"
+    expected_tuning = (
+        "full_goal_eraf_interface_plus_shared_video_action_lora_joint_tuning"
+        if lora_joint
+        else "frozen_baseline_dual_context_bidirectional_safe_gain"
+    )
 elif is_v926:
     expected_tuning = (
         "pretrained_eraf_native_counterfactual_bidirectional_world_action_"
@@ -445,7 +452,10 @@ if version == 9:
         raise SystemExit("PGC v9.13 checkpoint lacks phase-safe memory contract")
     expected_action_joint_contract = (
         (
-            "frozen_complete_eraf_bundle_plus_frozen_baseline_lora_"
+            "frozen_eraf_goalgraph_gate_plus_joint_compressor_injector_"
+            "shared_video_action_lora_single_path"
+            if lora_joint
+            else "frozen_complete_eraf_bundle_plus_frozen_baseline_lora_"
             "bidirectional_dual_path_training_pre_action_gain_gate_single_"
             "path_deployment"
             if is_v927
@@ -501,7 +511,10 @@ if version == 9:
     )
     expected_action_trainable_scope = (
         (
-            "eraf_action_token_compressor_plus_context_injector_only"
+            "eraf_action_token_compressor_plus_context_injector_plus_shared_"
+            "video_action_lora"
+            if lora_joint
+            else "eraf_action_token_compressor_plus_context_injector_only"
             if objective in {30, 31, 32, 33, 34, 35, 36, 37} else
             "eraf_action_token_compressor_plus_context_injector_plus_gain_"
             "gate_only"
@@ -546,7 +559,9 @@ if version == 9:
     )
     expected_role_trainable_scope = (
         (
-            "frozen_eraf_baseline_lora_and_gate_plus_compressor_injector"
+            "frozen_eraf_and_gate_plus_compressor_injector_shared_video_action_lora"
+            if lora_joint
+            else "frozen_eraf_baseline_lora_and_gate_plus_compressor_injector"
             if objective in {30, 31, 32, 33, 34, 35, 36, 37} else
             "frozen_complete_eraf_plus_frozen_baseline_lora_plus_compressor_"
             "injector_gain_gate"
@@ -709,6 +724,22 @@ if version == 9:
         raise SystemExit(
             "PGC V9.27 checkpoint lacks its frozen safe-gain contract"
         )
+    lora_contract = metadata.get("eraf_expert_lora_training_contract") or {}
+    saved_video_gradient_contract = lora_contract.get(
+        "video_lora_gradient_contract"
+    )
+    if objective >= 27 and (
+        bool(lora_contract.get("baseline_lora_trainable", False)) != lora_joint
+        or lora_contract.get("future_video_flow") != 0.0
+        or (
+            saved_video_gradient_contract
+            != "action_objective_through_differentiable_video_cache_no_future_video_flow"
+            if lora_joint
+            else saved_video_gradient_contract
+            not in (None, "frozen_detached_video_cache")
+        )
+    ):
+        raise SystemExit("PGC safe-gain checkpoint has an invalid Expert-LoRA contract")
     expected_gate_contract = (
         "frozen_v928_gate_no_optimization" if objective in {30, 31, 32, 33, 34, 35, 36, 37} else
         "detached_gate_calibration_from_mean_multi_noise_action_advantage_plus_"
@@ -1015,6 +1046,9 @@ mapping = {
     "eraf_fresh_joint_training": "fresh_joint_training",
     "eraf_pretrained_joint_training": "pretrained_joint_training",
     "eraf_safe_gain_training": "safe_gain_training",
+    "eraf_safe_gain_lora_joint_training": (
+        "safe_gain_lora_joint_training"
+    ),
     "eraf_bidirectional_supervision": "bidirectional_supervision",
     "eraf_context_injection_warmup_steps": (
         "context_injection_warmup_steps"

@@ -716,6 +716,15 @@ class FastWAM(torch.nn.Module):
         self.policy_guard_eraf_safe_gain_training = bool(
             eraf_config.get("safe_gain_training", False)
         )
+        # V9.39 is a causal training ablation over the V9.38 full-goal recipe:
+        # ERAF, GoalGraph, gain gate, and the released Base remain frozen while
+        # the compressor/injector and the already shared Video/Action LoRA are
+        # optimized together.  Keeping this as an explicit flag on objective
+        # 37 avoids changing the deployed architecture or making older V9.37
+        # checkpoints ambiguous.
+        self.policy_guard_eraf_safe_gain_lora_joint_training = bool(
+            eraf_config.get("safe_gain_lora_joint_training", False)
+        )
         raw_pretrained_checkpoint = eraf_config.get(
             "pretrained_checkpoint", None
         )
@@ -852,6 +861,16 @@ class FastWAM(torch.nn.Module):
             )
         ):
             raise ValueError("CF loss ablations require a V9.30+ frozen-gate teacher contract.")
+        if self.policy_guard_eraf_safe_gain_lora_joint_training and not (
+            self.policy_guard_eraf_grounding_objective_version == 37
+            and self.policy_guard_eraf_safe_gain_training
+            and self.policy_guard_eraf_training_stage == "action"
+            and self.policy_guard_eraf_action_joint_training
+        ):
+            raise ValueError(
+                "Safe-gain LoRA joint training requires the V9.37 action-stage "
+                "full-goal preservation contract."
+            )
         self.eraf_preservation_teacher = None
         self.eraf_preservation_provenance = {}
         self.eraf_preservation_source_state = None
@@ -2807,10 +2826,18 @@ class FastWAM(torch.nn.Module):
             for name in preservation.INTERFACE_NAMES
             for parameter in self.policy_guard_modules[name].parameters()
         }
+        if self.policy_guard_eraf_safe_gain_lora_joint_training:
+            adapter_ids = self._adapter_parameter_ids()
+            if not adapter_ids:
+                raise RuntimeError(
+                    "Safe-gain LoRA joint training produced no shared Expert LoRA."
+                )
+            expected.update(adapter_ids)
         actual = {id(p) for p in self.parameters() if p.requires_grad}
         if actual != expected:
             raise RuntimeError(
-                "V9.30+ trainable scope must be exactly compressor + injector."
+                "V9.30+ trainable scope must match its declared preservation "
+                "interface and optional shared Expert LoRA contract."
             )
         if groups is not None:
             grouped = [id(p) for group in groups for p in group["params"]]
@@ -2827,7 +2854,11 @@ class FastWAM(torch.nn.Module):
             for name, value in self.policy_guard_modules.state_dict().items()
             if name.split(".", 1)[0] not in preservation.INTERFACE_NAMES
         }
-        state.update({"lora." + k: v for k, v in self._lora_adapter_state_dict().items()})
+        if not self.policy_guard_eraf_safe_gain_lora_joint_training:
+            state.update({
+                "lora." + k: v
+                for k, v in self._lora_adapter_state_dict().items()
+            })
         if self.eraf_preservation_teacher is not None:
             state.update({
                 "teacher." + k: v
@@ -2846,7 +2877,10 @@ class FastWAM(torch.nn.Module):
             preservation.tensor_digest(self._v930_frozen_state())
             != self._eraf_preservation_frozen_digest
         ):
-            raise RuntimeError("Preservation frozen ERAF/GoalGraph/LoRA/gate/teacher tensors changed.")
+            raise RuntimeError(
+                "Preservation frozen ERAF/GoalGraph/gate/teacher tensors "
+                "changed outside the declared trainable scope."
+            )
 
     def _v930_restore_teacher(self, path, payload):
         objective = payload["architecture_metadata"]["eraf_grounding_objective_version"]
@@ -3387,6 +3421,22 @@ class FastWAM(torch.nn.Module):
                                         module = self.policy_guard_modules[module_name]
                                         module.train()
                                         module.requires_grad_(True)
+                                    if (
+                                        self.policy_guard_eraf_safe_gain_lora_joint_training
+                                    ):
+                                        adapter_ids = self._adapter_parameter_ids()
+                                        if not adapter_ids:
+                                            raise ValueError(
+                                                "Safe-gain LoRA joint training "
+                                                "produced no shared Expert LoRA "
+                                                "parameters."
+                                            )
+                                        self.mot.train()
+                                        self.video_expert.train()
+                                        self.action_expert.train()
+                                        for parameter in self.mot.parameters():
+                                            if id(parameter) in adapter_ids:
+                                                parameter.requires_grad_(True)
                                     continue_v926_setup = False
                                 else:
                                     continue_v926_setup = True
@@ -3773,9 +3823,9 @@ class FastWAM(torch.nn.Module):
                         "pgc_v9_group": module_name,
                     }
                 )
-        if (
+        if self.lora_enabled and (
             self.policy_guard_eraf_grounding_objective_version == 26
-            and self.lora_enabled
+            or self.policy_guard_eraf_safe_gain_lora_joint_training
         ):
             adapter_ids = self._adapter_parameter_ids()
             adapter_parameters = [
@@ -3785,8 +3835,8 @@ class FastWAM(torch.nn.Module):
             ]
             if not adapter_parameters:
                 raise RuntimeError(
-                    "PGC V9.26 optimizer received no trainable shared Expert "
-                    "LoRA parameters."
+                    "PGC shared-Expert optimizer received no trainable Video/"
+                    "Action LoRA parameters."
                 )
             groups.append(
                 {
@@ -9560,6 +9610,7 @@ class FastWAM(torch.nn.Module):
             video_pre, video_kv_cache, _ = prefill_video(
                 correct_context, correct_context_mask
             )
+            baseline_video_kv_cache = video_kv_cache
             video_seq_len = int(video_pre["tokens"].shape[1])
             video_tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
             attention_mask = self._build_mot_attention_mask(
@@ -9628,6 +9679,25 @@ class FastWAM(torch.nn.Module):
                     proprio=inputs.get("proprio_current"),
                 )
             )
+
+        # The historical safe-gain path intentionally detached the complete
+        # Video cache because its baseline LoRA was immutable.  V9.39 opens the
+        # shared Video/Action LoRA, so the student must receive a second cache
+        # computed with autograd enabled.  ERAF perception above still consumes
+        # released-base (LoRA-disabled) features, while Base/teacher comparisons
+        # retain the detached cache from the identical current policy weights.
+        if self.policy_guard_eraf_safe_gain_lora_joint_training:
+            student_video_pre, video_kv_cache, _ = prefill_video(
+                correct_context, correct_context_mask
+            )
+            if (
+                int(student_video_pre["tokens"].shape[1]) != video_seq_len
+                or int(student_video_pre["meta"]["tokens_per_frame"])
+                != video_tokens_per_frame
+            ):
+                raise RuntimeError(
+                    "Differentiable safe-gain Video cache changed token geometry."
+                )
 
         correct_tokens, gate_probability, safe_metrics = (
             self._policy_guard_eraf_safe_gain_decision(
@@ -9759,7 +9829,8 @@ class FastWAM(torch.nn.Module):
                     action_tokens=noisy, timestep_action=timestep,
                     context=correct_context, full_context_mask=correct_context_mask,
                     state_only_context_mask=state_only_context_mask,
-                    video_kv_cache=video_kv_cache, video_seq_len=video_seq_len,
+                    video_kv_cache=baseline_video_kv_cache,
+                    video_seq_len=video_seq_len,
                     video_tokens_per_frame=video_tokens_per_frame,
                     routed_goal_queries=teacher_tokens,
                     context_injector=self.eraf_preservation_teacher["eraf_action_context_injector"],
@@ -9835,7 +9906,7 @@ class FastWAM(torch.nn.Module):
                     context=correct_context,
                     context_mask=correct_context_mask,
                     state_only_context_mask=state_only_context_mask,
-                    video_kv_cache=video_kv_cache,
+                    video_kv_cache=baseline_video_kv_cache,
                     attention_mask=attention_mask,
                     video_seq_len=video_seq_len,
                 )
@@ -17531,6 +17602,10 @@ class FastWAM(torch.nn.Module):
             and self.policy_guard_eraf_grounding_objective_version in {31, 32, 33, 34, 35, 36, 37}
         )
         is_preservation = is_v930 or is_selective_full_goal
+        safe_gain_lora_joint = bool(
+            is_preservation
+            and self.policy_guard_eraf_safe_gain_lora_joint_training
+        )
         fresh_eraf_joint = bool(
             is_v926_plus and self.policy_guard_eraf_fresh_joint_training
         )
@@ -17573,7 +17648,10 @@ class FastWAM(torch.nn.Module):
                     (
                         (
                             (
-                                preservation.ROLE_SCOPE if is_preservation else
+                                preservation.LORA_JOINT_ROLE_SCOPE
+                                if safe_gain_lora_joint
+                                else preservation.ROLE_SCOPE
+                                if is_preservation else
                                 "frozen_complete_eraf_plus_frozen_baseline_lora_"
                                 "plus_compressor_injector_gain_gate"
                                 if is_v927
@@ -17683,7 +17761,9 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "base_policy": (
-                "frozen_no_eraf_policy_with_shared_expert_lora"
+                "frozen_base_with_jointly_tuned_no_eraf_shared_expert_lora"
+                if safe_gain_lora_joint
+                else "frozen_no_eraf_policy_with_shared_expert_lora"
                 if is_v927
                 else
                 "frozen_released_fastwam_with_shared_expert_lora"
@@ -17715,7 +17795,9 @@ class FastWAM(torch.nn.Module):
                 )
             ),
             "counterfactual_tuning": (
-                "frozen_baseline_dual_context_bidirectional_safe_gain"
+                "full_goal_eraf_interface_plus_shared_video_action_lora_joint_tuning"
+                if safe_gain_lora_joint
+                else "frozen_baseline_dual_context_bidirectional_safe_gain"
                 if is_v927
                 else
                 "pretrained_eraf_native_counterfactual_bidirectional_world_"
@@ -17861,7 +17943,9 @@ class FastWAM(torch.nn.Module):
                 self.policy_guard_require_direct_counterfactual_actions
             ),
             "policy_protection": (
-                "immutable_no_eraf_fallback_plus_pre_action_gain_gate"
+                "jointly_adapted_no_eraf_fallback_plus_pre_action_gain_gate"
+                if safe_gain_lora_joint
+                else "immutable_no_eraf_fallback_plus_pre_action_gain_gate"
                 if is_v927
                 else
                 "pretrained_eraf_ramp_then_single_path_no_candidate_gate"
@@ -18359,6 +18443,11 @@ class FastWAM(torch.nn.Module):
             "eraf_safe_gain_training": (
                 self.policy_guard_eraf_safe_gain_training if is_v9 else None
             ),
+            "eraf_safe_gain_lora_joint_training": (
+                self.policy_guard_eraf_safe_gain_lora_joint_training
+                if is_v9
+                else None
+            ),
             "eraf_bidirectional_supervision": (
                 self.policy_guard_eraf_bidirectional_supervision
                 if is_v9
@@ -18377,7 +18466,10 @@ class FastWAM(torch.nn.Module):
             "eraf_action_joint_contract": (
                 (
                     (
-                        "frozen_complete_eraf_bundle_plus_frozen_baseline_lora_"
+                        "frozen_eraf_goalgraph_gate_plus_joint_compressor_"
+                        "injector_shared_video_action_lora_single_path"
+                        if safe_gain_lora_joint
+                        else "frozen_complete_eraf_bundle_plus_frozen_baseline_lora_"
                         "bidirectional_dual_path_training_pre_action_gain_gate_"
                         "single_path_deployment"
                         if is_v927
@@ -18443,7 +18535,10 @@ class FastWAM(torch.nn.Module):
             "eraf_action_trainable_scope": (
                 (
                     (
-                        preservation.ACTION_SCOPE if is_preservation else
+                        preservation.LORA_JOINT_ACTION_SCOPE
+                        if safe_gain_lora_joint
+                        else preservation.ACTION_SCOPE
+                        if is_preservation else
                         "eraf_action_token_compressor_plus_context_injector_"
                         "plus_gain_gate_only"
                         if is_v927
@@ -18688,8 +18783,14 @@ class FastWAM(torch.nn.Module):
             ),
             "eraf_expert_lora_training_contract": (
                 {
-                    "baseline_lora_trainable": False,
+                    "baseline_lora_trainable": safe_gain_lora_joint,
                     "future_video_flow": 0.0,
+                    "video_lora_gradient_contract": (
+                        "action_objective_through_differentiable_video_cache_"
+                        "no_future_video_flow"
+                        if safe_gain_lora_joint
+                        else "frozen_detached_video_cache"
+                    ),
                     "native_action_flow": (
                         self.policy_guard_eraf_expert_lora_native_action_weight
                     ),
@@ -19987,6 +20088,9 @@ class FastWAM(torch.nn.Module):
         saved_eraf_completion_only_memory = bool(
             metadata.get("eraf_completion_only_memory", False)
         )
+        saved_eraf_safe_gain_lora_joint_training = bool(
+            metadata.get("eraf_safe_gain_lora_joint_training", False)
+        )
         preservation_objective = self.policy_guard_eraf_grounding_objective_version
         if preservation_objective in {30, 31, 32, 33, 34, 35, 36, 37}:
             if saved_eraf_grounding_objective not in {28, preservation_objective}:
@@ -19999,6 +20103,14 @@ class FastWAM(torch.nn.Module):
                     f"V9.{preservation_objective} requires the V9.28 step10000 teacher checkpoint."
                 )
             if saved_eraf_grounding_objective == preservation_objective:
+                if (
+                    saved_eraf_safe_gain_lora_joint_training
+                    != self.policy_guard_eraf_safe_gain_lora_joint_training
+                ):
+                    raise ValueError(
+                        f"V9.{preservation_objective} checkpoint contract "
+                        "mismatch: eraf_safe_gain_lora_joint_training."
+                    )
                 preservation.validate_teacher_payload(payload)
                 if cf_ablation.checkpoint_mode(metadata) != self.policy_guard_eraf_cf_ablation:
                     raise ValueError(
@@ -20843,7 +20955,9 @@ class FastWAM(torch.nn.Module):
 
         if saved_policy_guard_version >= 3:
             expected_tuning = (
-                "frozen_baseline_dual_context_bidirectional_safe_gain"
+                "full_goal_eraf_interface_plus_shared_video_action_lora_joint_tuning"
+                if saved_eraf_safe_gain_lora_joint_training
+                else "frozen_baseline_dual_context_bidirectional_safe_gain"
                 if saved_policy_guard_version == 9
                 and int(saved_eraf_grounding_objective or 1) >= 27
                 else
@@ -20885,7 +20999,9 @@ class FastWAM(torch.nn.Module):
                 )
             )
             expected_protection = (
-                "immutable_no_eraf_fallback_plus_pre_action_gain_gate"
+                "jointly_adapted_no_eraf_fallback_plus_pre_action_gain_gate"
+                if saved_eraf_safe_gain_lora_joint_training
+                else "immutable_no_eraf_fallback_plus_pre_action_gain_gate"
                 if saved_policy_guard_version == 9
                 and int(saved_eraf_grounding_objective or 1) >= 27
                 else
@@ -22183,7 +22299,10 @@ class FastWAM(torch.nn.Module):
                                 expected_scope = (
                                     (
                                         (
-                                            preservation.ROLE_SCOPE if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36, 37} else
+                                            preservation.LORA_JOINT_ROLE_SCOPE
+                                            if saved_eraf_safe_gain_lora_joint_training
+                                            else preservation.ROLE_SCOPE
+                                            if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36, 37} else
                                             "frozen_complete_eraf_plus_frozen_"
                                             "baseline_lora_plus_compressor_injector_"
                                             "gain_gate"
@@ -22810,7 +22929,11 @@ class FastWAM(torch.nn.Module):
                                     )
                                 expected_action_joint_contract = (
                                     (
-                                        "frozen_complete_eraf_bundle_plus_frozen_"
+                                        "frozen_eraf_goalgraph_gate_plus_joint_"
+                                        "compressor_injector_shared_video_action_"
+                                        "lora_single_path"
+                                        if saved_eraf_safe_gain_lora_joint_training
+                                        else "frozen_complete_eraf_bundle_plus_frozen_"
                                         "baseline_lora_bidirectional_dual_path_"
                                         "training_pre_action_gain_gate_single_path_"
                                         "deployment"
@@ -22883,7 +23006,10 @@ class FastWAM(torch.nn.Module):
                                 )
                                 expected_action_trainable_scope = (
                                     (
-                                        preservation.ACTION_SCOPE if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36, 37} else
+                                        preservation.LORA_JOINT_ACTION_SCOPE
+                                        if saved_eraf_safe_gain_lora_joint_training
+                                        else preservation.ACTION_SCOPE
+                                        if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36, 37} else
                                         "eraf_action_token_compressor_plus_context_"
                                         "injector_plus_gain_gate_only"
                                         if saved_grounding_objective >= 27
@@ -22943,7 +23069,10 @@ class FastWAM(torch.nn.Module):
                                     ),
                                     "eraf_role_adapter_trainable_scope": (
                                         (
-                                            preservation.ROLE_SCOPE if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36, 37} else
+                                            preservation.LORA_JOINT_ROLE_SCOPE
+                                            if saved_eraf_safe_gain_lora_joint_training
+                                            else preservation.ROLE_SCOPE
+                                            if saved_grounding_objective in {30, 31, 32, 33, 34, 35, 36, 37} else
                                             "frozen_complete_eraf_plus_frozen_"
                                             "baseline_lora_plus_compressor_injector_"
                                             "gain_gate"

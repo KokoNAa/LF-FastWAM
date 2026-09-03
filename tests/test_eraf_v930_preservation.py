@@ -21,7 +21,13 @@ from fastwam.utils import cf_ablation as ablation
 from test_policy_guard import tiny_pgc_fastwam
 
 
-def model_for(objective=30, source=None, ablation="none"):
+def model_for(
+    objective=30,
+    source=None,
+    ablation="none",
+    *,
+    lora_joint=False,
+):
     return tiny_pgc_fastwam(
         version=9,
         v9_stage="action",
@@ -31,6 +37,7 @@ def model_for(objective=30, source=None, ablation="none"):
         v9_action_joint_training=True,
         v9_pretrained_joint_training=True,
         v9_safe_gain_training=True,
+        v9_safe_gain_lora_joint_training=lora_joint,
         v9_pretrained_checkpoint=str(source) if source else None,
         v9_bidirectional_supervision=True,
         v9_context_injection_warmup_steps=0,
@@ -776,6 +783,46 @@ def test_v938_refresh_changes_only_corrective_binding(tmp_path):
     assert 4 * derived.batch_size * derived.gradient_accumulation_steps == 12
 
 
+def test_v939_joint_config_changes_only_lora_trainability_and_short_schedule(
+    tmp_path,
+):
+    root = Path(__file__).resolve().parents[1]
+    path = root / "scripts/train_libero_eraf_full_goal_lora_joint_v939.py"
+    spec = importlib.util.spec_from_file_location("v939_joint", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with initialize_config_dir(config_dir=str(root / "configs"), version_base=None):
+        source = compose(
+            config_name="train",
+            overrides=["task=libero_eraf_safe_gain_v930_2cam224"],
+        )
+    source.batch_size = 1
+    source.gradient_accumulation_steps = 4
+    source.data.train.pgc_closed_loop_corrective_dataset_dirs = ["old-corrective"]
+    source.data.train.pgc_entity_relation_sidecar_dirs = [
+        f"sidecar-{i}" for i in range(5)
+    ]
+    dataset = tmp_path / "full-goal"
+    sidecar = tmp_path / "full-goal-sidecar"
+    derived = module.joint_config(
+        source, tmp_path / "v939", dataset, sidecar, gpus=4
+    )
+    eraf = derived.model.policy_guard.entity_relation_grounding
+    assert eraf.grounding_objective_version == 37
+    assert eraf.safe_gain_lora_joint_training is True
+    assert eraf.safe_gain_injector_training_steps == derived.max_steps == 25
+    assert eraf.safe_gain_gate_calibration_steps == 0
+    assert derived.save_every == 5
+    assert derived.data.train.pgc_closed_loop_corrective_dataset_dirs == [
+        str(dataset.resolve())
+    ]
+    assert derived.data.train.pgc_entity_relation_sidecar_dirs[-1] == str(
+        sidecar.resolve()
+    )
+    assert 4 * derived.batch_size * derived.gradient_accumulation_steps == 12
+    assert module.REQUIRED_SAVE_STEPS == (5, 10, 15, 20, 25)
+
+
 def test_migration_optimizer_freeze_and_teacher_roundtrip(warm_checkpoint, tmp_path):
     student = model_for()
     # Same order as Trainer: modules/optimizer exist before checkpoint loading.
@@ -1058,23 +1105,28 @@ def test_v937_roundtrip_records_soft_action_violation_semantic_contract(
     resumed._v930_audit_frozen()
 
 
-@pytest.mark.parametrize("objective,ablation,all_lift", [
-    (30, "none", False),
-    (30, "mask_lift_corrective", False),
-    (30, "mask_corrective_ranking", False),
-    (30, "mask_lift_corrective", True),
-    (31, "mask_corrective_ranking", False),
-    (32, "mask_lift_ranking", False),
-    (33, "mask_lift_ranking", False),
-    (34, "mask_lift_ranking", False),
-    (35, "mask_lift_ranking", False),
-    (36, "mask_lift_ranking", False),
-    (37, "mask_lift_ranking", False),
+@pytest.mark.parametrize("objective,ablation,all_lift,lora_joint", [
+    (30, "none", False, False),
+    (30, "mask_lift_corrective", False, False),
+    (30, "mask_corrective_ranking", False, False),
+    (30, "mask_lift_corrective", True, False),
+    (31, "mask_corrective_ranking", False, False),
+    (32, "mask_lift_ranking", False, False),
+    (33, "mask_lift_ranking", False, False),
+    (34, "mask_lift_ranking", False, False),
+    (35, "mask_lift_ranking", False, False),
+    (36, "mask_lift_ranking", False, False),
+    (37, "mask_lift_ranking", False, False),
+    (37, "mask_lift_ranking", False, True),
 ])
 def test_real_action_forward_backward_and_eval_preflight(
-    warm_checkpoint, tmp_path, objective, ablation, all_lift
+    warm_checkpoint, tmp_path, objective, ablation, all_lift, lora_joint
 ):
-    student = model_for(objective=objective, ablation=ablation)
+    student = model_for(
+        objective=objective,
+        ablation=ablation,
+        lora_joint=lora_joint,
+    )
     student.prepare_trainable_parameters()
     student.load_checkpoint(warm_checkpoint)
     groups = student.policy_guard_optimizer_groups(2e-6)
@@ -1200,6 +1252,21 @@ def test_real_action_forward_backward_and_eval_preflight(
         for p in student.policy_guard_modules["eraf_gain_gate"].parameters()
     )
     assert all(p.grad is None for p in student.eraf_preservation_teacher.parameters())
+    video_lora = [
+        p
+        for name, p in student.video_expert.named_parameters()
+        if name.endswith((".lora_A", ".lora_B"))
+    ]
+    action_lora = [
+        p
+        for name, p in student.action_expert.named_parameters()
+        if name.endswith((".lora_A", ".lora_B"))
+    ]
+    if lora_joint:
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in video_lora)
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in action_lora)
+    else:
+        assert all(p.grad is None for p in video_lora + action_lora)
     optimizer.step()
     student._v930_audit_frozen()
     saved = tmp_path / f"v9{objective}.pt"
@@ -1251,6 +1318,12 @@ def test_real_action_forward_backward_and_eval_preflight(
             "paired_semantic_non_violation_weight=0.5"
             in overrides
         )
+    if lora_joint:
+        assert (
+            "model.policy_guard.entity_relation_grounding."
+            "safe_gain_lora_joint_training=true"
+            in overrides
+        )
     with initialize_config_dir(config_dir=str(root / "configs"), version_base=None):
         evaluation = compose(
             config_name="sim_libero",
@@ -1265,7 +1338,11 @@ def test_real_action_forward_backward_and_eval_preflight(
         == 0
     )
     assert evaluation.model.policy_guard.entity_relation_grounding.cf_ablation == ablation
-    reloaded = model_for(objective=objective, ablation=ablation)
+    reloaded = model_for(
+        objective=objective,
+        ablation=ablation,
+        lora_joint=lora_joint,
+    )
     reloaded.load_checkpoint(saved)
     if objective == 30 and ablation != "none":
         with pytest.raises(ValueError, match="eraf_cf_ablation"):

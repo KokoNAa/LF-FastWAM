@@ -48,6 +48,7 @@ def tiny_pgc_fastwam(
     v9_fresh_joint_training: bool = False,
     v9_pretrained_joint_training: bool = False,
     v9_safe_gain_training: bool = False,
+    v9_safe_gain_lora_joint_training: bool = False,
     v9_pretrained_checkpoint: str | None = None,
     v9_bidirectional_supervision: bool = False,
     v9_context_injection_warmup_steps: int = 1500,
@@ -215,6 +216,9 @@ def tiny_pgc_fastwam(
                 "fresh_joint_training": v9_fresh_joint_training,
                 "pretrained_joint_training": v9_pretrained_joint_training,
                 "safe_gain_training": v9_safe_gain_training,
+                "safe_gain_lora_joint_training": (
+                    v9_safe_gain_lora_joint_training
+                ),
                 "pretrained_checkpoint": v9_pretrained_checkpoint,
                 "bidirectional_supervision": v9_bidirectional_supervision,
                 "context_injection_warmup_steps": (

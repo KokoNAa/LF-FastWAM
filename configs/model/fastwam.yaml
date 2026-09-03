@@ -349,6 +349,11 @@ policy_guard:
     # base schema so checkpoint-driven evaluation can restore them under Hydra
     # struct mode; historical objectives retain the disabled/zero defaults.
     safe_gain_training: false
+    # V9.39 experimental ablation: retain the frozen ERAF/GoalGraph/gate and
+    # the V9.28 interface teacher, but jointly optimize the compressor,
+    # injector, and the existing shared Video/Action LoRA. This flag changes
+    # training only; deployment remains one pre-action-gated Action path.
+    safe_gain_lora_joint_training: false
     pretrained_checkpoint: null
     bidirectional_supervision: false
     context_injection_warmup_steps: 1500

@@ -14,6 +14,12 @@ INTERFACE_NAMES = (
 )
 ROLE_SCOPE = "frozen_eraf_baseline_lora_and_gate_plus_compressor_injector"
 ACTION_SCOPE = "eraf_action_token_compressor_plus_context_injector_only"
+LORA_JOINT_ROLE_SCOPE = (
+    "frozen_eraf_and_gate_plus_compressor_injector_shared_video_action_lora"
+)
+LORA_JOINT_ACTION_SCOPE = (
+    "eraf_action_token_compressor_plus_context_injector_plus_shared_video_action_lora"
+)
 SCHEDULE = "injector_only_with_frozen_v928_teacher_and_gate"
 GATE_CONTRACT = "frozen_v928_gate_no_optimization"
 PRESERVATION_CONTRACT = (
