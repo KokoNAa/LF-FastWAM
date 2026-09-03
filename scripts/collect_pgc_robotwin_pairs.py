@@ -46,6 +46,83 @@ from experiments.robotwin.pgc_task_variants import (
 from fastwam.datasets.pgc_libero import PGC_DATA_FORMAT
 
 
+COLLECTION_PROFILES = {
+    "grounding": {
+        "native": {
+            "artifact_role": "eraf_grounding_supervision",
+            "allowed_training_stages": ["grounding"],
+            "forbidden_training_stages": [
+                "no_eraf",
+                "joint",
+                "final_short_lora",
+            ],
+        },
+        "counterfactual": {
+            "artifact_role": "eraf_grounding_supervision",
+            "allowed_training_stages": ["grounding"],
+            "forbidden_training_stages": [
+                "no_eraf",
+                "joint",
+                "final_short_lora",
+            ],
+        },
+    },
+    "no_eraf_historical": {
+        "native": {
+            "artifact_role": "offline_native",
+            "allowed_training_stages": [
+                "no_eraf",
+                "joint",
+                "final_short_lora",
+            ],
+            "forbidden_training_stages": ["grounding"],
+        },
+        "counterfactual": {
+            "artifact_role": "historical_cf",
+            "allowed_training_stages": [
+                "no_eraf",
+                "joint",
+                "final_short_lora",
+            ],
+            "forbidden_training_stages": ["grounding"],
+        },
+    },
+    "no_eraf_strict": {
+        # The source replay is retained only as the same-scene strict audit.
+        # It is not added to the optimizer's offline-native pool.
+        "native": {
+            "artifact_role": "strict_source_native_audit",
+            "allowed_training_stages": [],
+            "forbidden_training_stages": [
+                "grounding",
+                "no_eraf",
+                "joint",
+                "final_short_lora",
+            ],
+        },
+        "counterfactual": {
+            "artifact_role": "strict_cf",
+            "allowed_training_stages": [
+                "no_eraf",
+                "joint",
+                "final_short_lora",
+            ],
+            "forbidden_training_stages": ["grounding"],
+        },
+    },
+}
+
+
+def collection_contract(profile: str, dataset_kind: str) -> dict[str, Any]:
+    try:
+        return dict(COLLECTION_PROFILES[str(profile)][str(dataset_kind)])
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported RoboTwin collection profile/kind: "
+            f"{profile!r}/{dataset_kind!r}."
+        ) from exc
+
+
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -152,18 +229,17 @@ def _write_provenance(
     dataset_kind: str,
     episode_count: int,
     task_config: str,
+    collection_profile: str,
 ) -> None:
+    contract = collection_contract(collection_profile, dataset_kind)
     provenance = {
         "format": PGC_DATA_FORMAT,
         "raw_format": PGC_ROBOTWIN_RAW_FORMAT,
         "platform": "robotwin",
-        "artifact_role": "eraf_grounding_supervision",
-        "allowed_training_stages": ["grounding"],
-        "forbidden_training_stages": [
-            "no_eraf",
-            "joint",
-            "final_short_lora",
-        ],
+        "artifact_role": contract["artifact_role"],
+        "collection_profile": collection_profile,
+        "allowed_training_stages": contract["allowed_training_stages"],
+        "forbidden_training_stages": contract["forbidden_training_stages"],
         "full_goal_usage": "not_present",
         "dataset_kind": dataset_kind,
         "task_config": task_config,
@@ -205,6 +281,7 @@ def _replay_dataset(
     dataset_kind: str,
     spec: RoboTwinPairSpec,
     task_config: str,
+    collection_profile: str,
 ) -> None:
     audit_path = run_root / "meta" / "pgc_episodes.jsonl"
     audit_path.write_text("", encoding="utf-8")
@@ -304,6 +381,7 @@ def _replay_dataset(
         dataset_kind=dataset_kind,
         episode_count=len(accepted),
         task_config=task_config,
+        collection_profile=collection_profile,
     )
 
 
@@ -316,6 +394,7 @@ def collect_pair(
     episodes: int,
     start_seed: int,
     max_seed_attempts: int,
+    collection_profile: str = "grounding",
 ) -> Path:
     spec = pair_spec_from_source_task(source_task)
     pair_root = output_root / spec.pair_id
@@ -414,6 +493,7 @@ def collect_pair(
         dataset_kind="native",
         spec=spec,
         task_config=task_config,
+        collection_profile=collection_profile,
     )
     _replay_dataset(
         task=task,
@@ -424,6 +504,7 @@ def collect_pair(
         dataset_kind="counterfactual",
         spec=spec,
         task_config=task_config,
+        collection_profile=collection_profile,
     )
     return pair_root
 
@@ -437,6 +518,15 @@ def main() -> None:
     parser.add_argument("--task-config", default="demo_clean")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--start-seed", type=int, default=4300000)
+    parser.add_argument(
+        "--collection-profile",
+        choices=tuple(COLLECTION_PROFILES),
+        default="grounding",
+        help=(
+            "Bind immutable provenance for grounding, the no-ERAF "
+            "offline/historical pair, or the no-ERAF strict-CF audit."
+        ),
+    )
     parser.add_argument(
         "--max-seed-attempts",
         type=int,
@@ -465,6 +555,7 @@ def main() -> None:
             episodes=args.episodes,
             start_seed=args.start_seed + offset * 1_000_000,
             max_seed_attempts=max_seed_attempts,
+            collection_profile=args.collection_profile,
         )
 
 
