@@ -9,6 +9,7 @@ from experiments.robotwin.pgc_data import ROBOTWIN_ERAF_PAIR_IDS
 from scripts.build_pgc_robotwin_eraf_grounding_manifest import (
     OUTPUT_FORMAT,
     build_grounding_manifest,
+    load_grounding_training_matrix,
 )
 
 
@@ -134,6 +135,40 @@ class RoboTwinERAFGroundingManifestTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "Full-goal index leaked"):
                     build_grounding_manifest(work_root=root)
+
+    def test_training_loader_reaudits_exact_grounding_matrix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            indices = _make_formal_tree(root)
+            with mock.patch(
+                "scripts.build_pgc_robotwin_eraf_grounding_manifest."
+                "load_pgc_entity_relation_index",
+                side_effect=lambda path: indices[str(Path(path).resolve())],
+            ):
+                result = build_grounding_manifest(work_root=root)
+                matrix = load_grounding_training_matrix(Path(result["manifest"]))
+            self.assertEqual(len(matrix["dataset_dirs"]), 10)
+            self.assertEqual(len(matrix["counterfactual_dirs"]), 10)
+            self.assertEqual(len(matrix["sidecar_dirs"]), 20)
+            self.assertEqual(matrix["total_successful_trajectories"], 50)
+            self.assertEqual(matrix["manifest_sha256"], result["sha256"])
+
+    def test_training_loader_rejects_relaxed_stage_policy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            indices = _make_formal_tree(root)
+            with mock.patch(
+                "scripts.build_pgc_robotwin_eraf_grounding_manifest."
+                "load_pgc_entity_relation_index",
+                side_effect=lambda path: indices[str(Path(path).resolve())],
+            ):
+                result = build_grounding_manifest(work_root=root)
+            manifest = Path(result["manifest"])
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["allowed_training_stages"] = ["grounding", "joint"]
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "not grounding-only"):
+                load_grounding_training_matrix(manifest)
 
 
 if __name__ == "__main__":

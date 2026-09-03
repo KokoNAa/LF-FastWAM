@@ -270,6 +270,123 @@ def build_grounding_manifest(*, work_root: Path, output: Path | None = None) -> 
     return {**payload, "manifest": str(output), "sha256": _file_sha256(output)}
 
 
+def load_grounding_training_matrix(path: Path) -> dict[str, Any]:
+    """Re-audit a combined manifest immediately before grounding training."""
+
+    path = path.expanduser().resolve()
+    payload = _load_json(path)
+    if payload.get("format") != OUTPUT_FORMAT or payload.get("complete") is not True:
+        raise ValueError(f"Incomplete/unsupported ERAF grounding manifest: {path}.")
+    if (
+        payload.get("artifact_role") != "eraf_grounding_supervision"
+        or payload.get("allowed_training_stages") != ["grounding"]
+        or payload.get("full_goal_usage") != "not_present"
+        or payload.get("full_goal_verified") is not False
+    ):
+        raise ValueError(f"Combined manifest is not grounding-only: {path}.")
+    forbidden = set(payload.get("forbidden_training_stages") or ())
+    if forbidden != {"no_eraf", "joint", "final_short_lora"}:
+        raise ValueError(f"Combined manifest has an unsafe stage policy: {path}.")
+    if (
+        tuple(payload.get("pairs") or ()) != ROBOTWIN_ERAF_PAIR_IDS
+        or int(payload.get("pair_count", -1)) != len(ROBOTWIN_ERAF_PAIR_IDS)
+        or int(payload.get("dataset_count", -1)) != 20
+        or int(payload.get("total_successful_trajectories", -1)) != 50
+        or payload.get("domains")
+        != {name: episodes for name, episodes in DOMAIN_EPISODES}
+    ):
+        raise ValueError(f"Combined manifest dimensions are not the formal plan: {path}.")
+
+    source_records = payload.get("source_manifests")
+    if not isinstance(source_records, list):
+        raise ValueError("Combined manifest source_manifests must be a list.")
+    sources_by_domain = {
+        str(record.get("task_config")): record
+        for record in source_records
+        if isinstance(record, Mapping)
+    }
+    if set(sources_by_domain) != {name for name, _ in DOMAIN_EPISODES}:
+        raise ValueError("Combined manifest must bind clean and randomized sources.")
+
+    all_entries: list[dict[str, Any]] = []
+    domain_signatures: dict[
+        str, dict[tuple[str, str], list[tuple[str, str]]]
+    ] = {}
+    for task_config, expected_episodes in DOMAIN_EPISODES:
+        source = sources_by_domain[task_config]
+        source_path = Path(str(source.get("path", ""))).expanduser().resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"ERAF source manifest not found: {source_path}.")
+        if (
+            int(source.get("episodes_per_dataset", -1)) != expected_episodes
+            or str(source.get("sha256", "")) != _file_sha256(source_path)
+        ):
+            raise ValueError(f"ERAF source manifest binding changed: {source_path}.")
+        entries, signatures = _validate_source_manifest(
+            path=source_path,
+            task_config=task_config,
+            expected_episodes=expected_episodes,
+        )
+        all_entries.extend(entries)
+        domain_signatures[task_config] = signatures
+
+    expected_entries = [
+        entry
+        for dataset_kind in DATASET_KINDS
+        for pair_id in ROBOTWIN_ERAF_PAIR_IDS
+        for task_config, _ in DOMAIN_EPISODES
+        for entry in all_entries
+        if entry["dataset_kind"] == dataset_kind
+        and entry["pair_id"] == pair_id
+        and entry["task_config"] == task_config
+    ]
+    if payload.get("datasets") != expected_entries:
+        raise ValueError(
+            "Combined manifest datasets no longer match their audited source "
+            "manifests."
+        )
+    expected_counts = {
+        pair_id: {"native": 5, "counterfactual": 5}
+        for pair_id in ROBOTWIN_ERAF_PAIR_IDS
+    }
+    if payload.get("pair_episode_counts") != expected_counts:
+        raise ValueError("Combined manifest pair counts are not exactly 5+5.")
+    for pair_id in ROBOTWIN_ERAF_PAIR_IDS:
+        clean_states = {
+            state
+            for state, _ in domain_signatures["demo_clean"][(pair_id, "native")]
+        }
+        randomized_states = {
+            state
+            for state, _ in domain_signatures["demo_randomized"][
+                (pair_id, "native")
+            ]
+        }
+        if clean_states & randomized_states:
+            raise ValueError(f"Clean/randomized state leakage detected for {pair_id}.")
+
+    native_entries = [
+        entry for entry in expected_entries if entry["dataset_kind"] == "native"
+    ]
+    counterfactual_entries = [
+        entry
+        for entry in expected_entries
+        if entry["dataset_kind"] == "counterfactual"
+    ]
+    return {
+        "manifest": str(path),
+        "manifest_sha256": _file_sha256(path),
+        "dataset_dirs": [entry["dataset"] for entry in native_entries],
+        "counterfactual_dirs": [
+            entry["dataset"] for entry in counterfactual_entries
+        ],
+        "sidecar_dirs": [entry["sidecar"] for entry in expected_entries],
+        "pair_ids": list(ROBOTWIN_ERAF_PAIR_IDS),
+        "pair_episode_counts": expected_counts,
+        "total_successful_trajectories": 50,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-root", type=Path, required=True)
