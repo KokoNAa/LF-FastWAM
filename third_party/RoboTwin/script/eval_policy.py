@@ -654,6 +654,24 @@ def eval_policy(task_name,
 
         succ = False
         reset_func(model)
+        if hasattr(model, "begin_episode"):
+            episode_capture_metadata = {}
+            if intervention_pair is not None:
+                episode_capture_metadata = {
+                    "pair_id": intervention_pair.pair_id,
+                    "source_task": intervention_pair.source_task,
+                    "counterfactual_task": intervention_pair.counterfactual_task,
+                    "task_config": str(args["task_config"]),
+                    "scene_seed": int(now_seed),
+                    "episode_index": int(now_id),
+                    "source_instruction": source_instruction,
+                    "counterfactual_instruction": counterfactual_instruction,
+                    "policy_instruction": str(instruction),
+                    "condition": condition,
+                    "instruction_goal": instruction_goal,
+                    "checkpoint": str(args["ckpt_setting"]),
+                }
+            model.begin_episode(TASK_ENV, episode_capture_metadata)
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
             need_obs = True
             if skip_get_obs_within_replan and hasattr(model, "should_request_observation"):

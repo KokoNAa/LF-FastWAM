@@ -26,6 +26,13 @@ if str(SRC_ROOT) not in sys.path:
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from experiments.robotwin.closed_loop_capture import (
+    capture_frame,
+    classify_online_stage,
+    write_capture_segment,
+)
+from experiments.robotwin.pgc_data import pair_spec_from_source_task
+from experiments.robotwin.pgc_task_variants import install_pgc_observation_contract
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +242,8 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        task_name: str,
+        task_config: str,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -271,6 +280,44 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
+        self.task_name = str(task_name)
+        self.task_config = str(task_config)
+
+        capture_value = os.environ.get(
+            "PGC_ROBOTWIN_CLOSED_LOOP_CAPTURE_DIR", ""
+        ).strip()
+        self.closed_loop_capture_dir = (
+            None if not capture_value else Path(capture_value).expanduser().resolve()
+        )
+        self.closed_loop_capture_stride = int(
+            os.environ.get("PGC_ROBOTWIN_CLOSED_LOOP_CAPTURE_STRIDE_REPLANS", "1")
+        )
+        self.closed_loop_capture_max = int(
+            os.environ.get(
+                "PGC_ROBOTWIN_CLOSED_LOOP_CAPTURE_MAX_STATES_PER_EPISODE", "12"
+            )
+        )
+        if self.closed_loop_capture_stride <= 0 or self.closed_loop_capture_max <= 0:
+            raise ValueError("RoboTwin closed-loop capture stride/max must be positive.")
+        if self.closed_loop_capture_dir is not None:
+            architecture_enabled = {
+                "latent_action_queries": bool(
+                    model_cfg.action_dit_config.get("use_latent_action_queries", False)
+                ),
+                "langforce": bool(model_cfg.get("langforce_mvp", {}).get("enabled", False)),
+                "transition_contract": bool(
+                    model_cfg.get("transition_contract", {}).get("enabled", False)
+                ),
+                "policy_guard": bool(model_cfg.get("policy_guard", {}).get("enabled", False)),
+            }
+            enabled = sorted(name for name, value in architecture_enabled.items() if value)
+            checkpoint_format = str(checkpoint_payload.get("format", ""))
+            if enabled or checkpoint_format.startswith("fastwam_policy_guard_"):
+                raise RuntimeError(
+                    "Closed-loop-native capture requires the immutable released "
+                    f"B0 checkpoint; enabled={enabled} format={checkpoint_format!r}."
+                )
+            self.closed_loop_capture_dir.mkdir(parents=True, exist_ok=True)
 
         self.pending_actions: deque[np.ndarray] = deque()
         # V9.13 policy state is caller-owned and reset for every RoboTwin
@@ -279,6 +326,11 @@ class WorldActionRobotWinPolicy:
         self.policy_diagnostics: list[Dict[str, Any]] = []
         self.episode_count = 0
         self.step_count = 0
+        self.replan_count = 0
+        self.closed_loop_capture_count = 0
+        self._closed_loop_episode_metadata: Optional[dict[str, Any]] = None
+        self._closed_loop_pending_segment: Optional[dict[str, Any]] = None
+        self._closed_loop_previous_stage: Optional[str] = None
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
         logger.info(
@@ -372,16 +424,65 @@ class WorldActionRobotWinPolicy:
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
         return action_chunk
 
-    def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
+    def _fill_action_queue(
+        self,
+        task_env: Any,
+        observation: Dict[str, Any],
+        instruction: str,
+    ) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
         n_exec = min(self.replan_steps, action_chunk.shape[0])
+        if (
+            self.closed_loop_capture_dir is not None
+            and self._closed_loop_episode_metadata is not None
+            and self.closed_loop_capture_count < self.closed_loop_capture_max
+            and self.replan_count % self.closed_loop_capture_stride == 0
+            and n_exec >= 2
+        ):
+            snapshot = task_env.pgc_eraf_snapshot()
+            stage = classify_online_stage(
+                snapshot,
+                replan_index=self.replan_count,
+                left_gripper_open=bool(task_env.is_left_gripper_open()),
+                right_gripper_open=bool(task_env.is_right_gripper_open()),
+                previous_stage=self._closed_loop_previous_stage,
+            )
+            self._closed_loop_pending_segment = {
+                "replan_index": self.replan_count,
+                "online_stage": stage,
+                "first_frame": capture_frame(
+                    task_env, observation, np.asarray(action_chunk[0], dtype=np.float32)
+                ),
+            }
+            self._closed_loop_previous_stage = stage
         for i in range(n_exec):
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
+        self.replan_count += 1
 
     def should_request_observation(self) -> bool:
         return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
+        if (
+            self._closed_loop_pending_segment is not None
+            and observation is not None
+            and self.pending_actions
+        ):
+            pending = self._closed_loop_pending_segment
+            second_frame = capture_frame(
+                task_env,
+                observation,
+                np.asarray(self.pending_actions[0], dtype=np.float32),
+            )
+            write_capture_segment(
+                capture_root=self.closed_loop_capture_dir,
+                metadata=self._closed_loop_episode_metadata,
+                replan_index=int(pending["replan_index"]),
+                online_stage=str(pending["online_stage"]),
+                frames=(pending["first_frame"], second_frame),
+            )
+            self.closed_loop_capture_count += 1
+            self._closed_loop_pending_segment = None
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
@@ -389,7 +490,11 @@ class WorldActionRobotWinPolicy:
                     "(replan step for fastwam)."
                 )
             instruction = task_env.get_instruction()
-            self._fill_action_queue(observation=observation, instruction=instruction)
+            self._fill_action_queue(
+                task_env=task_env,
+                observation=observation,
+                instruction=instruction,
+            )
 
         if not self.pending_actions:
             logger.warning("No action generated; skip current eval step.")
@@ -427,7 +532,47 @@ class WorldActionRobotWinPolicy:
         self.policy_diagnostics.clear()
         self.episode_count += 1
         self.step_count = 0
+        self.replan_count = 0
+        self.closed_loop_capture_count = 0
+        self._closed_loop_episode_metadata = None
+        self._closed_loop_pending_segment = None
+        self._closed_loop_previous_stage = None
         self.reset_timing_rollout()
+
+    def begin_episode(self, task_env: Any, metadata: Dict[str, Any]) -> None:
+        """Bind Correct/source rollout metadata after the ordinary reset."""
+        if self.closed_loop_capture_dir is None:
+            return
+        required = {
+            "source_task",
+            "task_config",
+            "scene_seed",
+            "episode_index",
+            "source_instruction",
+            "counterfactual_instruction",
+            "policy_instruction",
+            "condition",
+            "instruction_goal",
+            "pair_id",
+            "checkpoint",
+        }
+        missing = sorted(required - set(metadata))
+        if missing:
+            raise ValueError(f"Closed-loop episode metadata is missing {missing}.")
+        if (
+            str(metadata["source_task"]) != self.task_name
+            or str(metadata["task_config"]) != self.task_config
+            or str(metadata["condition"]) != "correct"
+            or str(metadata["instruction_goal"]) != "source"
+            or str(metadata["policy_instruction"]).strip().casefold()
+            != str(metadata["source_instruction"]).strip().casefold()
+        ):
+            raise ValueError("Closed-loop-native capture accepts Correct/source B0 only.")
+        spec = pair_spec_from_source_task(self.task_name)
+        if str(metadata["pair_id"]) != spec.pair_id:
+            raise ValueError("Closed-loop episode pair does not match its source task.")
+        install_pgc_observation_contract(task_env, spec)
+        self._closed_loop_episode_metadata = dict(metadata)
 
 
 def encode_obs(observation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -532,6 +677,8 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        task_name=str(usr_args.get("task_name")),
+        task_config=str(usr_args.get("task_config")),
     )
     return policy
 

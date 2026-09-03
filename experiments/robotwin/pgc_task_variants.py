@@ -255,9 +255,8 @@ def eraf_snapshot(task: Any, spec: RoboTwinPairSpec) -> dict[str, np.ndarray]:
     }
 
 
-def install_pgc_task_contract(task: Any, spec: RoboTwinPairSpec) -> Any:
-    """Attach lazy scene/entity hooks without modifying RoboTwin task classes."""
-
+def install_pgc_observation_contract(task: Any, spec: RoboTwinPairSpec) -> Any:
+    """Attach read-only scene/entity hooks without changing success semantics."""
     task._pgc_pair_spec = spec
 
     def scene_actors(bound_task: Any) -> list[Any]:
@@ -268,7 +267,16 @@ def install_pgc_task_contract(task: Any, spec: RoboTwinPairSpec) -> Any:
 
     task.pgc_scene_actors = MethodType(scene_actors, task)
     task.pgc_eraf_snapshot = MethodType(snapshot, task)
+    return task
+
+
+def install_pgc_task_contract(task: Any, spec: RoboTwinPairSpec) -> Any:
+    """Attach collection hooks and the selected expert success predicate."""
+
+    install_pgc_observation_contract(task, spec)
     if hasattr(task, "check_success"):
+        if hasattr(task, "_pgc_native_check_success"):
+            return task
         task._pgc_native_check_success = task.check_success
 
         def active_check_success(bound_task: Any) -> bool:
