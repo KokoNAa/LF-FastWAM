@@ -577,12 +577,17 @@ def eval_policy(task_name,
                     instruction_type=instruction_type,
                     scene_seed=now_seed,
                 )
-                counterfactual_instruction = _deterministic_instruction(
-                    task_name=intervention_pair.counterfactual_task,
-                    episode_info=episode_info["info"],
-                    instruction_type=instruction_type,
-                    scene_seed=now_seed,
-                )
+                if intervention_pair.counterfactual_instruction is not None:
+                    counterfactual_instruction = str(
+                        intervention_pair.counterfactual_instruction
+                    )
+                else:
+                    counterfactual_instruction = _deterministic_instruction(
+                        task_name=intervention_pair.counterfactual_task,
+                        episode_info=episode_info["info"],
+                        instruction_type=instruction_type,
+                        scene_seed=now_seed,
+                    )
             else:
                 source_instruction = str(canonical_record["source_instruction"])
                 counterfactual_instruction = str(

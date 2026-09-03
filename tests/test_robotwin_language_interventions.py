@@ -18,6 +18,9 @@ from experiments.robotwin.language_interventions import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = PROJECT_ROOT / "configs" / "eval" / "robotwin_cis_spatial.json"
+FOUR_TASK_MANIFEST = (
+    PROJECT_ROOT / "configs" / "eval" / "robotwin_cis_v939_four_tasks.json"
+)
 
 
 class _Pose:
@@ -26,11 +29,18 @@ class _Pose:
 
 
 class _Actor:
-    def __init__(self, position):
+    def __init__(self, position, functional_points=None):
         self.position = list(position)
+        self.functional_points = [
+            list(point) for point in (functional_points or [position])
+        ]
 
     def get_pose(self):
         return _Pose(self.position)
+
+    def get_functional_point(self, point_id, mode):
+        assert mode == "pose"
+        return _Pose(self.functional_points[point_id])
 
 
 class _Robot:
@@ -55,6 +65,16 @@ class _Env:
         raise AssertionError("native check should be replaced")
 
 
+class _MultiActorEnv:
+    def __init__(self, **actors):
+        self.robot = _Robot()
+        for name, actor in actors.items():
+            setattr(self, name, actor)
+
+    def check_success(self):
+        raise AssertionError("native check should be replaced")
+
+
 class RoboTwinManifestTest(unittest.TestCase):
     def test_checked_in_manifest_is_bidirectional_and_executable(self):
         pairs = load_intervention_manifest(
@@ -73,6 +93,32 @@ class RoboTwinManifestTest(unittest.TestCase):
         raw = json.loads(MANIFEST.read_text(encoding="utf-8"))
         raw["pairs"] = raw["pairs"][:1]
         with self.assertRaisesRegex(ManifestError, "missing reverse"):
+            validate_manifest_data(raw)
+
+    def test_four_task_manifest_has_five_source_directions(self):
+        pairs = load_intervention_manifest(
+            FOUR_TASK_MANIFEST,
+            robotwin_root=PROJECT_ROOT / "third_party" / "RoboTwin",
+        )
+        self.assertEqual(
+            [pair.source_task for pair in pairs],
+            [
+                "place_a2b_left",
+                "place_a2b_right",
+                "stack_blocks_two",
+                "blocks_ranking_rgb",
+                "place_burger_fries",
+            ],
+        )
+        one_way = [pair for pair in pairs if not pair.require_reverse]
+        self.assertEqual(len(one_way), 3)
+        self.assertTrue(all(pair.counterfactual_instruction for pair in one_way))
+
+    def test_one_way_pair_requires_inline_counterfactual_instruction(self):
+        raw = json.loads(FOUR_TASK_MANIFEST.read_text(encoding="utf-8"))
+        raw["pairs"] = [raw["pairs"][2]]
+        del raw["pairs"][0]["counterfactual_instruction"]
+        with self.assertRaisesRegex(ManifestError, "inline"):
             validate_manifest_data(raw)
 
     def test_condition_contracts_match_dtl_and_cis_definitions(self):
@@ -224,6 +270,56 @@ class RoboTwinGoalTest(unittest.TestCase):
         observer.restore_native_goal()
         with self.assertRaisesRegex(AssertionError, "native check"):
             env.check_success()
+
+    def test_stack_order_goals_are_mutually_exclusive(self):
+        pairs = load_intervention_manifest(FOUR_TASK_MANIFEST)
+        pair = next(pair for pair in pairs if pair.source_task == "stack_blocks_two")
+        env = _MultiActorEnv(
+            block1=_Actor((0.0, -0.13, 0.75)),
+            block2=_Actor((0.0, -0.13, 0.80)),
+        )
+        self.assertTrue(evaluate_goal(env, pair.source_goal).success)
+        self.assertFalse(evaluate_goal(env, pair.counterfactual_goal).success)
+        env.block1.position[2] = 0.80
+        env.block2.position[2] = 0.75
+        self.assertFalse(evaluate_goal(env, pair.source_goal).success)
+        self.assertTrue(evaluate_goal(env, pair.counterfactual_goal).success)
+
+    def test_rgb_and_bgr_row_goals_are_mutually_exclusive(self):
+        pairs = load_intervention_manifest(FOUR_TASK_MANIFEST)
+        pair = next(pair for pair in pairs if pair.source_task == "blocks_ranking_rgb")
+        env = _MultiActorEnv(
+            block1=_Actor((-0.08, -0.15, 0.765)),
+            block2=_Actor((0.0, -0.15, 0.765)),
+            block3=_Actor((0.08, -0.15, 0.765)),
+        )
+        self.assertTrue(evaluate_goal(env, pair.source_goal).success)
+        self.assertFalse(evaluate_goal(env, pair.counterfactual_goal).success)
+        env.block1.position[0] = 0.08
+        env.block3.position[0] = -0.08
+        self.assertFalse(evaluate_goal(env, pair.source_goal).success)
+        self.assertTrue(evaluate_goal(env, pair.counterfactual_goal).success)
+
+    def test_burger_fries_slot_goals_are_mutually_exclusive(self):
+        pairs = load_intervention_manifest(FOUR_TASK_MANIFEST)
+        pair = next(pair for pair in pairs if pair.source_task == "place_burger_fries")
+        env = _MultiActorEnv(
+            hamburg=_Actor((-0.1, -0.15, 0.75)),
+            frenchfries=_Actor((0.1, -0.15, 0.75)),
+            tray=_Actor(
+                (0.0, -0.15, 0.75),
+                functional_points=[
+                    (-0.1, -0.15, 0.75),
+                    (0.1, -0.15, 0.75),
+                ],
+            ),
+        )
+        self.assertTrue(evaluate_goal(env, pair.source_goal).success)
+        self.assertFalse(evaluate_goal(env, pair.counterfactual_goal).success)
+        env.hamburg.functional_points[0][0] = 0.1
+        env.frenchfries.functional_points[0][0] = -0.1
+        self.assertFalse(evaluate_goal(env, pair.source_goal).success)
+        self.assertTrue(evaluate_goal(env, pair.counterfactual_goal).success)
 
 
 if __name__ == "__main__":

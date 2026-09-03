@@ -27,7 +27,7 @@ def main() -> None:
         args.manifest,
         robotwin_root=args.robotwin_root,
     )
-    print(f"Validated {len(pairs)} bidirectional RoboTwin CIS records:")
+    print(f"Validated {len(pairs)} executable RoboTwin CIS records:")
     for pair in pairs:
         print(f"  {pair.pair_id}: {pair.source_task} -> " f"{pair.counterfactual_task}")
 

@@ -1,0 +1,155 @@
+{
+  "format": "robotwin_language_interventions_v1",
+  "description": "V9.39 baseline matched CIS over four RoboTwin task families: spatial direction, stack order, RGB row order, and tray-slot assignment.",
+  "pairs": [
+    {
+      "pair_id": "place_a2b_left_to_right",
+      "source_task": "place_a2b_left",
+      "counterfactual_task": "place_a2b_right",
+      "source_goal": {
+        "type": "relative_pose",
+        "actor": "object",
+        "reference": "target_object",
+        "axis": "x",
+        "direction": "negative",
+        "min_planar_distance": 0.08,
+        "max_planar_distance": 0.2,
+        "max_orthogonal_distance": 0.05,
+        "require_both_grippers_open": true
+      },
+      "counterfactual_goal": {
+        "type": "relative_pose",
+        "actor": "object",
+        "reference": "target_object",
+        "axis": "x",
+        "direction": "positive",
+        "min_planar_distance": 0.08,
+        "max_planar_distance": 0.2,
+        "max_orthogonal_distance": 0.05,
+        "require_both_grippers_open": true
+      }
+    },
+    {
+      "pair_id": "place_a2b_right_to_left",
+      "source_task": "place_a2b_right",
+      "counterfactual_task": "place_a2b_left",
+      "source_goal": {
+        "type": "relative_pose",
+        "actor": "object",
+        "reference": "target_object",
+        "axis": "x",
+        "direction": "positive",
+        "min_planar_distance": 0.08,
+        "max_planar_distance": 0.2,
+        "max_orthogonal_distance": 0.05,
+        "require_both_grippers_open": true
+      },
+      "counterfactual_goal": {
+        "type": "relative_pose",
+        "actor": "object",
+        "reference": "target_object",
+        "axis": "x",
+        "direction": "negative",
+        "min_planar_distance": 0.08,
+        "max_planar_distance": 0.2,
+        "max_orthogonal_distance": 0.05,
+        "require_both_grippers_open": true
+      }
+    },
+    {
+      "pair_id": "stack_blocks_two_green_on_red_to_red_on_green",
+      "source_task": "stack_blocks_two",
+      "counterfactual_task": "stack_blocks_two_red_on_green",
+      "counterfactual_instruction": "Move the green block to the center, then stack the red block on the green block.",
+      "require_reverse": false,
+      "source_goal": {
+        "type": "stacked_on",
+        "actor": "block2",
+        "reference": "block1",
+        "max_x_error": 0.025,
+        "max_y_error": 0.025,
+        "expected_vertical_delta": 0.05,
+        "max_vertical_error": 0.012,
+        "require_both_grippers_open": true
+      },
+      "counterfactual_goal": {
+        "type": "stacked_on",
+        "actor": "block1",
+        "reference": "block2",
+        "max_x_error": 0.025,
+        "max_y_error": 0.025,
+        "expected_vertical_delta": 0.05,
+        "max_vertical_error": 0.012,
+        "require_both_grippers_open": true
+      }
+    },
+    {
+      "pair_id": "blocks_ranking_rgb_to_bgr",
+      "source_task": "blocks_ranking_rgb",
+      "counterfactual_task": "blocks_ranking_bgr",
+      "counterfactual_instruction": "Arrange the blue, green, and red blocks from left to right in a row.",
+      "require_reverse": false,
+      "source_goal": {
+        "type": "ordered_row",
+        "actors": ["block1", "block2", "block3"],
+        "max_adjacent_x_distance": 0.13,
+        "max_adjacent_y_distance": 0.03,
+        "require_both_grippers_open": true
+      },
+      "counterfactual_goal": {
+        "type": "ordered_row",
+        "actors": ["block3", "block2", "block1"],
+        "max_adjacent_x_distance": 0.13,
+        "max_adjacent_y_distance": 0.03,
+        "require_both_grippers_open": true
+      }
+    },
+    {
+      "pair_id": "place_burger_fries_native_to_swapped_slots",
+      "source_task": "place_burger_fries",
+      "counterfactual_task": "place_burger_fries_swapped_slots",
+      "counterfactual_instruction": "Place the hamburger on the right slot of the tray and the french fries on the left slot.",
+      "require_reverse": false,
+      "source_goal": {
+        "type": "functional_point_assignment",
+        "assignments": [
+          {
+            "actor": "hamburg",
+            "actor_point": 0,
+            "reference": "tray",
+            "reference_point": 0,
+            "max_planar_distance": 0.08
+          },
+          {
+            "actor": "frenchfries",
+            "actor_point": 0,
+            "reference": "tray",
+            "reference_point": 1,
+            "max_planar_distance": 0.08
+          }
+        ],
+        "require_both_grippers_open": true
+      },
+      "counterfactual_goal": {
+        "type": "functional_point_assignment",
+        "assignments": [
+          {
+            "actor": "hamburg",
+            "actor_point": 0,
+            "reference": "tray",
+            "reference_point": 1,
+            "max_planar_distance": 0.08
+          },
+          {
+            "actor": "frenchfries",
+            "actor_point": 0,
+            "reference": "tray",
+            "reference_point": 0,
+            "max_planar_distance": 0.08
+          }
+        ],
+        "require_both_grippers_open": true
+      }
+    }
+  ]
+}

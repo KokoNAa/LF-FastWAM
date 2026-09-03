@@ -51,6 +51,58 @@ as counterfactual coverage of all RoboTwin tasks; most other native tasks do
 not provide an executable, mutually exclusive alternate goal in the same
 scene.
 
+## V9.39 four-task-family baseline
+
+`configs/eval/robotwin_cis_v939_four_tasks.json` extends the matched protocol
+to four task families.  It contains five executable source directions because
+the native left/right family is audited in both directions:
+
+| Family | Source | Counterfactual instruction/goal |
+|---|---|---|
+| spatial direction | `place_a2b_left`, `place_a2b_right` | reverse left/right relation |
+| stack order | `stack_blocks_two` | red on green instead of green on red |
+| row order | `blocks_ranking_rgb` | blue-green-red instead of red-green-blue |
+| tray slots | `place_burger_fries` | hamburger/right and fries/left instead of native slots |
+
+The final three are one-way interventions in their native RoboTwin scene;
+RoboTwin does not ship reverse environment classes for them.  Their source
+predicates mirror native `check_success`, while their alternate predicates are
+independent executable same-scene goals.  Their alternate instructions are
+fixed in the manifest so no nonexistent task description file is required.
+
+Run a clean-domain one-episode smoke matrix first:
+
+```bash
+export MANIFEST_PATH="$PWD/configs/eval/robotwin_cis_v939_four_tasks.json"
+export CIS_TASKS=place_a2b_left,place_a2b_right,stack_blocks_two,blocks_ranking_rgb,place_burger_fries
+export CIS_TASK_CONFIGS=demo_clean
+export CIS_CONDITIONS=correct,shuffled,counterfactual
+export FASTWAM_EVAL_MODE=B0
+export RUN_TAG=robotwin_v939_baseline_four_tasks_smoke_seed42
+
+bash scripts/eval_robotwin_cis.sh \
+  8 1 10 42 \
+  "$ROBOTWIN_CKPT" \
+  "$STATS_PATH"
+```
+
+After the smoke matrix validates, run both domains with 100 matched episodes
+per cell:
+
+```bash
+export CIS_TASK_CONFIGS=demo_clean,demo_randomized
+export RUN_TAG=robotwin_v939_baseline_four_tasks_formal_seed42
+
+bash scripts/eval_robotwin_cis.sh \
+  8 100 10 42 \
+  "$ROBOTWIN_CKPT" \
+  "$STATS_PATH"
+```
+
+The formal matrix contains `5 source directions x 2 domains x 3 conditions =
+30 jobs`, or 3,000 matched rollouts.  This evaluation produces no training or
+full-goal data.
+
 ## Server preflight
 
 The server needs the normal RoboTwin environment, assets, `task_config`,

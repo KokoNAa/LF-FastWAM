@@ -35,6 +35,8 @@ class InterventionPair:
     counterfactual_task: str
     source_goal: dict[str, Any]
     counterfactual_goal: dict[str, Any]
+    counterfactual_instruction: str | None = None
+    require_reverse: bool = True
 
 
 @dataclass(frozen=True)
@@ -93,50 +95,131 @@ def _nonempty(record: Mapping[str, Any], field: str, *, context: str) -> str:
     return value
 
 
-def _validate_goal_spec(raw: Any, *, context: str) -> dict[str, Any]:
-    if not isinstance(raw, Mapping):
-        raise ManifestError(f"{context}: goal must be a JSON object")
-    goal = dict(raw)
-    if goal.get("type") != "relative_pose":
-        raise ManifestError(
-            f"{context}: unsupported goal type {goal.get('type')!r}; "
-            "expected 'relative_pose'"
-        )
-    for field in ("actor", "reference"):
-        _nonempty(goal, field, context=context)
-    axis = str(goal.get("axis", "")).strip().lower()
-    if axis not in AXIS_INDEX:
-        raise ManifestError(f"{context}: `axis` must be one of {sorted(AXIS_INDEX)}")
-    if axis == "z":
-        raise ManifestError(f"{context}: relative_pose CIS currently requires x/y axis")
-    direction = str(goal.get("direction", "")).strip().lower()
-    if direction not in VALID_DIRECTIONS:
-        raise ManifestError(
-            f"{context}: `direction` must be one of {list(VALID_DIRECTIONS)}"
-        )
-    for field in (
-        "min_planar_distance",
-        "max_planar_distance",
-        "max_orthogonal_distance",
-    ):
-        try:
-            value = float(goal[field])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ManifestError(f"{context}: `{field}` must be numeric") from exc
-        if value < 0:
-            raise ManifestError(f"{context}: `{field}` must be non-negative")
-        goal[field] = value
-    if goal["max_planar_distance"] <= goal["min_planar_distance"]:
-        raise ManifestError(
-            f"{context}: max_planar_distance must exceed min_planar_distance"
-        )
+def _numeric_field(
+    record: dict[str, Any], field: str, *, context: str, positive: bool = False
+) -> float:
+    try:
+        value = float(record[field])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ManifestError(f"{context}: `{field}` must be numeric") from exc
+    if value < 0 or (positive and value <= 0):
+        comparison = "positive" if positive else "non-negative"
+        raise ManifestError(f"{context}: `{field}` must be {comparison}")
+    record[field] = value
+    return value
+
+
+def _validate_gripper_requirement(goal: dict[str, Any], *, context: str) -> None:
     require_open = goal.get("require_both_grippers_open", False)
     if not isinstance(require_open, bool):
         raise ManifestError(
             f"{context}: `require_both_grippers_open` must be a boolean"
         )
-    goal["axis"] = axis
-    goal["direction"] = direction
+
+
+def _validate_goal_spec(raw: Any, *, context: str) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise ManifestError(f"{context}: goal must be a JSON object")
+    goal = dict(raw)
+    goal_type = str(goal.get("type", "")).strip()
+    if goal_type == "relative_pose":
+        for field in ("actor", "reference"):
+            _nonempty(goal, field, context=context)
+        axis = str(goal.get("axis", "")).strip().lower()
+        if axis not in AXIS_INDEX:
+            raise ManifestError(
+                f"{context}: `axis` must be one of {sorted(AXIS_INDEX)}"
+            )
+        if axis == "z":
+            raise ManifestError(
+                f"{context}: relative_pose CIS currently requires x/y axis"
+            )
+        direction = str(goal.get("direction", "")).strip().lower()
+        if direction not in VALID_DIRECTIONS:
+            raise ManifestError(
+                f"{context}: `direction` must be one of {list(VALID_DIRECTIONS)}"
+            )
+        for field in (
+            "min_planar_distance",
+            "max_planar_distance",
+            "max_orthogonal_distance",
+        ):
+            _numeric_field(goal, field, context=context)
+        if goal["max_planar_distance"] <= goal["min_planar_distance"]:
+            raise ManifestError(
+                f"{context}: max_planar_distance must exceed min_planar_distance"
+            )
+        goal["axis"] = axis
+        goal["direction"] = direction
+    elif goal_type == "stacked_on":
+        for field in ("actor", "reference"):
+            _nonempty(goal, field, context=context)
+        for field in (
+            "max_x_error",
+            "max_y_error",
+            "expected_vertical_delta",
+            "max_vertical_error",
+        ):
+            _numeric_field(goal, field, context=context, positive=True)
+    elif goal_type == "ordered_row":
+        actors = goal.get("actors")
+        if not isinstance(actors, list) or len(actors) < 2:
+            raise ManifestError(f"{context}: `actors` must contain at least two names")
+        normalized_actors = [str(actor).strip() for actor in actors]
+        if any(not actor for actor in normalized_actors):
+            raise ManifestError(f"{context}: `actors` contains an empty name")
+        if len(set(normalized_actors)) != len(normalized_actors):
+            raise ManifestError(f"{context}: `actors` contains duplicates")
+        goal["actors"] = normalized_actors
+        _numeric_field(goal, "max_adjacent_x_distance", context=context, positive=True)
+        _numeric_field(goal, "max_adjacent_y_distance", context=context, positive=True)
+    elif goal_type == "functional_point_assignment":
+        assignments = goal.get("assignments")
+        if not isinstance(assignments, list) or not assignments:
+            raise ManifestError(f"{context}: `assignments` must be a non-empty list")
+        normalized_assignments: list[dict[str, Any]] = []
+        actor_ids: set[str] = set()
+        for index, raw_assignment in enumerate(assignments):
+            assignment_context = f"{context}.assignments[{index}]"
+            if not isinstance(raw_assignment, Mapping):
+                raise ManifestError(f"{assignment_context}: must be a JSON object")
+            assignment = dict(raw_assignment)
+            actor = _nonempty(assignment, "actor", context=assignment_context)
+            reference = _nonempty(assignment, "reference", context=assignment_context)
+            if actor in actor_ids:
+                raise ManifestError(
+                    f"{assignment_context}: duplicate actor assignment {actor!r}"
+                )
+            actor_ids.add(actor)
+            for field in ("actor_point", "reference_point"):
+                try:
+                    value = int(assignment.get(field, 0))
+                except (TypeError, ValueError) as exc:
+                    raise ManifestError(
+                        f"{assignment_context}: `{field}` must be an integer"
+                    ) from exc
+                if value < 0:
+                    raise ManifestError(
+                        f"{assignment_context}: `{field}` must be non-negative"
+                    )
+                assignment[field] = value
+            _numeric_field(
+                assignment,
+                "max_planar_distance",
+                context=assignment_context,
+                positive=True,
+            )
+            assignment["actor"] = actor
+            assignment["reference"] = reference
+            normalized_assignments.append(assignment)
+        goal["assignments"] = normalized_assignments
+    else:
+        raise ManifestError(
+            f"{context}: unsupported goal type {goal_type!r}; expected one of "
+            "['functional_point_assignment', 'ordered_row', 'relative_pose', "
+            "'stacked_on']"
+        )
+    _validate_gripper_requirement(goal, context=context)
     return goal
 
 
@@ -163,6 +246,17 @@ def validate_manifest_data(raw: Any) -> list[InterventionPair]:
         counterfactual_task = _nonempty(
             raw_pair, "counterfactual_task", context=context
         )
+        raw_counterfactual_instruction = raw_pair.get("counterfactual_instruction")
+        counterfactual_instruction = None
+        if raw_counterfactual_instruction is not None:
+            counterfactual_instruction = str(raw_counterfactual_instruction).strip()
+            if not counterfactual_instruction:
+                raise ManifestError(
+                    f"{context}: `counterfactual_instruction` must be non-empty"
+                )
+        require_reverse = raw_pair.get("require_reverse", True)
+        if not isinstance(require_reverse, bool):
+            raise ManifestError(f"{context}: `require_reverse` must be a boolean")
         if pair_id in pair_ids:
             raise ManifestError(f"{context}: duplicate pair_id {pair_id!r}")
         if source_task in source_tasks:
@@ -189,11 +283,20 @@ def validate_manifest_data(raw: Any) -> list[InterventionPair]:
                 counterfactual_task=counterfactual_task,
                 source_goal=source_goal,
                 counterfactual_goal=counterfactual_goal,
+                counterfactual_instruction=counterfactual_instruction,
+                require_reverse=require_reverse,
             )
         )
 
     by_source = {pair.source_task: pair for pair in pairs}
     for pair in pairs:
+        if not pair.require_reverse:
+            if pair.counterfactual_instruction is None:
+                raise ManifestError(
+                    f"pair {pair.pair_id!r}: one-way intervention requires an "
+                    "inline `counterfactual_instruction`"
+                )
+            continue
         reverse = by_source.get(pair.counterfactual_task)
         if reverse is None:
             raise ManifestError(
@@ -228,11 +331,12 @@ def load_intervention_manifest(
     if robotwin_root is not None:
         root = Path(robotwin_root).expanduser().resolve()
         missing: list[Path] = []
-        task_names = {
-            task
+        task_names = {pair.source_task for pair in pairs}
+        task_names.update(
+            pair.counterfactual_task
             for pair in pairs
-            for task in (pair.source_task, pair.counterfactual_task)
-        }
+            if pair.counterfactual_instruction is None
+        )
         for task_name in sorted(task_names):
             for relative in (
                 Path("envs") / f"{task_name}.py",
@@ -250,14 +354,16 @@ def load_intervention_manifest(
             source_path = (
                 root / "description" / "task_instruction" / f"{pair.source_task}.json"
             )
+            with source_path.open("r", encoding="utf-8") as handle:
+                source_instructions = json.load(handle)
+            if pair.counterfactual_instruction is not None:
+                continue
             counterfactual_path = (
                 root
                 / "description"
                 / "task_instruction"
                 / f"{pair.counterfactual_task}.json"
             )
-            with source_path.open("r", encoding="utf-8") as handle:
-                source_instructions = json.load(handle)
             with counterfactual_path.open("r", encoding="utf-8") as handle:
                 counterfactual_instructions = json.load(handle)
             for instruction_type in ("seen", "unseen"):
@@ -397,45 +503,63 @@ def _actor_position(env: Any, attribute: str) -> tuple[float, float, float]:
     return float(position[0]), float(position[1]), float(position[2])
 
 
+def _functional_point_position(
+    env: Any, attribute: str, point_id: int
+) -> tuple[float, float, float]:
+    if not hasattr(env, attribute):
+        raise AttributeError(
+            f"RoboTwin environment {type(env).__name__} has no actor {attribute!r}"
+        )
+    actor = getattr(env, attribute)
+    pose = actor.get_functional_point(int(point_id), "pose")
+    position = pose.p
+    if len(position) < 3:
+        raise ValueError(
+            f"Actor {attribute!r} functional point {point_id} returned an invalid "
+            f"pose: {position!r}"
+        )
+    return float(position[0]), float(position[1]), float(position[2])
+
+
+def _grippers_open(env: Any, goal: Mapping[str, Any]) -> bool:
+    if not goal.get("require_both_grippers_open", False):
+        return True
+    robot = getattr(env, "robot", None)
+    if robot is None:
+        raise AttributeError("RoboTwin environment has no `robot` for gripper goal")
+    return bool(robot.is_left_gripper_open() and robot.is_right_gripper_open())
+
+
 def evaluate_goal(env: Any, goal: Mapping[str, Any]) -> GoalEvaluation:
     """Evaluate one validated declarative goal against a RoboTwin environment."""
 
-    if goal.get("type") != "relative_pose":
-        raise ValueError(f"Unsupported goal type at runtime: {goal.get('type')!r}")
-    actor_position = _actor_position(env, str(goal["actor"]))
-    reference_position = _actor_position(env, str(goal["reference"]))
-    delta = tuple(
-        actor_position[index] - reference_position[index] for index in range(3)
-    )
-    axis = str(goal["axis"])
-    axis_index = AXIS_INDEX[axis]
-    orthogonal_axis = "y" if axis == "x" else "x"
-    orthogonal_index = AXIS_INDEX[orthogonal_axis]
-    planar_distance = math.hypot(delta[0], delta[1])
-    direction_ok = (
-        delta[axis_index] < 0
-        if goal["direction"] == "negative"
-        else delta[axis_index] > 0
-    )
-    grippers_open = True
-    if goal.get("require_both_grippers_open", False):
-        robot = getattr(env, "robot", None)
-        if robot is None:
-            raise AttributeError("RoboTwin environment has no `robot` for gripper goal")
-        grippers_open = bool(
-            robot.is_left_gripper_open() and robot.is_right_gripper_open()
+    goal_type = str(goal.get("type"))
+    grippers_open = _grippers_open(env, goal)
+    if goal_type == "relative_pose":
+        actor_position = _actor_position(env, str(goal["actor"]))
+        reference_position = _actor_position(env, str(goal["reference"]))
+        delta = tuple(
+            actor_position[index] - reference_position[index] for index in range(3)
         )
-    success = bool(
-        direction_ok
-        and float(goal["min_planar_distance"])
-        < planar_distance
-        < float(goal["max_planar_distance"])
-        and abs(delta[orthogonal_index]) < float(goal["max_orthogonal_distance"])
-        and grippers_open
-    )
-    return GoalEvaluation(
-        success=success,
-        details={
+        axis = str(goal["axis"])
+        axis_index = AXIS_INDEX[axis]
+        orthogonal_axis = "y" if axis == "x" else "x"
+        orthogonal_index = AXIS_INDEX[orthogonal_axis]
+        planar_distance = math.hypot(delta[0], delta[1])
+        direction_ok = (
+            delta[axis_index] < 0
+            if goal["direction"] == "negative"
+            else delta[axis_index] > 0
+        )
+        success = bool(
+            direction_ok
+            and float(goal["min_planar_distance"])
+            < planar_distance
+            < float(goal["max_planar_distance"])
+            and abs(delta[orthogonal_index]) < float(goal["max_orthogonal_distance"])
+            and grippers_open
+        )
+        details = {
             "actor_position": list(actor_position),
             "reference_position": list(reference_position),
             "delta": list(delta),
@@ -444,9 +568,86 @@ def evaluate_goal(env: Any, goal: Mapping[str, Any]) -> GoalEvaluation:
             "axis_delta": float(delta[axis_index]),
             "orthogonal_delta": float(delta[orthogonal_index]),
             "planar_distance": float(planar_distance),
-            "grippers_open": bool(grippers_open),
-        },
-    )
+        }
+    elif goal_type == "stacked_on":
+        actor_position = _actor_position(env, str(goal["actor"]))
+        reference_position = _actor_position(env, str(goal["reference"]))
+        delta = tuple(
+            actor_position[index] - reference_position[index] for index in range(3)
+        )
+        success = bool(
+            abs(delta[0]) < float(goal["max_x_error"])
+            and abs(delta[1]) < float(goal["max_y_error"])
+            and abs(delta[2] - float(goal["expected_vertical_delta"]))
+            < float(goal["max_vertical_error"])
+            and grippers_open
+        )
+        details = {
+            "actor_position": list(actor_position),
+            "reference_position": list(reference_position),
+            "delta": list(delta),
+        }
+    elif goal_type == "ordered_row":
+        actors = [str(value) for value in goal["actors"]]
+        positions = [_actor_position(env, actor) for actor in actors]
+        adjacent = []
+        for left, right in zip(positions, positions[1:]):
+            adjacent.append(
+                {
+                    "x_delta": float(right[0] - left[0]),
+                    "y_delta": float(right[1] - left[1]),
+                }
+            )
+        success = bool(
+            all(
+                0.0 < item["x_delta"] < float(goal["max_adjacent_x_distance"])
+                and abs(item["y_delta"]) < float(goal["max_adjacent_y_distance"])
+                for item in adjacent
+            )
+            and grippers_open
+        )
+        details = {
+            "actors": actors,
+            "positions": [list(position) for position in positions],
+            "adjacent": adjacent,
+        }
+    elif goal_type == "functional_point_assignment":
+        assignment_details = []
+        assignments_ok = True
+        for assignment in goal["assignments"]:
+            actor_position = _functional_point_position(
+                env, str(assignment["actor"]), int(assignment["actor_point"])
+            )
+            reference_position = _functional_point_position(
+                env,
+                str(assignment["reference"]),
+                int(assignment["reference_point"]),
+            )
+            planar_distance = math.hypot(
+                actor_position[0] - reference_position[0],
+                actor_position[1] - reference_position[1],
+            )
+            assignment_ok = planar_distance < float(assignment["max_planar_distance"])
+            assignments_ok = assignments_ok and assignment_ok
+            assignment_details.append(
+                {
+                    "actor": str(assignment["actor"]),
+                    "actor_point": int(assignment["actor_point"]),
+                    "reference": str(assignment["reference"]),
+                    "reference_point": int(assignment["reference_point"]),
+                    "actor_position": list(actor_position),
+                    "reference_position": list(reference_position),
+                    "planar_distance": float(planar_distance),
+                    "assignment_ok": bool(assignment_ok),
+                }
+            )
+        success = bool(assignments_ok and grippers_open)
+        details = {"assignments": assignment_details}
+    else:
+        raise ValueError(f"Unsupported goal type at runtime: {goal_type!r}")
+    details["goal_type"] = goal_type
+    details["grippers_open"] = bool(grippers_open)
+    return GoalEvaluation(success=success, details=details)
 
 
 class GoalObserver:
