@@ -7,6 +7,10 @@ from fastwam.datasets.robotwin_eraf_sampling import (
 )
 from experiments.robotwin.pgc_data import array_sha256 as collection_array_sha256
 from scripts.train_pgc_robotwin_eraf_grounding import build_overrides
+from scripts.train_pgc_robotwin_eraf_grounding_role import (
+    build_role_overrides,
+    validate_grounding_payload,
+)
 
 
 PAIR_IDS = tuple(f"pair_{index}" for index in range(5))
@@ -103,6 +107,65 @@ class RoboTwinERAFGroundingTrainingTest(unittest.TestCase):
             any("RoboTwinERAFGroundingDataset" in value for value in overrides)
         )
         self.assertFalse(any("full_goal" in value for value in overrides))
+
+    def test_role_continuation_matches_libero_objective_three_contract(self):
+        matrix = {
+            "dataset_dirs": [f"/native/{index}" for index in range(10)],
+            "counterfactual_dirs": [f"/cf/{index}" for index in range(10)],
+            "sidecar_dirs": [f"/sidecar/{index}" for index in range(20)],
+        }
+        overrides = build_role_overrides(
+            matrix=matrix,
+            grounding_checkpoint=Path("/step_001500.pt"),
+            stats_path=Path("/stats.json"),
+            cache_dir=Path("/cache"),
+            seed=42,
+            stage_steps=1000,
+            save_every=250,
+            gradient_accumulation_steps=4,
+        )
+        self.assertIn("resume=/step_001500.pt", overrides)
+        self.assertIn("weight_only_start_step=1500", overrides)
+        self.assertIn("max_steps=2500", overrides)
+        self.assertIn("learning_rate=2.0e-5", overrides)
+        self.assertIn(
+            "model.policy_guard.entity_relation_grounding."
+            "grounding_objective_version=3",
+            overrides,
+        )
+        self.assertIn(
+            "model.policy_guard.entity_relation_grounding."
+            "role_assignment_weight=4.0",
+            overrides,
+        )
+        self.assertIn(
+            "model.policy_guard.entity_relation_grounding."
+            "role_assignment_hard_weight=2.0",
+            overrides,
+        )
+        self.assertFalse(any("full_goal" in value for value in overrides))
+
+    def test_role_continuation_admits_exact_objective_two_checkpoint(self):
+        payload = {
+            "format": "fastwam_policy_guard_v9",
+            "step": 1500,
+            "architecture_metadata": {
+                "policy_guard_version": 9,
+                "eraf_grounding_objective_version": 2,
+                "eraf_training_stage": "grounding",
+                "warm_start_contract": "released_base_fresh_eraf",
+                "action_output_dim": 14,
+                "proprio_dim": 14,
+                "eraf_camera_count": 3,
+                "eraf_camera_layout": "robotwin_mosaic",
+                "eraf_visual_aspect_ratio": 5.0 / 6.0,
+            },
+        }
+        metadata = validate_grounding_payload(payload)
+        self.assertEqual(metadata["eraf_grounding_objective_version"], 2)
+        payload["architecture_metadata"]["eraf_grounding_objective_version"] = 3
+        with self.assertRaisesRegex(ValueError, "mismatches"):
+            validate_grounding_payload(payload)
 
 
 if __name__ == "__main__":

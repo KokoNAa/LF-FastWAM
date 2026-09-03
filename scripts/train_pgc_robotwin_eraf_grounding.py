@@ -82,11 +82,18 @@ def build_overrides(
     steps: int,
     save_every: int,
     gradient_accumulation_steps: int,
+    grounding_objective_version: int = GROUNDING_OBJECTIVE_VERSION,
+    weight_only_start_step: int | None = None,
+    learning_rate: float = 1.0e-4,
 ) -> list[str]:
-    return [
+    learning_rate_text = f"{learning_rate:.1e}".replace("e-0", "e-").replace(
+        "e+0", "e+"
+    )
+    overrides = [
         "task=robotwin_pgc_3cam_384",
         f"resume={base_checkpoint}",
-        "weight_only_start_step=null",
+        "weight_only_start_step="
+        + ("null" if weight_only_start_step is None else str(weight_only_start_step)),
         "data.val=null",
         "data.train._target_=fastwam.datasets.lerobot."
         "robotwin_eraf_grounding_dataset.RoboTwinERAFGroundingDataset",
@@ -109,7 +116,7 @@ def build_overrides(
         f"seed={seed}",
         f"max_steps={steps}",
         "num_epochs=1",
-        "learning_rate=1.0e-4",
+        f"learning_rate={learning_rate_text}",
         "lr_scheduler_type=constant",
         f"gradient_accumulation_steps={gradient_accumulation_steps}",
         "log_every=10",
@@ -130,11 +137,23 @@ def build_overrides(
         "model.policy_guard.entity_relation_grounding."
         "initialization_contract=released_base_fresh_eraf",
         "model.policy_guard.entity_relation_grounding."
-        f"grounding_objective_version={GROUNDING_OBJECTIVE_VERSION}",
+        f"grounding_objective_version={grounding_objective_version}",
         "model.policy_guard.entity_relation_grounding.completion_only_memory=false",
         "model.policy_guard.entity_relation_grounding.action_joint_training=false",
         "model.lora.enabled=false",
     ]
+    if grounding_objective_version == 3:
+        overrides.extend(
+            [
+                "model.policy_guard.entity_relation_grounding."
+                "role_assignment_weight=4.0",
+                "model.policy_guard.entity_relation_grounding."
+                "role_assignment_temperature=0.10",
+                "model.policy_guard.entity_relation_grounding."
+                "role_assignment_hard_weight=2.0",
+            ]
+        )
+    return overrides
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
