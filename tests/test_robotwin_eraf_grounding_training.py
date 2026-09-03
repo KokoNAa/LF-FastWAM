@@ -3,7 +3,9 @@ from pathlib import Path
 
 from fastwam.datasets.robotwin_eraf_sampling import (
     build_robotwin_eraf_grounding_sample_indices,
+    robotwin_array_sha256,
 )
+from experiments.robotwin.pgc_data import array_sha256 as collection_array_sha256
 from scripts.train_pgc_robotwin_eraf_grounding import build_overrides
 
 
@@ -36,6 +38,14 @@ def _formal_sampling_fixture():
 
 
 class RoboTwinERAFGroundingTrainingTest(unittest.TestCase):
+    def test_runtime_hash_matches_robotwin_collection_contract(self):
+        import numpy as np
+
+        actions = np.arange(42, dtype=np.float32).reshape(3, 14)
+        self.assertEqual(
+            robotwin_array_sha256(actions), collection_array_sha256(actions)
+        )
+
     def test_sampler_balances_pair_kind_after_combining_domains(self):
         frame_groups, sidecars = _formal_sampling_fixture()
         sample_indices, labels = build_robotwin_eraf_grounding_sample_indices(

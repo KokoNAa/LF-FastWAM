@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections import defaultdict
 from typing import Any, Mapping, Sequence
+
+import numpy as np
 
 from .pgc_libero import build_pgc_pair_balanced_sample_indices
 
 
 EXPECTED_DOMAIN_EPISODE_COUNTS = (2, 3)
+
+
+def robotwin_array_sha256(value: np.ndarray | Sequence[Any]) -> str:
+    """Reproduce the typed hash used by RoboTwin collection and raw audit."""
+
+    array = np.ascontiguousarray(np.asarray(value))
+    header = f"{array.dtype.str}|{array.shape}".encode("utf-8")
+    return hashlib.sha256(header + b"\0" + array.tobytes(order="C")).hexdigest()
 
 
 def build_robotwin_eraf_grounding_sample_indices(
