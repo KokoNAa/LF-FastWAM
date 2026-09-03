@@ -2,7 +2,10 @@ import unittest
 from pathlib import Path
 
 from scripts.collect_pgc_robotwin_pairs import collection_contract
-from scripts.prepare_pgc_robotwin_no_eraf_expert_data import build_plan
+from scripts.prepare_pgc_robotwin_no_eraf_expert_data import (
+    FULL_GOAL_INDEX,
+    build_plan,
+)
 
 
 class RoboTwinNoERAFExpertDataTest(unittest.TestCase):
@@ -63,6 +66,12 @@ class RoboTwinNoERAFExpertDataTest(unittest.TestCase):
     def test_unknown_collection_profile_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             collection_contract("full_goal", "counterfactual")
+
+    def test_full_goal_leak_check_uses_stable_dataset_relative_path(self):
+        self.assertEqual(
+            FULL_GOAL_INDEX,
+            Path("meta/pgc_robotwin_full_goal/index.json"),
+        )
 
 
 if __name__ == "__main__":

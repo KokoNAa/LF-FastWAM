@@ -4,6 +4,7 @@ set -Eeuo pipefail
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 NO_ERAF_WORK_ROOT=${NO_ERAF_WORK_ROOT:-/root/gpufree-data/pgc_robotwin_no_eraf_v1}
 NO_ERAF_EXPERT_STAGE=${NO_ERAF_EXPERT_STAGE:-formal}
+NO_ERAF_REUSE_RAW=${NO_ERAF_REUSE_RAW:-0}
 PYTHON_BIN=${PYTHON_BIN:-/opt/conda/bin/python}
 ROBOTWIN_ROOT=${ROBOTWIN_ROOT:-$PROJECT_ROOT/third_party/RoboTwin}
 
@@ -46,53 +47,61 @@ collect_split() {
   local base_seed=$5
   local raw_root=$STAGE_ROOT/expert/$profile/$task_config/raw
   local log_root=$STAGE_ROOT/logs/expert_${profile}_${task_config}
+  local reuse_raw=0
 
   if [[ -e $raw_root ]]; then
-    echo "Refusing to overwrite existing raw root: $raw_root" >&2
-    return 2
+    if [[ $NO_ERAF_REUSE_RAW != 1 ]]; then
+      echo "Refusing to overwrite existing raw root: $raw_root" >&2
+      echo "Set NO_ERAF_REUSE_RAW=1 only to validate and reuse a completed capture." >&2
+      return 2
+    fi
+    reuse_raw=1
+    echo "[robotwin-no-eraf-expert] reusing raw=$raw_root"
   fi
   mkdir -p "$log_root"
   echo "[robotwin-no-eraf-expert] profile=$profile config=$task_config episodes=$episodes"
 
-  CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" scripts/collect_pgc_robotwin_pairs.py \
-    --robotwin-root "$ROBOTWIN_ROOT" --output-root "$raw_root" \
-    --task-config "$task_config" --episodes "$episodes" \
-    --start-seed "$base_seed" --collection-profile "$collector_profile" \
-    --source-tasks place_a2b_left >"$log_root/gpu0_place_left.log" 2>&1 &
-  local p0=$!
+  if [[ $reuse_raw == 0 ]]; then
+    CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" scripts/collect_pgc_robotwin_pairs.py \
+      --robotwin-root "$ROBOTWIN_ROOT" --output-root "$raw_root" \
+      --task-config "$task_config" --episodes "$episodes" \
+      --start-seed "$base_seed" --collection-profile "$collector_profile" \
+      --source-tasks place_a2b_left >"$log_root/gpu0_place_left.log" 2>&1 &
+    local p0=$!
 
-  CUDA_VISIBLE_DEVICES=1 "$PYTHON_BIN" scripts/collect_pgc_robotwin_pairs.py \
-    --robotwin-root "$ROBOTWIN_ROOT" --output-root "$raw_root" \
-    --task-config "$task_config" --episodes "$episodes" \
-    --start-seed "$((base_seed + 1000000))" --collection-profile "$collector_profile" \
-    --source-tasks place_a2b_right >"$log_root/gpu1_place_right.log" 2>&1 &
-  local p1=$!
+    CUDA_VISIBLE_DEVICES=1 "$PYTHON_BIN" scripts/collect_pgc_robotwin_pairs.py \
+      --robotwin-root "$ROBOTWIN_ROOT" --output-root "$raw_root" \
+      --task-config "$task_config" --episodes "$episodes" \
+      --start-seed "$((base_seed + 1000000))" --collection-profile "$collector_profile" \
+      --source-tasks place_a2b_right >"$log_root/gpu1_place_right.log" 2>&1 &
+    local p1=$!
 
-  CUDA_VISIBLE_DEVICES=2 "$PYTHON_BIN" scripts/collect_pgc_robotwin_pairs.py \
-    --robotwin-root "$ROBOTWIN_ROOT" --output-root "$raw_root" \
-    --task-config "$task_config" --episodes "$episodes" \
-    --start-seed "$((base_seed + 2000000))" --collection-profile "$collector_profile" \
-    --source-tasks stack_blocks_two >"$log_root/gpu2_stack.log" 2>&1 &
-  local p2=$!
+    CUDA_VISIBLE_DEVICES=2 "$PYTHON_BIN" scripts/collect_pgc_robotwin_pairs.py \
+      --robotwin-root "$ROBOTWIN_ROOT" --output-root "$raw_root" \
+      --task-config "$task_config" --episodes "$episodes" \
+      --start-seed "$((base_seed + 2000000))" --collection-profile "$collector_profile" \
+      --source-tasks stack_blocks_two >"$log_root/gpu2_stack.log" 2>&1 &
+    local p2=$!
 
-  CUDA_VISIBLE_DEVICES=3 "$PYTHON_BIN" scripts/collect_pgc_robotwin_pairs.py \
-    --robotwin-root "$ROBOTWIN_ROOT" --output-root "$raw_root" \
-    --task-config "$task_config" --episodes "$episodes" \
-    --start-seed "$((base_seed + 3000000))" --collection-profile "$collector_profile" \
-    --source-tasks blocks_ranking_rgb place_burger_fries \
-    >"$log_root/gpu3_ranking_burger.log" 2>&1 &
-  local p3=$!
+    CUDA_VISIBLE_DEVICES=3 "$PYTHON_BIN" scripts/collect_pgc_robotwin_pairs.py \
+      --robotwin-root "$ROBOTWIN_ROOT" --output-root "$raw_root" \
+      --task-config "$task_config" --episodes "$episodes" \
+      --start-seed "$((base_seed + 3000000))" --collection-profile "$collector_profile" \
+      --source-tasks blocks_ranking_rgb place_burger_fries \
+      >"$log_root/gpu3_ranking_burger.log" 2>&1 &
+    local p3=$!
 
-  ACTIVE_PIDS=("$p0" "$p1" "$p2" "$p3")
-  local status=0
-  local pid
-  for pid in "${ACTIVE_PIDS[@]}"; do
-    wait "$pid" || status=1
-  done
-  ACTIVE_PIDS=()
-  if [[ $status -ne 0 ]]; then
-    echo "Collection failed; inspect $log_root" >&2
-    return 1
+    ACTIVE_PIDS=("$p0" "$p1" "$p2" "$p3")
+    local status=0
+    local pid
+    for pid in "${ACTIVE_PIDS[@]}"; do
+      wait "$pid" || status=1
+    done
+    ACTIVE_PIDS=()
+    if [[ $status -ne 0 ]]; then
+      echo "Collection failed; inspect $log_root" >&2
+      return 1
+    fi
   fi
 
   "$PYTHON_BIN" scripts/prepare_pgc_robotwin_no_eraf_expert_data.py \

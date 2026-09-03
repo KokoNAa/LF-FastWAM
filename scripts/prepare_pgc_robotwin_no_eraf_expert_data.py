@@ -27,10 +27,7 @@ from experiments.robotwin.pgc_data import (
     ROBOTWIN_ERAF_PAIR_IDS,
     ROBOTWIN_ERAF_PAIR_SPECS,
 )
-from fastwam.datasets.pgc_libero import (
-    PGC_ROBOTWIN_FULL_GOAL_INDEX,
-    load_pgc_entity_relation_index,
-)
+from fastwam.datasets.pgc_libero import load_pgc_entity_relation_index
 from scripts.build_pgc_robotwin_entity_relations import build_sidecar
 from scripts.collect_pgc_robotwin_pairs import collection_contract
 from scripts.convert_pgc_robotwin_to_lerobot import convert_dataset
@@ -38,6 +35,7 @@ from scripts.validate_pgc_robotwin_raw import validate_raw_dataset
 
 
 DATASET_KINDS = ("native", "counterfactual")
+FULL_GOAL_INDEX = Path("meta/pgc_robotwin_full_goal/index.json")
 PROFILES = {
     "historical": "no_eraf_historical",
     "strict": "no_eraf_strict",
@@ -224,7 +222,7 @@ def _prepare(plan: dict[str, Any]) -> dict[str, Any]:
                     dataset_root=dataset,
                     output_root=sidecar,
                 )
-            if (dataset / PGC_ROBOTWIN_FULL_GOAL_INDEX).exists():
+            if (dataset / FULL_GOAL_INDEX).exists():
                 raise ValueError(f"full-goal leaked into no-ERAF pool: {dataset}")
             index = load_pgc_entity_relation_index(sidecar)
             contract = collection_contract(collector_profile, kind)
