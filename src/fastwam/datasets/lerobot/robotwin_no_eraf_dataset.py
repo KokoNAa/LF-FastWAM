@@ -12,8 +12,11 @@ import logging
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import torch
 
+from fastwam.datasets.pgc_libero import read_jsonl
+from fastwam.datasets.robotwin_eraf_sampling import robotwin_array_sha256
 from fastwam.datasets.lerobot.robot_video_dataset import (
     RobotVideoDataset,
     build_pgc_v912_sample_plan,
@@ -123,6 +126,130 @@ def build_robotwin_no_eraf_sample_plan(
 
 class RoboTwinNoERAFFourPoolDataset(RobotVideoDataset):
     """RoboTwin action dataset with a full-goal-free four-pool sampler."""
+
+    def _validate_pgc_entity_relation_dataset_audits(
+        self, *, underlying: list[Any], combined_dataset_dirs: list[str]
+    ) -> None:
+        """Bind all four pools to RoboTwin's typed action/state hashes."""
+
+        for dataset_index, (dataset, dataset_dir) in enumerate(
+            zip(underlying, combined_dataset_dirs, strict=True)
+        ):
+            index = self.pgc_entity_relation_indices[dataset_index]
+            records = index["episodes_by_index"]
+            expected_episode_count = int(dataset.meta.total_episodes)
+            if int(index.get("episode_count", -1)) != expected_episode_count or set(
+                records
+            ) != set(range(expected_episode_count)):
+                raise ValueError(
+                    "RoboTwin no-ERAF sidecar episodes do not exactly cover "
+                    f"dataset index {dataset_index}."
+                )
+            selected_episode_ids = (
+                list(dataset.episodes)
+                if dataset.episodes is not None
+                else list(range(expected_episode_count))
+            )
+            dataset_root = Path(dataset_dir).expanduser().resolve()
+            audit_path = dataset_root / "meta/pgc_episodes.jsonl"
+            if not audit_path.is_file():
+                raise FileNotFoundError(
+                    f"RoboTwin no-ERAF episode audit is missing: {audit_path}."
+                )
+            audits = {
+                int(record["episode_index"]): dict(record)
+                for record in read_jsonl(audit_path)
+            }
+            if set(audits) != set(range(expected_episode_count)):
+                raise ValueError(
+                    "RoboTwin no-ERAF episode audit must be dense and complete "
+                    f"at dataset index {dataset_index}."
+                )
+
+            for local_episode_index, episode_index in enumerate(selected_episode_ids):
+                episode_index = int(episode_index)
+                record = records[episode_index]
+                audit = audits[episode_index]
+                episode = dataset.get_episode_data(local_episode_index)
+                if "action" not in episode:
+                    raise KeyError(
+                        "RoboTwin no-ERAF dataset has no raw action column at "
+                        f"{dataset_index}/{episode_index}."
+                    )
+                action = episode["action"]
+                if hasattr(action, "detach"):
+                    action = action.detach().cpu().numpy()
+                action = np.ascontiguousarray(np.asarray(action, dtype=np.float32))
+                expected_action_dim = int(index["action_dim"])
+                if action.ndim != 2 or action.shape[1] != expected_action_dim:
+                    raise ValueError(
+                        "RoboTwin no-ERAF actions have the wrong shape at "
+                        f"{dataset_index}/{episode_index}: {action.shape}."
+                    )
+                if int(record["frame_count"]) != int(action.shape[0]):
+                    raise ValueError(
+                        "RoboTwin no-ERAF frame/action count mismatch at "
+                        f"{dataset_index}/{episode_index}."
+                    )
+                expected_action_digest = str(record["action_sha256"])
+                if (
+                    robotwin_array_sha256(action) != expected_action_digest
+                    or str(audit.get("action_sha256", "")) != expected_action_digest
+                ):
+                    raise ValueError(
+                        "RoboTwin no-ERAF typed qpos hash does not match the "
+                        f"loaded LeRobot episode {dataset_index}/{episode_index}."
+                    )
+                if str(audit.get("pair_id", "")) != str(record.get("pair_id", "")):
+                    raise ValueError(
+                        "RoboTwin no-ERAF pair audit mismatch at "
+                        f"{dataset_index}/{episode_index}."
+                    )
+                expected_state_digest = str(record.get("initial_state_sha256", ""))
+                if expected_state_digest != str(audit.get("initial_state_sha256", "")):
+                    raise ValueError(
+                        "RoboTwin no-ERAF initial-state provenance mismatch at "
+                        f"{dataset_index}/{episode_index}."
+                    )
+                if index.get("artifact_role") == "closed_loop_native":
+                    if (
+                        index.get("state_distribution")
+                        != "immutable_base_closed_loop_replan"
+                        or not str(audit.get("capture_id", "")).strip()
+                    ):
+                        raise ValueError(
+                            "RoboTwin closed-loop native audit contract changed at "
+                            f"{dataset_index}/{episode_index}."
+                        )
+                    continue
+                state_relpath = Path(str(audit.get("source_initial_state_catalog", "")))
+                if (
+                    not str(state_relpath)
+                    or state_relpath.is_absolute()
+                    or ".." in state_relpath.parts
+                ):
+                    raise ValueError(
+                        "RoboTwin no-ERAF initial-state audit path is unsafe at "
+                        f"{dataset_index}/{episode_index}."
+                    )
+                state_path = dataset_root / state_relpath
+                if not state_path.is_file():
+                    raise FileNotFoundError(
+                        f"RoboTwin initial-state file is missing: {state_path}."
+                    )
+                if (
+                    robotwin_array_sha256(np.load(state_path, allow_pickle=False))
+                    != expected_state_digest
+                ):
+                    raise ValueError(
+                        "RoboTwin no-ERAF typed initial-state hash changed at "
+                        f"{dataset_index}/{episode_index}."
+                    )
+
+        logger.info(
+            "Validated RoboTwin no-ERAF typed action/state hashes for %d datasets.",
+            len(combined_dataset_dirs),
+        )
 
     def __init__(
         self,
