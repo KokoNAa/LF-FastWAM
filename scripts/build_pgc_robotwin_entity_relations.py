@@ -88,9 +88,12 @@ def _view_geometry(
 
 
 def _normalize_position(position: np.ndarray) -> np.ndarray:
-    value = 2.0 * (np.asarray(position, dtype=np.float32) - WORKSPACE_MIN) / (
-        WORKSPACE_MAX - WORKSPACE_MIN
-    ) - 1.0
+    value = (
+        2.0
+        * (np.asarray(position, dtype=np.float32) - WORKSPACE_MIN)
+        / (WORKSPACE_MAX - WORKSPACE_MIN)
+        - 1.0
+    )
     return np.clip(value, -1.0, 1.0).astype(np.float32)
 
 
@@ -166,7 +169,9 @@ def _role_arrays(
     reference_entity_id: int,
 ) -> dict[str, np.ndarray]:
     subject = _h5_array(handle, "pgc_entity_state/subject_position").astype(np.float32)
-    reference = _h5_array(handle, "pgc_entity_state/reference_position").astype(np.float32)
+    reference = _h5_array(handle, "pgc_entity_state/reference_position").astype(
+        np.float32
+    )
     subject_ids = _h5_array(handle, "pgc_entity_state/subject_actor_id").reshape(-1)
     reference_ids = _h5_array(handle, "pgc_entity_state/reference_actor_id").reshape(-1)
     head = _h5_array(handle, "observation/head_camera/actor_segmentation_ids")
@@ -186,8 +191,12 @@ def _role_arrays(
     goal = reference.copy()
     goal[:, 0] += -0.13 if direction == "left" else 0.13
     for frame in range(frame_count):
-        subject_mask = _mosaic_mask(head[frame], left[frame], right[frame], int(subject_ids[frame]))
-        reference_mask = _mosaic_mask(head[frame], left[frame], right[frame], int(reference_ids[frame]))
+        subject_mask = _mosaic_mask(
+            head[frame], left[frame], right[frame], int(subject_ids[frame])
+        )
+        reference_mask = _mosaic_mask(
+            head[frame], left[frame], right[frame], int(reference_ids[frame])
+        )
         subject_visible, subject_centers = _view_geometry(
             head[frame], left[frame], right[frame], int(subject_ids[frame])
         )
@@ -221,6 +230,162 @@ def _role_arrays(
     return arrays
 
 
+def _generic_role_arrays(
+    *,
+    handle: h5py.File,
+    prefix: str,
+    entity_ids: list[int],
+) -> dict[str, np.ndarray]:
+    positions = _h5_array(handle, "pgc_entity_state/entity_positions").astype(
+        np.float32
+    )
+    actor_ids = _h5_array(handle, "pgc_entity_state/entity_actor_ids").astype(np.int64)
+    entity_valid = _h5_array(handle, "pgc_entity_state/entity_valid").astype(np.bool_)
+    subject_indices = _h5_array(
+        handle, f"pgc_entity_state/{prefix}_subject_indices"
+    ).astype(np.int64)
+    reference_indices = _h5_array(
+        handle, f"pgc_entity_state/{prefix}_reference_indices"
+    ).astype(np.int64)
+    predicate_ids = _h5_array(
+        handle, f"pgc_entity_state/{prefix}_predicate_ids"
+    ).astype(np.int64)
+    goal_positions = _h5_array(
+        handle, f"pgc_entity_state/{prefix}_goal_positions"
+    ).astype(np.float32)
+    predicate_truth = _h5_array(
+        handle, f"pgc_entity_state/{prefix}_predicate_truth"
+    ).astype(np.float32)
+    clause_valid = _h5_array(handle, f"pgc_entity_state/{prefix}_clause_valid").astype(
+        np.bool_
+    )
+    head = _h5_array(handle, "observation/head_camera/actor_segmentation_ids")
+    left = _h5_array(handle, "observation/left_camera/actor_segmentation_ids")
+    right = _h5_array(handle, "observation/right_camera/actor_segmentation_ids")
+    frame_count = int(positions.shape[0])
+    expected_shapes = {
+        "positions": (frame_count, 4, 3),
+        "actor_ids": (frame_count, 4),
+        "entity_valid": (frame_count, 4),
+        "subject_indices": (frame_count, 4),
+        "reference_indices": (frame_count, 4),
+        "predicate_ids": (frame_count, 4),
+        "goal_positions": (frame_count, 4, 3),
+        "predicate_truth": (frame_count, 4),
+        "clause_valid": (frame_count, 4),
+    }
+    values = {
+        "positions": positions,
+        "actor_ids": actor_ids,
+        "entity_valid": entity_valid,
+        "subject_indices": subject_indices,
+        "reference_indices": reference_indices,
+        "predicate_ids": predicate_ids,
+        "goal_positions": goal_positions,
+        "predicate_truth": predicate_truth,
+        "clause_valid": clause_valid,
+    }
+    for name, expected in expected_shapes.items():
+        if values[name].shape != expected:
+            raise ValueError(
+                f"Raw RoboTwin {prefix} {name} has shape {values[name].shape}; "
+                f"expected {expected}."
+            )
+    arrays = _empty_arrays(frame_count)
+    for clause_index in range(4):
+        valid_frames = np.flatnonzero(clause_valid[:, clause_index])
+        if valid_frames.size == 0:
+            continue
+        if valid_frames.size != frame_count:
+            raise ValueError(
+                f"RoboTwin {prefix} clause {clause_index} validity changes by frame."
+            )
+        subject_index = int(subject_indices[0, clause_index])
+        reference_index = int(reference_indices[0, clause_index])
+        predicate_id = int(predicate_ids[0, clause_index])
+        if not (0 <= subject_index < len(entity_ids)) or not (
+            0 <= reference_index < len(entity_ids)
+        ):
+            raise ValueError(
+                f"RoboTwin {prefix} clause {clause_index} references an invalid entity."
+            )
+        if not (
+            np.all(subject_indices[:, clause_index] == subject_index)
+            and np.all(reference_indices[:, clause_index] == reference_index)
+            and np.all(predicate_ids[:, clause_index] == predicate_id)
+        ):
+            raise ValueError(
+                f"RoboTwin {prefix} clause {clause_index} semantics drift by frame."
+            )
+        if not (0 < predicate_id < len(PGC_ENTITY_RELATION_PREDICATES)):
+            raise ValueError(
+                f"RoboTwin {prefix} clause {clause_index} has predicate {predicate_id}."
+            )
+        if not (
+            np.all(entity_valid[:, subject_index])
+            and np.all(entity_valid[:, reference_index])
+        ):
+            raise ValueError(
+                f"RoboTwin {prefix} clause {clause_index} uses an invalid entity."
+            )
+        subject = positions[:, subject_index]
+        reference = positions[:, reference_index]
+        truth = predicate_truth[:, clause_index]
+        arrays["clause_valid"][:, clause_index] = True
+        arrays["predicate_ids"][:, clause_index] = predicate_id
+        arrays["subject_entity_ids"][:, clause_index] = entity_ids[subject_index]
+        arrays["reference_entity_ids"][:, clause_index] = entity_ids[reference_index]
+        arrays["predicate_truth"][:, clause_index] = truth
+        arrays["predicate_truth_valid"][:, clause_index] = True
+        arrays["phase_ids"][:, clause_index] = _phase_ids(subject, truth)
+        arrays["phase_valid"][:, clause_index] = True
+        arrays["subject_positions"][:, clause_index] = np.stack(
+            [_normalize_position(value) for value in subject]
+        )
+        arrays["reference_positions"][:, clause_index] = np.stack(
+            [_normalize_position(value) for value in reference]
+        )
+        normalized_goal = np.stack(
+            [_normalize_position(value) for value in goal_positions[:, clause_index]]
+        )
+        arrays["subject_position_valid"][:, clause_index] = True
+        arrays["reference_position_valid"][:, clause_index] = True
+        arrays["grasp_anchors"][:, clause_index] = arrays["subject_positions"][
+            :, clause_index
+        ]
+        arrays["goal_anchors"][:, clause_index] = normalized_goal
+        arrays["interaction_anchors"][:, clause_index] = normalized_goal
+        arrays["grasp_anchor_valid"][:, clause_index] = True
+        arrays["goal_anchor_valid"][:, clause_index] = True
+        arrays["interaction_anchor_valid"][:, clause_index] = True
+        for frame in range(frame_count):
+            subject_actor_id = int(actor_ids[frame, subject_index])
+            reference_actor_id = int(actor_ids[frame, reference_index])
+            subject_mask = _mosaic_mask(
+                head[frame], left[frame], right[frame], subject_actor_id
+            )
+            reference_mask = _mosaic_mask(
+                head[frame], left[frame], right[frame], reference_actor_id
+            )
+            subject_visible, subject_centers = _view_geometry(
+                head[frame], left[frame], right[frame], subject_actor_id
+            )
+            reference_visible, reference_centers = _view_geometry(
+                head[frame], left[frame], right[frame], reference_actor_id
+            )
+            arrays["subject_masks"][frame, clause_index] = subject_mask
+            arrays["reference_masks"][frame, clause_index] = reference_mask
+            arrays["subject_mask_valid"][frame, clause_index] = bool(subject_mask.any())
+            arrays["reference_mask_valid"][frame, clause_index] = bool(
+                reference_mask.any()
+            )
+            arrays["subject_view_visible"][frame, clause_index] = subject_visible
+            arrays["reference_view_visible"][frame, clause_index] = reference_visible
+            arrays["subject_view_centers"][frame, clause_index] = subject_centers
+            arrays["reference_view_centers"][frame, clause_index] = reference_centers
+    return arrays
+
+
 def build_sidecar(*, raw_root: Path, dataset_root: Path, output_root: Path) -> Path:
     records = read_jsonl(raw_root / "meta" / "pgc_episodes.jsonl")
     if not records:
@@ -231,45 +396,79 @@ def build_sidecar(*, raw_root: Path, dataset_root: Path, output_root: Path) -> P
     dataset_kind = str(provenance.get("dataset_kind", ""))
     if dataset_kind not in {"native", "counterfactual"}:
         raise ValueError(f"Invalid raw RoboTwin dataset_kind: {dataset_kind!r}.")
+    pairs = provenance.get("pairs") or []
+    if len(pairs) > 1:
+        raise ValueError("Raw RoboTwin ERAF provenance must contain at most one pair.")
+    pair = pairs[0] if pairs else {}
+    source_task = str(pair.get("source_task", ""))
+    entity_names = tuple(str(name) for name in pair.get("entity_names") or ())
+    generic_capture = bool(entity_names)
+    if generic_capture and not (1 <= len(entity_names) <= 4):
+        raise ValueError("Raw RoboTwin ERAF entity_names must contain 1..4 names.")
     output_root.mkdir(parents=True, exist_ok=True)
     episode_dir = output_root / "episodes"
     episode_dir.mkdir(parents=True, exist_ok=True)
     subject_entity_id = _entity_id("robotwin:place_a2b:subject")
     reference_entity_id = _entity_id("robotwin:place_a2b:reference")
+    entity_keys = [f"robotwin:{source_task}:{name}" for name in entity_names]
+    entity_ids = [_entity_id(key) for key in entity_keys]
     episode_records = []
     for episode_index, record in enumerate(records):
         hdf5_path = raw_root / str(record["raw_hdf5"])
-        source_direction = direction_from_task(record["source_task"])
-        target_direction = direction_from_task(record["counterfactual_task"])
         with h5py.File(hdf5_path, "r") as handle:
-            subject = _h5_array(handle, "pgc_entity_state/subject_position").astype(np.float32)
-            reference = _h5_array(handle, "pgc_entity_state/reference_position").astype(np.float32)
-            target_truth = _truth(subject, reference, target_direction)
-            phase = _phase_ids(subject, target_truth)
-            target = _role_arrays(
-                handle=handle,
-                direction=target_direction,
-                phase_ids=phase,
-                subject_entity_id=subject_entity_id,
-                reference_entity_id=reference_entity_id,
-            )
-            source = _role_arrays(
-                handle=handle,
-                direction=source_direction,
-                phase_ids=phase,
-                subject_entity_id=subject_entity_id,
-                reference_entity_id=reference_entity_id,
-            )
+            if generic_capture:
+                target = _generic_role_arrays(
+                    handle=handle,
+                    prefix="target",
+                    entity_ids=entity_ids,
+                )
+                source = _generic_role_arrays(
+                    handle=handle,
+                    prefix="source",
+                    entity_ids=entity_ids,
+                )
+                phase = target["phase_ids"]
+            else:
+                source_direction = direction_from_task(record["source_task"])
+                target_direction = direction_from_task(record["counterfactual_task"])
+                subject = _h5_array(handle, "pgc_entity_state/subject_position").astype(
+                    np.float32
+                )
+                reference = _h5_array(
+                    handle, "pgc_entity_state/reference_position"
+                ).astype(np.float32)
+                target_truth = _truth(subject, reference, target_direction)
+                phase = _phase_ids(subject, target_truth)
+                target = _role_arrays(
+                    handle=handle,
+                    direction=target_direction,
+                    phase_ids=phase,
+                    subject_entity_id=subject_entity_id,
+                    reference_entity_id=reference_entity_id,
+                )
+                source = _role_arrays(
+                    handle=handle,
+                    direction=source_direction,
+                    phase_ids=phase,
+                    subject_entity_id=subject_entity_id,
+                    reference_entity_id=reference_entity_id,
+                )
         payload = {
             **{f"target_{key}": value for key, value in target.items()},
             **{f"source_{key}": value for key, value in source.items()},
         }
-        if not bool(payload["target_subject_masks"][:, 0].any()) or not bool(
-            payload["target_reference_masks"][:, 0].any()
-        ):
-            raise ValueError(
-                f"Actor-ID supervision is empty for episode {episode_index}."
-            )
+        for role in ("source", "target"):
+            valid_clauses = np.flatnonzero(payload[f"{role}_clause_valid"][0])
+            for clause_index in valid_clauses:
+                if not bool(
+                    payload[f"{role}_subject_masks"][:, clause_index].any()
+                ) or not bool(
+                    payload[f"{role}_reference_masks"][:, clause_index].any()
+                ):
+                    raise ValueError(
+                        "Actor-ID supervision is empty for "
+                        f"episode {episode_index}, {role} clause {clause_index}."
+                    )
         output_path = episode_dir / f"episode{episode_index}.npz"
         np.savez_compressed(output_path, **payload)
         episode_records.append(
@@ -278,7 +477,7 @@ def build_sidecar(*, raw_root: Path, dataset_root: Path, output_root: Path) -> P
                 "pair_id": record["pair_id"],
                 "file": output_path.relative_to(output_root).as_posix(),
                 "sha256": _file_sha256(output_path),
-                "frame_count": int(len(phase)),
+                "frame_count": int(phase.shape[0]),
                 "state_sha256": record["initial_state_sha256"],
                 "initial_state_sha256": record["initial_state_sha256"],
                 "action_sha256": record["action_sha256"],
@@ -286,6 +485,11 @@ def build_sidecar(*, raw_root: Path, dataset_root: Path, output_root: Path) -> P
         )
     index = {
         "format": PGC_ROBOTWIN_ENTITY_RELATION_FORMAT,
+        "artifact_role": provenance.get("artifact_role", "eraf_grounding_supervision"),
+        "allowed_training_stages": list(
+            provenance.get("allowed_training_stages") or ["grounding"]
+        ),
+        "full_goal_verified": False,
         "privileged_supervision": "training_only",
         "deployment_inputs": "rgb_language_proprio",
         "dataset": str(dataset_root.resolve()),
@@ -295,10 +499,14 @@ def build_sidecar(*, raw_root: Path, dataset_root: Path, output_root: Path) -> P
         "action_dim": 14,
         "entity_id_scheme": "sha256_63bit",
         "predicate_vocabulary": list(PGC_ENTITY_RELATION_PREDICATES),
-        "entity_vocabulary": {
-            "robotwin:place_a2b:subject": subject_entity_id,
-            "robotwin:place_a2b:reference": reference_entity_id,
-        },
+        "entity_vocabulary": (
+            dict(zip(entity_keys, entity_ids))
+            if generic_capture
+            else {
+                "robotwin:place_a2b:subject": subject_entity_id,
+                "robotwin:place_a2b:reference": reference_entity_id,
+            }
+        ),
         "max_clauses": 4,
         "mask_size": list(MASK_SIZE),
         "camera_names": ["cam_high", "cam_left_wrist", "cam_right_wrist"],

@@ -534,36 +534,39 @@ class Base_Task(gym.Env):
             pkl_dic["joint_action"]["right_gripper"] = right_jointstate[-1]
             pkl_dic["joint_action"]["vector"] = np.array(left_jointstate + right_jointstate)
         if self.data_type.get("pgc_entity_state", False):
-            if not hasattr(self, "object") or not hasattr(self, "target_object"):
+            if hasattr(self, "pgc_eraf_snapshot"):
+                pkl_dic["pgc_entity_state"] = self.pgc_eraf_snapshot()
+            elif not hasattr(self, "object") or not hasattr(self, "target_object"):
                 raise ValueError(
-                    "PGC entity-state capture requires object and target_object."
+                    "PGC entity-state capture requires a pgc_eraf_snapshot hook "
+                    "or object and target_object."
                 )
+            else:
+                def scene_id(actor):
+                    entity = actor.actor
+                    value = getattr(entity, "per_scene_id", None)
+                    if value is None and hasattr(entity, "get_per_scene_id"):
+                        value = entity.get_per_scene_id()
+                    if value is None:
+                        raise RuntimeError(
+                            "SAPIEN entity does not expose a per-scene actor ID."
+                        )
+                    return int(value)
 
-            def scene_id(actor):
-                entity = actor.actor
-                value = getattr(entity, "per_scene_id", None)
-                if value is None and hasattr(entity, "get_per_scene_id"):
-                    value = entity.get_per_scene_id()
-                if value is None:
-                    raise RuntimeError(
-                        "SAPIEN entity does not expose a per-scene actor ID."
-                    )
-                return int(value)
-
-            pkl_dic["pgc_entity_state"] = {
-                "subject_position": np.asarray(
-                    self.object.get_pose().p, dtype=np.float32
-                ),
-                "reference_position": np.asarray(
-                    self.target_object.get_pose().p, dtype=np.float32
-                ),
-                "subject_actor_id": np.asarray(
-                    scene_id(self.object), dtype=np.uint32
-                ),
-                "reference_actor_id": np.asarray(
-                    scene_id(self.target_object), dtype=np.uint32
-                ),
-            }
+                pkl_dic["pgc_entity_state"] = {
+                    "subject_position": np.asarray(
+                        self.object.get_pose().p, dtype=np.float32
+                    ),
+                    "reference_position": np.asarray(
+                        self.target_object.get_pose().p, dtype=np.float32
+                    ),
+                    "subject_actor_id": np.asarray(
+                        scene_id(self.object), dtype=np.uint32
+                    ),
+                    "reference_actor_id": np.asarray(
+                        scene_id(self.target_object), dtype=np.uint32
+                    ),
+                }
         # pointcloud
         if self.data_type.get("pointcloud", False):
             pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
