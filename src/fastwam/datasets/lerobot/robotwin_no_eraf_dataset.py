@@ -15,7 +15,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
-from fastwam.datasets.pgc_libero import read_jsonl
+from fastwam.datasets.pgc_libero import (
+    build_pgc_bidirectional_language_pair_index,
+    load_pgc_episode_language_pairs,
+    read_jsonl,
+)
 from fastwam.datasets.robotwin_eraf_sampling import robotwin_array_sha256
 from fastwam.datasets.lerobot.robot_video_dataset import (
     RobotVideoDataset,
@@ -334,6 +338,45 @@ class RoboTwinNoERAFFourPoolDataset(RobotVideoDataset):
             **kwargs,
         )
 
+        # The immutable-Base closed-loop pool records the exact task wording
+        # seen during rollout. RoboTwin may paraphrase the same task with
+        # scene-specific entity names, so those audited per-episode language
+        # pairs must participate in native reverse-ranking too. The base class
+        # only loads language pairs from counterfactual datasets; merge the
+        # closed-loop provenance explicitly, while binding every pair ID back
+        # to its already validated sidecar episode.
+        closed_start = counts[0]
+        closed_end = closed_start + counts[1]
+        closed_loop_language_pair_count = 0
+        for dataset_index in range(closed_start, closed_end):
+            pairs = load_pgc_episode_language_pairs(native_dirs[dataset_index])
+            records = self.pgc_entity_relation_indices[dataset_index][
+                "episodes_by_index"
+            ]
+            if set(pairs) != set(records):
+                raise ValueError(
+                    "RoboTwin closed-loop language provenance does not exactly "
+                    f"cover sidecar episodes at dataset index {dataset_index}."
+                )
+            for episode_index, pair in pairs.items():
+                if str(pair.get("pair_id", "")) != str(
+                    records[episode_index].get("pair_id", "")
+                ):
+                    raise ValueError(
+                        "RoboTwin closed-loop language/sidecar pair mismatch at "
+                        f"{dataset_index}/{episode_index}."
+                    )
+            self.pgc_episode_language_pairs[dataset_index] = pairs
+            closed_loop_language_pair_count += len(pairs)
+        self.pgc_bidirectional_language_pairs_by_source = (
+            build_pgc_bidirectional_language_pair_index(self.pgc_episode_language_pairs)
+        )
+        logger.info(
+            "Merged %d audited closed-loop language pairs into RoboTwin "
+            "no-ERAF bidirectional supervision.",
+            closed_loop_language_pair_count,
+        )
+
         expected_roles = (
             ["offline_native"] * counts[0]
             + ["closed_loop_native"] * counts[1]
@@ -368,8 +411,6 @@ class RoboTwinNoERAFFourPoolDataset(RobotVideoDataset):
 
         underlying = self.lerobot_dataset.multi_dataset._datasets
         frame_counts = [int(dataset.num_frames) for dataset in underlying]
-        closed_start = counts[0]
-        closed_end = closed_start + counts[1]
         strict_start = sum(counts[:3])
         closed_stages: list[str] = []
         for dataset_index in range(closed_start, closed_end):
