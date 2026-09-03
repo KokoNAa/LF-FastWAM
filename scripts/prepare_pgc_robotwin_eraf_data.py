@@ -153,7 +153,10 @@ def _preflight(plan: dict[str, Any]) -> None:
             "Refusing to overwrite an existing raw capture. Choose a new "
             f"--work-root or audit and remove this exact root: {raw_root}"
         )
-    _require_modules(("h5py", "numpy", "yaml", "torch", "lerobot"))
+    # Conversion uses the repository's vendored LeRobot implementation under
+    # fastwam.datasets.lerobot; there is intentionally no top-level
+    # ``lerobot`` package requirement.
+    _require_modules(("h5py", "numpy", "yaml", "torch"))
     if not plan["skip_collection"]:
         _require_modules(("sapien",))
 
