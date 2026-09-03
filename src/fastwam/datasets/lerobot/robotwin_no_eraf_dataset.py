@@ -289,6 +289,14 @@ class RoboTwinNoERAFFourPoolDataset(RobotVideoDataset):
             raise AssertionError(
                 f"RoboTwin no-ERAF mixture is not 1:1:1:1: {group_counts}."
             )
+        # The trainer's paired-language guard names the original LIBERO
+        # four-pool contract fields. Advertise the equivalent post-build
+        # invariants here; pgc_v9_closed_loop_grounding stays false, so no
+        # ERAF module is constructed or marked active for these rows.
+        self.pgc_balance_native_counterfactual = True
+        self.pgc_v9_balanced_sampling = True
+        self.pgc_v9_phase_safe_memory = True
+        self.pgc_v9_closed_loop_native_dataset_count = counts[1]
         self.pgc_effective_native_sample_count = group_counts[0] + group_counts[1]
         self.pgc_effective_counterfactual_sample_count = (
             group_counts[2] + group_counts[3]
