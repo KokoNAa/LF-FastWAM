@@ -31,10 +31,16 @@ class RoboTwinNoERAFTrainingTest(unittest.TestCase):
                 "released_unfinished",
                 "holding",
             ],
-            strict_relation_categories=["left_right", "stack", "left_right"],
+            strict_relation_categories=[
+                "left_right",
+                "stack",
+                "left_right",
+                "stack",
+                "left_right",
+            ],
         )
-        self.assertEqual(len(indices), 20)
-        self.assertEqual([groups.count(group) for group in range(4)], [5, 5, 5, 5])
+        self.assertEqual(len(indices), 24)
+        self.assertEqual([groups.count(group) for group in range(4)], [6, 6, 6, 6])
         pools = [set(range(0, 5)), set(range(5, 9)), {9}, set(range(10, 15))]
         for index, group in zip(indices, groups, strict=True):
             self.assertIn(index, pools[group])
