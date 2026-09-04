@@ -68,8 +68,9 @@ class RoboTwinNoERAFTrainingTest(unittest.TestCase):
             "FakeDataset",
             (),
             {
+                "episodes": [1],
                 "hf_dataset": {
-                    "episode_index": [0] * CAPTURE_FRAME_COUNT,
+                    "episode_index": [1] * CAPTURE_FRAME_COUNT,
                     "frame_index": list(range(CAPTURE_FRAME_COUNT)),
                 }
             },
@@ -83,7 +84,7 @@ class RoboTwinNoERAFTrainingTest(unittest.TestCase):
                 "productive_start_count_per_episode": (
                     CAPTURE_PRODUCTIVE_START_COUNT
                 ),
-                "productive_frame_count": CAPTURE_PRODUCTIVE_START_COUNT,
+                "productive_frame_count": 2 * CAPTURE_PRODUCTIVE_START_COUNT,
                 "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
                 "episodes_by_index": {
                     0: {
@@ -96,14 +97,25 @@ class RoboTwinNoERAFTrainingTest(unittest.TestCase):
                         ),
                         "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
                         "online_stage_v2": "initial_search",
-                    }
+                    },
+                    1: {
+                        "frame_count": CAPTURE_FRAME_COUNT,
+                        "action_video_freq_ratio": (
+                            CAPTURE_ACTION_VIDEO_FREQ_RATIO
+                        ),
+                        "productive_start_count": (
+                            CAPTURE_PRODUCTIVE_START_COUNT
+                        ),
+                        "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
+                        "online_stage_v2": "holding",
+                    },
                 },
             },
             dataset_offset=10,
             action_video_freq_ratio=CAPTURE_ACTION_VIDEO_FREQ_RATIO,
         )
         self.assertEqual(productive, [10, 11, 12, 13, 14])
-        self.assertEqual(stages, ["initial_search"] * 5)
+        self.assertEqual(stages, ["holding"] * 5)
         indices, groups = build_robotwin_no_eraf_sample_plan(
             dataset_frame_counts=[3, 2, 4, 1, 2, 3],
             offline_native_dataset_count=2,

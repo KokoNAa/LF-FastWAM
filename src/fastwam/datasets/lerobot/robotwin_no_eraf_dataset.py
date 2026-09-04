@@ -162,8 +162,19 @@ def _closed_loop_productive_rows(
             productive_indices.append(int(dataset_offset) + local_index)
             productive_stages.append(stage)
 
-    if set(frames_by_episode) != set(episode_records):
-        raise ValueError("Closed-loop sidecar/dataset episode coverage differs.")
+    selected_episode_ids = (
+        [int(episode_index) for episode_index in dataset.episodes]
+        if getattr(dataset, "episodes", None) is not None
+        else list(episode_records)
+    )
+    if (
+        len(set(selected_episode_ids)) != len(selected_episode_ids)
+        or not set(selected_episode_ids).issubset(set(episode_records))
+        or set(frames_by_episode) != set(selected_episode_ids)
+    ):
+        raise ValueError(
+            "Closed-loop loaded-episode coverage is not an audited sidecar subset."
+        )
     for episode_index, frame_indices in frames_by_episode.items():
         if frame_indices != list(range(CLOSED_LOOP_CAPTURE_FRAME_COUNT)):
             raise ValueError(
@@ -171,14 +182,22 @@ def _closed_loop_productive_rows(
                 f"0..{CLOSED_LOOP_CAPTURE_FRAME_COUNT - 1}: "
                 f"episode={episode_index} frames={frame_indices}."
             )
-    expected_productive = len(episode_records) * CLOSED_LOOP_PRODUCTIVE_START_COUNT
+    expected_full_productive = (
+        len(episode_records) * CLOSED_LOOP_PRODUCTIVE_START_COUNT
+    )
+    expected_selected_productive = (
+        len(selected_episode_ids) * CLOSED_LOOP_PRODUCTIVE_START_COUNT
+    )
     if (
-        len(productive_indices) != expected_productive
-        or int(index.get("productive_frame_count", -1)) != expected_productive
+        len(productive_indices) != expected_selected_productive
+        or int(index.get("productive_frame_count", -1))
+        != expected_full_productive
     ):
         raise ValueError(
             "Closed-loop productive-row count changed: "
-            f"selected={len(productive_indices)} expected={expected_productive}."
+            f"selected={len(productive_indices)} "
+            f"expected_selected={expected_selected_productive} "
+            f"expected_full={expected_full_productive}."
         )
     return productive_indices, productive_stages
 
