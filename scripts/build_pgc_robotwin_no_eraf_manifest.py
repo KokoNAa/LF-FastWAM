@@ -16,11 +16,19 @@ for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
+from experiments.robotwin.closed_loop_capture import (
+    CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+    CAPTURE_FORMAT,
+    CAPTURE_FRAME_COUNT,
+    CAPTURE_PRODUCTIVE_START_COUNT,
+    CAPTURE_STATE_DISTRIBUTION,
+    CAPTURE_TEMPORAL_CONTRACT,
+)
 from experiments.robotwin.pgc_data import ROBOTWIN_ERAF_PAIR_IDS
 from fastwam.datasets.pgc_libero import load_pgc_entity_relation_index
 
 
-MANIFEST_FORMAT = "pgc_robotwin_no_eraf_four_pool_v1"
+MANIFEST_FORMAT = "pgc_robotwin_no_eraf_four_pool_v2"
 POOL_ORDER = (
     "offline_native",
     "closed_loop_native",
@@ -89,20 +97,47 @@ def _closed_loop_entry(dataset: Path, sidecar: Path) -> dict[str, Any]:
     dataset = dataset.expanduser().resolve()
     sidecar = sidecar.expanduser().resolve()
     index = _load_json(dataset / CLOSED_LOOP_INDEX)
+    expected = {
+        "format": "pgc_robotwin_closed_loop_native_v2",
+        "complete": True,
+        "state_distribution": CAPTURE_STATE_DISTRIBUTION,
+        "full_goal_usage": "forbidden_not_present",
+        "capture_format": CAPTURE_FORMAT,
+        "capture_frame_count": CAPTURE_FRAME_COUNT,
+        "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+        "productive_start_count_per_episode": CAPTURE_PRODUCTIVE_START_COUNT,
+        "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
+    }
+    mismatches = {
+        key: (index.get(key), value)
+        for key, value in expected.items()
+        if index.get(key) != value
+    }
+    episode_count = int(index.get("episode_count", 0))
+    frame_count = int(index.get("frame_count", 0))
+    productive_frame_count = int(index.get("productive_frame_count", 0))
     if (
-        index.get("format") != "pgc_robotwin_closed_loop_native_v1"
-        or index.get("complete") is not True
-        or index.get("state_distribution") != "immutable_base_closed_loop_replan"
-        or index.get("full_goal_usage") != "forbidden_not_present"
+        mismatches
+        or episode_count <= 0
+        or frame_count != episode_count * CAPTURE_FRAME_COUNT
+        or productive_frame_count
+        != episode_count * CAPTURE_PRODUCTIVE_START_COUNT
     ):
         raise ValueError(
-            f"Invalid closed-loop native index: {dataset / CLOSED_LOOP_INDEX}."
+            "Invalid/productively unusable closed-loop native index: "
+            f"{dataset / CLOSED_LOOP_INDEX}; mismatches={mismatches}."
         )
     return {
         "dataset": str(dataset),
         "sidecar": str(sidecar),
-        "episodes": int(index["episode_count"]),
-        "frames": int(index["frame_count"]),
+        "episodes": episode_count,
+        "frames": frame_count,
+        "productive_frames": productive_frame_count,
+        "capture_format": CAPTURE_FORMAT,
+        "capture_frame_count": CAPTURE_FRAME_COUNT,
+        "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+        "productive_start_count_per_episode": CAPTURE_PRODUCTIVE_START_COUNT,
+        "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
         "stage_counts": dict(index.get("stage_counts") or {}),
         "dataset_kind": "native",
         "artifact_role": "closed_loop_native",
@@ -202,6 +237,36 @@ def load_no_eraf_manifest(path: Path, *, verify_files: bool = True) -> dict[str,
                 )
             if int(entry.get("episodes", 0)) <= 0:
                 raise ValueError(f"No episodes in no-ERAF pool {pool}: {dataset}.")
+            if pool == "closed_loop_native":
+                expected_temporal = {
+                    "capture_format": CAPTURE_FORMAT,
+                    "capture_frame_count": CAPTURE_FRAME_COUNT,
+                    "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+                    "productive_start_count_per_episode": (
+                        CAPTURE_PRODUCTIVE_START_COUNT
+                    ),
+                    "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
+                }
+                temporal_mismatches = {
+                    key: (entry.get(key), value)
+                    for key, value in expected_temporal.items()
+                    if entry.get(key) != value
+                }
+                expected_frames = int(entry["episodes"]) * CAPTURE_FRAME_COUNT
+                expected_productive = (
+                    int(entry["episodes"]) * CAPTURE_PRODUCTIVE_START_COUNT
+                )
+                if (
+                    temporal_mismatches
+                    or int(entry.get("frames", 0)) != expected_frames
+                    or int(entry.get("productive_frames", 0))
+                    != expected_productive
+                ):
+                    raise ValueError(
+                        "Closed-loop native entry violates the productive "
+                        f"temporal contract: {dataset}; "
+                        f"mismatches={temporal_mismatches}."
+                    )
             if verify_files:
                 if not dataset.is_dir():
                     raise FileNotFoundError(f"no-ERAF dataset not found: {dataset}.")
@@ -217,6 +282,25 @@ def load_no_eraf_manifest(path: Path, *, verify_files: bool = True) -> dict[str,
                     raise ValueError(
                         f"Dataset provenance mismatch in {pool}: {dataset}."
                     )
+                if pool == "closed_loop_native":
+                    expected_temporal = {
+                        "capture_format": CAPTURE_FORMAT,
+                        "capture_frame_count": CAPTURE_FRAME_COUNT,
+                        "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+                        "productive_start_count_per_episode": (
+                            CAPTURE_PRODUCTIVE_START_COUNT
+                        ),
+                        "productive_frame_count": int(entry["productive_frames"]),
+                        "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
+                    }
+                    if any(
+                        provenance.get(key) != value
+                        for key, value in expected_temporal.items()
+                    ):
+                        raise ValueError(
+                            "Closed-loop native provenance violates the "
+                            f"productive temporal contract: {dataset}."
+                        )
                 index = load_pgc_entity_relation_index(sidecar)
                 if (
                     Path(str(index["dataset"])).resolve() != dataset
@@ -231,11 +315,25 @@ def load_no_eraf_manifest(path: Path, *, verify_files: bool = True) -> dict[str,
                     raise ValueError(f"Sidecar contract mismatch in {pool}: {sidecar}.")
                 if (
                     pool == "closed_loop_native"
-                    and index.get("state_distribution")
-                    != "immutable_base_closed_loop_replan"
+                    and (
+                        index.get("state_distribution")
+                        != CAPTURE_STATE_DISTRIBUTION
+                        or index.get("capture_format") != CAPTURE_FORMAT
+                        or int(index.get("capture_frame_count", -1))
+                        != CAPTURE_FRAME_COUNT
+                        or int(index.get("action_video_freq_ratio", -1))
+                        != CAPTURE_ACTION_VIDEO_FREQ_RATIO
+                        or int(index.get("productive_start_count_per_episode", -1))
+                        != CAPTURE_PRODUCTIVE_START_COUNT
+                        or int(index.get("productive_frame_count", -1))
+                        != int(entry["productive_frames"])
+                        or index.get("temporal_contract")
+                        != CAPTURE_TEMPORAL_CONTRACT
+                    )
                 ):
                     raise ValueError(
-                        "Closed-loop native sidecar has wrong state distribution."
+                        "Closed-loop native sidecar has an invalid productive "
+                        "temporal contract."
                     )
                 pair_ids[pool].update(_entry_pair_ids(index))
             else:
@@ -305,7 +403,7 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "format": "pgc_robotwin_no_eraf_four_pool_ready_v1",
+                "format": "pgc_robotwin_no_eraf_four_pool_ready_v2",
                 "complete": True,
                 **validated,
             },

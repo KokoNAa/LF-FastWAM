@@ -32,8 +32,8 @@ run_config() {
   local task_config=$1
   local episodes=$2
   local eval_seed=$3
-  local run_tag="robotwin_v939_closed_loop_native_${CLOSED_LOOP_STAGE}_${task_config}_seed${eval_seed}"
-  echo "[robotwin-closed-loop-native] config=$task_config episodes=$episodes seed=$eval_seed"
+  local run_tag="robotwin_v939_closed_loop_native_temporal_v2_${CLOSED_LOOP_STAGE}_${task_config}_seed${eval_seed}"
+  echo "[robotwin-closed-loop-native] config=$task_config episodes=$episodes seed=$eval_seed capture_frames=9 video_stride=4 productive_starts=5"
   PGC_ROBOTWIN_CLOSED_LOOP_CAPTURE_DIR="$CAPTURE_ROOT" \
   PGC_ROBOTWIN_CLOSED_LOOP_CAPTURE_STRIDE_REPLANS=1 \
   PGC_ROBOTWIN_CLOSED_LOOP_CAPTURE_MAX_STATES_PER_EPISODE=12 \

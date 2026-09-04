@@ -21,8 +21,12 @@ for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 
 from experiments.robotwin.closed_loop_capture import (
     ALLOWED_STAGES,
+    CAPTURE_ACTION_VIDEO_FREQ_RATIO,
     CAPTURE_FORMAT,
+    CAPTURE_FRAME_COUNT,
+    CAPTURE_PRODUCTIVE_START_COUNT,
     CAPTURE_STATE_DISTRIBUTION,
+    CAPTURE_TEMPORAL_CONTRACT,
 )
 from experiments.robotwin.pgc_data import (
     ROBOTWIN_ERAF_PAIR_SPECS,
@@ -107,7 +111,10 @@ def _load_records(
             "full_goal_verified": False,
             "condition": "correct",
             "instruction_goal": "source",
-            "frame_count": 2,
+            "frame_count": CAPTURE_FRAME_COUNT,
+            "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+            "productive_start_count": CAPTURE_PRODUCTIVE_START_COUNT,
+            "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
         }
         mismatches = {
             key: (record.get(key), expected)
@@ -137,9 +144,16 @@ def _load_records(
         with np.load(capture_file, allow_pickle=False) as payload:
             arrays = {key: np.asarray(payload[key]).copy() for key in payload.files}
         for name in ("state", "action", "scene_state"):
-            if arrays.get(name, np.empty(0)).shape[0] != 2:
-                raise ValueError(f"Closed-loop {name} is not a two-frame segment: {path}.")
-        if arrays["state"].shape != (2, 14) or arrays["action"].shape != (2, 14):
+            if arrays.get(name, np.empty(0)).shape[0] != CAPTURE_FRAME_COUNT:
+                raise ValueError(
+                    f"Closed-loop {name} does not contain "
+                    f"{CAPTURE_FRAME_COUNT} frames: {path}."
+                )
+        expected_qpos_shape = (CAPTURE_FRAME_COUNT, 14)
+        if (
+            arrays["state"].shape != expected_qpos_shape
+            or arrays["action"].shape != expected_qpos_shape
+        ):
             raise ValueError(f"Closed-loop qpos/action shape mismatch: {path}.")
         if array_sha256(arrays["scene_state"]) != str(record["state_sha256"]):
             raise ValueError(f"Closed-loop state hash changed: {path}.")
@@ -225,7 +239,12 @@ def _clauses(record: Mapping[str, Any], prefix: str) -> list[dict[str, Any]]:
 def _role_arrays(record: Mapping[str, Any], prefix: str) -> dict[str, np.ndarray]:
     spec = pair_spec_from_source_task(str(record["source_task"]))
     captured = record["arrays"]
-    frame_count = 2
+    frame_count = int(np.asarray(captured["state"]).shape[0])
+    if frame_count != CAPTURE_FRAME_COUNT:
+        raise ValueError(
+            f"Closed-loop sidecar expected {CAPTURE_FRAME_COUNT} frames, "
+            f"got {frame_count}."
+        )
     positions = np.asarray(captured["snapshot_entity_positions"], dtype=np.float32)
     actor_ids = np.asarray(captured["snapshot_entity_actor_ids"], dtype=np.uint32)
     entity_valid = np.asarray(captured["snapshot_entity_valid"], dtype=np.bool_)
@@ -361,10 +380,20 @@ def build_dataset(
         for spec in ROBOTWIN_ERAF_PAIR_SPECS
         for name in spec.entity_names
     }
+    total_frames = 0
+    total_productive_starts = 0
     for episode_index, record in enumerate(records):
         captured = record["arrays"]
+        frame_count = int(np.asarray(captured["state"]).shape[0])
+        productive_start_count = frame_count - CAPTURE_ACTION_VIDEO_FREQ_RATIO
+        if productive_start_count != CAPTURE_PRODUCTIVE_START_COUNT:
+            raise ValueError(
+                "Closed-loop segment does not satisfy the productive temporal "
+                f"contract: frames={frame_count} ratio="
+                f"{CAPTURE_ACTION_VIDEO_FREQ_RATIO}."
+            )
         instruction = str(record["source_instruction"])
-        for frame in range(2):
+        for frame in range(frame_count):
             dataset.add_frame(
                 {
                     "observation.images.cam_high": captured["head_rgb"][frame],
@@ -393,7 +422,10 @@ def build_dataset(
                 "pair_id": str(record["training_pair_id"]),
                 "file": relpath.as_posix(),
                 "sha256": _file_sha256(episode_path),
-                "frame_count": 2,
+                "frame_count": frame_count,
+                "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+                "productive_start_count": productive_start_count,
+                "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
                 "state_sha256": str(record["state_sha256"]),
                 "initial_state_sha256": str(record["state_sha256"]),
                 "action_sha256": str(record["action_sha256"]),
@@ -415,10 +447,15 @@ def build_dataset(
                 "online_stage_v2": str(record["online_stage_v2"]),
                 "initial_state_sha256": str(record["state_sha256"]),
                 "action_sha256": str(record["action_sha256"]),
-                "action_count": 2,
+                "action_count": frame_count,
+                "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+                "productive_start_count": productive_start_count,
+                "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
             }
         )
         stage_counts[str(record["online_stage_v2"])] += 1
+        total_frames += frame_count
+        total_productive_starts += productive_start_count
 
     task_ids = {
         spec.source_task: index for index, spec in enumerate(ROBOTWIN_ERAF_PAIR_SPECS)
@@ -451,6 +488,12 @@ def build_dataset(
         "state_distribution": CAPTURE_STATE_DISTRIBUTION,
         "rollout_policy": "immutable_released_base",
         "action_integrity": "selected_equals_immutable_base_exact",
+        "capture_format": CAPTURE_FORMAT,
+        "capture_frame_count": CAPTURE_FRAME_COUNT,
+        "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+        "productive_start_count_per_episode": CAPTURE_PRODUCTIVE_START_COUNT,
+        "productive_frame_count": total_productive_starts,
+        "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
         "task_configs": list(task_configs),
         "successful_episode_count": len(audits),
         "pairs": pairs,
@@ -464,10 +507,18 @@ def build_dataset(
     (output / DATA_INDEX).write_text(
         json.dumps(
             {
-                "format": "pgc_robotwin_closed_loop_native_v1",
+                "format": "pgc_robotwin_closed_loop_native_v2",
                 "complete": True,
                 "episode_count": len(audits),
-                "frame_count": 2 * len(audits),
+                "frame_count": total_frames,
+                "productive_frame_count": total_productive_starts,
+                "capture_format": CAPTURE_FORMAT,
+                "capture_frame_count": CAPTURE_FRAME_COUNT,
+                "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+                "productive_start_count_per_episode": (
+                    CAPTURE_PRODUCTIVE_START_COUNT
+                ),
+                "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
                 "stage_counts": dict(stage_counts),
                 "state_distribution": CAPTURE_STATE_DISTRIBUTION,
                 "full_goal_usage": "forbidden_not_present",
@@ -503,6 +554,12 @@ def build_dataset(
         "workspace_min": WORKSPACE_MIN.tolist(),
         "workspace_max": WORKSPACE_MAX.tolist(),
         "episode_count": len(episode_records),
+        "capture_format": CAPTURE_FORMAT,
+        "capture_frame_count": CAPTURE_FRAME_COUNT,
+        "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+        "productive_start_count_per_episode": CAPTURE_PRODUCTIVE_START_COUNT,
+        "productive_frame_count": total_productive_starts,
+        "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
         "stage_counts": dict(stage_counts),
         "episodes": episode_records,
     }
@@ -513,12 +570,18 @@ def build_dataset(
     if (output / FULL_GOAL_INDEX).exists():
         raise ValueError("full-goal leaked into closed-loop-native output.")
     return {
-        "format": "pgc_robotwin_closed_loop_native_ready_v1",
+        "format": "pgc_robotwin_closed_loop_native_ready_v2",
         "complete": True,
         "dataset": str(output),
         "sidecar": str(sidecar),
         "episodes": len(audits),
-        "frames": 2 * len(audits),
+        "frames": total_frames,
+        "productive_frames": total_productive_starts,
+        "capture_format": CAPTURE_FORMAT,
+        "capture_frame_count": CAPTURE_FRAME_COUNT,
+        "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+        "productive_start_count_per_episode": CAPTURE_PRODUCTIVE_START_COUNT,
+        "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
         "stage_counts": dict(stage_counts),
         "state_distribution": CAPTURE_STATE_DISTRIBUTION,
         "full_goal_verified": False,

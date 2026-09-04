@@ -12,8 +12,16 @@ import numpy as np
 from experiments.robotwin.pgc_data import array_sha256, scene_state_vector
 
 
-CAPTURE_FORMAT = "pgc_robotwin_closed_loop_native_capture_v1"
+CAPTURE_FORMAT = "pgc_robotwin_closed_loop_native_capture_v2"
 CAPTURE_STATE_DISTRIBUTION = "immutable_base_closed_loop_replan"
+CAPTURE_FRAME_COUNT = 9
+CAPTURE_ACTION_VIDEO_FREQ_RATIO = 4
+CAPTURE_PRODUCTIVE_START_COUNT = (
+    CAPTURE_FRAME_COUNT - CAPTURE_ACTION_VIDEO_FREQ_RATIO
+)
+CAPTURE_TEMPORAL_CONTRACT = (
+    "contiguous_pre_action_qpos_stride1_with_realized_video_at_t_plus_4"
+)
 ALLOWED_STAGES = (
     "initial_search",
     "holding",
@@ -128,8 +136,11 @@ def write_capture_segment(
 ) -> Path:
     if online_stage not in ALLOWED_STAGES:
         raise ValueError(f"Unsupported RoboTwin online stage: {online_stage!r}.")
-    if len(frames) != 2:
-        raise ValueError("A closed-loop capture segment must contain exactly two frames.")
+    if len(frames) != CAPTURE_FRAME_COUNT:
+        raise ValueError(
+            "A closed-loop capture segment must contain exactly "
+            f"{CAPTURE_FRAME_COUNT} frames, got {len(frames)}."
+        )
     task_name = str(metadata["source_task"])
     task_config = str(metadata["task_config"])
     scene_seed = int(metadata["scene_seed"])
@@ -151,6 +162,10 @@ def write_capture_segment(
         "replan_index": int(replan_index),
         "online_stage_v2": online_stage,
         "policy_instruction": str(metadata["policy_instruction"]),
+        "frame_count": CAPTURE_FRAME_COUNT,
+        "action_video_freq_ratio": CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+        "productive_start_count": CAPTURE_PRODUCTIVE_START_COUNT,
+        "temporal_contract": CAPTURE_TEMPORAL_CONTRACT,
         "state_sha256": state_digest,
         "action_sha256": action_digest,
     }
@@ -189,7 +204,6 @@ def write_capture_segment(
         "capture_id": capture_id,
         "capture_file": array_path.name,
         "capture_file_sha256": _file_sha256(array_path),
-        "frame_count": 2,
         "rollout_policy": "immutable_released_base",
         "action_integrity": "selected_equals_immutable_base_exact",
         "state_distribution": CAPTURE_STATE_DISTRIBUTION,

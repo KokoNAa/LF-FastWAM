@@ -6,7 +6,11 @@ from pathlib import Path
 import numpy as np
 
 from experiments.robotwin.closed_loop_capture import (
+    CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+    CAPTURE_FRAME_COUNT,
+    CAPTURE_PRODUCTIVE_START_COUNT,
     CAPTURE_STATE_DISTRIBUTION,
+    CAPTURE_TEMPORAL_CONTRACT,
     capture_frame,
     classify_online_stage,
     write_capture_segment,
@@ -100,12 +104,18 @@ class RoboTwinClosedLoopNativeTest(unittest.TestCase):
         self.assertFalse(hasattr(task, "_pgc_native_check_success"))
         self.assertTrue(callable(task.pgc_eraf_snapshot))
 
-    def test_capture_writes_two_frame_base_segment_without_full_goal(self):
+    def test_capture_writes_productive_base_segment_without_full_goal(self):
         task = install_pgc_observation_contract(
             _PlaceTask(), pair_spec_from_source_task("place_a2b_left")
         )
-        first = capture_frame(task, _observation(), np.zeros(14, dtype=np.float32))
-        second = capture_frame(task, _observation(), np.ones(14, dtype=np.float32))
+        frames = tuple(
+            capture_frame(
+                task,
+                _observation(),
+                np.full(14, frame_index, dtype=np.float32),
+            )
+            for frame_index in range(CAPTURE_FRAME_COUNT)
+        )
         metadata = {
             "pair_id": "place_a2b_left_to_right",
             "source_task": "place_a2b_left",
@@ -126,25 +136,44 @@ class RoboTwinClosedLoopNativeTest(unittest.TestCase):
                 metadata=metadata,
                 replan_index=0,
                 online_stage="initial_search",
-                frames=(first, second),
+                frames=frames,
             )
             record = json.loads(record_path.read_text(encoding="utf-8"))
-            self.assertEqual(record["frame_count"], 2)
+            self.assertEqual(record["frame_count"], CAPTURE_FRAME_COUNT)
+            self.assertEqual(
+                record["action_video_freq_ratio"],
+                CAPTURE_ACTION_VIDEO_FREQ_RATIO,
+            )
+            self.assertEqual(
+                record["productive_start_count"], CAPTURE_PRODUCTIVE_START_COUNT
+            )
+            self.assertEqual(record["temporal_contract"], CAPTURE_TEMPORAL_CONTRACT)
             self.assertEqual(record["artifact_role"], "closed_loop_native")
             self.assertEqual(record["state_distribution"], CAPTURE_STATE_DISTRIBUTION)
             self.assertFalse(record["full_goal_verified"])
             self.assertNotIn("full_goal", record["allowed_training_stages"])
             with np.load(record_path.parent / record["capture_file"]) as payload:
-                self.assertEqual(payload["action"].shape, (2, 14))
-                self.assertEqual(payload["head_actor_ids"].shape, (2, 16, 20))
+                self.assertEqual(payload["action"].shape, (CAPTURE_FRAME_COUNT, 14))
+                self.assertEqual(
+                    payload["head_actor_ids"].shape,
+                    (CAPTURE_FRAME_COUNT, 16, 20),
+                )
             replay_path = write_capture_segment(
                 capture_root=Path(temp_dir),
                 metadata=metadata,
                 replan_index=0,
                 online_stage="initial_search",
-                frames=(first, second),
+                frames=frames,
             )
             self.assertEqual(replay_path, record_path)
+            with self.assertRaisesRegex(ValueError, "exactly 9 frames"):
+                write_capture_segment(
+                    capture_root=Path(temp_dir),
+                    metadata=metadata,
+                    replan_index=1,
+                    online_stage="initial_search",
+                    frames=frames[:2],
+                )
 
     def test_stage_classifier_covers_holding_and_release(self):
         task = install_pgc_observation_contract(

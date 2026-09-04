@@ -42,6 +42,13 @@ ALLOWED_CLOSED_LOOP_STAGES = {
     "released_unfinished",
     "next_clause_search",
 }
+CLOSED_LOOP_CAPTURE_FORMAT = "pgc_robotwin_closed_loop_native_capture_v2"
+CLOSED_LOOP_CAPTURE_FRAME_COUNT = 9
+CLOSED_LOOP_ACTION_VIDEO_FREQ_RATIO = 4
+CLOSED_LOOP_PRODUCTIVE_START_COUNT = 5
+CLOSED_LOOP_TEMPORAL_CONTRACT = (
+    "contiguous_pre_action_qpos_stride1_with_realized_video_at_t_plus_4"
+)
 
 
 def _frame_ranges(frame_counts: Sequence[int]) -> list[list[int]]:
@@ -79,6 +86,103 @@ def _frame_categories(
     return categories
 
 
+def _scalar_int(value: Any) -> int:
+    return int(torch.as_tensor(value).reshape(-1)[0].item())
+
+
+def _closed_loop_productive_rows(
+    *,
+    dataset: Any,
+    index: Mapping[str, Any],
+    dataset_offset: int,
+    action_video_freq_ratio: int,
+) -> tuple[list[int], list[str]]:
+    """Return only starts with a realized observation at video offset ``t+4``."""
+
+    expected_index = {
+        "capture_format": CLOSED_LOOP_CAPTURE_FORMAT,
+        "capture_frame_count": CLOSED_LOOP_CAPTURE_FRAME_COUNT,
+        "action_video_freq_ratio": CLOSED_LOOP_ACTION_VIDEO_FREQ_RATIO,
+        "productive_start_count_per_episode": CLOSED_LOOP_PRODUCTIVE_START_COUNT,
+        "temporal_contract": CLOSED_LOOP_TEMPORAL_CONTRACT,
+    }
+    mismatches = {
+        key: (index.get(key), expected)
+        for key, expected in expected_index.items()
+        if index.get(key) != expected
+    }
+    if int(action_video_freq_ratio) != CLOSED_LOOP_ACTION_VIDEO_FREQ_RATIO:
+        mismatches["training_action_video_freq_ratio"] = (
+            int(action_video_freq_ratio),
+            CLOSED_LOOP_ACTION_VIDEO_FREQ_RATIO,
+        )
+    if mismatches:
+        raise ValueError(
+            "RoboTwin closed-loop native temporal contract mismatch: "
+            f"{mismatches}."
+        )
+
+    episode_records = index["episodes_by_index"]
+    raw_episode_indices = dataset.hf_dataset["episode_index"]
+    raw_frame_indices = dataset.hf_dataset["frame_index"]
+    if len(raw_episode_indices) != len(raw_frame_indices):
+        raise ValueError("Closed-loop episode/frame columns have different lengths.")
+
+    frames_by_episode: dict[int, list[int]] = {}
+    productive_indices: list[int] = []
+    productive_stages: list[str] = []
+    for local_index, (raw_episode_index, raw_frame_index) in enumerate(
+        zip(raw_episode_indices, raw_frame_indices, strict=True)
+    ):
+        episode_index = _scalar_int(raw_episode_index)
+        frame_index = _scalar_int(raw_frame_index)
+        try:
+            record = episode_records[episode_index]
+        except KeyError as exc:
+            raise KeyError(
+                "Closed-loop sidecar does not cover dataset episode "
+                f"{episode_index}."
+            ) from exc
+        record_expected = {
+            "frame_count": CLOSED_LOOP_CAPTURE_FRAME_COUNT,
+            "action_video_freq_ratio": CLOSED_LOOP_ACTION_VIDEO_FREQ_RATIO,
+            "productive_start_count": CLOSED_LOOP_PRODUCTIVE_START_COUNT,
+            "temporal_contract": CLOSED_LOOP_TEMPORAL_CONTRACT,
+        }
+        if any(record.get(key) != value for key, value in record_expected.items()):
+            raise ValueError(
+                "Closed-loop episode violates the productive temporal contract: "
+                f"episode={episode_index}."
+            )
+        stage = str(record.get("online_stage_v2", "")).strip()
+        if stage not in ALLOWED_CLOSED_LOOP_STAGES:
+            raise ValueError(f"Unsupported closed-loop online stage {stage!r}.")
+        frames_by_episode.setdefault(episode_index, []).append(frame_index)
+        if frame_index < CLOSED_LOOP_PRODUCTIVE_START_COUNT:
+            productive_indices.append(int(dataset_offset) + local_index)
+            productive_stages.append(stage)
+
+    if set(frames_by_episode) != set(episode_records):
+        raise ValueError("Closed-loop sidecar/dataset episode coverage differs.")
+    for episode_index, frame_indices in frames_by_episode.items():
+        if frame_indices != list(range(CLOSED_LOOP_CAPTURE_FRAME_COUNT)):
+            raise ValueError(
+                "Closed-loop episode must contain dense ordered frame indices "
+                f"0..{CLOSED_LOOP_CAPTURE_FRAME_COUNT - 1}: "
+                f"episode={episode_index} frames={frame_indices}."
+            )
+    expected_productive = len(episode_records) * CLOSED_LOOP_PRODUCTIVE_START_COUNT
+    if (
+        len(productive_indices) != expected_productive
+        or int(index.get("productive_frame_count", -1)) != expected_productive
+    ):
+        raise ValueError(
+            "Closed-loop productive-row count changed: "
+            f"selected={len(productive_indices)} expected={expected_productive}."
+        )
+    return productive_indices, productive_stages
+
+
 def build_robotwin_no_eraf_sample_plan(
     *,
     dataset_frame_counts: Sequence[int],
@@ -86,6 +190,7 @@ def build_robotwin_no_eraf_sample_plan(
     closed_loop_native_dataset_count: int,
     historical_cf_dataset_count: int,
     strict_cf_dataset_count: int,
+    closed_loop_productive_indices: Sequence[int],
     closed_loop_stage_categories: Sequence[str],
     strict_relation_categories: Sequence[str],
 ) -> tuple[list[int], list[int]]:
@@ -112,8 +217,18 @@ def build_robotwin_no_eraf_sample_plan(
             [index for group in ranges[cursor : cursor + count] for index in group]
         )
         cursor += count
-    if len(closed_loop_stage_categories) != len(pool_indices[1]):
-        raise ValueError("Closed-loop stage labels do not cover every frame.")
+    closed_loop_productive = [int(index) for index in closed_loop_productive_indices]
+    if not closed_loop_productive or len(set(closed_loop_productive)) != len(
+        closed_loop_productive
+    ):
+        raise ValueError("Closed-loop productive starts must be non-empty and unique.")
+    if not set(closed_loop_productive).issubset(set(pool_indices[1])):
+        raise ValueError(
+            "Closed-loop productive starts must stay inside the declared pool."
+        )
+    pool_indices[1] = closed_loop_productive
+    if len(closed_loop_stage_categories) != len(closed_loop_productive):
+        raise ValueError("Closed-loop stage labels do not cover productive starts.")
     if len(strict_relation_categories) != len(pool_indices[3]):
         raise ValueError("Strict relation labels do not cover every frame.")
     return build_pgc_v912_sample_plan(
@@ -220,6 +335,22 @@ class RoboTwinNoERAFFourPoolDataset(RobotVideoDataset):
                         index.get("state_distribution")
                         != "immutable_base_closed_loop_replan"
                         or not str(audit.get("capture_id", "")).strip()
+                        or int(record.get("frame_count", -1))
+                        != CLOSED_LOOP_CAPTURE_FRAME_COUNT
+                        or int(record.get("action_video_freq_ratio", -1))
+                        != CLOSED_LOOP_ACTION_VIDEO_FREQ_RATIO
+                        or int(record.get("productive_start_count", -1))
+                        != CLOSED_LOOP_PRODUCTIVE_START_COUNT
+                        or record.get("temporal_contract")
+                        != CLOSED_LOOP_TEMPORAL_CONTRACT
+                        or int(audit.get("action_count", -1))
+                        != CLOSED_LOOP_CAPTURE_FRAME_COUNT
+                        or int(audit.get("action_video_freq_ratio", -1))
+                        != CLOSED_LOOP_ACTION_VIDEO_FREQ_RATIO
+                        or int(audit.get("productive_start_count", -1))
+                        != CLOSED_LOOP_PRODUCTIVE_START_COUNT
+                        or audit.get("temporal_contract")
+                        != CLOSED_LOOP_TEMPORAL_CONTRACT
                     ):
                         raise ValueError(
                             "RoboTwin closed-loop native audit contract changed at "
@@ -404,26 +535,44 @@ class RoboTwinNoERAFFourPoolDataset(RobotVideoDataset):
                 )
             if (
                 expected_role == "closed_loop_native"
-                and index.get("state_distribution")
-                != "immutable_base_closed_loop_replan"
+                and (
+                    index.get("state_distribution")
+                    != "immutable_base_closed_loop_replan"
+                    or index.get("capture_format")
+                    != CLOSED_LOOP_CAPTURE_FORMAT
+                    or int(index.get("capture_frame_count", -1))
+                    != CLOSED_LOOP_CAPTURE_FRAME_COUNT
+                    or int(index.get("action_video_freq_ratio", -1))
+                    != CLOSED_LOOP_ACTION_VIDEO_FREQ_RATIO
+                    or int(index.get("productive_start_count_per_episode", -1))
+                    != CLOSED_LOOP_PRODUCTIVE_START_COUNT
+                    or index.get("temporal_contract")
+                    != CLOSED_LOOP_TEMPORAL_CONTRACT
+                )
             ):
-                raise ValueError("Closed-loop native state distribution is invalid.")
+                raise ValueError(
+                    "Closed-loop native productive temporal contract is invalid."
+                )
 
         underlying = self.lerobot_dataset.multi_dataset._datasets
         frame_counts = [int(dataset.num_frames) for dataset in underlying]
+        dataset_offsets: list[int] = []
+        offset = 0
+        for frame_count in frame_counts:
+            dataset_offsets.append(offset)
+            offset += frame_count
         strict_start = sum(counts[:3])
+        closed_productive_indices: list[int] = []
         closed_stages: list[str] = []
         for dataset_index in range(closed_start, closed_end):
-            closed_stages.extend(
-                _frame_categories(
-                    dataset=underlying[dataset_index],
-                    episode_records=self.pgc_entity_relation_indices[dataset_index][
-                        "episodes_by_index"
-                    ],
-                    field="online_stage_v2",
-                    allowed=ALLOWED_CLOSED_LOOP_STAGES,
-                )
+            productive_indices, productive_stages = _closed_loop_productive_rows(
+                dataset=underlying[dataset_index],
+                index=self.pgc_entity_relation_indices[dataset_index],
+                dataset_offset=dataset_offsets[dataset_index],
+                action_video_freq_ratio=int(self.action_video_freq_ratio),
             )
+            closed_productive_indices.extend(productive_indices)
+            closed_stages.extend(productive_stages)
         strict_categories: list[str] = []
         for dataset_index in range(strict_start, len(underlying)):
             strict_categories.extend(
@@ -442,6 +591,7 @@ class RoboTwinNoERAFFourPoolDataset(RobotVideoDataset):
                 closed_loop_native_dataset_count=counts[1],
                 historical_cf_dataset_count=counts[2],
                 strict_cf_dataset_count=counts[3],
+                closed_loop_productive_indices=closed_productive_indices,
                 closed_loop_stage_categories=closed_stages,
                 strict_relation_categories=strict_categories,
             )

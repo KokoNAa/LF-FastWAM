@@ -27,6 +27,7 @@ from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcess
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from experiments.robotwin.closed_loop_capture import (
+    CAPTURE_FRAME_COUNT,
     capture_frame,
     classify_online_stage,
     write_capture_segment,
@@ -434,10 +435,19 @@ class WorldActionRobotWinPolicy:
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         if (
             self.closed_loop_capture_dir is not None
+            and self._closed_loop_pending_segment is not None
+        ):
+            raise RuntimeError(
+                "A RoboTwin closed-loop capture reached the next replan "
+                "without enough observed action steps. Set "
+                "EVALUATION.skip_get_obs_within_replan=false."
+            )
+        if (
+            self.closed_loop_capture_dir is not None
             and self._closed_loop_episode_metadata is not None
             and self.closed_loop_capture_count < self.closed_loop_capture_max
             and self.replan_count % self.closed_loop_capture_stride == 0
-            and n_exec >= 2
+            and n_exec >= CAPTURE_FRAME_COUNT
         ):
             snapshot = task_env.pgc_eraf_snapshot()
             stage = classify_online_stage(
@@ -450,9 +460,13 @@ class WorldActionRobotWinPolicy:
             self._closed_loop_pending_segment = {
                 "replan_index": self.replan_count,
                 "online_stage": stage,
-                "first_frame": capture_frame(
-                    task_env, observation, np.asarray(action_chunk[0], dtype=np.float32)
-                ),
+                "frames": [
+                    capture_frame(
+                        task_env,
+                        observation,
+                        np.asarray(action_chunk[0], dtype=np.float32),
+                    )
+                ],
             }
             self._closed_loop_previous_stage = stage
         for i in range(n_exec):
@@ -469,20 +483,23 @@ class WorldActionRobotWinPolicy:
             and self.pending_actions
         ):
             pending = self._closed_loop_pending_segment
-            second_frame = capture_frame(
-                task_env,
-                observation,
-                np.asarray(self.pending_actions[0], dtype=np.float32),
+            pending["frames"].append(
+                capture_frame(
+                    task_env,
+                    observation,
+                    np.asarray(self.pending_actions[0], dtype=np.float32),
+                )
             )
-            write_capture_segment(
-                capture_root=self.closed_loop_capture_dir,
-                metadata=self._closed_loop_episode_metadata,
-                replan_index=int(pending["replan_index"]),
-                online_stage=str(pending["online_stage"]),
-                frames=(pending["first_frame"], second_frame),
-            )
-            self.closed_loop_capture_count += 1
-            self._closed_loop_pending_segment = None
+            if len(pending["frames"]) == CAPTURE_FRAME_COUNT:
+                write_capture_segment(
+                    capture_root=self.closed_loop_capture_dir,
+                    metadata=self._closed_loop_episode_metadata,
+                    replan_index=int(pending["replan_index"]),
+                    online_stage=str(pending["online_stage"]),
+                    frames=tuple(pending["frames"]),
+                )
+                self.closed_loop_capture_count += 1
+                self._closed_loop_pending_segment = None
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
