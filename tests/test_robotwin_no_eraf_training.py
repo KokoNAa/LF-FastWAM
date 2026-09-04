@@ -114,6 +114,10 @@ class RoboTwinNoERAFTrainingTest(unittest.TestCase):
             "model.lora.paired_language_control.deployment_matched_action_cache=true",
             overrides,
         )
+        self.assertIn(
+            "model.lora.paired_language_control.correct_branch_action_ranking=true",
+            overrides,
+        )
         self.assertIn("pgc_closed_loop_corrective_dataset_dirs=[]", joined)
         self.assertNotIn("full_goal", joined)
         self.assertEqual(MODES["diagnostic"]["steps"], 1000)

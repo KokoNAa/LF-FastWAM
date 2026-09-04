@@ -18,6 +18,7 @@ CONTROL_CONFIG = {
         "enabled": True,
         "bidirectional_supervision": True,
         "deployment_matched_action_cache": True,
+        "correct_branch_action_ranking": True,
         "world_language_weight": 0.10,
         "world_language_margin": 0.01,
         "native_action_weight": 1.0,
@@ -136,6 +137,9 @@ class LoRAOnlyAblationTest(unittest.TestCase):
         self.assertEqual(
             metrics["lora_only_deployment_matched_action_cache"], 1.0
         )
+        self.assertEqual(
+            metrics["lora_only_correct_branch_action_ranking"], 1.0
+        )
         for name in (
             "loss_lora_only_source_action_flow",
             "loss_lora_only_target_action_flow",
@@ -177,6 +181,32 @@ class LoRAOnlyAblationTest(unittest.TestCase):
         self.assertTrue(torch.equal(correct_mask[:, 0], torch.tensor([True, True])))
         self.assertTrue(torch.equal(wrong_mask[:, 0], torch.tensor([False, False])))
 
+    def test_correct_branch_ranking_detaches_wrong_language_reference(self):
+        correct = torch.tensor([1.0], requires_grad=True)
+        wrong = torch.tensor([1.0], requires_grad=True)
+        loss = tiny_lora_only_control()._paired_action_ranking_per_sample(
+            correct_error=correct,
+            wrong_error=wrong,
+            margin=0.01,
+            correct_branch_ranking=True,
+        ).sum()
+        loss.backward()
+        self.assertTrue(torch.equal(correct.grad, torch.ones_like(correct)))
+        self.assertIsNone(wrong.grad)
+
+    def test_legacy_ranking_detaches_correct_language_reference(self):
+        correct = torch.tensor([1.0], requires_grad=True)
+        wrong = torch.tensor([1.0], requires_grad=True)
+        loss = tiny_lora_only_control()._paired_action_ranking_per_sample(
+            correct_error=correct,
+            wrong_error=wrong,
+            margin=0.01,
+            correct_branch_ranking=False,
+        ).sum()
+        loss.backward()
+        self.assertIsNone(correct.grad)
+        self.assertTrue(torch.equal(wrong.grad, -torch.ones_like(wrong)))
+
     def test_checkpoint_persists_strict_control_contract(self):
         model = tiny_lora_only_control()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -198,6 +228,11 @@ class LoRAOnlyAblationTest(unittest.TestCase):
         self.assertTrue(
             payload["lora_config"]["paired_language_control"][
                 "deployment_matched_action_cache"
+            ]
+        )
+        self.assertTrue(
+            payload["lora_config"]["paired_language_control"][
+                "correct_branch_action_ranking"
             ]
         )
         self.assertEqual(payload["lora_config"]["experts"], ["video", "action"])

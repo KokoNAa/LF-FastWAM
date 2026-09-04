@@ -169,6 +169,7 @@ def build_overrides(
         "model.lora.paired_language_control.enabled=true",
         "model.lora.paired_language_control.bidirectional_supervision=true",
         "model.lora.paired_language_control.deployment_matched_action_cache=true",
+        "model.lora.paired_language_control.correct_branch_action_ranking=true",
     ]
 
 

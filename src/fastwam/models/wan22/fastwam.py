@@ -5083,6 +5083,21 @@ class FastWAM(torch.nn.Module):
             wrong_context_mask,
         )
 
+    @staticmethod
+    def _paired_action_ranking_per_sample(
+        *,
+        correct_error: torch.Tensor,
+        wrong_error: torch.Tensor,
+        margin: float,
+        correct_branch_ranking: bool,
+    ) -> torch.Tensor:
+        """Build the paired Action hinge with an explicit gradient direction."""
+        if correct_branch_ranking:
+            return torch.relu(
+                float(margin) + correct_error - wrong_error.detach()
+            )
+        return torch.relu(float(margin) + correct_error.detach() - wrong_error)
+
     def _policy_guard_clean_action_from_velocity(
         self,
         *,
@@ -8936,6 +8951,9 @@ class FastWAM(torch.nn.Module):
         deployment_matched_action_cache = bool(
             control.get("deployment_matched_action_cache", False)
         )
+        correct_branch_action_ranking = bool(
+            control.get("correct_branch_action_ranking", False)
+        )
         if any(
             value is None
             for value in (
@@ -9210,10 +9228,11 @@ class FastWAM(torch.nn.Module):
         counterfactual_action_loss = self._masked_policy_guard_mean(
             correct_action_error * action_weight, counterfactual_valid
         )
-        action_ranking_per_sample = torch.relu(
-            float(control["action_language_margin"])
-            + correct_action_error.detach()
-            - wrong_action_error
+        action_ranking_per_sample = self._paired_action_ranking_per_sample(
+            correct_error=correct_action_error,
+            wrong_error=wrong_action_error,
+            margin=float(control["action_language_margin"]),
+            correct_branch_ranking=correct_branch_action_ranking,
         )
         source_action_language_ranking = self._masked_policy_guard_mean(
             action_ranking_per_sample, source_semantic_valid
@@ -9371,6 +9390,11 @@ class FastWAM(torch.nn.Module):
             "lora_only_deployment_matched_action_cache": (
                 correct_action_error.new_tensor(
                     float(deployment_matched_action_cache)
+                )
+            ),
+            "lora_only_correct_branch_action_ranking": (
+                correct_action_error.new_tensor(
+                    float(correct_branch_action_ranking)
                 )
             ),
             "lora_only_shared_video_action_expert": (

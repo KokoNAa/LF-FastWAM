@@ -542,6 +542,12 @@ lora:
     # When enabled, native rows use the audited target language as their
     # same-state negative while CF rows keep the audited source negative.
     bidirectional_supervision: false
+    # Keep historical LIBERO checkpoints on their published hybrid-cache and
+    # wrong-branch ranking contracts unless a target port opts in explicitly.
+    deployment_matched_action_cache: false
+    # Report-aligned hinge: update the correct-language Action branch against
+    # a detached wrong-language reference.
+    correct_branch_action_ranking: false
     world_language_weight: 0.10
     world_language_margin: 0.01
     native_action_weight: 1.0

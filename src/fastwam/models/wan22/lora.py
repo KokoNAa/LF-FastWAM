@@ -37,8 +37,13 @@ DEFAULT_PAIRED_LANGUAGE_CONTROL = {
     "enabled": False,
     "bidirectional_supervision": False,
     # Existing LIBERO runs keep their published hybrid-cache objective. A
-    # target can opt into deployment-matched Action ranking explicitly.
+    # target can opt into deployment-matched Action caches explicitly.
     "deployment_matched_action_cache": False,
+    # The historical control pushes the wrong-language branch away from the
+    # demonstration. A target can instead train the correct-language branch
+    # against a detached wrong-language reference, matching the V9.38
+    # acquisition-ranking contract.
+    "correct_branch_action_ranking": False,
     "world_language_weight": 0.10,
     "world_language_margin": 0.01,
     "native_action_weight": 1.0,
@@ -62,6 +67,9 @@ def normalize_paired_language_control_config(
         "deployment_matched_action_cache": bool(
             raw.get("deployment_matched_action_cache", False)
         ),
+        "correct_branch_action_ranking": bool(
+            raw.get("correct_branch_action_ranking", False)
+        ),
         **{
             name: float(raw.get(name, default))
             for name, default in DEFAULT_PAIRED_LANGUAGE_CONTROL.items()
@@ -70,6 +78,7 @@ def normalize_paired_language_control_config(
                 "enabled",
                 "bidirectional_supervision",
                 "deployment_matched_action_cache",
+                "correct_branch_action_ranking",
             }
         },
     }
@@ -103,6 +112,14 @@ def normalize_paired_language_control_config(
     ):
         raise ValueError(
             "Deployment-matched Action ranking requires "
+            "`paired_language_control.enabled=true`."
+        )
+    if (
+        normalized["correct_branch_action_ranking"]
+        and not normalized["enabled"]
+    ):
+        raise ValueError(
+            "Correct-branch Action ranking requires "
             "`paired_language_control.enabled=true`."
         )
     return normalized
