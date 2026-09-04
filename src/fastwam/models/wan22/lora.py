@@ -36,6 +36,9 @@ DEFAULT_EXTRA_TRAINABLE_PATTERNS = (
 DEFAULT_PAIRED_LANGUAGE_CONTROL = {
     "enabled": False,
     "bidirectional_supervision": False,
+    # Existing LIBERO runs keep their published hybrid-cache objective. A
+    # target can opt into deployment-matched Action ranking explicitly.
+    "deployment_matched_action_cache": False,
     "world_language_weight": 0.10,
     "world_language_margin": 0.01,
     "native_action_weight": 1.0,
@@ -56,10 +59,18 @@ def normalize_paired_language_control_config(
         "bidirectional_supervision": bool(
             raw.get("bidirectional_supervision", False)
         ),
+        "deployment_matched_action_cache": bool(
+            raw.get("deployment_matched_action_cache", False)
+        ),
         **{
             name: float(raw.get(name, default))
             for name, default in DEFAULT_PAIRED_LANGUAGE_CONTROL.items()
-            if name not in {"enabled", "bidirectional_supervision"}
+            if name
+            not in {
+                "enabled",
+                "bidirectional_supervision",
+                "deployment_matched_action_cache",
+            }
         },
     }
     non_negative = (
@@ -84,6 +95,14 @@ def normalize_paired_language_control_config(
     if normalized["bidirectional_supervision"] and not normalized["enabled"]:
         raise ValueError(
             "LoRA bidirectional supervision requires "
+            "`paired_language_control.enabled=true`."
+        )
+    if (
+        normalized["deployment_matched_action_cache"]
+        and not normalized["enabled"]
+    ):
+        raise ValueError(
+            "Deployment-matched Action ranking requires "
             "`paired_language_control.enabled=true`."
         )
     return normalized

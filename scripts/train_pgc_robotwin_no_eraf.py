@@ -29,6 +29,12 @@ DEFAULT_PROMPT = (
 )
 MODES = {
     "smoke": {"steps": 2, "save_every": 1, "num_workers": 0, "log_every": 1},
+    "diagnostic": {
+        "steps": 1000,
+        "save_every": 250,
+        "num_workers": 2,
+        "log_every": 10,
+    },
     "formal": {
         "steps": 10000,
         "save_every": 250,
@@ -162,6 +168,7 @@ def build_overrides(
         "model.lora.extra_trainable_patterns=[]",
         "model.lora.paired_language_control.enabled=true",
         "model.lora.paired_language_control.bidirectional_supervision=true",
+        "model.lora.paired_language_control.deployment_matched_action_cache=true",
     ]
 
 

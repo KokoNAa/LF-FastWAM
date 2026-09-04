@@ -33,6 +33,7 @@ model:
     paired_language_control:
       enabled: true
       bidirectional_supervision: true
+      deployment_matched_action_cache: true
       world_language_weight: 0.10
       world_language_margin: 0.01
       native_action_weight: 1.0

@@ -104,8 +104,14 @@ class RoboTwinNoERAFTrainingTest(unittest.TestCase):
         self.assertIn("learning_rate=5.0e-6", overrides)
         self.assertIn("model.policy_guard.enabled=false", overrides)
         self.assertIn("model.lora.rank=16", overrides)
+        self.assertIn(
+            "model.lora.paired_language_control.deployment_matched_action_cache=true",
+            overrides,
+        )
         self.assertIn("pgc_closed_loop_corrective_dataset_dirs=[]", joined)
         self.assertNotIn("full_goal", joined)
+        self.assertEqual(MODES["diagnostic"]["steps"], 1000)
+        self.assertEqual(MODES["diagnostic"]["save_every"], 250)
         self.assertEqual(MODES["formal"]["save_every"], 250)
 
 

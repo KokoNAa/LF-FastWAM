@@ -8906,8 +8906,9 @@ class FastWAM(torch.nn.Module):
         Native rows explicitly supervise source language and rank their
         audited target language as wrong; counterfactual rows supervise target
         language and rank source language as wrong. Each correct/wrong pair
-        shares the row's state, action, diffusion noise, timestep, and correct
-        Video cache. No policy-guard, ERAF, completion-memory,
+        shares the row's state, action, diffusion noise, and timestep. Targets
+        may require each Action branch to consume the Video cache produced
+        under that same language. No policy-guard, ERAF, completion-memory,
         context-injector, or ERAF-preservation tensor participates.
         """
         if not (
@@ -8931,6 +8932,9 @@ class FastWAM(torch.nn.Module):
         control = self.lora_paired_language_control_config
         bidirectional_supervision = bool(
             control.get("bidirectional_supervision", False)
+        )
+        deployment_matched_action_cache = bool(
+            control.get("deployment_matched_action_cache", False)
         )
         if any(
             value is None
@@ -9089,7 +9093,7 @@ class FastWAM(torch.nn.Module):
                 "The no-ERAF LoRA control wrong-language Video prefill "
                 "returned no hidden state."
             )
-        _, wrong_video_hidden = wrong_prefill_result
+        wrong_video_kv_cache, wrong_video_hidden = wrong_prefill_result
         wrong_pred_video = self.video_expert.post_dit(
             wrong_video_hidden, wrong_video_pre
         )
@@ -9175,7 +9179,11 @@ class FastWAM(torch.nn.Module):
             timestep_action=timestep_action,
             context=wrong_context,
             context_mask=wrong_context_mask,
-            video_kv_cache=video_kv_cache,
+            video_kv_cache=(
+                wrong_video_kv_cache
+                if deployment_matched_action_cache
+                else video_kv_cache
+            ),
             video_seq_len=video_seq_len,
             video_tokens_per_frame=video_tokens_per_frame,
         )
@@ -9358,6 +9366,11 @@ class FastWAM(torch.nn.Module):
             "lora_only_bidirectional_supervision_enabled": (
                 correct_action_error.new_tensor(
                     float(bidirectional_supervision)
+                )
+            ),
+            "lora_only_deployment_matched_action_cache": (
+                correct_action_error.new_tensor(
+                    float(deployment_matched_action_cache)
                 )
             ),
             "lora_only_shared_video_action_expert": (

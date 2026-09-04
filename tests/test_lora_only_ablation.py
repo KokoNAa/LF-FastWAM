@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -16,6 +17,7 @@ CONTROL_CONFIG = {
     "paired_language_control": {
         "enabled": True,
         "bidirectional_supervision": True,
+        "deployment_matched_action_cache": True,
         "world_language_weight": 0.10,
         "world_language_margin": 0.01,
         "native_action_weight": 1.0,
@@ -92,16 +94,47 @@ class LoRAOnlyAblationTest(unittest.TestCase):
                 batch_size, dtype=torch.bool
             ),
         }
-        loss, metrics = model._training_loss_lora_paired_language_control(
-            inputs=inputs,
-            full_context_mask=context_mask,
-        )
+        prefetched_caches = []
+        action_caches = []
+        original_prefill = model.mot.prefill_video_cache
+        original_action_forward = model._forward_shared_action_from_cache
+
+        def record_prefill(*args, **kwargs):
+            result = original_prefill(*args, **kwargs)
+            prefetched_caches.append(result[0])
+            return result
+
+        def record_action_forward(**kwargs):
+            action_caches.append(kwargs["video_kv_cache"])
+            return original_action_forward(**kwargs)
+
+        with mock.patch.object(
+            model.mot,
+            "prefill_video_cache",
+            side_effect=record_prefill,
+        ), mock.patch.object(
+            model,
+            "_forward_shared_action_from_cache",
+            side_effect=record_action_forward,
+        ):
+            loss, metrics = model._training_loss_lora_paired_language_control(
+                inputs=inputs,
+                full_context_mask=context_mask,
+            )
+        self.assertEqual(len(prefetched_caches), 2)
+        self.assertEqual(len(action_caches), 2)
+        self.assertIs(action_caches[0], prefetched_caches[0])
+        self.assertIs(action_caches[1], prefetched_caches[1])
+        self.assertIsNot(action_caches[0], action_caches[1])
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(metrics["lora_only_eraf_enabled"], 0.0)
         self.assertEqual(metrics["lora_only_policy_guard_enabled"], 0.0)
         self.assertEqual(metrics["loss_pgc_v9_eraf"], 0.0)
         self.assertEqual(
             metrics["lora_only_bidirectional_supervision_enabled"], 1.0
+        )
+        self.assertEqual(
+            metrics["lora_only_deployment_matched_action_cache"], 1.0
         )
         for name in (
             "loss_lora_only_source_action_flow",
@@ -160,6 +193,11 @@ class LoRAOnlyAblationTest(unittest.TestCase):
         self.assertTrue(
             payload["lora_config"]["paired_language_control"][
                 "bidirectional_supervision"
+            ]
+        )
+        self.assertTrue(
+            payload["lora_config"]["paired_language_control"][
+                "deployment_matched_action_cache"
             ]
         )
         self.assertEqual(payload["lora_config"]["experts"], ["video", "action"])
