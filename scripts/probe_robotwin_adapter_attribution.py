@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Factorial Video/Action adapter ablation on fixed RoboTwin observations.
 
-No training. Full and zero-adapter controls must replay saved step1000 and
-Base actions at the original seed. Hybrids isolate each adapter's functional
+No training. Full and zero-adapter controls must replay current-runtime
+step1000 and Base actions. Historical replay differences are recorded separately.
+Hybrids isolate each adapter's functional
 contribution; they are not independently trained models or success rates.
 """
 from __future__ import annotations
@@ -39,12 +40,47 @@ def worker(args):
         raise ValueError("Expected ten audited paired initial states.")
     root = Path(args.output).resolve() / f"shard{args.shard}"
     root.mkdir(parents=True, exist_ok=False)
-    policy, audit = load_probe_policy(plan, "step1000", args.gpu)
+    policy, base_audit = load_probe_policy(plan, "base", args.gpu)
     import numpy as np
     import torch
     from experiments.robotwin.no_eraf_probe import CAMERAS, observation_hash, difference
     from experiments.robotwin.same_state_repair import action_rows
     from scripts.inspect_robotwin_same_state_repair import paired_components
+
+    def observation(state):
+        if sha256(state["file"]) != state["sha256"]:
+            raise ValueError("Observation artifact changed.")
+        with np.load(state["file"], allow_pickle=False) as data:
+            arrays = dict(data)
+        if observation_hash(arrays) != state["observation_sha256"]:
+            raise ValueError("Observation fingerprint mismatch.")
+        return arrays, {"joint_action": {"vector": arrays["state"]}, "observation": {
+            camera: {"rgb": arrays[camera]} for camera in CAMERAS}}
+
+    def predict(policy, obs, instruction, seed):
+        policy.seed = seed
+        policy.policy_guard_state = None
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        raw = policy._infer_action_chunk(obs, instruction)
+        norm = policy.processor.normalizer.normalizers["action"][policy.processor.shape_meta["action"][0]["key"]]
+        return (torch.as_tensor(raw, dtype=torch.float32).unsqueeze(0) * norm.scale + norm.offset)[0].cpu().numpy()
+
+    base_predictions = {}
+    for state in all_states[args.shard::args.shards]:
+        _, obs = observation(state)
+        for seed in args.seeds:
+            values = {k: predict(policy, obs, state[f], seed) for k, f in (
+                ("source", "source_instruction"), ("target", "counterfactual_instruction"))}
+            base_predictions[state["id"], seed] = values
+            np.savez_compressed(root / f"{state['id']}_{seed}_base_fresh.npz", **values)
+        print(f"[base-control] {state['id']}", flush=True)
+    write_json(root / "base_checkpoint_audit.json", base_audit)
+    del policy
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    policy, audit = load_probe_policy(plan, "step1000", args.gpu)
 
     model = policy.model
     model.eval()
@@ -55,16 +91,9 @@ def worker(args):
     protected = {n: p._version for n, p in model.mot.named_parameters() if n not in saved}
     normalizer = policy.processor.normalizer.normalizers["action"][policy.processor.shape_meta["action"][0]["key"]]
     write_json(root / "checkpoint_audit.json", audit)
-    records, replays = [], []
+    records, replays, historical_replays = [], [], []
     for state in all_states[args.shard::args.shards]:
-        if sha256(state["file"]) != state["sha256"]:
-            raise ValueError("Observation artifact changed.")
-        with np.load(state["file"], allow_pickle=False) as data:
-            arrays = dict(data)
-        if observation_hash(arrays) != state["observation_sha256"]:
-            raise ValueError("Observation fingerprint mismatch.")
-        obs = {"joint_action": {"vector": arrays["state"]}, "observation": {
-            camera: {"rgb": arrays[camera]} for camera in CAMERAS}}
+        arrays, obs = observation(state)
         refs = {k: normalizer.forward(torch.as_tensor(arrays[k + "_reference"]).unsqueeze(0))[0].numpy()
                 for k in ("source", "target")}
         originals = {}
@@ -76,23 +105,25 @@ def worker(args):
                 if difference(refs[k], originals[variant][k + "_reference"])["max_abs"] > 1e-5:
                     raise ValueError("Reference normalization mismatch.")
         for seed in args.seeds:
+            select_adapters(model, saved, ("video", "action"))
+            controls = {"base_zero": base_predictions[state["id"], seed],
+                        "full": {k: predict(policy, obs, state[f], seed) for k, f in (
+                            ("source", "source_instruction"), ("target", "counterfactual_instruction"))}}
             predictions = {}
             for variant, active in VARIANTS.items():
                 select_adapters(model, saved, active)
                 values = {}
                 for language, field in (("source", "source_instruction"), ("target", "counterfactual_instruction")):
-                    policy.seed = seed
-                    policy.policy_guard_state = None
-                    torch.manual_seed(seed)
-                    np.random.seed(seed)
-                    raw = policy._infer_action_chunk(obs, state[field])
-                    values[language] = (torch.as_tensor(raw).unsqueeze(0) * normalizer.scale + normalizer.offset)[0].numpy()
+                    values[language] = predict(policy, obs, state[field], seed)
                     if seed == plan["probe_seed"] and variant in originals:
                         error = difference(values[language], originals[variant][language])["max_abs"]
-                        replays.append({"id": state["id"], "variant": variant, "language": language, "max_abs": error})
+                        historical_replays.append({"id": state["id"], "variant": variant, "language": language, "max_abs": error})
+                    if variant in controls:
+                        error = difference(values[language], controls[variant][language])["max_abs"]
+                        replays.append({"id": state["id"], "seed": seed, "variant": variant, "language": language, "max_abs": error})
                         if error > 1e-5:
                             write_json(root / "replay_failure.json", replays[-1])
-                            raise ValueError("Full/zero adapter control did not replay original model.")
+                            raise ValueError("Full/zero adapter control did not replay current-runtime model.")
                 predictions[variant] = values
                 baseline = predictions["base_zero"]
                 for row in action_rows(values["source"], values["target"], refs["source"], refs["target"],
@@ -110,6 +141,7 @@ def worker(args):
         raise ValueError("A non-ablated tensor changed.")
     write_json(root / "records.json", records)
     write_json(root / "complete.json", {"complete": True, "rows": len(records), "control_replays": replays,
+               "historical_replays": historical_replays,
                "source_plan_sha256": sha256(source / "plan.json"), "states_sha256": sha256(source / "states.json"),
                "non_ablated_tensors_unchanged": True, "adapter_B_tensor_count": len(saved)})
 
