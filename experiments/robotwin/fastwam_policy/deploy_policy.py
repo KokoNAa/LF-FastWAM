@@ -333,6 +333,8 @@ class WorldActionRobotWinPolicy:
         self._closed_loop_pending_segment: Optional[dict[str, Any]] = None
         self._closed_loop_previous_stage: Optional[str] = None
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
+        from experiments.robotwin.initial_observation_audit import InitialObservationAudit
+        self.initial_observation_audit = InitialObservationAudit.from_environment()
 
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
@@ -431,6 +433,8 @@ class WorldActionRobotWinPolicy:
         observation: Dict[str, Any],
         instruction: str,
     ) -> None:
+        if self.initial_observation_audit is not None:
+            self.initial_observation_audit.record(observation, instruction)
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         if (
@@ -544,6 +548,8 @@ class WorldActionRobotWinPolicy:
         }
 
     def reset(self) -> None:
+        if self.initial_observation_audit is not None:
+            self.initial_observation_audit.reset()
         self.pending_actions.clear()
         self.policy_guard_state = None
         self.policy_diagnostics.clear()
@@ -558,6 +564,8 @@ class WorldActionRobotWinPolicy:
 
     def begin_episode(self, task_env: Any, metadata: Dict[str, Any]) -> None:
         """Bind Correct/source rollout metadata after the ordinary reset."""
+        if self.initial_observation_audit is not None:
+            self.initial_observation_audit.begin(metadata)
         if self.closed_loop_capture_dir is None:
             return
         required = {
