@@ -104,6 +104,8 @@ def main():
     ap.add_argument("--eval-every", type=int, default=200)
     ap.add_argument("--learning-rate", type=float, default=1e-5)
     ap.add_argument("--endpoint-weight", type=float, default=.25)
+    ap.add_argument("--conditional-gain", type=float, default=1.,
+                    help="Weight for language-dependent action difference within endpoint MSE.")
     ap.add_argument("--focus-repeats", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42027)
     ap.add_argument("--resume-state")
@@ -157,6 +159,8 @@ def main():
     if args.resume_state:
         state = torch.load(args.resume_state, map_location="cpu", weights_only=False)
         optimizer.load_state_dict(state["optimizer"])
+        for group in optimizer.param_groups:
+            group["lr"] = args.learning_rate
         start = int(state["step"])
         del state
     payloads = {r["id"]: move_cache(torch.load(r["payload"], map_location="cpu", weights_only=True), model.device)
@@ -219,7 +223,7 @@ def main():
                 refs = {k: v.to(model.torch_dtype) for k, v in p["references"].items()}
                 terms.append(paired_backward(model, p["captured"], refs, noise, t,
                     float(scheduler.training_weight(t).item()) / local_pairs,
-                    args.endpoint_weight / local_pairs, 1.))
+                    args.endpoint_weight / local_pairs, args.conditional_gain))
             average_gradients(list(selected.values()))
             norm = torch.nn.utils.clip_grad_norm_(list(selected.values()), 1., error_if_nonfinite=True)
             optimizer.step()
