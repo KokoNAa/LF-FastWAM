@@ -297,23 +297,17 @@ def inference_bootstrap_configs(cfg):
     return model_cfg, processor_cfg
 
 
-def worker(args):
-    # Set physical GPU visibility before importing torch or the policy wrapper.
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+def load_probe_policy(plan, model_name, physical_gpu):
+    """Shared, audited loader. Call before importing torch in each GPU worker."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_gpu)
     for key in list(os.environ):
         if key.startswith("PGC_ROBOTWIN_CLOSED_LOOP_CAPTURE"):
             del os.environ[key]
-    import numpy as np
     import torch
     from omegaconf import OmegaConf
     from experiments.robotwin.fastwam_policy.deploy_policy import WorldActionRobotWinPolicy
-    from experiments.robotwin.no_eraf_probe import difference, reference_metrics, observation_hash
-
-    plan = read_json(args.plan)
-    output = Path(plan["output"]) / args.model
-    output.mkdir(exist_ok=False)
-    checkpoint = plan["checkpoints"][args.model]
-    if sha256(checkpoint) != plan["checkpoint_sha256"][args.model]:
+    checkpoint = plan["checkpoints"][model_name]
+    if sha256(checkpoint) != plan["checkpoint_sha256"][model_name]:
         raise ValueError("Checkpoint changed after planning.")
     if sha256(plan["stats_path"]) != plan["stats_sha256"]:
         raise ValueError("Action statistics changed after planning.")
@@ -333,19 +327,31 @@ def worker(args):
         rand_device="cpu", tiled=False, timing_enabled=False,
         num_video_frames=plan["num_video_frames"], task_name="same_state_probe", task_config=plan["task_config"],
     )
-    audit = {"model": args.model, "checkpoint": checkpoint,
-             "checkpoint_sha256": plan["checkpoint_sha256"][args.model],
-             "physical_gpu": args.gpu, "lora_enabled": policy.model.lora_enabled}
-    if args.model == "base":
+    audit = {"model": model_name, "checkpoint": checkpoint,
+             "checkpoint_sha256": plan["checkpoint_sha256"][model_name],
+             "physical_gpu": physical_gpu, "lora_enabled": policy.model.lora_enabled}
+    if model_name == "base":
         if policy.model.lora_enabled:
             raise ValueError("Base unexpectedly enabled LoRA.")
     else:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        audit.update(validate_loaded_adapter(policy.model, payload, plan["base_checkpoint"], int(args.model[4:])))
+        audit.update(validate_loaded_adapter(policy.model, payload, plan["base_checkpoint"], int(model_name[4:])))
         del payload
     if (policy.model.policy_guard_enabled or policy.model.transition_contract_enabled
             or policy.model.action_expert.use_latent_action_queries):
         raise ValueError("Runtime is not query-free no-ERAF.")
+    return policy, audit
+
+
+def worker(args):
+    plan = read_json(args.plan)
+    output = Path(plan["output"]) / args.model
+    output.mkdir(exist_ok=False)
+    policy, audit = load_probe_policy(plan, args.model, args.gpu)
+    import numpy as np
+    import torch
+    from experiments.robotwin.no_eraf_probe import difference, reference_metrics, observation_hash
+
     write_json(output / "checkpoint_audit.json", audit)
     key = policy.processor.shape_meta["action"][0]["key"]
     normalizer = policy.processor.normalizer.normalizers["action"][key]

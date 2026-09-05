@@ -42,7 +42,7 @@ cat "$OUT/summary.json"
 
 - 使用训练运行保存的配置、发布版 Base 和相同归一化统计。训练专家 episode 按实际训练配置的验证比例及数据集默认 seed 42 选择；strict native 仅作为同场景审计参考，输出明确标记它不属于训练池。
 - 每个 pair/profile 先取一个符合训练划分的场景，取开头、有效起点范围的 25%/50%/75%，另取原任务与 CF 的 qpos 公共前缀最后一帧，以覆盖可能的决策分岔。全部窗口包含完整 32 步参考。
-- 固定三相机 RGB、机器人状态、扩散 seed，切换原任务/CF 指令，比较三个模型。调用现有 `WorldActionRobotWinPolicy._infer_action_chunk`，沿用部署拼图、提示模板、状态处理、10 步采样和 9 视频帧。
+- 固定三相机 RGB、机器人状态、扩散 seed，切换原任务/CF 指令，比较三个模型。调用现有 `WorldActionRobotWinPolicy._infer_action_chunk`，沿用部署拼图、提示模板、状态处理和 10 步采样。当前 `infer_action` 只编码当前观测帧；包装器的 `num_video_frames=9` 仅在模型接口支持该参数时传入，不能视为实际进行了 9 帧视频预测。
 - 图像来自 raw HDF5 的 JPEG，动作/状态与转换器相同，来自 `joint_action/vector`。这不是读取训练 MP4 的压缩后像素，也不是当前失败 rollout 的重放。
 - 检查 raw 与转换后元数据、动作/初始状态 hash；保存配置、统计、checkpoint 和固定状态指纹。LoRA 检查运行时每个已保存 MoT 张量与 checkpoint 经 dtype 转换后精确一致、video/action LoRA-B 非零。每个模型首个状态重复推理，归一化动作最大差须不超过 `1e-5`。
 - 只有原任务和 CF 轨迹在同帧的完整 RGB **及**状态完全一致，才计算双专家参考指标。中途不同观测的轨迹只与自己的专家参考比较。公共前缀未来 32 步仍相同的窗口标为不可区分，不计为语言失败。
