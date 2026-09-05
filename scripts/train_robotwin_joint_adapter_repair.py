@@ -36,9 +36,12 @@ def worker(args):
     from experiments.robotwin.no_eraf_probe import CAMERAS, observation_hash, difference, typed_hash
     from scripts.inspect_robotwin_same_state_repair import paired_components
     model = policy.model
+    from collections import Counter
+    loaded_dtypes = dict(Counter(str(p.dtype) for n, p in model.mot.named_parameters()
+                                if n.endswith((".lora_A", ".lora_B"))))
     selected = configure_adapters(model, ARMS[args.arm])
     protected = frozen_versions(model)
-    audit.update(experts=ARMS[args.arm], trainable_parameters=list(selected),
+    audit.update(experts=ARMS[args.arm], trainable_parameters=list(selected), loaded_adapter_dtypes=loaded_dtypes,
                  all_adapter_arithmetic="float32 in both arms; frozen base bfloat16")
     write_json(root / "checkpoint_audit.json", audit)
     norm = policy.processor.normalizer.normalizers["action"][policy.processor.shape_meta["action"][0]["key"]]
@@ -163,14 +166,15 @@ def worker(args):
                 evaluate(step)
                 save(step)
     audit_frozen(model, protected)
-    # Probe the adapter dtype used by the normal deployment loader after training.
+    # Explicit precision ablation, NOT the normal loader: it injects fp32 LoRA
+    # parameters even when the frozen backbone and saved source weights are bf16.
     # This intentional final conversion is excluded from the frozen training audit.
     del optimizer
     model.zero_grad(set_to_none=True)
     for n, p in model.mot.named_parameters():
         if n.endswith((".lora_A", ".lora_B")):
             p.data = p.data.to(model.torch_dtype)
-    evaluate(plan["steps"], "deployment_dtype")
+    evaluate(plan["steps"], "forced_bf16")
     write_json(root / "complete.json", {"complete": True, "arm": args.arm, "steps": plan["steps"],
                "scores": scores, "frozen_training_parameters_unchanged": True,
                "all_evaluations_replayed_production": True})
