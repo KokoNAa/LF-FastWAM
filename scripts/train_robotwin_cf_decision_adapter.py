@@ -64,6 +64,20 @@ def small_validation_set(rows):
     return list(selected.values())
 
 
+def mixed_stream(rows, seed, focus_repeats, balanced_task_domains):
+    """Alternate paired experts and source-only policy states, when supplied."""
+    native = [r for r in rows if r.get('native_retention')]
+    paired = [r for r in rows if not r.get('native_retention')]
+    pairs = pair_stream(paired, seed, focus_repeats, balanced_task_domains)
+    if not native:
+        yield from pairs
+    else:
+        retained = pair_stream(native, seed + 193, 1, True)
+        while True:
+            yield next(pairs)
+            yield next(retained)
+
+
 def average_gradients(parameters):
     """Synchronize accumulated paired gradients in one collective per step."""
     import torch
@@ -128,6 +142,7 @@ def main():
                     help="Mix seen-template and manifest-bound paraphrases into training positives.")
     ap.add_argument('--native-teacher-checkpoint')
     ap.add_argument('--native-teacher-weight', type=float, default=0.)
+    ap.add_argument('--native-retention-weight', type=float, default=2.)
     ap.add_argument('--target-weight', type=float, default=1., help='Relative weight of CF expert positives.')
     ap.add_argument('--adapter-scope', choices=['all', 'language'], default='all')
     ap.add_argument('--stream-payloads', action='store_true',
@@ -172,6 +187,9 @@ def main():
     barrier()
     manifest = json.loads(Path(args.manifest).read_text())
     rows = manifest["states"]
+    if any(r.get('native_retention') for r in rows) and (
+            not args.native_teacher_checkpoint or args.native_retention_weight <= 0):
+        raise ValueError('Native retention rows need a teacher and positive retention weight.')
     validation = small_validation_set(rows) if rank == 0 else []
     plan = vars(args) | {"training_pairs": sum(r["replay_split"] == "train" for r in rows),
         "focus_pairs": FOCUS, "validation_states": len(validation), "world_size": world,
@@ -207,9 +225,9 @@ def main():
         payloads = {r["id"]: move_cache(torch.load(r["payload"], map_location="cpu", weights_only=True), model.device)
                     for r in rows if r["replay_split"] == "train" or r in validation}
     from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
-    seen_contexts = (build_seen_contexts(model, REPO, rows)
+    seen_contexts = (build_seen_contexts(model, REPO, [r for r in rows if not r.get('native_retention')])
                      if args.seen_language_augmentation else {})
-    stream = itertools.islice(pair_stream(rows, args.seed, args.focus_repeats, args.balanced_task_domains),
+    stream = itertools.islice(mixed_stream(rows, args.seed, args.focus_repeats, args.balanced_task_domains),
                              start * args.pairs_per_step + rank, None, world)
 
     def save(step):
@@ -260,7 +278,8 @@ def main():
                 p = payloads[row["id"]]
                 seed = args.seed + (step - 1) * args.pairs_per_step + i * world + rank
                 captured = p['captured']
-                variants = seen_contexts.get(row.get('language_replay_key', row['pair_id']), [])
+                variants = ([] if row.get('native_retention') else
+                            seen_contexts.get(row.get('language_replay_key', row['pair_id']), []))
                 rng = random.Random(seed)
                 if variants and rng.random() < .5:
                     variant = rng.choice(variants)
@@ -272,6 +291,12 @@ def main():
                 scheduler = model.train_action_scheduler
                 t = (scheduler._phi(u, scheduler.shift) * scheduler.num_train_timesteps).to(device=model.device, dtype=model.torch_dtype)
                 refs = {k: v.to(model.torch_dtype) for k, v in p["references"].items()}
+                if row.get('native_retention'):
+                    from experiments.robotwin.native_teacher import retention_backward
+                    terms.append(retention_backward(model, captured['source'], refs['source'], noise, t,
+                        native_teacher, args.native_retention_weight / local_pairs,
+                        args.endpoint_weight))
+                    continue
                 terms.append(paired_backward(model, captured, refs, noise, t,
                     float(scheduler.training_weight(t).item()) / local_pairs,
                     args.endpoint_weight / local_pairs,
@@ -285,7 +310,7 @@ def main():
             log.write(json.dumps(report) + "\n")
             if rank == 0 and (step == start + 1 or step % 10 == 0):
                 print(f"[train] step={step}/{args.steps} seconds_per_step={(time.monotonic()-started)/(step-start):.2f} "
-                      f"endpoint_mse={sum(t['common_mse'] + t['conditional_mse'] for t in terms)/len(terms):.6f}", flush=True)
+                      f"endpoint_mse={sum(t.get('common_mse', t.get('retention_endpoint_mse', 0.)) + t.get('conditional_mse', 0.) for t in terms)/len(terms):.6f}", flush=True)
             if rank == 0 and (step % args.save_every == 0 or step == args.steps):
                 save(step)
             if rank == 0 and (step % args.eval_every == 0 or step == args.steps):

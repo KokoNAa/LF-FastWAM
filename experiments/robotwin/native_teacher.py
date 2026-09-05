@@ -39,3 +39,26 @@ class NativeTeacher:
             return self.model._predict_action_noise_with_cache(
                 latents_action=noisy, timestep_action=timestep,
                 **build_cache(self.model, captured)).detach()
+
+
+def retention_backward(model, captured, reference, noise, time, teacher, weight, endpoint_weight):
+    """Distill native velocity fields on actual policy states; no CF label here."""
+    import torch
+    from experiments.robotwin.joint_adapter_repair import predict
+    scheduler = model.train_action_scheduler
+    endpoint = torch.tensor([scheduler.num_train_timesteps], device=model.device, dtype=model.torch_dtype)
+    noisy = scheduler.add_noise(reference, noise, time)
+    # Finish every teacher swap before constructing student autograd graphs.
+    targets = [teacher.predict(captured, noisy, time), teacher.predict(captured, noise, endpoint)]
+    terms = {}
+    for name, x, t, target, coefficient in (
+        ('flow', noisy, time, targets[0], float(scheduler.training_weight(time).item())),
+        ('endpoint', noise, endpoint, targets[1], endpoint_weight),
+    ):
+        prediction = predict(model, captured, x, t)
+        loss = (prediction.float() - target.float()).square().mean()
+        if not bool(torch.isfinite(loss)):
+            raise ValueError('Nonfinite native retention loss.')
+        (weight * coefficient * loss).backward()
+        terms['retention_' + name + '_mse'] = float(loss.detach())
+    return terms
