@@ -24,7 +24,7 @@ sys.path[:0] = [str(REPO / "src"), str(REPO)]
 FOCUS = ("blocks_ranking_rgb_to_bgr", "stack_blocks_two_green_on_red_to_red_on_green")
 
 
-def pair_stream(rows, seed, focus_repeats=2):
+def pair_stream(rows, seed, focus_repeats=2, balanced_task_domains=False):
     """Visit every training scene; modestly upsample early goal decisions."""
     groups = defaultdict(list)
     for row in rows:
@@ -33,7 +33,19 @@ def pair_stream(rows, seed, focus_repeats=2):
     if not groups or focus_repeats < 1:
         raise ValueError("Need training pairs and a positive sampling factor.")
     rng = random.Random(seed)
+    bags = {}
     while True:
+        if balanced_task_domains:
+            keys = [key for key in sorted(groups)
+                    for _ in range(focus_repeats if key[0] in FOCUS else 1)]
+            rng.shuffle(keys)
+            for key in keys:
+                if not bags.get(key):
+                    bags[key] = [row for row in groups[key]
+                                 for _ in range(int(row.get('sampling_weight', 1)))]
+                    rng.shuffle(bags[key])
+                yield bags[key].pop()
+            continue
         cycle = []
         for key, values in sorted(groups.items()):
             shuffled = [row for row in values for _ in range(int(row.get("sampling_weight", 1)))]
@@ -108,6 +120,8 @@ def main():
     ap.add_argument("--conditional-gain", type=float, default=1.,
                     help="Weight for language-dependent action difference within endpoint MSE.")
     ap.add_argument("--focus-repeats", type=int, default=2)
+    ap.add_argument('--balanced-task-domains', action='store_true',
+                    help='Give each task/domain equal draws even when trajectory lengths differ.')
     ap.add_argument("--seed", type=int, default=42027)
     ap.add_argument("--resume-state")
     ap.add_argument("--seen-language-augmentation", action="store_true",
@@ -185,7 +199,7 @@ def main():
     from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
     seen_contexts = (build_seen_contexts(model, REPO, rows)
                      if args.seen_language_augmentation else {})
-    stream = itertools.islice(pair_stream(rows, args.seed, args.focus_repeats),
+    stream = itertools.islice(pair_stream(rows, args.seed, args.focus_repeats, args.balanced_task_domains),
                              start * args.pairs_per_step + rank, None, world)
 
     def save(step):

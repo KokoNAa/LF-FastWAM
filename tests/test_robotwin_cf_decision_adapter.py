@@ -39,6 +39,17 @@ class DecisionSamplingTest(unittest.TestCase):
         counts = Counter(r['id'] for r in itertools.islice(pair_stream(rows, 42), 5))
         self.assertEqual(counts, {'initial': 4, 'phase': 1})
 
+    def test_dense_trajectory_length_does_not_change_task_frequency(self):
+        rows = [{'id': f'{task}/{i}', 'pair_id': task, 'task_config': 'clean',
+                 'replay_split': 'train'} for task, length in [('short', 2), ('long', 8)]
+                for i in range(length)]
+        rows.append({'id': 'heldout', 'pair_id': 'long', 'task_config': 'clean',
+                     'replay_split': 'replay_holdout'})
+        drawn = list(itertools.islice(pair_stream(rows, 42, 1, True), 16))
+        self.assertEqual(Counter(row['pair_id'] for row in drawn), {'short': 8, 'long': 8})
+        self.assertEqual(len({row['id'] for row in drawn if row['pair_id'] == 'long'}), 8)
+        self.assertNotIn('heldout', {row['id'] for row in drawn})
+
 
 if __name__ == "__main__":
     unittest.main()
