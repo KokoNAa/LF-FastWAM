@@ -179,8 +179,8 @@ def prepare_states(plan):
         obs = {"state": actions[frame]}
         for camera in CAMERAS:
             raw = bytes(handle[f"observation/{camera}/rgb"][frame]).rstrip(b"\0")
-            with Image.open(io.BytesIO(raw)) as im:
-                obs[camera] = np.asarray(im.convert("RGB"), dtype=np.uint8)
+            from experiments.robotwin.image_io import decode_legacy_robotwin_rgb
+            obs[camera] = decode_legacy_robotwin_rgb(raw)
         return obs
 
     for pair in plan["pairs"]:

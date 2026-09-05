@@ -82,8 +82,8 @@ def main():
             images = {}
             for camera in CAMERAS:
                 blob = bytes(handle[f'observation/{camera}/rgb'][0]).rstrip(b'\0')
-                with Image.open(io.BytesIO(blob)) as im:
-                    images[camera] = np.asarray(im.convert('RGB'), dtype=np.uint8)
+                from experiments.robotwin.image_io import decode_legacy_robotwin_rgb
+                images[camera] = decode_legacy_robotwin_rgb(blob)
         return actions, images
 
     skipped = []

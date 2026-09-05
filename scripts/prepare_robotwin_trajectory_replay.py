@@ -75,8 +75,8 @@ def worker(args):
         images = {}
         for camera in CAMERAS:
             blob = bytes(handle[f'observation/{camera}/rgb'][frame]).rstrip(b'\0')
-            with Image.open(io.BytesIO(blob)) as im:
-                images[camera] = np.asarray(im.convert('RGB'), dtype=np.uint8)
+            from experiments.robotwin.image_io import decode_legacy_robotwin_rgb
+            images[camera] = decode_legacy_robotwin_rgb(blob)
         obs = {'joint_action': {'vector': actions[0]}, 'observation': {c: {'rgb': images[c]} for c in CAMERAS}}
         _, captured, _ = capture_inputs(policy.model, lambda: policy._infer_action_chunk(obs, instruction))
         return captured, norm.forward(torch.as_tensor(actions).unsqueeze(0)).cpu()

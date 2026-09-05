@@ -56,8 +56,8 @@ def _decode_rgb(value: np.bytes_) -> np.ndarray:
     encoded = bytes(value).rstrip(b"\0")
     if not encoded:
         raise ValueError("Raw RoboTwin frame contains an empty JPEG payload.")
-    with Image.open(io.BytesIO(encoded)) as image:
-        return np.asarray(image.convert("RGB"), dtype=np.uint8)
+    from experiments.robotwin.image_io import decode_legacy_robotwin_rgb
+    return decode_legacy_robotwin_rgb(encoded)
 
 
 def _array(handle: h5py.File, key: str) -> np.ndarray:
