@@ -16,7 +16,7 @@ from experiments.robotwin.no_eraf_probe import difference, paired_action_details
 
 
 FORMAT = "robotwin_same_state_action_repair_v1"
-ARMS = ("paired_flow", "paired_flow_anchor")
+ARMS = ("paired_flow", "paired_flow_anchor", "paired_flow_anchor_delta")
 
 
 def move_cache(value, device, *, clone=False):
@@ -117,7 +117,7 @@ def sample_cached_actions(model, cache, seed, steps, horizon=32):
 
 
 def backward_paired_flow(model, caches, references, noise, timestep, coefficient,
-                         *, checkpoint=True):
+                         *, checkpoint=True, include_components=False):
     """Backpropagate equal source/target positives without keeping two graphs.
 
     coefficient is explicit: the sigma=1 anchor MUST NOT inherit the scheduler's
@@ -128,7 +128,7 @@ def backward_paired_flow(model, caches, references, noise, timestep, coefficient
     if not math.isfinite(coefficient) or coefficient < 0:
         raise ValueError("Flow coefficient must be finite and nonnegative.")
     scheduler = model.train_action_scheduler
-    errors = {}
+    errors, saved_predictions, saved_targets = {}, {}, {}
     for language in ("source", "target"):
         clean = references[language]
         noisy = scheduler.add_noise(clean, noise, timestep)
@@ -139,7 +139,140 @@ def backward_paired_flow(model, caches, references, noise, timestep, coefficient
             raise RuntimeError("Nonfinite paired flow loss.")
         (error * (coefficient / 2)).backward()
         errors[language] = float(error.detach())
+        if include_components:
+            saved_predictions[language], saved_targets[language] = prediction.detach(), target.detach()
+    if include_components:
+        parts = paired_velocity_losses(saved_predictions, saved_targets)
+        errors.update({key: float(parts[key]) for key in ("common_mse", "conditional_mse")})
     return errors
+
+
+def paired_velocity_losses(predictions, targets):
+    """Pair MSE = common MSE + half-difference MSE, with gradients on BOTH branches."""
+    s, t = (predictions[k].float() for k in ("source", "target"))
+    r, q = (targets[k].float() for k in ("source", "target"))
+    common = ((s + t - r - q) / 2).square().mean()
+    conditional = ((t - s - (q - r)) / 2).square().mean()
+    return {"source": (s - r).square().mean(), "target": (t - q).square().mean(),
+            "common_mse": common, "conditional_mse": conditional}
+
+
+def pure_anchor_losses(model, caches, references, noise, *, checkpoint=True):
+    import torch
+
+    scheduler = model.train_action_scheduler
+    time = torch.tensor([scheduler.num_train_timesteps], device=model.device, dtype=model.torch_dtype)
+    predictions, targets = {}, {}
+    for kind in ("source", "target"):
+        noisy = scheduler.add_noise(references[kind], noise, time)
+        if not torch.equal(noisy, noise):
+            raise ValueError("Pure-noise anchor input still contains expert actions.")
+        predictions[kind] = predict_with_grad(model, caches[kind], noisy, time, checkpoint=checkpoint)
+        targets[kind] = scheduler.training_target(references[kind], noise, time)
+    losses = paired_velocity_losses(predictions, targets)
+    if any(not bool(torch.isfinite(value)) for value in losses.values()):
+        raise RuntimeError("Nonfinite pure-noise paired loss.")
+    return losses
+
+
+def backward_paired_anchor(model, caches, references, noise, coefficient, *, conditional_gain=1., checkpoint=True):
+    """Reweight an existing endpoint loss component; no new labels or negatives.
+
+    gain=1 exactly recovers equal source/target positive MSE. gain>1 adds
+    (gain-1)*MSE((v_target-v_source)-(y_target-y_source))/4. At sigma=1 the
+    two inputs share noise, and y_target-y_source = -(a_target-a_source)
+    up to scheduler dtype rounding. Whole-forward checkpointing retains
+    only the two graph boundaries until their joint backward.
+    """
+    if (not math.isfinite(coefficient) or coefficient < 0
+            or not math.isfinite(conditional_gain) or conditional_gain < 1):
+        raise ValueError("Invalid anchor coefficient or conditional gain.")
+    if conditional_gain == 1:
+        # Preserve the old control's exact arithmetic/backward order, including
+        # BF16 gradient rounding; detached diagnostics add no model calls.
+        import torch
+        scheduler = model.train_action_scheduler
+        time = torch.tensor([scheduler.num_train_timesteps], device=model.device, dtype=model.torch_dtype)
+        if any(not torch.equal(scheduler.add_noise(ref, noise, time), noise) for ref in references.values()):
+            raise ValueError("Pure-noise anchor input still contains expert actions.")
+        return backward_paired_flow(model, caches, references, noise, time, coefficient,
+                                    checkpoint=checkpoint, include_components=True)
+    losses = pure_anchor_losses(model, caches, references, noise, checkpoint=checkpoint)
+    (coefficient * (losses["common_mse"] + conditional_gain * losses["conditional_mse"])).backward()
+    return {key: float(value.detach()) for key, value in losses.items()}
+
+
+def anchor_gradient_audit(model, caches, references, noise):
+    """Local common/difference gradients at one fixed sigma=1 input; no update.
+
+    These are unweighted endpoint-component gradients, not gradients of the
+    whole training objective or evidence of interference between tasks.
+    """
+    import torch
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    losses = pure_anchor_losses(model, caches, references, noise)
+    common = torch.autograd.grad(losses["common_mse"], params, retain_graph=True, allow_unused=True)
+    common = [g.detach().float().cpu() if g is not None else None for g in common]
+    conditional = torch.autograd.grad(losses["conditional_mse"], params, allow_unused=True)
+    c2 = d2 = dot = 0.
+    for c, d in zip(common, conditional):
+        if c is not None:
+            c2 += float(c.double().square().sum())
+        if d is not None:
+            d = d.detach().float().cpu()
+            d2 += float(d.double().square().sum())
+            if c is not None:
+                dot += float((c.double() * d.double()).sum())
+    if not all(math.isfinite(value) for value in (c2, d2, dot)):
+        raise RuntimeError("Nonfinite anchor component gradient.")
+    return {"common_mse": float(losses["common_mse"].detach()),
+            "conditional_mse": float(losses["conditional_mse"].detach()),
+            "common_grad_norm": math.sqrt(c2), "conditional_grad_norm": math.sqrt(d2),
+            "conditional_to_common_grad_norm": math.sqrt(d2 / c2) if c2 else None,
+            "gradient_cosine": dot / math.sqrt(c2 * d2) if c2 and d2 else None}
+
+
+def fixed_flow_rows(model, caches, references, seeds, sigmas):
+    """Fixed-input positive-flow evaluation, separate from ten-step generation.
+
+    Only sigma=1 compares languages at identical noisy actions. At lower
+    sigma the noisy inputs contain their own expert actions.
+    """
+    import torch
+
+    rows = []
+    scheduler = model.train_action_scheduler
+    with torch.no_grad():
+        for seed in seeds:
+            noise = noise_tensor((1, 32, 14), seed, model)
+            for sigma in sigmas:
+                if not 0 < sigma <= 1:
+                    raise ValueError("Fixed-flow sigma must be in (0,1].")
+                time = torch.tensor([sigma * scheduler.num_train_timesteps],
+                                    device=model.device, dtype=model.torch_dtype)
+                predictions, targets = {}, {}
+                for kind in ("source", "target"):
+                    noisy = scheduler.add_noise(references[kind], noise, time)
+                    predictions[kind] = model._predict_action_noise_with_cache(
+                        latents_action=noisy, timestep_action=time, **caches[kind])
+                    targets[kind] = scheduler.training_target(references[kind], noise, time)
+                for horizon in (24, 32):
+                    pred = {k: p[:, :horizon] for k, p in predictions.items()}
+                    truth = {k: p[:, :horizon] for k, p in targets.items()}
+                    losses = paired_velocity_losses(pred, truth)
+                    if any(not bool(torch.isfinite(value)) for value in losses.values()):
+                        raise RuntimeError("Nonfinite fixed-flow evaluation.")
+                    delta = pred["target"].float() - pred["source"].float()
+                    desired = truth["target"].float() - truth["source"].float()
+                    energy = float(desired.square().sum())
+                    rows.append({"noise_seed": seed, "sigma": sigma, "horizon": horizon,
+                        "actual_time": float(time.float().item()),
+                        "source_mse": float(losses["source"]), "target_mse": float(losses["target"]),
+                        "common_mse": float(losses["common_mse"]),
+                        "conditional_mse": float(losses["conditional_mse"]),
+                        "delta_projection": float((delta * desired).sum()) / energy if energy > 1e-12 else None})
+    return rows
 
 
 def action_rows(source, target, source_ref, target_ref, initial_source, initial_target):

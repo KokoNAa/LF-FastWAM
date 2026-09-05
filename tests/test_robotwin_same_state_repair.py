@@ -23,8 +23,10 @@ from fastwam.models.wan22.mot import MoT
 from fastwam.models.wan22.schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from fastwam.models.wan22.wan_video_dit import WanVideoDiT
 from experiments.robotwin.same_state_repair import (
-    action_rows, audit_frozen, backward_paired_flow, checkpoint_score, configure_action_lora,
-    frozen_versions, move_cache, noise_tensor, predict_with_grad, repair_payload, sample_cached_actions,
+    action_rows, anchor_gradient_audit, audit_frozen, backward_paired_anchor,
+    backward_paired_flow, checkpoint_score, configure_action_lora, fixed_flow_rows,
+    frozen_versions, move_cache, noise_tensor, paired_velocity_losses,
+    predict_with_grad, repair_payload, sample_cached_actions,
 )
 from scripts import train_robotwin_same_state_repair as runner
 from scripts.probe_robotwin_no_eraf import sha256, write_json
@@ -166,6 +168,53 @@ class RepairAutogradTest(unittest.TestCase):
             if actual[name] is not None:
                 torch.testing.assert_close(actual[name], parameter.grad, rtol=1e-5, atol=1e-7)
 
+    def test_anchor_gain_one_matches_original_positive_loss_gradients(self):
+        old_errors = backward_paired_flow(self.model, self.caches, self.refs, self.noise, self.time, .25)
+        expected = {name: p.grad.clone() if p.grad is not None else None for name, p in self.selected.items()}
+        self.model.zero_grad(set_to_none=True)
+        errors = backward_paired_anchor(self.model, self.caches, self.refs, self.noise, .25)
+        self.assertAlmostEqual(errors["common_mse"] + errors["conditional_mse"],
+                               (old_errors["source"] + old_errors["target"]) / 2, places=6)
+        for name, parameter in self.selected.items():
+            if expected[name] is None:
+                self.assertIsNone(parameter.grad)
+            else:
+                torch.testing.assert_close(expected[name], parameter.grad, rtol=0, atol=0)
+
+    def test_difference_loss_corrects_reversed_velocity_with_both_branch_gradients(self):
+        # source action=0, CF action=1, common noise=0 => velocities 0 and -1.
+        # Start with the velocities reversed. Descent must raise source and lower CF.
+        source, target = nn.Parameter(torch.tensor([[[-1.]]])), nn.Parameter(torch.tensor([[[0.]]]))
+        losses = paired_velocity_losses({"source": source, "target": target},
+                                        {"source": torch.zeros_like(source), "target": -torch.ones_like(target)})
+        (losses["common_mse"] + 4 * losses["conditional_mse"]).backward()
+        self.assertAlmostEqual(float(source.grad), -4.)
+        self.assertAlmostEqual(float(target.grad), 4.)
+        self.assertAlmostEqual(float(losses["common_mse"].detach()), 0.)
+        self.assertAlmostEqual(float(losses["conditional_mse"].detach()), 1.)
+
+    def test_initial_component_gradient_audit_does_not_populate_optimizer_grads(self):
+        versions = frozen_versions(self.model)
+        before = {key: p.detach().clone() for key, p in self.selected.items()}
+        audit = anchor_gradient_audit(self.model, self.caches, self.refs, self.noise)
+        self.assertGreater(audit["common_grad_norm"], 0)
+        self.assertGreater(audit["conditional_grad_norm"], 0)
+        self.assertTrue(all(p.grad is None for p in self.selected.values()))
+        self.assertTrue(all(torch.equal(before[key], p) for key, p in self.selected.items()))
+        audit_frozen(self.model, versions)
+
+    def test_fixed_flow_is_repeatable_and_matches_the_production_endpoint(self):
+        before = torch.get_rng_state()
+        rows = fixed_flow_rows(self.model, self.caches, self.refs, [91, 92], [.5, 1.])
+        self.assertEqual(rows, fixed_flow_rows(self.model, self.caches, self.refs, [91, 92], [.5, 1.]))
+        torch.testing.assert_close(before, torch.get_rng_state(), rtol=0, atol=0)
+        self.assertEqual(len(rows), 8)
+        row = next(r for r in rows if r["noise_seed"] == 91 and r["sigma"] == 1 and r["horizon"] == 32)
+        prediction = self.model._predict_action_noise_with_cache(
+            latents_action=self.noise, timestep_action=self.time, **self.caches["source"])
+        self.assertAlmostEqual(row["source_mse"], float((prediction - (self.noise - self.refs["source"])).square().mean()))
+        self.assertTrue(all(p.grad is None for p in self.selected.values()))
+
     def test_bfloat16_backbone_keeps_float32_action_adapter_gradients(self):
         self.model.to(dtype=torch.bfloat16)
         self.model.torch_dtype = torch.bfloat16
@@ -176,6 +225,19 @@ class RepairAutogradTest(unittest.TestCase):
                              self.time.to(torch.bfloat16), .25)
         gradients = [p.grad for p in selected.values() if p.grad is not None]
         self.assertTrue(gradients)
+        self.assertTrue(all(g.dtype == torch.float32 and torch.isfinite(g).all() for g in gradients))
+        self.assertTrue(any(g.abs().sum() > 0 for g in gradients))
+        expected = {key: p.grad.clone() if p.grad is not None else None for key, p in selected.items()}
+        self.model.zero_grad(set_to_none=True)
+        backward_paired_anchor(self.model, caches, refs, self.noise.to(torch.bfloat16), .25, conditional_gain=1.)
+        for key, p in selected.items():
+            if expected[key] is None:
+                self.assertIsNone(p.grad)
+            else:
+                torch.testing.assert_close(p.grad, expected[key], rtol=0, atol=0)
+        self.model.zero_grad(set_to_none=True)
+        backward_paired_anchor(self.model, caches, refs, self.noise.to(torch.bfloat16), .25, conditional_gain=4.)
+        gradients = [p.grad for p in selected.values() if p.grad is not None]
         self.assertTrue(all(g.dtype == torch.float32 and torch.isfinite(g).all() for g in gradients))
         self.assertTrue(any(g.abs().sum() > 0 for g in gradients))
 
@@ -301,6 +363,32 @@ class RepairPipelineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "authorized historical"):
             runner.build_plan(self.args)
 
+    def test_source_repair_reuses_original_probe_and_rejects_changed_inputs(self):
+        previous = runner.build_plan(self.args)
+        previous_root = self.fixture.root / "previous-repair"
+        previous_root.mkdir()
+        write_json(previous_root / "plan.json", previous)
+        write_json(previous_root / "summary.json", {"format": runner.FORMAT, "complete": True})
+        folder = previous_root / "paired_flow_anchor"
+        folder.mkdir()
+        selected_id = next(s["id"] for s in previous["states"] if s["split"] == "repair")
+        records = [{"step": step, "draws": [{"id": selected_id, "noise_seed": 17000 + step,
+            "time": 500., "scheduler_weight": 1., "noise_sha256": "a" * 64}]} for step in (1, 2)]
+        (folder / "training.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+        self.args.source_repair = str(previous_root)
+        self.args.source_probe = "/not-the-selected-source"
+        plan = runner.build_plan(self.args)
+        self.assertEqual(plan["source_probe"], previous["source_probe"])
+        self.assertEqual(plan["initial_model"], "step1000")
+        self.assertIn(str((previous_root / "plan.json").resolve()), plan["source_artifact_sha256"])
+        self.assertEqual(plan["training_draws"]["1"][selected_id]["noise_seed"], 17001)
+        self.assertFalse(Path(self.args.output).exists())
+        source = copy.deepcopy(self.source)
+        source["changed_since_repair"] = True
+        write_json(self.root / "plan.json", source)
+        with self.assertRaisesRegex(ValueError, "Source artifact changed"):
+            runner.build_plan(self.args)
+
     def test_cpu_worker_runs_real_backward_saves_checkpoints_and_summarizes(self):
         class Policy:
             seed = 42
@@ -315,7 +403,24 @@ class RepairPipelineTest(unittest.TestCase):
 
         policy = Policy()
         self.args.arms = list(runner.ARMS)
+        self.args.fixed_flow_sigmas = [.5, 1.]
+        self.args.audit_anchor_gradients = True
         plan = runner.build_plan(self.args)
+        plan["normalization_state_count"] = 2
+        # Keep a two-state-style noise schedule even though this tiny fixture
+        # has one active state. A subset restart must not fall back to n=1 seeds.
+        from experiments.robotwin.no_eraf_probe import typed_hash
+        fit_id = next(s["id"] for s in plan["states"] if s["split"] == "repair")
+        scheduler = self.model.train_action_scheduler
+        plan["training_draws"] = {}
+        for step in (1, 2):
+            seed = plan["train_seed"] + 2 * step + 1
+            u = torch.rand((1,), generator=torch.Generator().manual_seed(1_000_000_000 + seed))
+            time = scheduler._phi(u, scheduler.shift) * scheduler.num_train_timesteps
+            noise = noise_tensor((1, 32, 14), seed, self.model)
+            plan["training_draws"][str(step)] = {fit_id: {"id": fit_id, "noise_seed": seed,
+                "time": float(time.item()), "scheduler_weight": float(scheduler.training_weight(time)),
+                "noise_sha256": typed_hash(noise[0].numpy())}}
         plan["git_commit"] = "cpu-fixture"
         root = Path(plan["output"])
         root.mkdir()
@@ -330,11 +435,16 @@ class RepairPipelineTest(unittest.TestCase):
             runner.summarize(root)
         summary = json.loads((root / "summary.json").read_text())
         self.assertTrue(summary["complete"])
+        self.assertTrue(summary["fixed_flow_summary"])
+        self.assertEqual(set(summary["anchor_gradient_audit"]), set(runner.ARMS))
         from scripts.inspect_robotwin_same_state_repair import inspect
         diagnostics = inspect(root)
         self.assertTrue(diagnostics["training_inputs_match_across_arms"])
         self.assertEqual(diagnostics["repair_states"], 1)
         json.dumps(diagnostics, allow_nan=False)
+        final_eval = json.loads((root / args.arm / "evaluation_000002.json").read_text())
+        self.assertEqual(len(final_eval["fixed_flow_rows"]), 8)
+        self.assertTrue(all(row["sigma"] in (.5, 1.) for row in final_eval["fixed_flow_rows"]))
         checkpoint = torch.load(root / args.arm / "checkpoints/repair_000002.pt", weights_only=False)
         self.assertEqual(checkpoint["step"], 1002)
         self.assertEqual(checkpoint["robotwin_same_state_repair"]["optimizer_steps"], 2)
@@ -342,6 +452,26 @@ class RepairPipelineTest(unittest.TestCase):
         log = (root / args.arm / "training.jsonl").read_text().splitlines()
         self.assertEqual(len(log), 2)
         self.assertTrue(all(json.loads(row)["gradient_norm_before_clip"] > 0 for row in log))
+        # A restart with the recorded draws and denominator reproduces the
+        # control exactly, with a fresh optimizer and the original weights.
+        child_args = copy.deepcopy(self.args)
+        child_args.source_repair = str(root)
+        child_args.output = str(root.parent / "restart-control")
+        child_args.arms = ["paired_flow_anchor"]
+        child_plan = runner.build_plan(child_args)
+        self.assertEqual(child_plan["normalization_state_count"], 2)
+        child_plan["git_commit"] = "cpu-fixture"
+        child_root = Path(child_plan["output"])
+        child_root.mkdir()
+        write_json(child_root / "plan.json", child_plan)
+        policy.model = copy.deepcopy(self.model)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(runner, "load_probe_policy", return_value=(policy, {})):
+                runner.worker(argparse.Namespace(plan=str(child_root / "plan.json"), arm="paired_flow_anchor", gpu=0))
+        original_payload = torch.load(root / "paired_flow_anchor/checkpoints/repair_000002.pt", weights_only=False)
+        restarted_payload = torch.load(child_root / "paired_flow_anchor/checkpoints/repair_000002.pt", weights_only=False)
+        for key, value in original_payload["mot_trainable"].items():
+            torch.testing.assert_close(value, restarted_payload["mot_trainable"][key], rtol=0, atol=0)
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.report("latest", root.parent), root)
         training_path = root / args.arm / "training.jsonl"
@@ -351,6 +481,14 @@ class RepairPipelineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "draws differ"):
             runner.summarize(root)
         training_path.write_text("\n".join(log) + "\n")
+        flow_path = root / args.arm / "evaluation_000001.json"
+        original_flow = json.loads(flow_path.read_text())
+        broken_flow = copy.deepcopy(original_flow)
+        broken_flow["fixed_flow_rows"].pop()
+        write_json(flow_path, broken_flow)
+        with self.assertRaisesRegex(ValueError, "fixed-flow evaluations"):
+            runner.summarize(root)
+        write_json(flow_path, original_flow)
         (root / args.arm / "evaluation_000001.json").unlink()
         with self.assertRaises(FileNotFoundError):
             runner.summarize(root)

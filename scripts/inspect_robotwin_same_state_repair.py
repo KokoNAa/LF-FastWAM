@@ -24,6 +24,7 @@ LANGUAGES = ("source", "target")
 NOTES = [
     "Training-window losses use changing noise/timesteps; they are not fixed-input denoising evaluations.",
     "Loss shares measure objective values, not gradient shares or gradient conflict.",
+    "source_objective_share covers positive branch losses; any extra conditional-difference contribution is separate.",
     "pair_mse = common_mse + conditional_mse; conditional_mse includes the factor 1/4.",
     "Generated-action metrics use matched seeds. Seed/horizon rows are not independent scenes or task successes.",
     "Recorded runtime checks are read from complete.json; checkpoints/models are not reloaded.",
@@ -77,7 +78,8 @@ def paired_components(source, target, source_ref, target_ref, initial_source, in
     }
 
 
-def training_windows(training, fit_ids, arm, anchor_weight, window):
+def training_windows(training, fit_ids, arm, anchor_weight, window, normalization_states=None):
+    normalization_states = normalization_states or len(fit_ids)
     width = min(window, max(1, len(training) // 2))
     groups = (("early", training[:width]), ("late", training[-width:]))
     rows = []
@@ -96,13 +98,19 @@ def training_windows(training, fit_ids, arm, anchor_weight, window):
                                  for d, t in zip(draws, terms))
                 result[f"weighted_flow_{kind}_mse"] = weighted
                 anchor = (fmean(t[f"anchor_{kind}_mse"] for t in terms)
-                          if arm == "paired_flow_anchor" else None)
+                          if arm != "paired_flow" else None)
                 result[f"anchor_{kind}_mse"] = anchor
-                # Each language contributes 1/(2 * number_of_repair_states).
-                objective[kind] = (weighted + anchor_weight * (anchor or 0)) / (2 * len(fit_ids))
+                # Isolated controls can retain the source run's loss denominator.
+                objective[kind] = (weighted + anchor_weight * (anchor or 0)) / (2 * normalization_states)
                 result[f"{kind}_objective_contribution"] = objective[kind]
             total = sum(objective.values())
             result["source_objective_share"] = objective["source"] / total if total else None
+            for field in ("anchor_common_mse", "anchor_conditional_mse"):
+                result[field] = fmean(t[field] for t in terms) if all(field in t for t in terms) else None
+            result["extra_conditional_objective_contribution"] = (anchor_weight * fmean(
+                (t["conditional_anchor_gain"] - 1) * t["anchor_conditional_mse"] for t in terms) / normalization_states
+                if arm == "paired_flow_anchor_delta" else 0.)
+            result["total_objective_contribution"] = total + result["extra_conditional_objective_contribution"]
             rows.append(result)
     return rows
 
@@ -130,7 +138,7 @@ def inspect(root, *, window=50):
         raise ValueError("Invalid repair/guard split.")
     arms = plan["arms"]
     if (not arms or len(set(arms)) != len(arms)
-            or not set(arms) <= {"paired_flow", "paired_flow_anchor"}):
+            or not set(arms) <= {"paired_flow", "paired_flow_anchor", "paired_flow_anchor_delta"}):
         raise ValueError("Invalid repair arms.")
     finite(plan["anchor_weight"], "anchor_weight", nonnegative=True)
     steps, seeds = plan["evaluation_steps"], plan["eval_seeds"]
@@ -160,9 +168,15 @@ def inspect(root, *, window=50):
                     finite(draws[key][field], field, nonnegative=True)
                 for field in ("flow_source_mse", "flow_target_mse"):
                     finite(terms[key][field], field, nonnegative=True)
-                if arm == "paired_flow_anchor":
+                if arm != "paired_flow":
                     for field in ("anchor_source_mse", "anchor_target_mse"):
                         finite(terms[key][field], field, nonnegative=True)
+                    if plan.get("anchor_objective") or arm == "paired_flow_anchor_delta":
+                        for field in ("anchor_common_mse", "anchor_conditional_mse", "conditional_anchor_gain"):
+                            finite(terms[key][field], field, nonnegative=True)
+                        gain = plan["conditional_anchor_gain"] if arm == "paired_flow_anchor_delta" else 1.
+                        if terms[key]["conditional_anchor_gain"] != gain or gain < 1:
+                            raise ValueError("Logged conditional gain differs from plan.")
             if matched_draws.setdefault(row["step"], draws) != draws:
                 raise ValueError("Training noise/timestep draws differ across arms.")
             if (finite(row["gradient_norm_before_clip"], "gradient norm", nonnegative=True) == 0
@@ -174,7 +188,8 @@ def inspect(root, *, window=50):
                           "max": max(norms), "fraction_clipped_at_1": fmean(n > 1 for n in norms),
                           "min_parameters_with_grad": min(r["parameters_with_grad"] for r in training),
                           "max_parameters_with_grad": max(r["parameters_with_grad"] for r in training)})
-        losses.extend(training_windows(training, fit_ids, arm, plan["anchor_weight"], window))
+        losses.extend(training_windows(training, fit_ids, arm, plan["anchor_weight"], window,
+                                       plan.get("normalization_state_count")))
         baseline = {}
         for step in steps:
             evaluation = read(folder / f"evaluation_{step:06d}.json")

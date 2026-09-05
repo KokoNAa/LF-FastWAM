@@ -23,7 +23,7 @@ from scripts.probe_robotwin_denoising import DEFAULT_PAIRS, resolve_source_probe
 from scripts.probe_robotwin_no_eraf import load_probe_policy, read_json, sha256, write_json
 
 FORMAT = "robotwin_same_state_action_repair_v1"
-ARMS = ("paired_flow", "paired_flow_anchor")
+ARMS = ("paired_flow", "paired_flow_anchor", "paired_flow_anchor_delta")
 
 
 def state_key(state):
@@ -37,7 +37,18 @@ def evaluation_steps(steps, every):
 def build_plan(args):
     from experiments.robotwin.no_eraf_probe import require_pair
 
-    root = resolve_source_probe(args.source_probe)
+    source_repair = getattr(args, "source_repair", None)
+    if source_repair:
+        previous_root = Path(source_repair).expanduser().resolve()
+        previous = read_json(previous_root / "plan.json")
+        previous_summary = read_json(previous_root / "summary.json")
+        if (previous.get("format") != FORMAT or previous_summary.get("format") != FORMAT
+                or previous_summary.get("complete") is not True
+                or previous["initial_model"] != args.initial_model):
+            raise ValueError("source-repair must be complete and use the same initial model.")
+        root = resolve_source_probe(previous["source_probe"])
+    else:
+        root = resolve_source_probe(args.source_probe)
     source = read_json(root / "plan.json")
     summary = read_json(root / "summary.json")
     if (source.get("format") != "robotwin_no_eraf_same_state_probe_v1"
@@ -83,13 +94,47 @@ def build_plan(args):
         if row["observation_sha256"] != state["observation_sha256"] or not row["dual_reference_valid"]:
             raise ValueError("Initial prediction/observation mismatch.")
         saved[state["id"]] = {"path": row["actions_file"], "sha256": sha256(row["actions_file"])}
-    noise_seeds = {args.train_seed + step * len(fit) + i
-                   for step in range(1, args.steps + 1) for i in range(len(fit))}
+    training_draws = {}
+    normalization_states = len(fit)
+    if source_repair:
+        if args.train_seed != previous["train_seed"] or args.steps > previous["steps"]:
+            raise ValueError("source-repair requires the original train seed and no more than its recorded steps.")
+        previous_fit = {s["id"] for s in previous["states"] if s["split"] == "repair"}
+        if not fit_ids <= previous_fit:
+            raise ValueError("source-repair can only isolate a subset of its original repair states.")
+        previous_arm = "paired_flow_anchor" if "paired_flow_anchor" in previous["arms"] else previous["arms"][0]
+        training_path = previous_root / previous_arm / "training.jsonl"
+        records = [json.loads(line) for line in training_path.read_text().splitlines()]
+        if [r["step"] for r in records] != list(range(1, previous["steps"] + 1)):
+            raise ValueError("Incomplete source-repair training draws.")
+        for row in records[:args.steps]:
+            draws = {d["id"]: d for d in row["draws"] if d["id"] in fit_ids}
+            if set(draws) != fit_ids or len([d for d in row["draws"] if d["id"] in fit_ids]) != len(fit_ids):
+                raise ValueError("Missing/duplicate source-repair state draws.")
+            for draw in draws.values():
+                if (not {"id", "noise_seed", "time", "scheduler_weight", "noise_sha256"} <= set(draw)
+                        or not isinstance(draw["noise_seed"], int) or draw["noise_seed"] < 0
+                        or any(not math.isfinite(draw[k]) or draw[k] < 0 for k in ("time", "scheduler_weight"))
+                        or not isinstance(draw["noise_sha256"], str) or len(draw["noise_sha256"]) != 64):
+                    raise ValueError("Invalid source-repair training draw.")
+            training_draws[str(row["step"])] = draws
+        normalization_states = previous.get("normalization_state_count", len(previous_fit))
+        if not isinstance(normalization_states, int) or normalization_states < len(fit):
+            raise ValueError("Invalid source-repair loss normalization count.")
+    noise_seeds = ({d["noise_seed"] for draws in training_draws.values() for d in draws.values()}
+                   if training_draws else {args.train_seed + step * len(fit) + i
+                       for step in range(1, args.steps + 1) for i in range(len(fit))})
     if noise_seeds.intersection(args.eval_seeds):
         raise ValueError("Training noise seeds overlap evaluation noise seeds.")
     paths = [root / name for name in ("plan.json", "states.json", "summary.json")]
     paths += [record_path, root / args.initial_model / "complete.json"]
+    if source_repair:
+        for path, expected_hash in previous["source_artifact_sha256"].items():
+            if sha256(path) != expected_hash:
+                raise ValueError(f"Source artifact changed since the earlier repair: {path}")
+        paths += [previous_root / "plan.json", previous_root / "summary.json", training_path]
     return {"format": FORMAT, "source_probe": str(root), "source_plan": source,
+            "source_repair": str(previous_root) if source_repair else None,
             "source_artifact_sha256": {str(path): sha256(path) for path in paths},
             "output": str(Path(args.output).expanduser().resolve()), "initial_model": args.initial_model,
             "initial_step": int(args.initial_model[4:]), "states": selected,
@@ -97,11 +142,16 @@ def build_plan(args):
             "steps": args.steps, "eval_every": args.eval_every,
             "evaluation_steps": evaluation_steps(args.steps, args.eval_every),
             "train_seed": args.train_seed, "eval_seeds": args.eval_seeds,
+            "training_draws": training_draws, "normalization_state_count": normalization_states,
             "learning_rate": args.learning_rate, "anchor_weight": args.anchor_weight,
+            "conditional_anchor_gain": getattr(args, "conditional_anchor_gain", 4.),
+            "anchor_objective": "paired_common_conditional_v1",
+            "fixed_flow_sigmas": getattr(args, "fixed_flow_sigmas", []),
+            "audit_anchor_gradients": getattr(args, "audit_anchor_gradients", False),
             "minimum_improvement": args.minimum_improvement,
             "guard_relative": args.guard_relative, "guard_absolute": args.guard_absolute,
             "scope": "Action LoRA A/B only; frozen production Video/context caches; dropout off; no ranking, Video loss, ERAF or full-goal data.",
-            "interpretation": "Repair-state learnability with new noise seeds and separate regression states. Not held-out-scene generalization or closed-loop success. Anchor arm performs twice as many Action forward/backward calls."}
+            "interpretation": "Repair-state learnability with evaluation noise seeds excluded from training and separate regression states. Not held-out-scene generalization or closed-loop success. Both anchor arms have the same Action calls per optimizer step, twice that of paired_flow. Conditional gain reweights existing positive supervision; it adds no new labels."}
 
 
 def write_csv(path, rows):
@@ -136,6 +186,9 @@ def report(output="latest", search_root=None):
     print(f"[report] {root}")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print((root / "repair_summary.csv").read_text(), end="")
+    if summary.get("fixed_flow_summary"):
+        print("[fixed_flow_summary] Fixed noise/timesteps; only sigma=1 has identical noisy inputs across languages.")
+        print((root / "fixed_flow_summary.csv").read_text(), end="")
     return root
 
 
@@ -152,7 +205,8 @@ def worker(args):
     from experiments.robotwin.denoising_probe import capture_action_cache
     from experiments.robotwin.no_eraf_probe import CAMERAS, difference, observation_hash, typed_hash
     from experiments.robotwin.same_state_repair import (
-        action_rows, audit_frozen, backward_paired_flow, checkpoint_score,
+        action_rows, anchor_gradient_audit, audit_frozen, backward_paired_anchor,
+        backward_paired_flow, checkpoint_score, fixed_flow_rows,
         configure_action_lora, frozen_versions, move_cache, noise_tensor,
         predict_with_grad, repair_payload, sample_cached_actions,
     )
@@ -223,6 +277,7 @@ def worker(args):
     write_json(root / "initial_replay.json", replay_rows)
 
     fit_states = [state for state in plan["states"] if state["split"] == "repair"]
+    normalization_states = plan.get("normalization_state_count", len(fit_states))
     # Confirm that removing only no_grad preserves the production predictor value.
     first = fit_states[0]
     probe_cache = move_cache(cached[first["id"]]["source"], model.device)
@@ -238,17 +293,39 @@ def worker(args):
     write_json(root / "autograd_forward_check.json", predictor_error)
     del probe_cache, production, differentiable, probe_noise, probe_time
 
+    if plan.get("audit_anchor_gradients"):
+        gradient_rows = []
+        for state in fit_states:
+            caches = move_cache(cached[state["id"]], model.device)
+            refs = {kind: torch.as_tensor(value, device=model.device, dtype=model.torch_dtype).unsqueeze(0)
+                    for kind, value in references[state["id"]].items()}
+            noise = noise_tensor((1, 32, 14), policy.seed, model)
+            gradient_rows.append({"id": state["id"], "noise_seed": policy.seed,
+                                  **anchor_gradient_audit(model, caches, refs, noise)})
+            if any(p.grad is not None for p in selected.values()):
+                raise ValueError("Read-only gradient audit populated optimizer gradients.")
+            audit_frozen(model, protected)
+            del caches, refs, noise
+        write_json(root / "anchor_gradient_audit.json", gradient_rows)
+
     optimizer = torch.optim.AdamW(list(selected.values()), lr=plan["learning_rate"], weight_decay=0.)
     baseline, scores, latest_predictions = {}, [], {}
     (root / "actions").mkdir()
     (root / "checkpoints").mkdir()
 
     def evaluate(step):
-        rows = []
+        rows, flow_rows = [], []
         model.eval()
         for state in plan["states"]:
             caches = move_cache(cached[state["id"]], model.device)
             refs = references[state["id"]]
+            if state["split"] == "repair" and plan.get("fixed_flow_sigmas"):
+                refs_tensor = {k: torch.as_tensor(v, device=model.device, dtype=model.torch_dtype).unsqueeze(0)
+                               for k, v in refs.items()}
+                flow_rows.extend({"arm": args.arm, "repair_step": step, "id": state["id"], **row}
+                                 for row in fixed_flow_rows(model, caches, refs_tensor,
+                                                           plan["eval_seeds"], plan["fixed_flow_sigmas"]))
+                del refs_tensor
             for seed in plan["eval_seeds"]:
                 predictions = {kind: sample_cached_actions(model, caches[kind], seed, 10)
                                for kind in ("source", "target")}
@@ -275,7 +352,11 @@ def worker(args):
                 "initial_checkpoint_sha256": plan["source_plan"]["checkpoint_sha256"][plan["initial_model"]],
                 "repair_state_ids": [s["id"] for s in fit_states], "scope": plan["scope"],
                 "learning_rate": plan["learning_rate"],
-                "anchor_weight": plan["anchor_weight"] if args.arm == "paired_flow_anchor" else 0.,
+                "anchor_weight": plan["anchor_weight"] if args.arm != "paired_flow" else 0.,
+                "conditional_anchor_gain": plan["conditional_anchor_gain"] if args.arm == "paired_flow_anchor_delta" else 1.,
+                "anchor_objective": plan.get("anchor_objective", "paired_positive_mse"),
+                "normalization_state_count": normalization_states,
+                "source_training_draws_reused": bool(plan.get("training_draws")),
                 "source_plan": str(Path(plan["output"]) / "plan.json"), "git_commit": plan["git_commit"]})
             temporary = path.with_suffix(".tmp")
             torch.save(payload, temporary)
@@ -287,7 +368,7 @@ def worker(args):
             score.update(checkpoint=str(path), checkpoint_sha256=sha256(path))
             del payload, saved
         audit_frozen(model, protected)
-        write_json(root / f"evaluation_{step:06d}.json", {"rows": rows, "score": score})
+        write_json(root / f"evaluation_{step:06d}.json", {"rows": rows, "score": score, "fixed_flow_rows": flow_rows})
         scores.append(score)
         print(f"[eval] {args.arm} repair_step={step} both_correct={score['fit_both_correct']}/{score['fit_rows']} "
               f"fit_pass={score['fit_pass']} guard_pass={score['guard_pass']} "
@@ -302,7 +383,8 @@ def worker(args):
                 caches = move_cache(cached[state["id"]], model.device)
                 refs = {kind: torch.as_tensor(value, device=model.device, dtype=model.torch_dtype).unsqueeze(0)
                         for kind, value in references[state["id"]].items()}
-                seed = plan["train_seed"] + step * len(fit_states) + index
+                previous_draw = plan.get("training_draws", {}).get(str(step), {}).get(state["id"])
+                seed = previous_draw["noise_seed"] if previous_draw else plan["train_seed"] + step * len(fit_states) + index
                 noise = noise_tensor((1, 32, 14), seed, model)
                 # Same distribution as sample_training_t, but an explicit CPU
                 # generator makes draws independent of extra anchor forwards.
@@ -311,16 +393,22 @@ def worker(args):
                 time = (scheduler._phi(u, scheduler.shift) * scheduler.num_train_timesteps).to(
                     device=model.device, dtype=model.torch_dtype)
                 weight = float(scheduler.training_weight(time).float().item())
-                errors = backward_paired_flow(model, caches, refs, noise, time, weight / len(fit_states))
+                draw = {"id": state["id"], "noise_seed": seed, "time": float(time.float().item()),
+                        "scheduler_weight": weight, "noise_sha256": typed_hash(numpy_first(noise))}
+                if previous_draw and (any(draw[k] != previous_draw[k] for k in ("id", "noise_seed", "noise_sha256"))
+                        or any(abs(draw[k] - previous_draw[k]) > 1e-7 for k in ("time", "scheduler_weight"))):
+                    raise ValueError("Reused training noise/timestep differs from the original repair.")
+                errors = backward_paired_flow(model, caches, refs, noise, time, weight / normalization_states)
                 item = {"id": state["id"], "flow_source_mse": errors["source"], "flow_target_mse": errors["target"]}
-                if args.arm == "paired_flow_anchor":
-                    pure_time = torch.full_like(time, scheduler.num_train_timesteps)
-                    anchor = backward_paired_flow(model, caches, refs, noise, pure_time,
-                                                  plan["anchor_weight"] / len(fit_states))
-                    item.update(anchor_source_mse=anchor["source"], anchor_target_mse=anchor["target"])
+                if args.arm != "paired_flow":
+                    gain = plan["conditional_anchor_gain"] if args.arm == "paired_flow_anchor_delta" else 1.
+                    anchor = backward_paired_anchor(model, caches, refs, noise,
+                        plan["anchor_weight"] / normalization_states, conditional_gain=gain)
+                    item.update(anchor_source_mse=anchor["source"], anchor_target_mse=anchor["target"],
+                                anchor_common_mse=anchor["common_mse"],
+                                anchor_conditional_mse=anchor["conditional_mse"], conditional_anchor_gain=gain)
                 terms.append(item)
-                draws.append({"id": state["id"], "noise_seed": seed, "time": float(time.float().item()),
-                              "scheduler_weight": weight, "noise_sha256": typed_hash(numpy_first(noise))})
+                draws.append(draw)
                 del caches, refs, noise
             grads = [p.grad for p in selected.values() if p.grad is not None]
             if not grads or any(not bool(torch.isfinite(g).all()) for g in grads):
@@ -368,6 +456,8 @@ def summarize(output):
     expected = {(state["id"], seed, horizon) for state in plan["states"]
                 for seed in plan["eval_seeds"] for horizon in (24, 32)}
     summaries, results, draws_by_step, initial = [], {}, {}, {}
+    flow_summary, flow_initial, gradient_audits = [], {}, {}
+    fit_ids = {s["id"] for s in plan["states"] if s["split"] == "repair"}
     for arm in plan["arms"]:
         complete = read_json(root / arm / "complete.json")
         if (complete.get("format") != FORMAT or complete.get("complete") is not True
@@ -381,8 +471,43 @@ def summarize(output):
             previous = draws_by_step.setdefault(row["step"], row["draws"])
             if previous != row["draws"]:
                 raise ValueError("Training noise/sigma draws differ across arms.")
+            if plan.get("anchor_objective") and arm != "paired_flow":
+                gain = plan["conditional_anchor_gain"] if arm == "paired_flow_anchor_delta" else 1.
+                for term in row["terms"]:
+                    if term.get("conditional_anchor_gain") != gain:
+                        raise ValueError("Logged conditional gain differs from the planned objective.")
         for step in plan["evaluation_steps"]:
             evaluation = read_json(root / arm / f"evaluation_{step:06d}.json")
+            if plan.get("fixed_flow_sigmas"):
+                expected_flow = {(key, seed, sigma, horizon) for key in fit_ids for seed in plan["eval_seeds"]
+                                 for sigma in plan["fixed_flow_sigmas"] for horizon in (24, 32)}
+                flow = evaluation["fixed_flow_rows"]
+                if (len(flow) != len(expected_flow) or
+                        {(r["id"], r["noise_seed"], r["sigma"], r["horizon"]) for r in flow} != expected_flow):
+                    raise ValueError("Incomplete/duplicate fixed-flow evaluations.")
+                fields = ("source_mse", "target_mse", "common_mse", "conditional_mse")
+                for row in flow:
+                    if row["arm"] != arm or row["repair_step"] != step:
+                        raise ValueError("Fixed-flow evaluation identity mismatch.")
+                    if any(not math.isfinite(row[f]) or row[f] < 0 for f in fields):
+                        raise ValueError("Invalid fixed-flow error.")
+                    if not math.isclose((row["source_mse"] + row["target_mse"]) / 2,
+                                        row["common_mse"] + row["conditional_mse"], rel_tol=1e-5, abs_tol=1e-6):
+                        raise ValueError("Fixed-flow error decomposition mismatch.")
+                    if step == 0:
+                        key = row["id"], row["noise_seed"], row["sigma"], row["horizon"]
+                        previous = flow_initial.setdefault(key, row)
+                        if any(abs(previous[f] - row[f]) > 1e-5 for f in (*fields, "actual_time")):
+                            raise ValueError("Initial fixed-flow evaluations differ across arms.")
+                groups = {}
+                for row in flow:
+                    groups.setdefault((row["id"], row["sigma"], row["horizon"]), []).append(row)
+                for (key, sigma, horizon), group in sorted(groups.items()):
+                    projections = [r["delta_projection"] for r in group]
+                    flow_summary.append({"arm": arm, "repair_step": step, "id": key, "sigma": sigma,
+                        "horizon": horizon, "seeds": len(group),
+                        **{f: fmean(r[f] for r in group) for f in fields},
+                        "delta_projection": fmean(projections) if all(x is not None for x in projections) else None})
             rows = evaluation["rows"]
             if len(rows) != len(expected) or {(r["id"], r["noise_seed"], r["horizon"]) for r in rows} != expected:
                 raise ValueError("Incomplete/duplicate evaluations.")
@@ -407,8 +532,20 @@ def summarize(output):
                     "fit_pass": evaluation["score"]["fit_pass"], "guard_pass": evaluation["score"]["guard_pass"]})
         results[arm] = {"best": complete["best"], "last_checkpoint": complete["last_checkpoint"],
                         "last_score": complete["scores"][-1]}
+        if plan.get("audit_anchor_gradients"):
+            gradient_audits[arm] = read_json(root / arm / "anchor_gradient_audit.json")
+            if (len(gradient_audits[arm]) != len(fit_ids)
+                    or {r["id"] for r in gradient_audits[arm]} != fit_ids):
+                raise ValueError("Incomplete/duplicate initial anchor gradient audit.")
+    if flow_summary:
+        write_csv(root / "fixed_flow_summary.csv", flow_summary)
     write_csv(root / "repair_summary.csv", summaries)
     write_json(root / "summary.json", {"format": FORMAT, "complete": True, "arms": results,
+               "source_training_draws_reused": bool(plan.get("training_draws")),
+               "normalization_state_count": plan.get("normalization_state_count", len(fit_ids)),
+               "fixed_flow_summary": str(root / "fixed_flow_summary.csv") if flow_summary else None,
+               "anchor_gradient_audit": gradient_audits,
+               "anchor_gradient_audit_interpretation": f"Unweighted common/difference endpoint gradients at initial weights and seed {plan['source_plan']['probe_seed']}; not whole-training or cross-task gradients." if gradient_audits else None,
                "interpretation": plan["interpretation"]})
     print(f"[complete] {root / 'summary.json'}\n[table] {root / 'repair_summary.csv'}", flush=True)
 
@@ -417,11 +554,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run")
-    run.add_argument("--source-probe", default="latest")
+    source_args = run.add_mutually_exclusive_group()
+    source_args.add_argument("--source-probe", default="latest")
+    source_args.add_argument("--source-repair", help="Reuse a completed repair's original probe, not its repaired weights.")
     run.add_argument("--output", required=True)
     run.add_argument("--initial-model", choices=["step500", "step1000"], default="step1000")
     run.add_argument("--gpus", type=int, nargs="+", default=[0, 1])
-    run.add_argument("--arms", choices=ARMS, nargs="+", default=list(ARMS))
+    run.add_argument("--arms", choices=ARMS, nargs="+", default=list(ARMS[:2]))
     run.add_argument("--pairs", nargs="+", default=DEFAULT_PAIRS)
     run.add_argument("--steps", type=int, default=300)
     run.add_argument("--eval-every", type=int, default=50)
@@ -429,6 +568,9 @@ def main():
     run.add_argument("--eval-seeds", type=int, nargs="+", default=[42, 43, 44])
     run.add_argument("--learning-rate", type=float, default=5e-6)
     run.add_argument("--anchor-weight", type=float, default=.25)
+    run.add_argument("--conditional-anchor-gain", type=float, default=4.)
+    run.add_argument("--fixed-flow-sigmas", type=float, nargs="+", default=[])
+    run.add_argument("--audit-anchor-gradients", action="store_true")
     run.add_argument("--minimum-improvement", type=float, default=.05)
     run.add_argument("--guard-relative", type=float, default=.10)
     run.add_argument("--guard-absolute", type=float, default=.005)
@@ -453,8 +595,13 @@ def main():
             or any(len(set(values)) != len(values) for values in (args.arms, args.gpus, args.pairs, args.eval_seeds))
             or any(not math.isfinite(value) or value < 0 for value in (
                 args.learning_rate, args.anchor_weight, args.minimum_improvement, args.guard_relative, args.guard_absolute))
+            or not math.isfinite(args.conditional_anchor_gain) or args.conditional_anchor_gain < 1
+            or any(not math.isfinite(s) or not 0 < s <= 1 for s in args.fixed_flow_sigmas)
+            or len(set(args.fixed_flow_sigmas)) != len(args.fixed_flow_sigmas)
             or args.learning_rate == 0 or args.anchor_weight == 0 or args.minimum_improvement >= 1):
         parser.error("Invalid steps, seeds, GPUs, repeated selections or loss/check thresholds.")
+    if "paired_flow_anchor_delta" in args.arms and 1. not in args.fixed_flow_sigmas:
+        parser.error("The conditional-difference arm requires --fixed-flow-sigmas including 1.")
     plan = build_plan(args)
     if plan["source_plan"]["probe_seed"] not in args.eval_seeds:
         parser.error("eval-seeds must include the original probe seed for production replay checks.")
@@ -463,6 +610,7 @@ def main():
         raise FileExistsError(f"Use a fresh output directory: {root}")
     print(json.dumps({"source_probe": plan["source_probe"], "output": str(root),
                       "initial_model": args.initial_model, "steps": args.steps, "arms": args.arms,
+                      "conditional_anchor_gain": args.conditional_anchor_gain,
                       "states": [{key: s[key] for key in ("id", "split")} for s in plan["states"]],
                       "scope": plan["scope"]}, indent=2), flush=True)
     if not args.execute:
