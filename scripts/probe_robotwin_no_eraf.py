@@ -279,6 +279,24 @@ def validate_loaded_adapter(model, payload, base, expected_step):
             "moments": moments, "saved_lora_config": payload["lora_config"]}
 
 
+def inference_bootstrap_configs(cfg):
+    """Build Base-first configs; the adapter loader restores saved LoRA later."""
+    from omegaconf import OmegaConf
+
+    model_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model, resolve=True))
+    processor_cfg = OmegaConf.create(OmegaConf.to_container(cfg.data.train.processor, resolve=True))
+    model_cfg.load_text_encoder = True
+    model_cfg.skip_dit_load_from_pretrain = True
+    model_cfg.action_dit_pretrained_path = None
+    model_cfg.lora.enabled = False
+    # All dependent switches must be disabled even when LoRA itself is off:
+    # normalize_lora_config validates the paired-control contract first.
+    for key in ("enabled", "bidirectional_supervision",
+                "deployment_matched_action_cache", "correct_branch_action_ranking"):
+        model_cfg.lora.paired_language_control[key] = False
+    return model_cfg, processor_cfg
+
+
 def worker(args):
     # Set physical GPU visibility before importing torch or the policy wrapper.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -302,15 +320,7 @@ def worker(args):
     if sha256(plan["train_config"]) != plan["train_config_sha256"]:
         raise ValueError("Training config changed after planning.")
     cfg = OmegaConf.load(plan["train_config"])
-    model_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model, resolve=True))
-    processor_cfg = OmegaConf.create(OmegaConf.to_container(cfg.data.train.processor, resolve=True))
-    model_cfg.load_text_encoder = True
-    model_cfg.skip_dit_load_from_pretrain = True
-    model_cfg.action_dit_pretrained_path = None
-    # The checkpoint loader configures and loads the saved adapter *after* Base.
-    model_cfg.lora.enabled = False
-    model_cfg.lora.paired_language_control.enabled = False
-    model_cfg.lora.paired_language_control.bidirectional_supervision = False
+    model_cfg, processor_cfg = inference_bootstrap_configs(cfg)
     if not torch.cuda.is_available():
         raise RuntimeError("This experiment requires a CUDA GPU.")
     policy = WorldActionRobotWinPolicy(

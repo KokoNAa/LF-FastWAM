@@ -1,6 +1,7 @@
 """CPU tests for actual HDF5 preparation and same-state comparison contracts."""
 
 import argparse
+import ast
 import io
 import json
 import shutil
@@ -14,7 +15,54 @@ from experiments.robotwin.no_eraf_probe import (
     CAMERAS, difference, frame_positions, last_equal_qpos_prefix,
     observations_equal, reference_metrics, require_pair, training_episode_ids, typed_hash,
 )
-from scripts.probe_robotwin_no_eraf import build_plan, prepare_states, summarize, write_json
+from scripts.probe_robotwin_no_eraf import (
+    build_plan, inference_bootstrap_configs, prepare_states, summarize, write_json,
+)
+
+
+class BootstrapConfigTest(unittest.TestCase):
+    def test_temporal_v2_bootstrap_passes_real_lora_validator_without_changing_saved_config(self):
+        from omegaconf import OmegaConf
+
+        # Execute the production pure-Python config validators, excluding the
+        # torch-dependent tensor implementation so this regression runs on CPU
+        # hosts without torch. Do not duplicate the validation rules in tests.
+        path = Path(__file__).resolve().parents[1] / "src/fastwam/models/wan22/lora.py"
+        tree = ast.parse(path.read_text())
+        names = {"normalize_lora_config", "normalize_paired_language_control_config"}
+        nodes = [node for node in tree.body if (
+            isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            or isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id.startswith("DEFAULT_") for target in node.targets)
+            or isinstance(node, ast.FunctionDef) and node.name in names
+        )]
+        namespace = {}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+        normalize = namespace["normalize_lora_config"]
+        cfg = OmegaConf.create({"dim": 14, "model": {"lora": {
+            "enabled": True, "rank": 16, "extra_trainable_patterns": [],
+            "paired_language_control": {key: True for key in (
+                "enabled", "bidirectional_supervision", "deployment_matched_action_cache",
+                "correct_branch_action_ranking")}}},
+            "data": {"train": {"processor": {"action_output_dim": "${dim}"}}}})
+        before = OmegaConf.to_container(cfg, resolve=True)
+        broken = OmegaConf.to_container(cfg.model.lora, resolve=True)
+        broken["enabled"] = False
+        broken["paired_language_control"].update(enabled=False, bidirectional_supervision=False)
+        with self.assertRaisesRegex(ValueError, "Deployment-matched Action ranking requires"):
+            normalize(broken)
+        model_cfg, processor_cfg = inference_bootstrap_configs(cfg)
+        bootstrap = normalize(OmegaConf.to_container(model_cfg.lora, resolve=True))
+        self.assertFalse(bootstrap["enabled"])
+        for key in ("enabled", "bidirectional_supervision", "deployment_matched_action_cache",
+                    "correct_branch_action_ranking"):
+            self.assertFalse(bootstrap["paired_language_control"][key])
+        self.assertEqual(processor_cfg.action_output_dim, 14)
+        self.assertEqual(OmegaConf.to_container(cfg, resolve=True), before)
+        # This is the saved config that _load_lora_adapter passes to configure_lora.
+        restored = normalize(before["model"]["lora"])
+        self.assertTrue(restored["enabled"])
+        self.assertTrue(restored["paired_language_control"]["correct_branch_action_ranking"])
 
 
 class MetricsTest(unittest.TestCase):
