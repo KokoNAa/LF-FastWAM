@@ -13,10 +13,10 @@ import numpy as np
 
 from experiments.robotwin.no_eraf_probe import (
     CAMERAS, difference, frame_positions, last_equal_qpos_prefix,
-    observations_equal, reference_metrics, require_pair, training_episode_ids, typed_hash,
+    observations_equal, paired_action_details, reference_metrics, require_pair, training_episode_ids, typed_hash,
 )
 from scripts.probe_robotwin_no_eraf import (
-    build_plan, inference_bootstrap_configs, prepare_states, summarize, write_json,
+    audit_actions, build_plan, inference_bootstrap_configs, prepare_states, summarize, write_json,
 )
 
 
@@ -77,6 +77,32 @@ class MetricsTest(unittest.TestCase):
         bad = reference_metrics(self.target, self.source, self.source, "native", self.source, self.target)
         self.assertAlmostEqual(bad["dual_reference"]["language_delta_projection_on_expert_delta"], -1.)
         self.assertFalse(bad["dual_reference"]["target_language_prefers_target_expert"])
+
+    def test_target_only_preference_is_not_bidirectional_switching(self):
+        args = (self.source, self.target, self.source, self.source)
+        both_target = paired_action_details(self.target, self.target, *args)[-1]
+        self.assertEqual(both_target["preference"], "both_target")
+        self.assertFalse(both_target["both_languages_prefer_own_expert"])
+        self.assertEqual(both_target["common_update_vs_base_rms"], 1.)
+        self.assertEqual(both_target["language_delta_update_vs_base_rms"], 0.)
+        reversed_choice = paired_action_details(self.target, self.source, *args)[-1]
+        self.assertEqual(reversed_choice["preference"], "reversed")
+        tied = paired_action_details(self.target * .5, self.target * .5, *args)[-1]
+        self.assertEqual(tied["preference"], "tie")
+
+    def test_action_audit_distinguishes_executed_prefix_and_gripper_energy(self):
+        target = self.source.copy()
+        target[24:, 6] = 1
+        windows = paired_action_details(self.source, target, self.source, target, self.source, self.source)
+        self.assertEqual([w["horizon"] for w in windows], [8, 16, 24, 32])
+        self.assertEqual(windows[2]["preference"], "indistinguishable_references")
+        self.assertIsNone(windows[2]["both_languages_prefer_own_expert"])
+        last = windows[-1]
+        self.assertEqual(last["preference"], "both_correct")
+        self.assertEqual(last["source_coordinate_on_reference_axis"], 0.)
+        self.assertEqual(last["target_coordinate_on_reference_axis"], 1.)
+        self.assertEqual(last["language_delta_top_dimensions"][0]["dimension"], "left_gripper")
+        self.assertEqual(last["language_delta_top_dimensions"][0]["energy_fraction"], 1.)
 
     def test_large_difference_can_be_orthogonal_to_goal_reference(self):
         target = self.source.copy()
@@ -275,6 +301,8 @@ class PreparationTest(unittest.TestCase):
         root = Path(plan["output"])
         with self.assertRaises(FileNotFoundError):
             summarize(root)
+        with self.assertRaises(FileNotFoundError):
+            audit_actions(root)
         for model in plan["checkpoints"]:
             (root / model).mkdir()
             records = []
@@ -288,7 +316,9 @@ class PreparationTest(unittest.TestCase):
                     target_ref = data["target_reference"] if state["dual_reference_valid"] else None
                     metrics = reference_metrics(source, target, ref, state["expert_kind"], source_ref, target_ref)
                 action_path = root / model / f"{state['id']}.npz"
-                np.savez(action_path, source=source, target=target)
+                paired_refs = ({"source_reference": source_ref, "target_reference": target_ref}
+                               if source_ref is not None else {})
+                np.savez(action_path, source=source, target=target, **paired_refs)
                 records.append({**state, "model": model, "actions_file": str(action_path),
                                 "metrics_normalized": metrics, "metrics_executed_prefix24": metrics})
             (root / model / "records.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
@@ -298,6 +328,21 @@ class PreparationTest(unittest.TestCase):
         self.assertEqual(summary["models"]["base"]["language_delta_rms"], 0)
         self.assertAlmostEqual(summary["models"]["step500"]["target_delta_vs_base_rms"], .1, places=6)
         self.assertTrue((root / "comparisons.csv").is_file())
+        before = (root / "summary.json").read_bytes()
+        audit_summary = audit_actions(root)
+        self.assertEqual(audit_summary["matched_states_per_model"], 4)
+        self.assertEqual(audit_summary["models"]["step1000"]["32"]["both_source"], 3)
+        self.assertEqual((root / "summary.json").read_bytes(), before)
+        self.assertTrue((root / "action_audit.csv").is_file())
+        # Alter one model's expert reference: a cross-model comparison must fail.
+        state = next(s for s in states if s["dual_reference_valid"])
+        path = root / "step1000" / f"{state['id']}.npz"
+        with np.load(path) as data:
+            values = {key: data[key] for key in data.files}
+        values["target_reference"] = values["target_reference"] + 1
+        np.savez(path, **values)
+        with self.assertRaisesRegex(ValueError, "expert reference mismatch"):
+            audit_actions(root)
 
 
 if __name__ == "__main__":

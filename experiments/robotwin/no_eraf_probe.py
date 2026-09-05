@@ -158,3 +158,55 @@ def reference_metrics(source_prediction, target_prediction, own_reference, own_k
         "target_prediction_target_rmse": difference(tp, tr)["rms"],
     }
     return out
+
+
+def paired_action_details(source, target, source_reference, target_reference, base_source, base_target):
+    """Inspect saved normalized actions; no additional model calls.
+
+    Both language choices must prefer their respective reference. A target-only
+    preference can instead reflect both predictions moving to the same expert.
+    Coordinates are along a joint-space reference axis, not Cartesian targets.
+    """
+    sp, tp, sr, tr, bs, bt = map(_actions, (
+        source, target, source_reference, target_reference, base_source, base_target))
+    if len({x.shape for x in (sp, tp, sr, tr, bs, bt)}) != 1:
+        raise ValueError("Paired action audit shapes differ.")
+    names = [*(f"left_joint_{i}" for i in range(1, 7)), "left_gripper",
+             *(f"right_joint_{i}" for i in range(1, 7)), "right_gripper"]
+    windows = []
+    for horizon in sorted({min(h, len(sp)) for h in (8, 16, 24, 32)}):
+        s, t, r, q = (x[:horizon] for x in (sp, tp, sr, tr))
+        dual = reference_metrics(s, t, r, "native", r, q)["dual_reference"]
+        reference_delta, language_delta = q - r, t - s
+        energy = float(np.sum(reference_delta ** 2))
+        valid = dual["expert_references_distinguishable"]
+        source_margin = dual["source_prediction_target_rmse"] - dual["source_prediction_source_rmse"]
+        target_margin = dual["target_prediction_source_rmse"] - dual["target_prediction_target_rmse"]
+        if not valid:
+            choice = "indistinguishable_references"
+        elif source_margin == 0 or target_margin == 0:
+            choice = "tie"
+        else:
+            choice = {(True, True): "both_correct", (True, False): "both_source",
+                      (False, True): "both_target", (False, False): "reversed"}[
+                          source_margin > 0, target_margin > 0]
+        dims = []
+        for delta in (reference_delta, language_delta):
+            per_dim = np.sum(delta ** 2, axis=0)
+            total = float(per_dim.sum())
+            dims.append([{"dimension": names[int(i)], "rms": float(np.sqrt(per_dim[i] / horizon)),
+                          "energy_fraction": float(per_dim[i] / total) if total else 0.}
+                         for i in np.argsort(-per_dim, kind="stable")[:3]])
+        source_update, target_update = s - bs[:horizon], t - bt[:horizon]
+        common_update = (source_update + target_update) / 2
+        conditional_update = target_update - source_update
+        windows.append({"horizon": horizon, "preference": choice, **dual,
+            "both_languages_prefer_own_expert": choice == "both_correct" if valid else None,
+            "source_reference_margin": source_margin, "target_reference_margin": target_margin,
+            "source_coordinate_on_reference_axis": float(np.sum((s - r) * reference_delta) / energy) if valid else None,
+            "target_coordinate_on_reference_axis": float(np.sum((t - r) * reference_delta) / energy) if valid else None,
+            "language_delta_rms": difference(t, s)["rms"],
+            "common_update_vs_base_rms": float(np.sqrt(np.mean(common_update ** 2))),
+            "language_delta_update_vs_base_rms": float(np.sqrt(np.mean(conditional_update ** 2))),
+            "reference_delta_top_dimensions": dims[0], "language_delta_top_dimensions": dims[1]})
+    return windows

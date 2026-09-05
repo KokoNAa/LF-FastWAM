@@ -461,6 +461,71 @@ def summarize(root):
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
 
+def audit_actions(root):
+    """CPU-only follow-up on an existing completed probe, preserving its files."""
+    import numpy as np
+    from experiments.robotwin.no_eraf_probe import paired_action_details
+
+    root = Path(root).resolve()
+    plan, states = read_json(root / "plan.json"), read_json(root / "states.json")
+    expected = {s["id"]: s for s in states}
+    records = {}
+    for model in plan["checkpoints"]:
+        if read_json(root / model / "complete.json")["states"] != len(states):
+            raise ValueError(f"Incomplete model: {model}")
+        rows = [json.loads(line) for line in (root / model / "records.jsonl").read_text().splitlines()]
+        if len(rows) != len(expected) or {r["id"] for r in rows} != set(expected):
+            raise ValueError(f"Incomplete or duplicated state records: {model}")
+        records[model] = {r["id"]: r for r in rows}
+    details, compact, counts = [], [], {}
+    for model, rows in records.items():
+        counts[model] = {}
+        for state_id, row in rows.items():
+            state = expected[state_id]
+            if row["observation_sha256"] != state["observation_sha256"]:
+                raise ValueError(f"Observation mismatch: {model}/{state_id}")
+            if row["dual_reference_valid"] != state["dual_reference_valid"]:
+                raise ValueError(f"Changed dual-reference validity: {model}/{state_id}")
+            if not state["dual_reference_valid"]:
+                continue
+            base_row = records["base"][state_id]
+            with np.load(row["actions_file"], allow_pickle=False) as actions, np.load(base_row["actions_file"], allow_pickle=False) as base:
+                for key in ("source_reference", "target_reference"):
+                    if not np.array_equal(actions[key], base[key]):
+                        raise ValueError(f"Cross-model expert reference mismatch: {model}/{state_id}/{key}")
+                windows = paired_action_details(actions["source"], actions["target"],
+                    actions["source_reference"], actions["target_reference"], base["source"], base["target"])
+            identity = {key: row[key] for key in ("id", "model", "profile", "pair_id", "frame_index")}
+            details.append({**identity, "windows": windows})
+            for window in windows:
+                horizon = str(window["horizon"])
+                count = counts[model].setdefault(horizon, {})
+                choice = window["preference"]
+                count[choice] = count.get(choice, 0) + 1
+                compact.append({**identity, **{key: window[key] for key in (
+                    "horizon", "preference", "expert_separation_rms", "language_delta_rms",
+                    "source_reference_margin", "target_reference_margin",
+                    "language_delta_projection_on_expert_delta", "language_delta_cosine_with_expert_delta",
+                    "common_update_vs_base_rms", "language_delta_update_vs_base_rms")},
+                    "top_language_dimension": window["language_delta_top_dimensions"][0]["dimension"],
+                    "top_language_dimension_energy_fraction": window["language_delta_top_dimensions"][0]["energy_fraction"]})
+    if not compact:
+        raise ValueError("No matched observations with paired action references.")
+    summary = {"format": "robotwin_paired_action_audit_v1", "complete": True,
+               "models": counts, "matched_states_per_model": len(details) // len(records),
+               "interpretation": "Joint-space nearest-reference choices, not task success. Both-target/source preferences do not show language-controlled switching. Tiny reference separation may be uninformative."}
+    write_json(root / "action_audit_summary.json", summary)
+    with (root / "action_audit_details.jsonl").open("w") as handle:
+        for detail in details:
+            handle.write(json.dumps(detail, ensure_ascii=False, allow_nan=False) + "\n")
+    with (root / "action_audit.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(compact[0]))
+        writer.writeheader()
+        writer.writerows(compact)
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -483,11 +548,15 @@ def main():
     work.add_argument("--gpu", type=int, required=True)
     summary = sub.add_parser("summarize")
     summary.add_argument("output")
+    audit = sub.add_parser("audit-actions", help="Audit saved actions on CPU; no model loading or inference")
+    audit.add_argument("output")
     args = parser.parse_args()
     if args.command == "worker":
         return worker(args)
     if args.command == "summarize":
         return summarize(args.output)
+    if args.command == "audit-actions":
+        return audit_actions(args.output)
     if (not args.gpus or len(set(args.gpus)) != len(args.gpus) or min(args.gpus) < 0
             or len(set(args.steps)) != len(args.steps) or min(args.steps) < 1
             or args.episodes_per_pair < 1 or args.inference_steps < 1 or args.seed < 0

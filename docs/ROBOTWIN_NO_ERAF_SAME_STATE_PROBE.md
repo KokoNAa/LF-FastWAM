@@ -64,6 +64,17 @@ cat "$OUT/summary.json"
 
 结果回传至少包含 `summary.json`、`comparisons.csv` 和三个模型的 `checkpoint_audit.json`。完整 `records.jsonl` 含前 24 步细节；每个状态 NPZ 保留预测和专家动作，便于进一步绘图。第一轮只定位机制；扩大到 `--episodes-per-pair 2` 或增加独立 seed 后才能判断稳定性。
 
+### 已有结果的双向动作审计（无需 GPU）
+
+单独统计“CF 指令更接近 CF 专家”会包含两个指令都偏向 CF 专家的情况。下面的命令读取已完成 probe 的 records 和 NPZ，按 8/16/24/32 步重新计算双向偏好，区分 `both_correct`、`both_source`、`both_target`、`reversed`、`tie` 和不可区分的参考。它不加载模型，不重新推理，不改写原始结果。
+
+```bash
+/opt/conda/bin/python scripts/probe_robotwin_no_eraf.py audit-actions "$OUT"
+cat "$OUT/action_audit.csv"
+```
+
+`action_audit_summary.json` 保存各窗口的计数，`action_audit.csv` 保存逐状态结果，`action_audit_details.jsonl` 还包含完整距离矩阵、参考轴坐标和变化最大的三个动作维度。参考轴上 source 为 0、target 为 1，最近参考分界为 0.5；不表示空间目标位置。共同更新量为两种指令相对 Base 更新的均值；条件差更新量为两种指令更新之差。夹爪/关节的贡献按归一化动作差的平方和计算。小于数值阈值之外的“参考可区分”不等于语义上的有效目标分岔。
+
 ## 本地 CPU 验证
 
 ```bash
