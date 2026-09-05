@@ -82,6 +82,7 @@ def plan_states(collection):
 
 def worker(args):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+    os.environ.setdefault('DIFFSYNTH_MODEL_BASE_PATH', '/root/gpufree-data/fastwam/FastWAM/checkpoints')
     import h5py
     import numpy as np
     import torch
