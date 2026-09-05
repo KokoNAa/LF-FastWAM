@@ -330,6 +330,11 @@ class RepairPipelineTest(unittest.TestCase):
             runner.summarize(root)
         summary = json.loads((root / "summary.json").read_text())
         self.assertTrue(summary["complete"])
+        from scripts.inspect_robotwin_same_state_repair import inspect
+        diagnostics = inspect(root)
+        self.assertTrue(diagnostics["training_inputs_match_across_arms"])
+        self.assertEqual(diagnostics["repair_states"], 1)
+        json.dumps(diagnostics, allow_nan=False)
         checkpoint = torch.load(root / args.arm / "checkpoints/repair_000002.pt", weights_only=False)
         self.assertEqual(checkpoint["step"], 1002)
         self.assertEqual(checkpoint["robotwin_same_state_repair"]["optimizer_steps"], 2)

@@ -32,6 +32,38 @@ cd /root/gpufree-data/LF-FastWAM
 
 把这条命令的输出回传即可。任一 worker 失败，driver 会打印该 worker 日志末尾，不汇总部分结果；没有新完成的实验时，`report latest` 可能仍指向以前完成的实验，需检查打印的路径。
 
+### 失败后的 CPU 诊断
+
+2026-09-05 的 `20260905-164002` 实验中，两组到第 300 步仍无合格 checkpoint，修复状态的双向正确检查均为 0/12。12 是两个状态、三种噪声、两个动作时域的组合，不是 12 个独立场景。前 24 步的原指令平均 RMSE 分别下降 6.38% / 7.99%，CF 却上升 48.94% / 34.05%；两组从第 100 步起都出现 guard 退化。纯噪声项减轻了部分 CF 退化，但本轮没有证明修复有效。不要用这两组 checkpoint 替换原模型，也不要因平均原指令误差下降而直接延长训练。
+
+先分析已经保存的逐状态训练日志和动作，不占 GPU、不重新加载 checkpoint：
+
+```bash
+cd /root/gpufree-data/LF-FastWAM
+git pull --ff-only origin main
+/opt/conda/bin/python scripts/inspect_robotwin_same_state_repair.py \
+  /root/gpufree-data/LF-FastWAM/runs/robotwin_same_state_repair/20260905-164002
+```
+
+回传终端输出即可。同一实验目录还会生成 `repair_diagnostics.txt` 和完整的 `repair_diagnostics.json`，原始日志和动作不会改变；此命令只需要 Python 和 NumPy。传入明确的实验目录，避免 `latest` 选到另一次实验。它检查两组训练抽样一致、日志和评估覆盖完整、起始模型指标一致，并将初始/末次保存动作重新计算的 RMSE 与逐状态评估核对。任何缺失或冲突都报错，不输出部分诊断。
+
+诊断包含每个修复状态前/后 50 步的 source/CF flow MSE、实际权重乘积、纯噪声 MSE、梯度范数与裁剪比例，以及每个状态初始/末次的动作误差、指令方向和误差分解。完整 JSON 还保留所有状态、所有检查点的逐状态平均指标。
+
+对于两条预测动作 `s,t` 和各自专家 `r,q`，成对 MSE 可精确分成：
+
+```text
+pair_mse = mean((((s+t) - (r+q))/2)^2) + mean(((t-s) - (q-r))^2)/4
+         = common_mse                    + conditional_mse
+```
+
+共同动作误差下降、指令差异误差不降，支持优先检查条件学习是否被共同动作拟合掩盖；若 source/CF 训练窗口误差都下降而完整生成恶化，应先用固定噪声复核这一分歧，再检查去噪轨迹上的训练与生成差异。若固定输入监督本身也不能拟合，再对单任务、Action/Video 条件通路分别做小规模干预。仅凭本轮汇总不能判定 Video 表示是瓶颈，也不能断言 Action LoRA 容量不足。
+
+注意：前后训练窗口使用不同的随机噪声和 timestep；即使窗口平均 MSE 下降，也不能替代固定输入的去噪评估。`source_objective_share` 只是 loss 数值占比，不代表梯度占比或证明梯度冲突。梯度存在且有限只说明反向在运行。分解后的 `pair_mse` 是逐样本平方误差的均值，不等于汇总表中平均 RMSE 的平方。
+
+```bash
+python -m unittest -q tests.test_robotwin_same_state_repair_diagnostics
+```
+
 ## 两个实验具体改变什么
 
 两组都从原 step1000 的同一套完整 Video+Action LoRA 开始；默认学习率 5e-6，AdamW，无 weight decay，梯度范数上限 1。每个 optimizer step 遍历全部修复状态，每个状态的 source/CF 正确专家动作等权。默认原 probe 只有 stacking、ranking 各一个 historical 初始状态，因此每步含两个完整配对、四条动作标签。
