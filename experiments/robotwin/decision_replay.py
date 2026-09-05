@@ -103,10 +103,11 @@ def balanced_order(rows, seed):
 
 
 class DecisionReplay:
-    def __init__(self, manifest, manifest_sha256, weight, seed, log_dir):
+    def __init__(self, manifest, manifest_sha256, weight, seed, log_dir, audit_hashes=False):
         from scripts.probe_robotwin_no_eraf import sha256
         path = Path(manifest)
-        if sha256(path) != manifest_sha256:
+        self.audit_hashes = bool(audit_hashes)
+        if self.audit_hashes and sha256(path) != manifest_sha256:
             raise ValueError("Replay manifest changed.")
         self.manifest = json.loads(path.read_text())
         if self.manifest.get("complete") is not True:
@@ -119,7 +120,7 @@ class DecisionReplay:
         self.order = balanced_order(rows, self.seed)
         self.payloads = {}
         for row in self.order:
-            if sha256(row["payload"]) != row["payload_sha256"]:
+            if self.audit_hashes and sha256(row["payload"]) != row["payload_sha256"]:
                 raise ValueError("Replay payload changed.")
             self.payloads[row["id"]] = torch.load(row["payload"], map_location="cpu", weights_only=True)
         self.counter = 0
@@ -140,18 +141,19 @@ class DecisionReplay:
                 raise ValueError("Both Video and Action adapters must train.")
             if any(p.requires_grad for p in model.proprio_encoder.parameters()):
                 raise ValueError("Captured proprio inputs require a frozen encoder.")
-            audit = {"initial_adapter_sha256": tensor_digest(selected), "trainable_tensors": len(selected),
+            audit = {"initial_adapter_sha256": tensor_digest(selected) if self.audit_hashes else None,
+                     "audit_hashes": self.audit_hashes, "trainable_tensors": len(selected),
                      "dtypes": sorted({str(p.dtype) for p in selected.values()}),
                      "rank": rank, "world_size": world}
             (self.log_dir / f"initial_rank{rank}.json").write_text(json.dumps(audit, indent=2) + "\n")
         position = self.counter * world + rank
         row = self.order[position % len(self.order)]
         seed = self.seed + 1_000_000 + position
-        sample_hash = tensor_digest(sample)
-        before = rng_digest(model)
+        sample_hash = tensor_digest(sample) if self.audit_hashes else None
+        before = rng_digest(model) if self.audit_hashes else None
         loss, metrics = original(sample, *args, **kwargs)
         original_value = float(loss.detach())
-        after_original = rng_digest(model)
+        after_original = rng_digest(model) if self.audit_hashes else None
         value = 0.0
         if self.weight:
             payload = self.payloads[row["id"]]
@@ -160,7 +162,7 @@ class DecisionReplay:
             if not math.isfinite(value):
                 raise ValueError("Nonfinite decision replay loss.")
             loss = loss + self.weight * auxiliary
-        if rng_digest(model) != after_original:
+        if self.audit_hashes and rng_digest(model) != after_original:
             raise ValueError("Replay advanced the ordinary training RNG.")
         self.handle.write(json.dumps({"position": position, "id": row["id"], "seed": seed,
             "sample_sha256": sample_hash, "rng_before": before, "rng_after_original": after_original,

@@ -29,12 +29,15 @@ def summarize(root):
             raise ValueError("Unexpected microstep count/order.")
     keys = ["position", "id", "seed", "sample_sha256", "rng_before", "rng_after_original"]
     first, second = list(logs.values())
+    hash_audited = bool(initials[0].get("initial_adapter_sha256")) and all(r["sample_sha256"] is not None for r in first + second)
     if [[r[k] for k in keys] for r in first] != [[r[k] for k in keys] for r in second]:
         raise ValueError("Original sample or diffusion/dropout random stream changed between arms.")
     if [r["original_loss"] for r in first[:16]] != [r["original_loss"] for r in second[:16]]:
         raise ValueError("Original losses differ before the first optimizer update.")
     result = {"format": "robotwin_full_training_decision_control_v1", "complete": True,
-        "runs": runs, "matched_initial_adapters": True, "matched_original_samples_and_rng": True,
+        "runs": runs, "hash_audits_enabled": hash_audited,
+        "matched_initial_adapters": True if hash_audited else None,
+        "matched_original_samples_and_rng": True if hash_audited else None,
         "matched_original_losses_before_first_update": True, "microsteps_per_arm": len(first),
         "scope": "Training completion and control validity only; CF success requires separate closed-loop evaluation."}
     write_json(root / "summary.json", result)
