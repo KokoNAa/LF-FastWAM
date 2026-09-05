@@ -395,7 +395,11 @@ def collect_pair(
     start_seed: int,
     max_seed_attempts: int,
     collection_profile: str = "grounding",
+    shared_grasp_prefix: bool = False,
 ) -> Path:
+    from experiments.robotwin.shared_grasp_prefix import SUPPORTED_TASKS, grasp_prefix
+    if shared_grasp_prefix and source_task not in SUPPORTED_TASKS:
+        raise ValueError('Shared grasp prefix applies only to spatial placement and burger/fries.')
     spec = pair_spec_from_source_task(source_task)
     pair_root = output_root / spec.pair_id
     native_root = pair_root / "native"
@@ -424,7 +428,12 @@ def collect_pair(
             task._pgc_active_variant = None
             task.setup_demo(now_ep_num=episode_index, seed=seed, **target_plan_args)
             target_initial_state = scene_state_vector(task)
-            play_variant(task, spec, spec.counterfactual_variant)
+            prefix = None
+            if shared_grasp_prefix:
+                with grasp_prefix(task) as prefix:
+                    play_variant(task, spec, spec.counterfactual_variant)
+            else:
+                play_variant(task, spec, spec.counterfactual_variant)
             target_ok = bool(
                 task.plan_success
                 and check_variant(task, spec, spec.counterfactual_variant)
@@ -449,7 +458,11 @@ def collect_pair(
                     "Joint seed selection changed scene state for "
                     f"{spec.pair_id} seed={seed}."
                 )
-            play_variant(task, spec, spec.source_variant)
+            if shared_grasp_prefix:
+                with grasp_prefix(task, replay=prefix):
+                    play_variant(task, spec, spec.source_variant)
+            else:
+                play_variant(task, spec, spec.source_variant)
             native_ok = bool(
                 task.plan_success and check_variant(task, spec, spec.source_variant)
             )
@@ -470,6 +483,13 @@ def collect_pair(
                 )
                 np.save(state_path, target_initial_state, allow_pickle=False)
             accepted.append((seed, target_initial_state))
+            if shared_grasp_prefix:
+                _append_jsonl(pair_root / 'shared_grasp_prefix.jsonl', {
+                    'episode_index': episode_index, 'scene_seed': seed,
+                    'left_path_segments': len(prefix['left_joint_path']),
+                    'right_path_segments': len(prefix['right_joint_path']),
+                    'strategy': 'Identical planned grasp/lift paths; both remaining goals replanned and replay verified.',
+                    'observation_equality': 'Must be checked from recorded observations before making same-state labels.'})
             print(
                 f"[plan] jointly accepted {spec.pair_id} episode={episode_index} "
                 f"seed={seed}",
@@ -518,6 +538,7 @@ def main() -> None:
     parser.add_argument("--task-config", default="demo_clean")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--start-seed", type=int, default=4300000)
+    parser.add_argument('--shared-grasp-prefix', action='store_true')
     parser.add_argument(
         "--collection-profile",
         choices=tuple(COLLECTION_PROFILES),
@@ -556,6 +577,7 @@ def main() -> None:
             start_seed=args.start_seed + offset * 1_000_000,
             max_seed_attempts=max_seed_attempts,
             collection_profile=args.collection_profile,
+            shared_grasp_prefix=args.shared_grasp_prefix,
         )
 
 
