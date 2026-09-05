@@ -20,6 +20,13 @@ class CompositionTest(unittest.TestCase):
             self.assertEqual(anchor['mot_trainable'][name].sum().item(), 0)
         with self.assertRaisesRegex(ValueError, 'same base'):
             compose(anchor, dict(repair, base_checkpoint='/other.pt'))
+        for strength in (.5, 1.):
+            blended, _ = compose(anchor, repair, strength)
+            for name in names:
+                expected = torch.ones(2, 2) * (1. if name in names[:2] else strength)
+                torch.testing.assert_close(blended['mot_trainable'][name], expected)
+        with self.assertRaisesRegex(ValueError, 'between zero and one'):
+            compose(anchor, repair, float('nan'))
 
 
 if __name__ == '__main__':
