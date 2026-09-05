@@ -194,6 +194,8 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(f"Invalid EVALUATION.output_dir: {output_dir}")
     run_root = PROJECT_ROOT / "evaluate_results" / "robotwin" / ckpt_tag / run_tag
     run_root.mkdir(parents=True, exist_ok=True)
+    baseline_value = os.environ.get('ROBOTWIN_CIS_BASELINE_ROOT', '').strip()
+    baseline_root = _resolve_path(baseline_value, base=PROJECT_ROOT) if baseline_value else None
     manager_log = run_root / "cis_manager.log"
     state_path = run_root / "cis_manager_state.json"
     failed_path = run_root / "failed_jobs.txt"
@@ -242,12 +244,18 @@ def main(cfg: DictConfig) -> None:
         spec: JobSpec, records: list[dict[str, Any]]
     ) -> bool:
         if spec.condition == "correct":
-            return True
-        correct_spec = JobSpec(spec.source_task, spec.task_config, "correct")
-        correct_output = load_complete_job(correct_spec)
-        if correct_output is None:
-            return False
-        _, correct_records = correct_output
+            if baseline_root is None:
+                return True
+            _, correct_records = load_job_output(
+                baseline_root / spec.source_task / spec.task_config / 'correct',
+                expected_episodes=expected_episodes, expected_source_task=spec.source_task,
+                expected_task_config=spec.task_config, expected_condition='correct')
+        else:
+            correct_spec = JobSpec(spec.source_task, spec.task_config, "correct")
+            correct_output = load_complete_job(correct_spec)
+            if correct_output is None:
+                return False
+            _, correct_records = correct_output
         fields = (
             "scene_seed",
             "source_instruction",
@@ -263,6 +271,7 @@ def main(cfg: DictConfig) -> None:
             "checkpoint": str(ckpt_path),
             "manifest": str(manifest_path),
             "run_root": str(run_root),
+            "baseline_root": str(baseline_root) if baseline_root else None,
             "expected_episodes_per_job": expected_episodes,
             "jobs": [
                 {
@@ -330,7 +339,10 @@ def main(cfg: DictConfig) -> None:
             f"EVALUATION.language_intervention_manifest={manifest_path}",
             f"EVALUATION.output_dir={output_dir}",
         ]
-        if spec.condition != "correct":
+        if spec.condition == 'correct' and baseline_root is not None:
+            command.append('EVALUATION.matched_episode_records_path='
+                           f'{baseline_root / spec.source_task / spec.task_config / "correct" / "episodes.jsonl"}')
+        elif spec.condition != "correct":
             correct_spec = JobSpec(spec.source_task, spec.task_config, "correct")
             command.append(
                 "EVALUATION.matched_episode_records_path="

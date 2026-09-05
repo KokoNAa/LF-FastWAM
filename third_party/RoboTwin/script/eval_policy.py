@@ -258,10 +258,9 @@ def main(usr_args):
         "none",
         "null",
     }:
-        if intervention_pair is None or condition == "correct":
+        if intervention_pair is None:
             raise ValueError(
-                "Canonical matched episode records are only valid for "
-                "shuffled/counterfactual CIS workers."
+                "Canonical matched episode records require a CIS intervention pair."
             )
         from experiments.robotwin.language_interventions import (
             load_matched_episode_records,
