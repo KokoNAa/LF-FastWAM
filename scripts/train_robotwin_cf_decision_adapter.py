@@ -35,7 +35,7 @@ def pair_stream(rows, seed, focus_repeats=2):
     while True:
         cycle = []
         for key, values in sorted(groups.items()):
-            shuffled = list(values)
+            shuffled = [row for row in values for _ in range(int(row.get("sampling_weight", 1)))]
             rng.shuffle(shuffled)
             copies = focus_repeats if key[0] in FOCUS else 1
             cycle.extend(shuffled * copies)
@@ -223,7 +223,8 @@ def main():
                 refs = {k: v.to(model.torch_dtype) for k, v in p["references"].items()}
                 terms.append(paired_backward(model, p["captured"], refs, noise, t,
                     float(scheduler.training_weight(t).item()) / local_pairs,
-                    args.endpoint_weight / local_pairs, args.conditional_gain))
+                    args.endpoint_weight / local_pairs,
+                    args.conditional_gain if row.get("initial_observations_exactly_equal", True) else 1.))
             average_gradients(list(selected.values()))
             norm = torch.nn.utils.clip_grad_norm_(list(selected.values()), 1., error_if_nonfinite=True)
             optimizer.step()

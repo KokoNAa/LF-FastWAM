@@ -33,6 +33,12 @@ class DecisionSamplingTest(unittest.TestCase):
         torch.testing.assert_close(a.grad, torch.tensor([4., 6.]))
         torch.testing.assert_close(b.grad, torch.tensor([5.]))
 
+    def test_initial_sampling_weight_preserves_phase_samples(self):
+        rows = [{'id': name, 'pair_id': 'task', 'task_config': 'clean', 'replay_split': 'train',
+                 'sampling_weight': weight} for name, weight in [('initial', 4), ('phase', 1)]]
+        counts = Counter(r['id'] for r in itertools.islice(pair_stream(rows, 42), 5))
+        self.assertEqual(counts, {'initial': 4, 'phase': 1})
+
 
 if __name__ == "__main__":
     unittest.main()
