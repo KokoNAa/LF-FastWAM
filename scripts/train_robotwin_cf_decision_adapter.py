@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Short multi-scene Video/Action LoRA repair using cached frozen inputs.
 
-Each sample contains both expert positives at one observation. Keep ordinary
-action flow training and add equal positive MSE at the pure-noise endpoint.
+Each sample contains both expert positives, at a shared initial observation or
+at each branch's own later observation. Keep ordinary action flow training and
+add positive MSE at the pure-noise endpoint.
 The cache stops before trainable Video operations, which are recomputed.
 No video reconstruction, sample hashing, or repeated deployment audits.
 """
@@ -109,6 +110,8 @@ def main():
     ap.add_argument("--focus-repeats", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42027)
     ap.add_argument("--resume-state")
+    ap.add_argument("--seen-language-augmentation", action="store_true",
+                    help="Mix seen-template paraphrases into ranking/stacking training positives.")
     args = ap.parse_args()
     if min(args.steps, args.pairs_per_step, args.save_every, args.eval_every) < 1:
         ap.error("Step counts and intervals must be positive.")
@@ -165,6 +168,9 @@ def main():
         del state
     payloads = {r["id"]: move_cache(torch.load(r["payload"], map_location="cpu", weights_only=True), model.device)
                 for r in rows if r["replay_split"] == "train" or r in validation}
+    from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
+    seen_contexts = (build_seen_contexts(model, REPO, [r['pair_id'] for r in rows])
+                     if args.seen_language_augmentation else {})
     stream = itertools.islice(pair_stream(rows, args.seed, args.focus_repeats),
                              start * args.pairs_per_step + rank, None, world)
 
@@ -215,13 +221,20 @@ def main():
                 ids.append(row["id"])
                 p = payloads[row["id"]]
                 seed = args.seed + (step - 1) * args.pairs_per_step + i * world + rank
+                captured = p['captured']
+                variants = seen_contexts.get(row['pair_id'], [])
+                rng = random.Random(seed)
+                if variants and rng.random() < .5:
+                    variant = rng.choice(variants)
+                    captured = {language: replace_language(captured[language], *variant[language])
+                                for language in ('source', 'target')}
                 noise = noise_tensor((1, 32, 14), seed, model)
                 generator = torch.Generator(device="cpu").manual_seed(seed + 1_000_000)
                 u = torch.rand((1,), generator=generator)
                 scheduler = model.train_action_scheduler
                 t = (scheduler._phi(u, scheduler.shift) * scheduler.num_train_timesteps).to(device=model.device, dtype=model.torch_dtype)
                 refs = {k: v.to(model.torch_dtype) for k, v in p["references"].items()}
-                terms.append(paired_backward(model, p["captured"], refs, noise, t,
+                terms.append(paired_backward(model, captured, refs, noise, t,
                     float(scheduler.training_weight(t).item()) / local_pairs,
                     args.endpoint_weight / local_pairs,
                     args.conditional_gain if row.get("initial_observations_exactly_equal", True) else 1.))
