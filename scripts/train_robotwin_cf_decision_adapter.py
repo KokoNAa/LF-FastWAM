@@ -112,7 +112,13 @@ def main():
     ap.add_argument("--resume-state")
     ap.add_argument("--seen-language-augmentation", action="store_true",
                     help="Mix seen-template and manifest-bound paraphrases into training positives.")
+    ap.add_argument('--native-teacher-checkpoint')
+    ap.add_argument('--native-teacher-weight', type=float, default=0.)
+    ap.add_argument('--stream-payloads', action='store_true',
+                    help='Load one sample at a time; required for compact dense replay.')
     args = ap.parse_args()
+    if args.native_teacher_weight < 0 or (args.native_teacher_weight and not args.native_teacher_checkpoint):
+        ap.error('Positive teacher weight requires a teacher adapter checkpoint.')
     if min(args.steps, args.pairs_per_step, args.save_every, args.eval_every) < 1:
         ap.error("Step counts and intervals must be positive.")
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -166,8 +172,16 @@ def main():
             group["lr"] = args.learning_rate
         start = int(state["step"])
         del state
-    payloads = {r["id"]: move_cache(torch.load(r["payload"], map_location="cpu", weights_only=True), model.device)
-                for r in rows if r["replay_split"] == "train" or r in validation}
+    native_teacher = None
+    if args.native_teacher_checkpoint:
+        from experiments.robotwin.native_teacher import NativeTeacher
+        native_teacher = NativeTeacher(model, selected, args.native_teacher_checkpoint)
+    if args.stream_payloads:
+        from experiments.robotwin.compact_replay import ReplayPayloads
+        payloads = ReplayPayloads(rows, model.device)
+    else:
+        payloads = {r["id"]: move_cache(torch.load(r["payload"], map_location="cpu", weights_only=True), model.device)
+                    for r in rows if r["replay_split"] == "train" or r in validation}
     from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
     seen_contexts = (build_seen_contexts(model, REPO, rows)
                      if args.seen_language_augmentation else {})
@@ -237,7 +251,8 @@ def main():
                 terms.append(paired_backward(model, captured, refs, noise, t,
                     float(scheduler.training_weight(t).item()) / local_pairs,
                     args.endpoint_weight / local_pairs,
-                    args.conditional_gain if row.get("initial_observations_exactly_equal", True) else 1.))
+                    args.conditional_gain if row.get("initial_observations_exactly_equal", True) else 1.,
+                    native_teacher=native_teacher, native_teacher_weight=args.native_teacher_weight))
             average_gradients(list(selected.values()))
             norm = torch.nn.utils.clip_grad_norm_(list(selected.values()), 1., error_if_nonfinite=True)
             optimizer.step()

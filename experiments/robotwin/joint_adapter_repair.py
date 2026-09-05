@@ -84,20 +84,33 @@ def predict(model, captured, noisy, time, checkpoint=True):
     return value
 
 
-def paired_backward(model, captured, refs, noise, time, flow_weight, anchor_weight, gain):
+def paired_backward(model, captured, refs, noise, time, flow_weight, anchor_weight, gain,
+                    *, native_teacher=None, native_teacher_weight=0.):
     """Identical loss, shared noise/time and backward order for both scope arms."""
     import torch
     from experiments.robotwin.same_state_repair import paired_velocity_losses
     scheduler = model.train_action_scheduler
     terms = {}
+    end = torch.tensor([scheduler.num_train_timesteps], device=model.device, dtype=model.torch_dtype)
+    # All teacher calls finish before any student graph is constructed, so
+    # activation-checkpoint recomputation always sees the student adapters.
+    teacher_flow = teacher_end = None
+    if native_teacher is not None and native_teacher_weight:
+        source_noisy = scheduler.add_noise(refs['source'], noise, time)
+        teacher_flow = native_teacher.predict(captured['source'], source_noisy, time)
+        teacher_end = native_teacher.predict(captured['source'], noise, end)
     for language in ("source", "target"):
         noisy = scheduler.add_noise(refs[language], noise, time)
         target = scheduler.training_target(refs[language], noise, time)
         pred = predict(model, captured[language], noisy, time)
         loss = (pred.float() - target.float()).square().mean()
-        (flow_weight * loss / 2).backward()
+        objective = loss / 2
+        if language == 'source' and teacher_flow is not None:
+            native_loss = (pred.float() - teacher_flow.float()).square().mean()
+            objective = objective + native_teacher_weight * native_loss
+            terms['native_flow_mse'] = float(native_loss.detach())
+        (flow_weight * objective).backward()
         terms["flow_" + language] = float(loss.detach())
-    end = torch.tensor([scheduler.num_train_timesteps], device=model.device, dtype=model.torch_dtype)
     predictions, targets = {}, {}
     for language in ("source", "target"):
         noisy = scheduler.add_noise(refs[language], noise, end)
@@ -107,6 +120,10 @@ def paired_backward(model, captured, refs, noise, time, flow_weight, anchor_weig
         targets[language] = scheduler.training_target(refs[language], noise, end)
     parts = paired_velocity_losses(predictions, targets)
     loss = anchor_weight * (parts["common_mse"] + gain * parts["conditional_mse"])
+    if teacher_end is not None:
+        native_loss = (predictions['source'].float() - teacher_end.float()).square().mean()
+        loss = loss + anchor_weight * native_teacher_weight * native_loss
+        terms['native_endpoint_mse'] = float(native_loss.detach())
     if not bool(torch.isfinite(loss)):
         raise ValueError("Nonfinite anchor loss.")
     loss.backward()
