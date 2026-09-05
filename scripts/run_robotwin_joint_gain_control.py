@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Change only endpoint difference gain in an existing joint-adapter protocol."""
+"""Change one endpoint-loss weight in an existing joint-adapter protocol."""
 from __future__ import annotations
 import argparse
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -17,17 +18,23 @@ def main():
     ap.add_argument("--reference-run", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--gpu", type=int, default=0)
-    ap.add_argument("--gain", type=float, default=1.)
+    choice = ap.add_mutually_exclusive_group()
+    choice.add_argument("--gain", type=float)
+    choice.add_argument("--anchor-weight", type=float)
     args = ap.parse_args()
     reference, root = args.reference_run.resolve(), args.output.resolve()
     source = read_json(reference / "plan.json")
-    if source["format"] != "robotwin_joint_adapter_repair_v1" or args.gain < 1 or args.gain >= source["conditional_gain"]:
-        raise ValueError("Require a smaller gain >=1 and the audited joint-adapter protocol.")
+    parameter = "anchor_weight" if args.anchor_weight is not None else "conditional_gain"
+    value = args.anchor_weight if args.anchor_weight is not None else (1. if args.gain is None else args.gain)
+    minimum = 0. if parameter == "anchor_weight" else 1.
+    if source["format"] != "robotwin_joint_adapter_repair_v1" or not math.isfinite(value) or not minimum <= value < source[parameter]:
+        raise ValueError("Require a smaller valid endpoint weight and the audited joint-adapter protocol.")
     if not (reference / "joint/evaluation_train_000000.json").is_file():
         raise ValueError("Reference has no completed initial evaluation.")
     root.mkdir(parents=True, exist_ok=False)
-    plan = {**source, "conditional_gain": args.gain, "arms": {"joint": ["video", "action"]},
+    plan = {**source, parameter: value, "arms": {"joint": ["video", "action"]},
             "gain_control_reference": str(reference), "reference_gain": source["conditional_gain"],
+            "controlled_parameter": parameter, "controlled_value": value, "reference_value": source[parameter],
             "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()}
     plan["source_artifact_sha256"] = {**source["source_artifact_sha256"], str(reference / "plan.json"): sha256(reference / "plan.json")}
     write_json(root / "plan.json", plan)
@@ -35,7 +42,7 @@ def main():
         process = subprocess.Popen([sys.executable, "-u", str(REPO / "scripts/train_robotwin_joint_adapter_repair.py"),
             "worker", "--source-probe", plan["source_probe"], "--output", str(root), "--arm", "joint", "--gpu", str(args.gpu)],
             cwd=REPO, stdout=log, stderr=subprocess.STDOUT)
-        print(f"[start] gain={args.gain} gpu={args.gpu} pid={process.pid}", flush=True)
+        print(f"[start] {parameter}={value} gpu={args.gpu} pid={process.pid}", flush=True)
         rc = process.wait()
     if rc:
         raise RuntimeError(f"Gain-control worker failed: {rc}")
@@ -52,8 +59,8 @@ def main():
     initial = [[[r[k] for k in fields] for r in read_json(p / "joint/evaluation_train_000000.json")["rows"]] for p in [root, reference]]
     if initial[0] != initial[1]:
         raise ValueError("Initial evaluations differ.")
-    write_json(root / "summary.json", {"format": "robotwin_joint_gain_control_v1", "complete": True,
-               "gain": args.gain, "reference_gain": source["conditional_gain"], "reference_run": str(reference),
+    write_json(root / "summary.json", {"format": "robotwin_joint_loss_control_v1", "complete": True,
+               "controlled_parameter": parameter, "controlled_value": value, "reference_value": source[parameter], "reference_run": str(reference),
                "matched_training_draws": True, "identical_initial_evaluations": True,
                "control": completed, "reference": other})
     print("[complete]", root / "summary.json", flush=True)

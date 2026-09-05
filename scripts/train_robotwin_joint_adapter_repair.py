@@ -147,18 +147,19 @@ def worker(args):
                               "noise_sha256": typed_hash(noise[0].float().cpu().numpy())})
                 del captured, targets, noise
             grad_by_expert = {}
+            zero_weight_step = plan["anchor_weight"] == 0 and all(d["weight"] == 0 for d in draws)
             for expert in ARMS[args.arm]:
                 grads = [p.grad for n, p in selected.items() if n.split('.')[1] == expert and p.grad is not None]
                 if not grads or not all(bool(torch.isfinite(g).all()) for g in grads):
                     raise ValueError("Missing/nonfinite expert gradients.")
                 grad_by_expert[expert] = float(torch.stack([g.float().square().sum() for g in grads]).sum().sqrt())
-                if grad_by_expert[expert] == 0:
+                if grad_by_expert[expert] == 0 and not zero_weight_step:
                     raise ValueError("Zero expert gradient.")
             grad_norm = float(torch.nn.utils.clip_grad_norm_(list(selected.values()), 1., error_if_nonfinite=True))
             optimizer.step()
             audit_frozen(model, protected)
             log.write(json.dumps({"step": step, "draws": draws, "terms": terms, "gradient_norm": grad_norm,
-                                  "gradient_by_expert": grad_by_expert}, allow_nan=False) + "\n")
+                                  "gradient_by_expert": grad_by_expert, "zero_weight_step": zero_weight_step}, allow_nan=False) + "\n")
             log.flush()
             if step == 1 or step % 10 == 0:
                 print(f"[train] {args.arm} step={step}/{plan['steps']} grad={grad_by_expert}", flush=True)
