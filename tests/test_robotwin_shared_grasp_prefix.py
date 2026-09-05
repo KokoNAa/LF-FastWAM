@@ -30,8 +30,11 @@ class SharedPrefixTest(unittest.TestCase):
         self.assertEqual(prefix['left_joint_path'], [[1], [2]])
         target = FakeTask()
         with grasp_prefix(target, replay=prefix):
+            self.assertFalse(target.need_plan)
             target.move(100)
+            self.assertFalse(target.need_plan)
             target.move(200)
+            self.assertTrue(target.need_plan)
             target.move(9)
         self.assertEqual(target.executed, [1, 2, 9])
         self.assertEqual(target.left_joint_path, [[1], [2], [9]])

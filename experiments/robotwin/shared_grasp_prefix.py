@@ -24,6 +24,9 @@ def grasp_prefix(task, *, replay=None):
             raise ValueError('Shared prefix needs a fresh planning scene.')
         task.left_joint_path = deepcopy(replay['left_joint_path'])
         task.right_joint_path = deepcopy(replay['right_joint_path'])
+        # grasp_actor is evaluated before task.move; prevent it from running
+        # an independent grasp planner when cached paths already exist.
+        task.need_plan = False
 
     def move(*args, **kwargs):
         nonlocal count
@@ -33,7 +36,7 @@ def grasp_prefix(task, *, replay=None):
         try:
             value = original(*args, **kwargs)
         finally:
-            task.need_plan = True
+            task.need_plan = not (replay is not None and count < 1)
         count += 1
         if count == 2 and task.plan_success:
             if replay is not None:
