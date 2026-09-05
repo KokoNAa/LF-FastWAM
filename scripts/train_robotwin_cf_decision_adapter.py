@@ -60,7 +60,7 @@ def small_validation_set(rows):
     selected = {}
     for row in rows:
         if row["replay_split"] == "replay_holdout":
-            selected.setdefault((row["pair_id"], row["task_config"]), row)
+            selected.setdefault((row["pair_id"], row["task_config"], row.get('validation_phase', 'initial')), row)
     return list(selected.values())
 
 
