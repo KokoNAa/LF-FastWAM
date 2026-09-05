@@ -1,10 +1,26 @@
 import unittest
 from pathlib import Path
+import json
+import tempfile
 
-from experiments.robotwin.decision_language_replay import replace_language, seen_instruction_pairs
+from experiments.robotwin.decision_language_replay import bound_spatial_instruction_pairs, replace_language, seen_instruction_pairs
 
 
 class LanguageReplayTest(unittest.TestCase):
+    def test_spatial_goal_reversal_preserves_actual_object_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            description = root / 'third_party/RoboTwin/description'
+            (description / 'task_instruction').mkdir(parents=True)
+            (description / 'objects_description').mkdir()
+            (description / 'task_instruction/place_a2b_left.json').write_text(json.dumps(
+                {'seen': ['Place {A} on the left of {B}.'], 'unseen': ['UNSEEN {A} {B}']}))
+            for name, text in [('box', 'box with a left arrow'), ('bottle', 'red bottle')]:
+                (description / f'objects_description/{name}.json').write_text(json.dumps({'seen': [text]}))
+            pair = bound_spatial_instruction_pairs(root, 'place_a2b_left_to_right', {'{A}': 'box', '{B}': 'bottle'})[0]
+            self.assertEqual(pair['source'], 'Place the box with a left arrow on the left of the red bottle.')
+            self.assertEqual(pair['target'], 'Place the box with a left arrow on the right of the red bottle.')
+
     def test_goal_slots_reverse_without_arm_or_unresolved_tokens(self):
         repo = Path(__file__).resolve().parents[1]
         for pair_id in ('blocks_ranking_rgb_to_bgr', 'stack_blocks_two_green_on_red_to_red_on_green'):

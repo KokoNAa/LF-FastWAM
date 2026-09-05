@@ -111,7 +111,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42027)
     ap.add_argument("--resume-state")
     ap.add_argument("--seen-language-augmentation", action="store_true",
-                    help="Mix seen-template paraphrases into ranking/stacking training positives.")
+                    help="Mix seen-template and manifest-bound paraphrases into training positives.")
     args = ap.parse_args()
     if min(args.steps, args.pairs_per_step, args.save_every, args.eval_every) < 1:
         ap.error("Step counts and intervals must be positive.")
@@ -169,7 +169,7 @@ def main():
     payloads = {r["id"]: move_cache(torch.load(r["payload"], map_location="cpu", weights_only=True), model.device)
                 for r in rows if r["replay_split"] == "train" or r in validation}
     from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
-    seen_contexts = (build_seen_contexts(model, REPO, [r['pair_id'] for r in rows])
+    seen_contexts = (build_seen_contexts(model, REPO, rows)
                      if args.seen_language_augmentation else {})
     stream = itertools.islice(pair_stream(rows, args.seed, args.focus_repeats),
                              start * args.pairs_per_step + rank, None, world)
@@ -222,7 +222,7 @@ def main():
                 p = payloads[row["id"]]
                 seed = args.seed + (step - 1) * args.pairs_per_step + i * world + rank
                 captured = p['captured']
-                variants = seen_contexts.get(row['pair_id'], [])
+                variants = seen_contexts.get(row.get('language_replay_key', row['pair_id']), [])
                 rng = random.Random(seed)
                 if variants and rng.random() < .5:
                     variant = rng.choice(variants)
