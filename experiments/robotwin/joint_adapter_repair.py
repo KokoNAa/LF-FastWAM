@@ -24,6 +24,24 @@ def configure_adapters(model, experts):
     return selected
 
 
+def language_adapters(parameters):
+    """Retain trainable text projections and cross-attention in both experts."""
+    selected = {}
+    for name, parameter in parameters.items():
+        use = '.cross_attn.' in name or '.text_embedding.' in name
+        parameter.requires_grad_(use)
+        if use:
+            selected[name] = parameter
+    if not selected:
+        raise ValueError('No language-facing adapters were found.')
+    return selected
+
+
+def weighted_pair_loss(parts, gain=1., target_weight=1.):
+    """Positive expert fitting plus optional paired-difference emphasis."""
+    return (parts['source'] + target_weight * parts['target']) / 2 + (gain - 1) * parts['conditional_mse']
+
+
 def capture_inputs(model, run):
     """Capture frozen VAE/T5 outputs before all trainable Video operations."""
     from experiments.robotwin.denoising_probe import capture_action_cache
@@ -85,7 +103,7 @@ def predict(model, captured, noisy, time, checkpoint=True):
 
 
 def paired_backward(model, captured, refs, noise, time, flow_weight, anchor_weight, gain,
-                    *, native_teacher=None, native_teacher_weight=0.):
+                    *, native_teacher=None, native_teacher_weight=0., target_weight=1.):
     """Identical loss, shared noise/time and backward order for both scope arms."""
     import torch
     from experiments.robotwin.same_state_repair import paired_velocity_losses
@@ -104,7 +122,7 @@ def paired_backward(model, captured, refs, noise, time, flow_weight, anchor_weig
         target = scheduler.training_target(refs[language], noise, time)
         pred = predict(model, captured[language], noisy, time)
         loss = (pred.float() - target.float()).square().mean()
-        objective = loss / 2
+        objective = loss * (target_weight if language == 'target' else 1.) / 2
         if language == 'source' and teacher_flow is not None:
             native_loss = (pred.float() - teacher_flow.float()).square().mean()
             objective = objective + native_teacher_weight * native_loss
@@ -119,7 +137,7 @@ def paired_backward(model, captured, refs, noise, time, flow_weight, anchor_weig
         predictions[language] = predict(model, captured[language], noisy, end)
         targets[language] = scheduler.training_target(refs[language], noise, end)
     parts = paired_velocity_losses(predictions, targets)
-    loss = anchor_weight * (parts["common_mse"] + gain * parts["conditional_mse"])
+    loss = anchor_weight * weighted_pair_loss(parts, gain, target_weight)
     if teacher_end is not None:
         native_loss = (predictions['source'].float() - teacher_end.float()).square().mean()
         loss = loss + anchor_weight * native_teacher_weight * native_loss

@@ -53,6 +53,32 @@ class CompactReplayTest(unittest.TestCase):
 
 
 class NativeTeacherTest(unittest.TestCase):
+    def test_language_scope_keeps_visual_and_motor_self_attention_frozen(self):
+        import torch
+        from experiments.robotwin.joint_adapter_repair import language_adapters
+        names = ['mixtures.video.blocks.0.cross_attn.q.lora_A',
+                 'mixtures.action.text_embedding.0.lora_B',
+                 'mixtures.video.blocks.0.self_attn.q.lora_A',
+                 'mixtures.action.blocks.0.ffn.0.lora_B']
+        parameters = {name: torch.nn.Parameter(torch.ones(1)) for name in names}
+        selected = language_adapters(parameters)
+        self.assertEqual(set(selected), set(names[:2]))
+        self.assertTrue(all(parameters[name].requires_grad for name in names[:2]))
+        self.assertFalse(any(parameters[name].requires_grad for name in names[2:]))
+
+    def test_cf_weight_changes_only_cf_positive_gradient_at_unit_gain(self):
+        import torch
+        from experiments.robotwin.joint_adapter_repair import weighted_pair_loss
+        from experiments.robotwin.same_state_repair import paired_velocity_losses
+        source = torch.tensor([2.], requires_grad=True)
+        target = torch.tensor([3.], requires_grad=True)
+        parts = paired_velocity_losses({'source': source, 'target': target},
+                                       {'source': torch.zeros(1), 'target': torch.zeros(1)})
+        torch.testing.assert_close(weighted_pair_loss(parts), parts['common_mse'] + parts['conditional_mse'])
+        weighted_pair_loss(parts, target_weight=4.).backward()
+        torch.testing.assert_close(source.grad, torch.tensor([2.]))
+        torch.testing.assert_close(target.grad, torch.tensor([12.]))
+
     def test_teacher_restores_student_parameters_and_optimizer_gradient(self):
         import torch
         from experiments.robotwin.native_teacher import teacher_parameters

@@ -128,11 +128,15 @@ def main():
                     help="Mix seen-template and manifest-bound paraphrases into training positives.")
     ap.add_argument('--native-teacher-checkpoint')
     ap.add_argument('--native-teacher-weight', type=float, default=0.)
+    ap.add_argument('--target-weight', type=float, default=1., help='Relative weight of CF expert positives.')
+    ap.add_argument('--adapter-scope', choices=['all', 'language'], default='all')
     ap.add_argument('--stream-payloads', action='store_true',
                     help='Load one sample at a time; required for compact dense replay.')
     args = ap.parse_args()
     if args.native_teacher_weight < 0 or (args.native_teacher_weight and not args.native_teacher_checkpoint):
         ap.error('Positive teacher weight requires a teacher adapter checkpoint.')
+    if args.target_weight <= 0:
+        ap.error('Target weight must be positive.')
     if min(args.steps, args.pairs_per_step, args.save_every, args.eval_every) < 1:
         ap.error("Step counts and intervals must be positive.")
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -176,7 +180,13 @@ def main():
         (root / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     policy = load_policy(args, manifest, f"cuda:{local_rank}")
     model = policy.model
-    selected = configure_adapters(model, ["video", "action"])
+    all_adapters = configure_adapters(model, ["video", "action"])
+    selected = all_adapters
+    if args.adapter_scope == 'language':
+        from experiments.robotwin.joint_adapter_repair import language_adapters
+        selected = language_adapters(all_adapters)
+    if rank == 0:
+        print(f'[adapters] scope={args.adapter_scope} trainable={len(selected)}/{len(all_adapters)}', flush=True)
     optimizer = torch.optim.AdamW(list(selected.values()), lr=args.learning_rate, weight_decay=0.)
     start = 0
     if args.resume_state:
@@ -189,7 +199,7 @@ def main():
     native_teacher = None
     if args.native_teacher_checkpoint:
         from experiments.robotwin.native_teacher import NativeTeacher
-        native_teacher = NativeTeacher(model, selected, args.native_teacher_checkpoint)
+        native_teacher = NativeTeacher(model, all_adapters, args.native_teacher_checkpoint)
     if args.stream_payloads:
         from experiments.robotwin.compact_replay import ReplayPayloads
         payloads = ReplayPayloads(rows, model.device)
@@ -266,7 +276,8 @@ def main():
                     float(scheduler.training_weight(t).item()) / local_pairs,
                     args.endpoint_weight / local_pairs,
                     args.conditional_gain if row.get("initial_observations_exactly_equal", True) else 1.,
-                    native_teacher=native_teacher, native_teacher_weight=args.native_teacher_weight))
+                    native_teacher=native_teacher, native_teacher_weight=args.native_teacher_weight,
+                    target_weight=args.target_weight))
             average_gradients(list(selected.values()))
             norm = torch.nn.utils.clip_grad_norm_(list(selected.values()), 1., error_if_nonfinite=True)
             optimizer.step()
