@@ -243,13 +243,13 @@ def main(cfg: DictConfig) -> None:
     def matches_correct_records(
         spec: JobSpec, records: list[dict[str, Any]]
     ) -> bool:
-        if spec.condition == "correct":
-            if baseline_root is None:
-                return True
+        if baseline_root is not None:
             _, correct_records = load_job_output(
                 baseline_root / spec.source_task / spec.task_config / 'correct',
                 expected_episodes=expected_episodes, expected_source_task=spec.source_task,
                 expected_task_config=spec.task_config, expected_condition='correct')
+        elif spec.condition == "correct":
+            return True
         else:
             correct_spec = JobSpec(spec.source_task, spec.task_config, "correct")
             correct_output = load_complete_job(correct_spec)
@@ -339,7 +339,7 @@ def main(cfg: DictConfig) -> None:
             f"EVALUATION.language_intervention_manifest={manifest_path}",
             f"EVALUATION.output_dir={output_dir}",
         ]
-        if spec.condition == 'correct' and baseline_root is not None:
+        if baseline_root is not None:
             command.append('EVALUATION.matched_episode_records_path='
                            f'{baseline_root / spec.source_task / spec.task_config / "correct" / "episodes.jsonl"}')
         elif spec.condition != "correct":
@@ -358,7 +358,9 @@ def main(cfg: DictConfig) -> None:
         return RunningJob(spec=spec, gpu_id=gpu_id, process=process)
 
     def is_launchable(spec: JobSpec) -> bool:
-        if spec.condition == "correct":
+        # A complete external baseline already supplies canonical scenes for
+        # every condition, so CF need not wait for this model's Correct job.
+        if baseline_root is not None or spec.condition == "correct":
             return True
         correct_spec = JobSpec(spec.source_task, spec.task_config, "correct")
         return correct_spec.key in completed
