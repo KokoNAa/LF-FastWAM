@@ -2,11 +2,47 @@ import unittest
 from pathlib import Path
 import json
 import tempfile
+import ast
+import sys
+from types import ModuleType
+from unittest.mock import patch
 
-from experiments.robotwin.decision_language_replay import bound_spatial_instruction_pairs, replace_language, seen_instruction_pairs
+from experiments.robotwin.decision_language_replay import build_seen_contexts, bound_spatial_instruction_pairs, replace_language, seen_instruction_pairs
 
 
 class LanguageReplayTest(unittest.TestCase):
+    def test_augmented_contexts_use_deployment_prompt_and_keep_pair_binding(self):
+        repo = Path(__file__).resolve().parents[1]
+        # Read the authoritative constant without loading the GPU dataset stack.
+        tree = ast.parse((repo / 'src/fastwam/datasets/lerobot/robot_video_dataset.py').read_text())
+        template = next(ast.literal_eval(node.value) for node in tree.body
+                        if isinstance(node, ast.Assign) and any(
+                            isinstance(target, ast.Name) and target.id == 'DEFAULT_PROMPT'
+                            for target in node.targets))
+        dataset = ModuleType('fastwam.datasets.lerobot.robot_video_dataset')
+        dataset.DEFAULT_PROMPT = template
+
+        class Encoder:
+            def __init__(self):
+                self.prompts = []
+
+            def encode_prompt(self, prompts):
+                self.prompts.extend(prompts)
+                return prompts, [True] * len(prompts)
+
+        pairs = [{'source': 'Put red on green.', 'target': 'Put green on red.'}]
+        rows = [dict(pair_id='test', replay_split='train', seen_instruction_pairs=pairs),
+                dict(pair_id='test', replay_split='train', seen_instruction_pairs=pairs),
+                dict(pair_id='heldout', replay_split='holdout',
+                     seen_instruction_pairs=[{'source': 'SECRET', 'target': 'SECRET'}])]
+        model = Encoder()
+        with patch.dict(sys.modules, {dataset.__name__: dataset}):
+            contexts = build_seen_contexts(model, repo, rows)
+        self.assertEqual(set(contexts), {'test'})
+        self.assertCountEqual(model.prompts, [template.format(task=text) for text in pairs[0].values()])
+        for branch, text in pairs[0].items():
+            self.assertEqual(contexts['test'][0][branch], ([template.format(task=text)], [True]))
+
     def test_spatial_goal_reversal_preserves_actual_object_names(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

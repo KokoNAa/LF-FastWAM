@@ -84,6 +84,8 @@ def bound_spatial_instruction_pairs(repo, pair_id, slots, count=4):
 
 
 def build_seen_contexts(model, repo, rows):
+    from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+
     specs = {}
     for row in rows:
         if row['replay_split'] != 'train':
@@ -95,7 +97,9 @@ def build_seen_contexts(model, repo, rows):
     encoded = {}
     for start in range(0, len(prompts), 4):
         batch = prompts[start:start + 4]
-        context, mask = model.encode_prompt(batch)
+        # Match both captured training inputs and deployment. Keep raw texts as
+        # lookup keys so paired variants still select the intended instruction.
+        context, mask = model.encode_prompt([DEFAULT_PROMPT.format(task=text) for text in batch])
         encoded.update({text: (context[i:i+1], mask[i:i+1]) for i, text in enumerate(batch)})
     print(f'[language] seen_prompts={len(prompts)} paired_keys={sum(bool(v) for v in specs.values())}', flush=True)
     return {key: [{language: encoded[text] for language, text in pair.items()} for pair in pairs]
