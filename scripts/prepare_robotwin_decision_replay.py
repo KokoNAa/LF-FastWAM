@@ -88,7 +88,7 @@ def main():
             with torch.no_grad():
                 cache = build_cache(model, move_cache(inputs, model.device))
                 replay = sample_cached_actions(model, cache, 42, 10)
-            normalized = norm.forward(torch.as_tensor(raw, dtype=torch.float32).unsqueeze(0))[0].numpy()
+            normalized = (torch.as_tensor(raw, dtype=torch.float32).unsqueeze(0) * norm.scale + norm.offset)[0].numpy()
             error = difference(normalized, replay)["max_abs"]
             if calls != 10 or error > 1e-5:
                 raise ValueError("Frozen inputs cannot reproduce current production inference.")

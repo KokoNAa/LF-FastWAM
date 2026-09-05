@@ -20,7 +20,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--manifest', required=True)
     ap.add_argument('--checkpoint', required=True)
-    ap.add_argument('--step', type=int, required=True)
+    kind = ap.add_mutually_exclusive_group(required=True)
+    kind.add_argument('--step', type=int)
+    kind.add_argument('--base', action='store_true')
     ap.add_argument('--output', required=True)
     ap.add_argument('--gpu', type=int, required=True)
     ap.add_argument('--seeds', type=int, nargs='+', default=[42, 43, 44])
@@ -31,7 +33,9 @@ def main():
     if manifest.get('complete') is not True:
         raise ValueError('Replay bank is incomplete.')
     plan = read_json(Path(manifest['source_probe']) / 'plan.json')
-    key = f'step{args.step}'
+    key = 'base' if args.base else f'step{args.step}'
+    if args.base and Path(args.checkpoint).resolve() != Path(plan['base_checkpoint']).resolve():
+        raise ValueError('Base probe must use the original released checkpoint.')
     plan['checkpoints'][key] = str(Path(args.checkpoint).resolve())
     plan['checkpoint_sha256'][key] = sha256(args.checkpoint)
     policy, audit = load_probe_policy(plan, key, args.gpu)
@@ -68,7 +72,9 @@ def main():
                         policy.seed = seed
                         policy.policy_guard_state = None
                         raw = policy._infer_action_chunk(obs, state[field])
-                        normalized = norm.forward(torch.as_tensor(raw, dtype=torch.float32).unsqueeze(0))[0].numpy()
+                        # Invert output denormalization without the reference
+                        # normalizer's clamp: predictions may exceed +/-5.
+                        normalized = (torch.as_tensor(raw, dtype=torch.float32).unsqueeze(0) * norm.scale + norm.offset)[0].numpy()
                         error = difference(normalized, values[language])['max_abs']
                         if error > 1e-5:
                             raise ValueError('Production and bank inference differ.')
