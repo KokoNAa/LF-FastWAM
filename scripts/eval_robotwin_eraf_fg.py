@@ -18,11 +18,14 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / 'src')]
 
 
-def official_module():
+def official_module(robotwin_root):
     path = REPO / 'third_party/RoboTwin/script/eval_policy.py'
     spec = importlib.util.spec_from_file_location('eraf_fg_official_eval', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Keep the versioned CIS loop, but resolve camera/video assets from the
+    # actual simulator installation, just like _load_robotwin_args below.
+    module.parent_directory = str(Path(robotwin_root) / 'script')
     return module
 
 
@@ -115,11 +118,12 @@ def main():
         task, options = _load_robotwin_args(robotwin_root=Path(args.robotwin_root), task_name=task_name,
                                           task_config='demo_clean', output_root=root)
         install_pgc_observation_contract(task, pair_spec_from_source_task(task_name))
-        official = official_module()
+        official = official_module(args.robotwin_root)
         pair = select_intervention_pair(pairs, source_task=task_name)
         options.update(eval_mode=True, render_freq=0, need_plan=True, save_data=False,
                        policy_name='eraf_fg_explicit_policy', ckpt_setting=args.checkpoint,
                        eval_video_log=args.videos)
+        video_size = official.get_eval_video_size(options) if args.videos else None
         if args.mode == 'catalog':
             directory = root / task_name / 'demo_clean' / 'correct'
             directory.mkdir(parents=True, exist_ok=False)
@@ -201,7 +205,7 @@ def main():
             try:
                 goal = 'source' if condition == 'correct' else 'counterfactual'
                 _, _, records = official.eval_policy(task_name, task, deepcopy(options), policy, 0,
-                    test_num=args.episodes, video_size=official.get_eval_video_size(options) if args.videos else None,
+                    test_num=args.episodes, video_size=video_size,
                     instruction_type='unseen', skip_get_obs_within_replan=True, condition=condition,
                     intervention_pair=pair, instruction_goal=goal, selected_goal=goal,
                     episode_results_path=directory / 'episodes.jsonl', matched_episode_records=canonical)
