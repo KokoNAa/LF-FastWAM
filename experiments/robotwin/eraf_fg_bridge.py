@@ -145,14 +145,15 @@ def validate_model_geometry(model) -> None:
 
 def save_repair_checkpoint(model, path: str | Path, *, stage: str, steps: int,
                            parent: str | Path, fg_supervision: str,
-                           provenance: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                           provenance: Mapping[str, Any] | None = None,
+                           record_hashes: bool = True) -> dict[str, Any]:
     import torch
     validate_model_geometry(model)
     payload = {
         "format": CHECKPOINT_FORMAT, "protocol": PROTOCOL, "stage": stage,
         "optimizer_steps": int(steps), "fg_supervision": fg_supervision,
         "base_checkpoint": model.lora_base_checkpoint,
-        "parent_checkpoint": str(Path(parent).resolve()), "parent_sha256": file_sha256(parent),
+        "parent_checkpoint": str(Path(parent).resolve()),
         "guard_config": eraf_guard_config(), "lora_config": dict(model.lora_config),
         "geometry": {"action_dim": 14, "proprio_dim": 14, "camera_count": 3,
                      "camera_layout": "robotwin_mosaic", "action_horizon": 32,
@@ -161,6 +162,8 @@ def save_repair_checkpoint(model, path: str | Path, *, stage: str, steps: int,
         "policy_guard": {k: v.detach().cpu().clone() for k, v in model.policy_guard_modules.state_dict().items()},
         "provenance": dict(provenance or {}),
     }
+    if record_hashes:
+        payload['parent_sha256'] = file_sha256(parent)
     validate_payload(payload)
     target = Path(path)
     if target.exists():
@@ -263,16 +266,20 @@ INTERFACE_PARTS = {"goal_graph", "goal_query_seeds", "eraf_action_grounding_brid
                    "eraf_action_context_injector"}
 
 
-def trainable_parameters(model, stage: str, *, eraf=True):
+def trainable_parameters(model, stage: str, *, eraf=True, policy_scope='all'):
     """Freeze semantic prediction after grounding; train its action interfaces."""
     import torch
     if stage not in {"grounding", "interface", "joint"}:
         raise ValueError("Unknown optimization stage.")
+    if policy_scope not in {'all', 'action'}:
+        raise ValueError('Unknown policy parameter scope.')
     model.eval().requires_grad_(False)
     selected = {}
     if stage == "joint":
         for name, p in model.mot.named_parameters():
             if name.endswith((".lora_A", ".lora_B")):
+                if policy_scope == 'action' and '.action.' not in '.' + name:
+                    continue
                 p.data = p.data.to(torch.float32)
                 p.requires_grad_(True)
                 selected["mot." + name] = p

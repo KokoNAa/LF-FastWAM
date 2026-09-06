@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -25,10 +26,17 @@ def main():
     ap.add_argument('--learning-rate', type=float, default=1e-5)
     ap.add_argument('--correct-weight', type=float, default=2.)
     ap.add_argument('--cf-weight', type=float, default=1.)
+    ap.add_argument('--policy-scope', choices=['all', 'action'], default='all')
+    ap.add_argument('--correction-weight', type=float, default=1.,
+                    help='Scale FG slots and their matched ordinary-CF replacements equally.')
+    ap.add_argument('--skip-file-hashes', action='store_true',
+                    help='Use manifest metadata and direct optimizer/model tensor binding on resume.')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--disable-seen-language-augmentation', action='store_true')
     ap.add_argument('--resume-state', help='Resume saved FP32 masters and optimizer at the supplied checkpoint.')
     args = ap.parse_args()
+    if not math.isfinite(args.correction_weight) or args.correction_weight <= 0:
+        ap.error('--correction-weight must be positive and finite')
     import torch
     import torch.distributed as dist
     from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint, validate_payload, file_sha256
@@ -94,24 +102,40 @@ def main():
                         raise ValueError(f'Formal FG training needs {minimum} {split} scenes for {task}, got {count}.')
     policy = load_policy(args.checkpoint, manifest, device=f'cuda:{local}', seed=args.seed)
     model = policy.model
-    selected = trainable_parameters(model, args.stage, eraf=args.eraf == 'on')
+    selected = trainable_parameters(model, args.stage, eraf=args.eraf == 'on',
+                                    policy_scope=args.policy_scope)
     adapters = {n: p for n, p in model.mot.named_parameters() if n.endswith(('.lora_A', '.lora_B'))}
     teachers = {'correct': NativeTeacher(model, adapters, args.correct_teacher),
                 'cf': NativeTeacher(model, adapters, args.cf_teacher)}
     optimizer = MasterAdamW(selected.values(), lr=args.learning_rate)
     start = 0
     optimization_contract = {k: getattr(args, k) for k in ('stage', 'fg', 'eraf', 'seed',
-        'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation')}
-    optimization_contract['manifest_sha256'] = file_sha256(args.manifest)
+        'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation',
+        'policy_scope', 'correction_weight', 'skip_file_hashes')}
+    if args.skip_file_hashes:
+        p = Path(args.manifest).resolve()
+        optimization_contract['manifest_identity'] = {'path': str(p), 'bytes': p.stat().st_size,
+                                                       'mtime_ns': p.stat().st_mtime_ns}
+    else:
+        optimization_contract['manifest_sha256'] = file_sha256(args.manifest)
     if args.fg == 'off':
         optimization_contract['fg_off_protocol'] = FG_OFF_PROTOCOL
     adjustments = {}
     if args.resume_state:
         state = torch.load(args.resume_state, map_location='cpu', weights_only=False)
-        if state['parameter_names'] != list(selected) or state['checkpoint_sha256'] != file_sha256(args.checkpoint):
+        if state['parameter_names'] != list(selected):
             raise ValueError('Optimizer does not belong to this exact checkpoint and parameter scope.')
+        if args.skip_file_hashes:
+            masters = state['optimizer']['master']
+            if (len(masters) != len(selected) or any(
+                    not torch.equal(value.to(dtype=live.dtype, device=live.device), live.detach())
+                    for value, live in zip(masters, selected.values(), strict=True))):
+                raise ValueError('Optimizer master tensors do not match the loaded checkpoint.')
+        elif state['checkpoint_sha256'] != file_sha256(args.checkpoint):
+            raise ValueError('Optimizer checkpoint identity changed.')
+        old_defaults = {'policy_scope': 'all', 'correction_weight': 1., 'skip_file_hashes': False}
         for key, value in optimization_contract.items():
-            if state['optimization_contract'].get(key) != value:
+            if state['optimization_contract'].get(key, old_defaults.get(key)) != value:
                 if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
                     raise ValueError(f'Resume changed immutable training contract: {key}')
                 adjustments[key] = {'from': state['optimization_contract'][key], 'to': value}
@@ -167,7 +191,8 @@ def main():
             t = (scheduler._phi(u, scheduler.shift) * scheduler.num_train_timesteps).to(model.device, model.torch_dtype)
             report = backward_example(model, row, payload, noise, t, teachers=teachers,
                 coefficient=1. / (12 // world), eraf=args.eraf == 'on', fg=args.fg,
-                correct_weight=args.correct_weight, cf_weight=args.cf_weight)
+                correct_weight=args.correct_weight, cf_weight=args.cf_weight,
+                correction_weight=args.correction_weight)
             reports.append({'id': row['id'], 'seen_variant': variant_index,
                             'ordinary_cf_control': bool(row.get('ordinary_cf_control')), **report})
         average_gradients(selected.values())
@@ -182,11 +207,15 @@ def main():
                 checkpoint_path = root / f'step_{step:06d}.pt'
                 save_repair_checkpoint(model, checkpoint_path, stage=args.stage,
                     steps=step, parent=args.checkpoint, fg_supervision=args.fg,
-                    provenance={'plan': str(root / 'plan.json'), 'eraf': args.eraf})
-                torch.save({'step': step, 'checkpoint': str(checkpoint_path),
-                    'checkpoint_sha256': file_sha256(checkpoint_path), 'parameter_names': list(selected),
-                    'optimization_contract': optimization_contract, 'optimizer': optimizer.state_dict()},
-                    root / 'optimizer_last.tmp')
+                    provenance={'plan': str(root / 'plan.json'), 'eraf': args.eraf,
+                                'policy_scope': args.policy_scope, 'correction_weight': args.correction_weight},
+                    record_hashes=not args.skip_file_hashes)
+                optimizer_payload = {'step': step, 'checkpoint': str(checkpoint_path),
+                    'parameter_names': list(selected), 'optimization_contract': optimization_contract,
+                    'optimizer': optimizer.state_dict()}
+                if not args.skip_file_hashes:
+                    optimizer_payload['checkpoint_sha256'] = file_sha256(checkpoint_path)
+                torch.save(optimizer_payload, root / 'optimizer_last.tmp')
                 (root / 'optimizer_last.tmp').replace(root / 'optimizer_last.pt')
                 print(f'[checkpoint] step={step}', flush=True)
             barrier()

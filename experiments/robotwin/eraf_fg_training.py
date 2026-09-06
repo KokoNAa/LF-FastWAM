@@ -28,8 +28,13 @@ def same_observation(captured):
 def backward_example(model, row, payload, noise, time, *, teachers, coefficient=1.,
                      eraf=True, fg='full', correct_weight=2., cf_weight=1.,
                      target_weight=2., endpoint_weight=1., conditional_gain=4.,
-                     gradient_observer=None):
+                     gradient_observer=None, correction_weight=1.):
     import torch
+    import math
+    if not math.isfinite(correction_weight) or correction_weight <= 0:
+        raise ValueError('Correction/control weight must be positive and finite.')
+    if row.get('fg_correction') or row.get('ordinary_cf_control'):
+        coefficient *= correction_weight
     from experiments.robotwin.eraf_fg_bridge import predict, masked_mse
     from experiments.robotwin.same_state_repair import paired_velocity_losses
     scheduler = model.train_action_scheduler
