@@ -50,6 +50,8 @@ def main():
         if value:
             setattr(args, key, str(Path(value).resolve()))
     root = Path(args.output)
+    if args.mode in ('worker', 'summarize') and not all((args.checkpoint, args.catalog_root)):
+        ap.error('Evaluation requires checkpoint and catalog root.')
     if args.mode == 'summarize':
         from experiments.robotwin.eraf_fg_bridge import file_sha256
         cells = []
@@ -75,7 +77,10 @@ def main():
                         any(a[k] != b[k] for k in fields) for a, b in zip(records, canonical, strict=True)):
                     raise ValueError('Evaluation did not use the exact matched seeds and instructions.')
                 initial_by_condition.append(json.loads((path / 'initial_states.json').read_text()))
-                cells.append(json.loads((path / 'summary.json').read_text()))
+                cell = json.loads((path / 'summary.json').read_text())
+                if cell['total_episodes'] != args.episodes:
+                    raise ValueError('Cell episode count changed.')
+                cells.append(cell | {'episodes': cell['total_episodes']})
             if any(x != initial_by_condition[0] for x in initial_by_condition):
                 raise ValueError('Correct and CF initial physical states differ.')
         if len(set(signatures)) != 1:

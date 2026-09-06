@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import random
 import sys
 import time
 
@@ -25,6 +26,7 @@ def main():
     ap.add_argument('--correct-weight', type=float, default=2.)
     ap.add_argument('--cf-weight', type=float, default=1.)
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--disable-seen-language-augmentation', action='store_true')
     args = ap.parse_args()
     import torch
     import torch.distributed as dist
@@ -76,6 +78,9 @@ def main():
     payloads = ReplayPayloads(rows, model.device)
     raw = RawReplay(args.source_bank)
     stream = mixture_stream(rows, args.seed, args.fg)
+    from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
+    seen_contexts = ({} if args.disable_seen_language_augmentation else build_seen_contexts(model, REPO,
+        [r for r in rows if not r.get('native_retention') and not r.get('cf_retention')]))
     if rank == 0:
         (root / 'plan.json').write_text(json.dumps(vars(args) | {'world_size': world, 'global_batch': 12,
             'trainable_parameters': list(selected), 'optimizer_precision': 'FP32 master weights',
@@ -94,6 +99,15 @@ def main():
             if row.get('frozen_input_protocol') != 'robotwin_eraf_fg_pre_dit_v1':
                 payload = raw.attach_proprio(payload, row, policy)
             seed = args.seed + (step - 1) * 12 + index
+            variants = ([] if row.get('native_retention') or row.get('cf_retention') else
+                        seen_contexts.get(row.get('language_replay_key', row['pair_id']), []))
+            variant_index = None
+            rng = random.Random(seed)
+            if variants and rng.random() < .5:
+                variant_index = rng.randrange(len(variants))
+                variant = variants[variant_index]
+                payload = dict(payload, captured={k: replace_language(v, *variant[k])
+                                                  for k, v in payload['captured'].items()})
             noise = noise_tensor((1, 32, 14), seed, model)
             u = torch.rand((1,), generator=torch.Generator(device='cpu').manual_seed(seed + 1_000_000))
             scheduler = model.train_action_scheduler
@@ -101,7 +115,7 @@ def main():
             report = backward_example(model, row, payload, noise, t, teachers=teachers,
                 coefficient=1. / (12 // world), eraf=args.eraf == 'on', fg=args.fg,
                 correct_weight=args.correct_weight, cf_weight=args.cf_weight)
-            reports.append({'id': row['id'], **report})
+            reports.append({'id': row['id'], 'seen_variant': variant_index, **report})
         average_gradients(selected.values())
         norm = optimizer.step()
         journal.write(json.dumps({'step': step, 'grad_norm': norm, 'examples': reports,
