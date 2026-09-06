@@ -67,10 +67,15 @@ def main():
     ap.add_argument('--cf-teacher', type=Path, default=teacher_root+'/repair-shared-decisions/step_000400.pt')
     ap.add_argument('--fg', choices=['off', 'local', 'full'], required=True)
     ap.add_argument('--gpus', type=int, nargs='+', required=True)
-    ap.add_argument('--steps', type=int, choices=[2, 200], default=200)
+    ap.add_argument('--steps', type=int, choices=[2, 100, 200], default=200)
     ap.add_argument('--deadline', default='2026-09-07T03:00:00+08:00')
     ap.add_argument('--training-only', action='store_true')
+    ap.add_argument('--evaluate-only', action='store_true', help='Evaluate an existing saved checkpoint; no optimizer.')
     args = ap.parse_args()
+    if args.steps == 100 and not args.evaluate_only:
+        ap.error('100 is an existing checkpoint selection, not an additional training budget')
+    if args.evaluate_only and args.training_only:
+        ap.error('Choose training-only or evaluate-only')
     if len(set(args.gpus)) != len(args.gpus) or any(g not in range(6) for g in args.gpus) or 12 % len(args.gpus):
         ap.error('Use distinct assigned GPUs and a world size dividing12')
     for key in ('root', 'output', 'manifest', 'checkpoint', 'source_bank', 'correct_teacher', 'cf_teacher'):
@@ -125,13 +130,24 @@ def main():
             '--fg', args.fg, '--correct-weight', '4', '--cf-weight', '2', '--policy-scope', 'action',
             '--correction-weight', '.25', '--target-tasks', 'place_a2b_left', 'place_empty_cup',
             '--skip-file-hashes']
-        start('train', command, args.gpus)
-        while not done('train'): budget(); time.sleep(5)
-        audit = training_audit(args.output, args.checkpoint, args.steps, len(args.gpus))
-        (args.output/'training_audit.json').write_text(json.dumps(audit, indent=2)+'\n')
-        if args.training_only:
-            plan['complete'] = True; save(); return
-        checkpoint = args.output/f'joint/step_{args.steps:06d}.pt'
+        if args.evaluate_only:
+            import torch
+            from experiments.robotwin.eraf_fg_bridge import validate_payload
+            saved = validate_payload(torch.load(args.checkpoint, map_location='cpu', weights_only=False))
+            if (saved['optimizer_steps'] != args.steps or saved['fg_supervision'] != args.fg or
+                    saved['provenance'].get('eraf') != 'off' or saved['provenance'].get('policy_scope') != 'action'):
+                raise ValueError('Wrong existing checkpoint for the declared evaluation arm')
+            del saved
+            checkpoint = args.checkpoint
+            plan['additional_optimizer_updates'] = 0; save()
+        else:
+            start('train', command, args.gpus)
+            while not done('train'): budget(); time.sleep(5)
+            audit = training_audit(args.output, args.checkpoint, args.steps, len(args.gpus))
+            (args.output/'training_audit.json').write_text(json.dumps(audit, indent=2)+'\n')
+            if args.training_only:
+                plan['complete'] = True; save(); return
+            checkpoint = args.output/f'joint/step_{args.steps:06d}.pt'
         catalogs = {'reg': (3, Path('/root/gpufree-data/LF-FastWAM/evaluate_results/robotwin/robotwin_uncond_3cam_384/cf-improvement-20260905-235608-base')),
                     'dev': (6, args.root/'catalog_dev')}
         cup_catalog = args.root/'cup_baseline_20260906_2221/catalog_dev/catalog.json'
