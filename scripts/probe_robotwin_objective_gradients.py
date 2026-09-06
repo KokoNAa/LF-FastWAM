@@ -92,11 +92,12 @@ def main():
     for key in ('manifest', 'source-bank', 'checkpoint', 'output', 'correct-teacher', 'cf-teacher'):
         parser.add_argument('--' + key, required=True)
     parser.add_argument('--batches', type=int, default=12)
+    parser.add_argument('--start-batch', type=int, default=1)
     parser.add_argument('--max-seconds', type=int, default=2100)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--skip-actions', action='store_true', help='Only for the one-batch runtime smoke.')
+    parser.add_argument('--skip-actions', action='store_true', help='Second disjoint gradient shard; avoid duplicate action probes.')
     args = parser.parse_args()
-    if not 1 <= args.batches <= 12 or args.max_seconds <= 0:
+    if not 1 <= args.batches <= 12 or args.start_batch < 1 or args.start_batch + args.batches - 1 > 12 or args.max_seconds <= 0:
         parser.error('Use1–12 fixed global batches and a positive runtime limit.')
     started = time.monotonic()
     output = Path(args.output)
@@ -134,8 +135,10 @@ def main():
                     'cf': NativeTeacher(model, adapters, args.cf_teacher)}
         seen = build_seen_contexts(model, REPO, [r for r in rows if not r.get('native_retention') and not r.get('cf_retention')])
         stream = mixture_stream(rows, args.seed, 'full')
+        for _ in range(args.start_batch - 1):
+            next(stream)
         with (output / 'gradients.jsonl').open('x', buffering=1) as journal:
-            for step in range(1, args.batches + 1):
+            for step in range(args.start_batch, args.start_batch + args.batches):
                 check_budget()
                 collector = GradientCollector(selected)
                 entries = []
@@ -166,11 +169,11 @@ def main():
                 journal.write(json.dumps({'batch': step, 'examples': entries, **collector.summary()}) + '\n')
                 if any(p.grad is not None for p in selected.values()):
                     raise ValueError('Diagnostic unexpectedly accumulated parameter.grad.')
-                result['batches_completed'] = step
+                result['batches_completed'] = step - args.start_batch + 1
                 (output / 'summary.json').write_text(json.dumps(result, indent=2))
                 del collector
                 gc.collect()
-                print(f'[gradients] batches={step}/{args.batches} seconds={time.monotonic()-started:.1f}', flush=True)
+                print(f'[gradients] batches={result["batches_completed"]}/{args.batches} global_batch={step} seconds={time.monotonic()-started:.1f}', flush=True)
         unchanged = all(torch.equal(p.detach().cpu(), original[n]) for n, p in selected.items())
         if not unchanged:
             raise ValueError('Diagnostic changed policy parameters.')
