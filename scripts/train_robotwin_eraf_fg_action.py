@@ -129,6 +129,11 @@ def main():
         if state['parameter_names'] != list(selected):
             raise ValueError('Optimizer does not belong to this exact checkpoint and parameter scope.')
         if args.skip_file_hashes:
+            checkpoint = Path(args.checkpoint).resolve()
+            identity = {'path': str(checkpoint), 'bytes': checkpoint.stat().st_size,
+                        'mtime_ns': checkpoint.stat().st_mtime_ns}
+            if state.get('checkpoint_identity') != identity:
+                raise ValueError('Optimizer checkpoint path or file metadata changed.')
             masters = state['optimizer']['master']
             if (len(masters) != len(selected) or any(
                     not torch.equal(value.to(dtype=live.dtype, device=live.device), live.detach())
@@ -220,6 +225,10 @@ def main():
                     'optimizer': optimizer.state_dict()}
                 if not args.skip_file_hashes:
                     optimizer_payload['checkpoint_sha256'] = file_sha256(checkpoint_path)
+                else:
+                    optimizer_payload['checkpoint_identity'] = {
+                        'path': str(checkpoint_path), 'bytes': checkpoint_path.stat().st_size,
+                        'mtime_ns': checkpoint_path.stat().st_mtime_ns}
                 torch.save(optimizer_payload, root / 'optimizer_last.tmp')
                 (root / 'optimizer_last.tmp').replace(root / 'optimizer_last.pt')
                 print(f'[checkpoint] step={step}', flush=True)
