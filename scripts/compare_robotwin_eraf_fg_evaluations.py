@@ -39,9 +39,15 @@ def evaluation(root):
     return summary, cells
 
 
-def compare(baseline_root, candidate_root):
+def compare(baseline_root, candidate_root, tasks=None):
     baseline, a = evaluation(baseline_root)
     candidate, b = evaluation(candidate_root)
+    if tasks is not None:
+        requested = set(tasks)
+        if not requested or any(not requested.issubset({k[0] for k in source}) for source in (a, b)):
+            raise ValueError('Every explicitly requested task must exist in both evaluations.')
+        a = {k: v for k, v in a.items() if k[0] in requested}
+        b = {k: v for k, v in b.items() if k[0] in requested}
     if not a or a.keys() != b.keys():
         raise ValueError('The two evaluation matrices differ or are empty.')
     cells, pairs = [], []
@@ -78,6 +84,7 @@ def compare(baseline_root, candidate_root):
             'baseline_policy_kind': meta_a['policy_kind'], 'candidate_policy_kind': meta_b['policy_kind']})
     return {'complete': True, 'baseline': baseline['checkpoint'], 'candidate': candidate['checkpoint'],
             'matched_episodes': len(pairs), 'cells': cells,
+            'explicit_task_subset': sorted(set(tasks)) if tasks is not None else None,
             'interpretation': 'Paired descriptive results; no component attribution from one comparison.'}, pairs
 
 
@@ -85,8 +92,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     for name in ('baseline', 'candidate', 'output'):
         ap.add_argument('--' + name, required=True)
+    ap.add_argument('--tasks', nargs='+', help='Explicitly declared diagnostic subset; both inputs must be complete.')
     args = ap.parse_args()
-    report, pairs = compare(args.baseline, args.candidate)
+    report, pairs = compare(args.baseline, args.candidate, args.tasks)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     (output / 'comparison.json').write_text(json.dumps(report, indent=2))
