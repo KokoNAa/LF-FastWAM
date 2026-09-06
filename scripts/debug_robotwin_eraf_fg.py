@@ -12,7 +12,7 @@ sys.path[:0] = [str(REPO), str(REPO / "src")]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trace", required=True)
+    parser.add_argument("--trace")
     parser.add_argument("--task", required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--step", type=int, default=24)
@@ -21,16 +21,20 @@ def main():
     parser.add_argument("--initial-expert", action="store_true")
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
+    if not args.initial_expert and not args.trace:
+        parser.error('Continuation debugging requires --trace.')
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     import numpy as np
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _capture_data_type, _close
     from experiments.robotwin.pgc_data import pair_spec_from_source_task
     from experiments.robotwin.pgc_task_variants import install_pgc_task_contract, play_variant
     from experiments.robotwin.eraf_fg_collection import replay_prefix, record_continuation, continue_to_goal, full_goal, replay_continuation
-    root = Path(args.trace).resolve().parent
-    with np.load(args.trace) as handle:
-        trace = {"initial": handle["initial"], "actions": handle["actions"],
-                 "states": dict(zip(handle["capture_steps"].tolist(), handle["states"]))}
+    import tempfile
+    root = Path(args.trace).resolve().parent if args.trace else Path(tempfile.mkdtemp(prefix='robotwin_expert_probe_'))
+    if args.trace:
+        with np.load(args.trace) as handle:
+            trace = {"initial": handle["initial"], "actions": handle["actions"],
+                     "states": dict(zip(handle["capture_steps"].tolist(), handle["states"]))}
     task, options = _load_robotwin_args(robotwin_root=Path(args.robotwin_root), task_name=args.task,
                                       task_config="demo_clean", output_root=root / "debug")
     spec = pair_spec_from_source_task(args.task)
@@ -41,6 +45,9 @@ def main():
     if not args.initial_expert:
         print("prefix", args.step, "drift", replay_prefix(task, spec, trace, args.step), flush=True)
     print("actors", [a.get_pose().p.tolist() for a in task.pgc_scene_actors()], flush=True)
+    print('scene', args.task, args.seed,
+          {k: str(getattr(task, k)) for k in ('selected_modelname_A', 'selected_model_id_A',
+                                            'selected_modelname_B', 'selected_model_id_B') if hasattr(task, k)}, flush=True)
     original, count = task.move, 0
 
     def move(*a, **kw):
