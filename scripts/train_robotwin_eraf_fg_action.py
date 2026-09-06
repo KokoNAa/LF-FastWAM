@@ -64,10 +64,19 @@ def main():
         cf_tasks = {r['source_task'] for r in rows if r.get('cf_retention')}
         if cf_tasks != {'place_a2b_right', 'place_burger_fries', 'stack_blocks_two'}:
             raise ValueError('CF retention must cover the three previously successful tasks.')
+        for task in cf_tasks:
+            if len({r['scene_seed'] for r in rows if r.get('cf_retention') and r['source_task'] == task}) < 10:
+                raise ValueError('Formal action training requires ten CF-retention scenes per preserved task.')
         if args.fg != 'off':
             for split in ('train', 'replay_holdout'):
                 if {r['source_task'] for r in rows if r.get('fg_correction') and r['replay_split'] == split} != {'place_a2b_left', 'blocks_ranking_rgb'}:
                     raise ValueError('FG train and holdout must cover both target tasks.')
+                minimum = 24 if split == 'train' else 6
+                for task in ('place_a2b_left', 'blocks_ranking_rgb'):
+                    count = len({r['scene_seed'] for r in rows if r.get('fg_correction')
+                                 and r['source_task'] == task and r['replay_split'] == split})
+                    if count < minimum:
+                        raise ValueError(f'Formal FG training needs {minimum} {split} scenes for {task}, got {count}.')
     policy = load_policy(args.checkpoint, manifest, device=f'cuda:{local}', seed=args.seed)
     model = policy.model
     selected = trainable_parameters(model, args.stage, eraf=args.eraf == 'on')

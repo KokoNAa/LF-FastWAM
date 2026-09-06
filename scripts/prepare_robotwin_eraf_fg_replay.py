@@ -25,6 +25,7 @@ def main():
     root = Path(args.output).resolve()
     root.mkdir(parents=True, exist_ok=True)
     base = json.loads(Path(args.manifest).read_text())
+    from scripts.collect_robotwin_eraf_fg import historical_scene_keys
     from experiments.robotwin.eraf_fg_contract import validate_correction, scene_key
     groups = []
     seen = set()
@@ -47,6 +48,8 @@ def main():
                 raise ValueError(f'Duplicate scene across collection inputs: {key}')
             seen.add(key)
             groups.append(rows)
+    if seen & historical_scene_keys(base['states']):
+        raise ValueError('A new collection scene already exists in the parent replay bank.')
     if args.mode == 'merge':
         rows = []
         for shard in range(args.shards):
