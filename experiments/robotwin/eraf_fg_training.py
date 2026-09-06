@@ -24,6 +24,10 @@ def backward_example(model, row, payload, noise, time, *, teachers, coefficient=
         if row['frame_index'] != 0:
             raise ValueError('Local control may only use the same failure-start observation.')
         valid['target'] = valid['target'] & (torch.arange(refs['target'].shape[1], device=model.device) < 12)
+        # Masking the loss alone still exposes later expert actions through
+        # the flow's noisy input and cross-token attention. Remove those
+        # targets before constructing any noisy input or velocity target.
+        refs['target'] = refs['target'].masked_fill(~valid['target'].unsqueeze(-1), 0.)
     retention = 'correct' if row.get('native_retention') else 'cf' if row.get('cf_retention') else None
     languages = list(refs)
     paired = set(languages) == {'source', 'target'}

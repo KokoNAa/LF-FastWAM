@@ -60,6 +60,42 @@ def test_local_ablation_rejects_a_later_full_goal_window(case):
             noise, time, teachers={}, fg='local')
 
 
+def test_local_control_cannot_read_future_labels_through_noisy_action_input(case, monkeypatch):
+    from types import SimpleNamespace
+    from experiments.robotwin import eraf_fg_bridge
+    production, _, _, time = case
+    model = SimpleNamespace(train_action_scheduler=production.train_action_scheduler,
+                            device='cpu', torch_dtype=torch.float32)
+    parameter = torch.nn.Parameter(torch.tensor(.2))
+    calls = []
+
+    def predict(model, captured, noisy, time, **kwargs):
+        calls.append(noisy.detach().clone())
+        # A prediction that can attend to every action token exposes the
+        # leakage that a per-token loss mask alone cannot prevent.
+        return parameter * noisy.mean(dim=1, keepdim=True).expand_as(noisy)
+
+    monkeypatch.setattr(eraf_fg_bridge, 'predict', predict)
+    noise = torch.linspace(-1, 1, 32 * 14).reshape(1, 32, 14)
+    ordinary = torch.ones_like(noise)
+    changed_future = ordinary.clone()
+    changed_future[:, 12:] = 1000
+
+    def evaluate(reference, mode):
+        calls.clear()
+        parameter.grad = None
+        report = backward_example(model, {'fg_correction': True, 'frame_index': 0},
+            {'captured': {'target': {}}, 'references': {'target': reference}},
+            noise, time, teachers={}, fg=mode)
+        return report, parameter.grad.clone(), [value.clone() for value in calls]
+
+    a, b = evaluate(ordinary, 'local'), evaluate(changed_future, 'local')
+    assert a[0] == b[0] and torch.equal(a[1], b[1])
+    assert all(torch.equal(x, y) for x, y in zip(a[2], b[2], strict=True))
+    full_a, full_b = evaluate(ordinary, 'full'), evaluate(changed_future, 'full')
+    assert not torch.equal(full_a[2][0], full_b[2][0])
+
+
 def test_local_and_full_draw_identical_scenes_and_preservation_examples():
     from experiments.robotwin.eraf_fg_training import mixture_stream
     rows = []

@@ -81,6 +81,10 @@ goal-reaching tail. Storage padding is masked out of the loss. The local
 control sees only the same failure-start observation and first12 corrective
 actions. Full and local controls draw exactly the same scene schedule and
 preservation examples; later FG windows never enter the local control.
+The local control also replaces expert actions after step12 with zeros before
+constructing the noisy flow input, so masked future labels cannot leak through
+action-token attention. Changing those hidden targets leaves its loss and
+gradient unchanged.
 
 Gold simulator entity state is used for training labels and auditing only.
 Deployment consumes three RGB cameras,14-D proprio and the instruction.
