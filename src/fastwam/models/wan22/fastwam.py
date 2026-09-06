@@ -24353,6 +24353,11 @@ class FastWAM(torch.nn.Module):
 
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
+        if payload.get("format") == "robotwin_eraf_fg_adapter_v1":
+            if optimizer is not None:
+                raise ValueError("ERAF/FG repair checkpoints contain weights only.")
+            from experiments.robotwin.eraf_fg_bridge import load_repair_checkpoint
+            return load_repair_checkpoint(self, path, payload=payload)
         if payload.get("format") in {
             "fastwam_policy_guard_v1",
             "fastwam_policy_guard_v2",
