@@ -41,5 +41,5 @@ def play_counterfactual(task):
     task.move(task.place_actor(task.cup, arm, target_pose=target,
                               functional_point_id=0, pre_dis=.05))
     task.move(task.move_by_displacement(arm, z=.05, move_axis='arm'))
-    task.delay(.3)
+    task.delay(30)
     return task.info
