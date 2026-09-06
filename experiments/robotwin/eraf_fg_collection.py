@@ -162,6 +162,7 @@ def record_continuation(task):
 
 
 def replay_continuation(task, controls):
+    max_error = 0.
     for index, row in enumerate(controls):
         if row.get('kind', 'dense') == 'dense':
             task.take_dense_action(deepcopy(row["control_seq"]), save_freq=row["save_freq"])
@@ -178,9 +179,10 @@ def replay_continuation(task, controls):
             raise ValueError('Unknown physical replay control kind.')
         if 'state_after' in row:
             try:
-                verify_replayed_state(row['state_after'], physical_state(task))
+                max_error = max(max_error, verify_replayed_state(row['state_after'], physical_state(task)))
             except ValueError as exc:
                 raise ValueError(f'Continuation control {index} ({row.get("kind")}): {exc}') from exc
+    return max_error
 
 
 def full_goal(task, spec, *, selected_goal="target"):

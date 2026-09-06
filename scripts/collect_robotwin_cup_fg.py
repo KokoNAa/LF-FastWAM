@@ -104,7 +104,7 @@ def main():
                     if not okay:continue
                     for repeat in range(2):
                         setup(seed);error=max(error,replay_prefix(task,spec,trace,step))
-                        replay_continuation(task,controls)
+                        error=max(error,replay_continuation(task,controls))
                         verified=full_goal(task,spec);close()
                         if not verified:raise ValueError('Control replay did not finish the full goal')
                     arrays={'actions':np.stack([f['qpos'] for f in frames]).astype(np.float32)}
