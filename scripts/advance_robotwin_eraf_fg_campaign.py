@@ -127,10 +127,16 @@ def main():
         sources = [root / name for name in COLLECTORS] + [root / 'ranking_collection28']
         paths = sorted(path for folder in sources for path in folder.glob('scene_*/record.json')
                        if str(path) not in used)
-        for gpu in cache_gpus:
-            if gpu in busy or not paths or (len(paths) < 6 and not all(finished.values())):
+        near_finish = sum(not value for value in finished.values()) <= 1
+        available = [gpu for gpu in cache_gpus if gpu not in busy]
+        for position, gpu in enumerate(available):
+            if not paths or (len(paths) < 6 and not near_finish):
                 continue
-            selected, paths = paths[:12], paths[12:]
+            # Once only the final collector remains, spread its small tail
+            # across free GPUs instead of waiting for another six-scene batch.
+            workers_left = len(available) - position
+            count = min(12, (len(paths) + workers_left - 1) // workers_left) if near_finish else 12
+            selected, paths = paths[:count], paths[count:]
             records = [validate_correction(read(path)) for path in selected]
             index = len(ledger['batches'])
             name = f'cache_fg_batch{index}'
