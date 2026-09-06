@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnose ERAF at inference on an unchanged trained checkpoint.
+"""Diagnose ERAF or cross-replan memory on an unchanged trained checkpoint.
 
 Wait for all ten first-candidate evaluations to be dispatched, then use only
 their released GPUs. This is an inference toggle, not a trained FG-only arm.
@@ -29,12 +29,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--root', required=True)
     ap.add_argument('--output', required=True)
+    ap.add_argument('--eraf', choices=['on', 'off'], default='off')
+    ap.add_argument('--memory-mode', choices=['carry', 'reset'], default='carry')
+    ap.add_argument('--gpus', nargs='+', type=int, choices=range(6), default=list(range(6)))
     ap.add_argument('--tasks', nargs='+', choices=TASKS,
                     default=['place_a2b_left', 'stack_blocks_two'])
     args = ap.parse_args()
     root, output = Path(args.root).resolve(), Path(args.output).resolve()
     if not args.tasks or len(set(args.tasks)) != len(args.tasks):
         raise ValueError('Nonempty unique task list required.')
+    if args.memory_mode == 'reset' and args.eraf != 'on':
+        raise ValueError('Memory reset requires ERAF on.')
     output.mkdir(parents=True, exist_ok=False)
     deadline = datetime.fromisoformat(read(root / 'launch.json')['stop_experiments_hkt'])
     checkpoint = root / 'joint_full200/step_000200.pt'
@@ -47,7 +52,8 @@ def main():
     wrapper = ('import subprocess,sys,json,pathlib; r=subprocess.run(json.loads(sys.argv[1])); '
                'pathlib.Path(sys.argv[2]).write_text(json.dumps(dict(exit_code=r.returncode))); '
                'sys.exit(r.returncode)')
-    plan = {'kind': 'unchanged_checkpoint_inference_toggle', 'eraf': 'off',
+    plan = {'kind': 'unchanged_checkpoint_inference_toggle', 'eraf': args.eraf,
+        'memory_mode': args.memory_mode, 'allowed_gpus': args.gpus,
         'checkpoint': str(checkpoint), 'tasks': args.tasks, 'episodes_per_condition': 3,
         'interpretation': 'Diagnostic only; this is not an independently trained FG-only ablation.',
         'code': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(),
@@ -75,14 +81,16 @@ def main():
                     '--format=csv,noheader,nounits'], text=True)
                 free = [int(line.split(',')[0]) for line in memory.splitlines()
                     if int(line.split(',')[1]) < 500
+                    and int(line.split(',')[0]) in args.gpus
                     and int(line.split(',')[0]) not in busy | set(running)]
                 for gpu in free:
                     if not pending:
                         break
                     task = pending.pop(0)
                     command = list(primary[f'reg_full200_{task}']['command'])
-                    for flag, value in {'--output': output, '--eraf': 'off', '--gpu': gpu}.items():
+                    for flag, value in {'--output': output, '--eraf': args.eraf, '--gpu': gpu}.items():
                         command[command.index(flag) + 1] = str(value)
+                    command += ['--memory-mode', args.memory_mode]
                     if Path(command[command.index('--checkpoint') + 1]) != checkpoint:
                         raise ValueError('The primary checkpoint changed.')
                     with (output / (task + '.log')).open('x') as log:
@@ -94,7 +102,7 @@ def main():
                                   'started_at': datetime.now().isoformat()}
                     running[gpu] = task
                     (output / 'diagnostic_plan.json').write_text(json.dumps(plan, indent=2))
-                    print(f'[start] {task} eraf=off gpu={gpu} pid={process.pid}', flush=True)
+                    print(f'[start] {task} eraf={args.eraf} memory={args.memory_mode} gpu={gpu} pid={process.pid}', flush=True)
             if pending or running:
                 time.sleep(20)
         template = primary['reg_full200_place_a2b_left']['command']

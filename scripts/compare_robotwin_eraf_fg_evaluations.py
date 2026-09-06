@@ -81,6 +81,8 @@ def compare(baseline_root, candidate_root, tasks=None):
             'delta_successes': successes_b - successes_a,
             'gained_scene_seeds': gained, 'lost_scene_seeds': lost,
             'baseline_eraf': meta_a['eraf'], 'candidate_eraf': meta_b['eraf'],
+            'baseline_memory_mode': meta_a.get('memory_mode', 'carry'),
+            'candidate_memory_mode': meta_b.get('memory_mode', 'carry'),
             'baseline_policy_kind': meta_a['policy_kind'], 'candidate_policy_kind': meta_b['policy_kind']})
     return {'complete': True, 'baseline': baseline['checkpoint'], 'candidate': candidate['checkpoint'],
             'matched_episodes': len(pairs), 'cells': cells,

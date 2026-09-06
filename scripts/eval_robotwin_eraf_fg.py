@@ -29,6 +29,17 @@ def official_module(robotwin_root):
     return module
 
 
+def install_memory_reset(policy):
+    """Expose the offline training history condition as an explicit diagnostic."""
+    original = policy._infer_action_chunk
+
+    def infer_without_history(*args, **kwargs):
+        policy.policy_guard_state = None
+        return original(*args, **kwargs)
+
+    policy._infer_action_chunk = infer_without_history
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('mode', choices=['catalog', 'worker', 'summarize'])
@@ -46,8 +57,11 @@ def main():
     ap.add_argument('--max-attempts', type=int, default=300)
     ap.add_argument('--eraf', choices=['on', 'off'], default='on')
     ap.add_argument('--policy-kind', choices=['repair', 'legacy'], default='repair')
+    ap.add_argument('--memory-mode', choices=['carry', 'reset'], default='carry')
     ap.add_argument('--videos', action='store_true')
     args = ap.parse_args()
+    if args.mode == 'worker' and args.memory_mode == 'reset' and (args.eraf != 'on' or args.policy_kind != 'repair'):
+        ap.error('Memory reset requires an ERAF-on repair checkpoint.')
     for key in ('output', 'robotwin_root', 'interventions', 'manifest', 'checkpoint', 'catalog_root'):
         value = getattr(args, key)
         if value:
@@ -69,7 +83,8 @@ def main():
                     raise ValueError('Mixed or incomplete checkpoint evaluation.')
                 if report['checkpoint_sha256'] != checkpoint_hash:
                     raise ValueError('Evaluation checkpoint changed.')
-                signatures.append((report['eraf'], report['policy_kind'], json.dumps(report['deployment'], sort_keys=True)))
+                signatures.append((report['eraf'], report['policy_kind'], report.get('memory_mode', 'carry'),
+                                   json.dumps(report['deployment'], sort_keys=True)))
                 canonical_path = Path(args.catalog_root) / task / 'demo_clean/correct/episodes.jsonl'
                 if report['canonical_sha256'] != file_sha256(canonical_path):
                     raise ValueError('Matched scene/instruction catalog changed.')
@@ -183,6 +198,9 @@ def main():
                 from types import SimpleNamespace
                 from scripts.train_robotwin_cf_decision_adapter import load_policy
                 policy = load_policy(SimpleNamespace(checkpoint=args.checkpoint, seed=42), manifest)
+            if args.memory_mode == 'reset':
+                install_memory_reset(policy)
+            print(f'[evaluation-runtime] eraf={args.eraf} memory={args.memory_mode}', flush=True)
         policy.task_name, policy.task_config = task_name, 'demo_clean'
         from experiments.robotwin.fastwam_policy.deploy_policy import eval as evaluate, reset_model
         official.eval_function_decorator = lambda name, function: {'eval': evaluate, 'reset_model': reset_model}[function]
@@ -218,6 +236,7 @@ def main():
             (directory / 'complete.json').write_text(json.dumps({'complete': len(records) == args.episodes,
                 'checkpoint': args.checkpoint, 'checkpoint_sha256': checkpoint_hash,
                 'canonical_sha256': file_sha256(canonical_path), 'eraf': args.eraf, 'policy_kind': args.policy_kind,
+                'memory_mode': args.memory_mode,
                 'deployment': {'action_horizon': 32, 'replan_steps': 24, 'inference_steps': 10}}, indent=2))
     if args.mode == 'catalog':
         (root / 'catalog_plan.json').write_text(json.dumps(vars(args), indent=2))

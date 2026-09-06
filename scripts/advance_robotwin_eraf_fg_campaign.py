@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Advance the authorized warm400 campaign through its first matched candidate.
+"""Advance the authorized warm400 campaign through one matched candidate.
 
 The campaign's launch.json and cache_batches/ledger.json are authoritative.
 This bounded driver collects no new seed ranges, chooses no checkpoint from
-evaluation outcomes, and stops after interface100 + joint200 and both dev sets.
+evaluation outcomes, and stops after the specified joint stage and both dev
+sets. Continuation restores an exact checkpoint and optimizer companion.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -41,9 +43,26 @@ def write(path, value):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--root', required=True)
+    ap.add_argument('--tag', default='full200')
+    ap.add_argument('--joint-steps', type=int, choices=[200, 400, 800], default=200)
+    ap.add_argument('--resume-checkpoint')
+    ap.add_argument('--resume-state')
+    ap.add_argument('--correct-weight', type=float, default=2.)
+    ap.add_argument('--cf-weight', type=float, default=1.)
+    ap.add_argument('--train-gpus', nargs='+', type=int, choices=range(6), default=list(range(6)))
+    ap.add_argument('--wait-for-exit', nargs='*', default=[])
     args = ap.parse_args()
+    if not re.fullmatch('[a-z0-9_]+', args.tag):
+        ap.error('The run tag must contain only lowercase letters, digits, and underscores.')
+    if len(set(args.train_gpus)) != len(args.train_gpus) or 12 % len(args.train_gpus):
+        ap.error('Distinct training GPUs must divide the global batch of12.')
+    if bool(args.resume_checkpoint) != bool(args.resume_state) or (args.joint_steps > 200 and not args.resume_state):
+        ap.error('Continuation requires both the exact checkpoint and its optimizer companion.')
+    if args.tag == 'full200' and (args.joint_steps != 200 or args.resume_state):
+        ap.error('Continuation needs a distinct run tag to preserve the first candidate.')
     root = Path(args.root).resolve()
-    lock = (root / 'first_candidate_driver.lock').open('w')
+    driver_name = 'first_candidate' if args.tag == 'full200' else 'continuation_' + args.tag
+    lock = (root / (driver_name + '_driver.lock')).open('w')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     launch = read(root / 'launch.json')
     deadline = datetime.fromisoformat(launch['stop_experiments_hkt'])
@@ -62,7 +81,7 @@ def main():
         if datetime.now() >= deadline:
             for name, job in launch['jobs'].items():
                 if (name not in COLLECTORS and not name.startswith('cache_fg_batch')
-                        and job.get('driver') != 'first_candidate'):
+                        and job.get('driver') != driver_name):
                     continue
                 if (root / (name + '_exit.json')).exists():
                     continue
@@ -99,7 +118,7 @@ def main():
         launch['jobs'][name] = {'pid': process.pid, 'command': command,
             'gpus': ','.join(map(str, gpus)), 'started_at': datetime.now().isoformat(),
             'code': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(),
-            'driver': 'first_candidate'}
+            'driver': driver_name}
         write(root / 'launch.json', launch)
         print(f'[start] {name} gpu={gpus} pid={process.pid}', flush=True)
 
@@ -182,18 +201,34 @@ def main():
     template = launch['jobs']['interface_smoke']['command']
     for name, stage, steps, lr, checkpoint in [
         ('interface_full100', 'interface', 100, '5e-5', root / 'grounding3000/step_002250.pt'),
-        ('joint_full200', 'joint', 200, '1e-5', root / 'interface_full100/step_000100.pt'),
+        ('joint_' + args.tag, 'joint', args.joint_steps, '1e-5',
+         Path(args.resume_checkpoint).resolve() if args.resume_checkpoint else root / 'interface_full100/step_000100.pt'),
     ]:
         command = list(template)
         for flag, value in {'--manifest': bank, '--checkpoint': checkpoint, '--output': root / name,
                              '--stage': stage, '--steps': steps, '--save-every': steps,
                              '--learning-rate': lr}.items():
             command[command.index(flag) + 1] = str(value)
-        command = [PYTHON, '-u', '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node=6'] + command[2:]
-        start(name, command, list(range(6)))
+        if stage == 'joint':
+            for flag, value in {'--correct-weight': args.correct_weight, '--cf-weight': args.cf_weight}.items():
+                if flag in command:
+                    command[command.index(flag) + 1] = str(value)
+                else:
+                    command += [flag, str(value)]
+            if args.resume_state:
+                command += ['--resume-state', str(Path(args.resume_state).resolve())]
+        command = [PYTHON, '-u', '-m', 'torch.distributed.run', '--standalone',
+                   f'--nproc_per_node={len(args.train_gpus)}'] + command[2:]
+        start(name, command, args.train_gpus)
         wait_for([name])
 
-    checkpoint = root / 'joint_full200/step_000200.pt'
+    for exit_path in map(Path, args.wait_for_exit):
+        while not exit_path.exists():
+            budget()
+            time.sleep(20)
+        if read(exit_path)['exit_code'] != 0:
+            raise RuntimeError(f'Independent diagnostic failed before GPU handover: {exit_path}')
+    checkpoint = root / ('joint_' + args.tag) / f'step_{args.joint_steps:06d}.pt'
     evaluations = [(kind, task, episodes, catalog) for task in TASKS
                    for kind, episodes, catalog in [('reg', 3, fixed_catalog), ('dev', 6, root / 'catalog_dev')]]
     running = {}
@@ -207,10 +242,10 @@ def main():
             if gpu in running or not evaluations:
                 continue
             kind, task, episodes, catalog = evaluations.pop(0)
-            name = f'{kind}_full200_{task}'
+            name = f'{kind}_{args.tag}_{task}'
             command = [PYTHON, '-u', 'scripts/eval_robotwin_eraf_fg.py', 'worker',
                 '--manifest', str(bank), '--checkpoint', str(checkpoint), '--eraf', 'on',
-                '--catalog-root', str(catalog), '--output', str(root / f'{kind}_full200'),
+                '--catalog-root', str(catalog), '--output', str(root / f'{kind}_{args.tag}'),
                 '--tasks', task, '--episodes', str(episodes), '--gpu', str(gpu), '--videos']
             start(name, command, [gpu])
             running[gpu] = name
@@ -218,15 +253,15 @@ def main():
             time.sleep(20)
     summaries = {}
     for kind, episodes, catalog in [('reg', 3, fixed_catalog), ('dev', 6, root / 'catalog_dev')]:
-        output = root / f'{kind}_full200'
+        output = root / f'{kind}_{args.tag}'
         subprocess.run([PYTHON, '-u', 'scripts/eval_robotwin_eraf_fg.py', 'summarize',
             '--output', str(output), '--checkpoint', str(checkpoint),
             '--catalog-root', str(catalog), '--episodes', str(episodes)], cwd=REPO, env=env, check=True)
         summaries[kind] = str(output / 'summary.json')
-    write(root / 'first_candidate_complete.json', {'complete': True, 'checkpoint': str(checkpoint),
+    write(root / (driver_name + '_complete.json'), {'complete': True, 'checkpoint': str(checkpoint),
           'summaries': summaries, 'finished_at': datetime.now().isoformat(),
           'next_action': 'Review fixed regression and development results before continuation or ablations.'})
-    print('[complete] First candidate is ready for review; locked test remains untouched.', flush=True)
+    print(f'[complete] Candidate {args.tag} is ready for review; locked test remains untouched.', flush=True)
 
 
 if __name__ == '__main__':
