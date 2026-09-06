@@ -7,6 +7,33 @@ from pathlib import Path
 import numpy as np
 
 
+def retention_language(row):
+    """Admit new retention captures only under their actually executed goal."""
+    native, cf = bool(row.get('native_retention')), bool(row.get('cf_retention'))
+    if native == cf:
+        raise ValueError('Exactly one retention kind is required.')
+    flag = 'full_native_episode_success' if native else 'full_cf_episode_success'
+    if row.get(flag) is not True:
+        raise ValueError('Retention capture lacks verified selected-goal success.')
+    expected = 'correct' if native else 'counterfactual'
+    if row.get('retention_condition', expected) != expected:
+        raise ValueError('Retention condition contradicts its kind.')
+    return 'source' if native else 'target'
+
+
+def validate_retention_scene(rows):
+    if not rows:
+        raise ValueError('Empty retention scene.')
+    language = retention_language(rows[0])
+    fields = ('source_task', 'task_config', 'scene_seed', 'capture_path', 'capture_sha256',
+              'teacher_checkpoint_sha256', 'source_instruction', 'counterfactual_instruction')
+    if any(retention_language(row) != language or any(row[k] != rows[0][k] for k in fields) for row in rows):
+        raise ValueError('Retention scene mixes condition, capture, teacher, or instruction provenance.')
+    if sorted(row['frame_index'] for row in rows) != list(range(len(rows))):
+        raise ValueError('Retention scene has missing or duplicate captured states.')
+    return language
+
+
 class RawReplay:
     def __init__(self, source_bank, *, label_cache=None):
         self.raw = {}

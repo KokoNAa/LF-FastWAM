@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep newly successful warm-policy CF episodes for three-task retention."""
+"""Keep successful teacher rollouts for explicit Correct or CF retention."""
 import argparse
 from copy import deepcopy
 import json
@@ -16,14 +16,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("manifest", "checkpoint", "output", "robotwin-root"):
         parser.add_argument("--" + name, required=True)
-    parser.add_argument("--task", choices=["place_a2b_right", "place_burger_fries", "stack_blocks_two"], required=True)
+    parser.add_argument("--task", choices=["place_a2b_left", "blocks_ranking_rgb", "place_a2b_right", "place_burger_fries", "stack_blocks_two"], required=True)
+    parser.add_argument('--condition', choices=['correct', 'counterfactual'], default='counterfactual')
     parser.add_argument("--start-seed", type=int, required=True)
     parser.add_argument("--scenes", type=int, default=10)
     parser.add_argument("--max-attempts", type=int, default=60)
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
-    if not 80200000 <= args.start_seed < 81000000:
-        parser.error("Use the reserved fresh CF-retention training seeds.")
+    if not 80200000 <= args.start_seed < 81000000 or args.start_seed + args.max_attempts >= 81000000:
+        parser.error("Use the reserved fresh policy-retention training seeds.")
+    if not 0 < args.scenes <= args.max_attempts:
+        parser.error('Require positive scenes<=attempts.')
+    native = args.condition == 'correct'
+    if not native and args.task not in {'place_a2b_right', 'place_burger_fries', 'stack_blocks_two'}:
+        parser.error('CF retention is restricted to the three previously successful tasks.')
+    language = 'source' if native else 'target'
+    kind = 'native' if native else 'cf'
     root = Path(args.output).resolve()
     root.mkdir(parents=True, exist_ok=False)
     args.manifest, args.checkpoint = str(Path(args.manifest).resolve()), str(Path(args.checkpoint).resolve())
@@ -65,13 +73,13 @@ def main():
             return action
 
         try:
-            task._pgc_active_variant = spec.counterfactual_variant
+            task._pgc_active_variant = spec.source_variant if native else spec.counterfactual_variant
             task.setup_demo(now_ep_num=0, seed=seed, **deepcopy(options))
             texts = ({"source": spec.source_instruction, "target": spec.counterfactual_instruction}
                      if args.task == "place_burger_fries" else instructions(task, spec))
             policy._infer_action_chunk = infer
-            trace = run_failure_rollout(task, policy, spec, texts["target"])
-            okay = bool(trace["audit"]["target"] and full_goal(task, spec))
+            trace = run_failure_rollout(task, policy, spec, texts[language], selected_goal=language)
+            okay = bool(trace["audit"][language] and full_goal(task, spec, selected_goal=language))
             if okay:
                 frames = sorted(set(np.rint(np.linspace(0, len(captured)-1, min(12, len(captured)))).astype(int)))
                 items = [captured[i] for i in frames]
@@ -80,19 +88,20 @@ def main():
                     reference_action_raw=np.stack([r["action"] for r in items]),
                     **{c: np.stack([r["images"][c] for r in items]) for c in CAMERAS})
                 digest = file_sha256(path)
-                accepted.extend([scene | {"id": f"cf_retention_{args.task}_{seed}_{i}", "pair_id": spec.pair_id,
-                    "cf_retention": True, "replay_split": "train", "source_instruction": texts["source"],
+                accepted.extend([scene | {"id": f"{kind}_retention_{args.task}_{seed}_{i}", "pair_id": spec.pair_id,
+                    kind + "_retention": True, "retention_condition": args.condition,
+                    "replay_split": "train", "source_instruction": texts["source"],
                     "counterfactual_instruction": texts["target"], "capture_path": str(path), "frame_index": i,
                     "capture_sha256": digest, "teacher_checkpoint": args.checkpoint,
-                    "teacher_checkpoint_sha256": checkpoint_hash, "full_cf_episode_success": True,
-                    "image_color_space": "RGB", "reference_kind": "deployed_successful_cf_policy_32_actions"}
+                    "teacher_checkpoint_sha256": checkpoint_hash, "full_" + kind + "_episode_success": True,
+                    "image_color_space": "RGB", "reference_kind": f"deployed_successful_{kind}_policy_32_actions"}
                     for i in range(len(items))])
                 episodes += 1
-            journal.write(json.dumps(scene | {"cf_success": okay, "accepted_scenes": episodes}) + "\n")
-            print(f"[cf-retention] {args.task} seed={seed} success={okay} scenes={episodes}/{args.scenes}", flush=True)
+            journal.write(json.dumps(scene | {kind + "_success": okay, "condition": args.condition, "accepted_scenes": episodes}) + "\n")
+            print(f"[{kind}-retention] {args.task} seed={seed} success={okay} scenes={episodes}/{args.scenes}", flush=True)
         except Exception as exc:
             journal.write(json.dumps(scene | {"error": repr(exc)}) + "\n")
-            print(f"[cf-retention-error] {args.task} seed={seed} {exc!r}", flush=True)
+            print(f"[{kind}-retention-error] {args.task} seed={seed} {exc!r}", flush=True)
         finally:
             policy._infer_action_chunk = original
             try:
@@ -100,10 +109,10 @@ def main():
             except Exception:
                 pass
     journal.close()
-    result = {"complete": episodes == args.scenes, "successful_scenes": episodes, "states": accepted}
+    result = {"complete": episodes == args.scenes, "condition": args.condition, "successful_scenes": episodes, "states": accepted}
     (root / "manifest.json").write_text(json.dumps(result, indent=2))
     if not result["complete"]:
-        raise RuntimeError("CF-retention scene target was not reached.")
+        raise RuntimeError(f"{kind}-retention scene target was not reached.")
 
 
 if __name__ == "__main__":

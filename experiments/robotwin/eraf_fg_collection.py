@@ -30,7 +30,9 @@ def physical_state(task):
 
 
 @contextmanager
-def goal_audit(task, spec):
+def goal_audit(task, spec, *, selected_goal="target"):
+    if selected_goal not in {"source", "target"}:
+        raise ValueError("Unknown audited rollout goal.")
     original = task.check_success
     status = {"source": False, "target": False}
 
@@ -39,7 +41,7 @@ def goal_audit(task, spec):
         target = bool(check_variant(task, spec, spec.counterfactual_variant))
         status["source"] |= source
         status["target"] |= target
-        return target
+        return source if selected_goal == "source" else target
 
     task.check_success = check
     try:
@@ -48,7 +50,7 @@ def goal_audit(task, spec):
         task.check_success = original
 
 
-def run_failure_rollout(task, policy, spec, instruction):
+def run_failure_rollout(task, policy, spec, instruction, *, selected_goal="target"):
     policy.reset()
     task.set_instruction(instruction)
     initial = physical_state(task)
@@ -63,7 +65,7 @@ def run_failure_rollout(task, policy, spec, instruction):
 
     task.take_action = take
     try:
-        with goal_audit(task, spec) as audit:
+        with goal_audit(task, spec, selected_goal=selected_goal) as audit:
             # Audit at physics steps through task.check_success, as in rollout.
             while len(actions) < int(task.step_lim) and not task.eval_success:
                 need_obs = policy.should_request_observation()
@@ -181,6 +183,9 @@ def replay_continuation(task, controls):
                 raise ValueError(f'Continuation control {index} ({row.get("kind")}): {exc}') from exc
 
 
-def full_goal(task, spec):
-    return bool(check_variant(task, spec, spec.counterfactual_variant)
+def full_goal(task, spec, *, selected_goal="target"):
+    if selected_goal not in {"source", "target"}:
+        raise ValueError("Unknown full-goal condition.")
+    variant = spec.source_variant if selected_goal == "source" else spec.counterfactual_variant
+    return bool(check_variant(task, spec, variant)
                 and task.robot.is_left_gripper_open() and task.robot.is_right_gripper_open())

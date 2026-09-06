@@ -32,6 +32,7 @@ def main():
     ap.add_argument('--cf-weight', type=float, default=2.)
     ap.add_argument('--steps', type=int, choices=[200, 400, 800], default=200)
     ap.add_argument('--resume-state', help='Exact optimizer companion for an explicitly selected continuation.')
+    ap.add_argument('--manifest', help='Audited expanded bank; defaults to the original formal bank.')
     args = ap.parse_args()
     if len(set(args.gpus)) != len(args.gpus) or 12 % len(args.gpus):
         ap.error('Distinct GPUs dividing global batch12 required.')
@@ -45,12 +46,12 @@ def main():
     if datetime.now() >= deadline:
         raise RuntimeError('Experimental budget expired.')
     from experiments.robotwin.eraf_fg_bridge import file_sha256
-    manifest = root / 'bank_full_v1/manifest.json'
+    manifest = Path(args.manifest).resolve() if args.manifest else root / 'bank_full_v1/manifest.json'
     audit = read(manifest.parent / 'audit.json')
     if not audit['complete'] or file_sha256(manifest) != audit['manifest_sha256']:
         raise ValueError('Formal replay audit does not match.')
     output.mkdir(exist_ok=False)
-    plan = vars(args) | {'checkpoint_sha256': file_sha256(args.checkpoint),
+    plan = vars(args) | {'manifest': str(manifest), 'checkpoint_sha256': file_sha256(args.checkpoint),
         'manifest_sha256': audit['manifest_sha256'],
         'interface_steps': 100 if args.eraf == 'on' and not args.resume_state else 0,
         'joint_steps': args.steps, 'global_batch': 12, 'seed': 42,

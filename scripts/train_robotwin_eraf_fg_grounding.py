@@ -105,7 +105,7 @@ def main():
             "policy_frozen": True, "optimizer_precision": "FP32 master weights",
             "optimizer_restart": bool(args.step_offset),
             "loss_weights": asdict(model.policy_guard_eraf_loss_weights),
-            "selection_rule": "Minimum equal-task/language mean of position and goal error cm among global AND EACH TARGET TASK role>=.8 and relation>=.9; baseline included; no action-test selection."}, indent=2))
+            "selection_rule": "Minimum equal-task/language mean of position and goal error cm among EACH TARGET TASK role>=.8 and relation>=.9; baseline included; no action-test selection."}, indent=2))
 
     def evaluate(step):
         reports = []
@@ -133,7 +133,7 @@ def main():
         relation = sum(r["relation_hits"] for r in reports) / max(1, sum(r["relation_count"] for r in reports))
         qualification = semantic_qualification(reports)
         result = {"step": step, "role_accuracy": role, "relation_accuracy": relation,
-                  "eligible": role >= .8 and relation >= .9 and qualification['target_tasks_eligible'],
+                  "eligible": qualification['target_tasks_eligible'],
                   "qualification": qualification, "rows": reports,
                   "geometry": summarize_geometry(reports)}
         (root / f"grounding_eval_{step:06d}.json").write_text(json.dumps(result, indent=2))

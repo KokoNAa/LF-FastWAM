@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cache frozen inputs for verified FG windows and successful CF retention."""
+"""Cache frozen inputs for verified FG windows and explicit policy retention."""
 from __future__ import annotations
 import argparse
 from collections import defaultdict
@@ -27,6 +27,7 @@ def main():
     base = json.loads(Path(args.manifest).read_text())
     from scripts.collect_robotwin_eraf_fg import historical_scene_keys
     from experiments.robotwin.eraf_fg_contract import validate_correction, scene_key
+    from experiments.robotwin.eraf_fg_data import retention_language, validate_retention_scene
     groups = []
     seen = set()
     for path in args.collections:
@@ -38,10 +39,11 @@ def main():
         else:
             scenes = defaultdict(list)
             for row in collection['states']:
-                if not row.get('cf_retention') or not row.get('full_cf_episode_success'):
-                    raise ValueError('Retention input is not an audited successful CF rollout.')
+                retention_language(row)
                 scenes[scene_key(row)].append(row)
             items = list(scenes.values())
+            for rows in items:
+                validate_retention_scene(rows)
         for rows in items:
             key = scene_key(rows[0])
             if key in seen:
@@ -87,7 +89,8 @@ def main():
     count = 0
     for records in groups[args.shard::args.shards]:
         record = records[0]
-        fg = not record.get('cf_retention')
+        fg = not (record.get('cf_retention') or record.get('native_retention'))
+        language = 'target' if fg else retention_language(record)
         path = Path(record['frame_path'] if fg else record['capture_path'])
         if file_sha256(path) != record['frame_sha256' if fg else 'capture_sha256']:
             raise ValueError('Collection archive identity changed.')
@@ -111,23 +114,24 @@ def main():
                 observation = {'observation': {c: {'rgb': images[c][frame]} for c in CAMERAS},
                                'joint_action': {'vector': proprio[frame]}}
                 policy.reset()
-                captured = capture_frozen_inputs(policy, observation, record['counterfactual_instruction'])
+                instruction = record['source_instruction' if language == 'source' else 'counterfactual_instruction']
+                captured = capture_frozen_inputs(policy, observation, instruction)
                 # The clean capture explicitly carries no gold or teacher memory.
                 if captured['policy_guard_state'] is not None:
                     raise ValueError('Frozen input capture carried a policy memory state.')
-                references = {'target': norm.forward(torch.from_numpy(raw).unsqueeze(0)).cpu()}
-                validity = {'target': torch.from_numpy(valid).unsqueeze(0)}
+                references = {language: norm.forward(torch.from_numpy(raw).unsqueeze(0)).cpu()}
+                validity = {language: torch.from_numpy(valid).unsqueeze(0)}
                 ident = f'eraf_fg_{record["source_task"]}_{record["scene_seed"]}_{frame}' if fg else window['id']
                 target = shard / 'payloads' / (ident + '.pt')
                 body = {k: captured[k] for k in ('video_inputs', 'action_inputs')}
                 extras = {k: captured[k] for k in ('proprio', 'policy_guard_state')}
                 if parent is None:
                     parent, parent_path = body, target
-                    payload = {'captured': {'target': captured}, 'references': references, 'valid': validity}
+                    payload = {'captured': {language: captured}, 'references': references, 'valid': validity}
                 else:
                     payload = {'format': 'robotwin_eraf_fg_compact_v1', 'parent_payload': str(parent_path),
-                               'capture_deltas': {'target': capture_delta(body, parent)},
-                               'capture_extras': {'target': extras}, 'references': references, 'valid': validity}
+                               'capture_deltas': {language: capture_delta(body, parent)},
+                               'capture_extras': {language: extras}, 'references': references, 'valid': validity}
                 torch.save(payload, target)
                 row = (record if fg else window) | {'id': ident, 'payload': str(target),
                     'frame_index': frame, 'fg_correction': fg, 'reference_valid_actions': int(valid.sum()),
