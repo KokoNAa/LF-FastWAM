@@ -23,6 +23,7 @@ def main():
     ap.add_argument('--task-config',choices=['demo_clean','demo_randomized'],default='demo_clean')
     ap.add_argument('--split',choices=['train','replay_holdout'],default='train')
     ap.add_argument('--candidates',type=int,default=4)
+    ap.add_argument('--candidate-order',choices=['late_first','early_first'],default='late_first')
     args=ap.parse_args()
     lower=82000000 if args.split=='train' else 83000000
     if not (lower<=args.start_seed and args.start_seed+args.scenes<=lower+1000000
@@ -90,7 +91,9 @@ def main():
                 capture_steps=np.array(list(trace['states'])),states=np.stack(list(trace['states'].values())))
             attempt['failure_audit']=trace['audit'];close()
             if trace['audit']['target']:continue
-            for step in candidate_replans(trace['states'],limit=args.candidates):
+            candidates=candidate_replans(trace['states'],limit=args.candidates)
+            if args.candidate_order=='early_first':candidates.sort()
+            for step in candidates:
                 candidate={'prefix_steps':step};attempt['candidates'].append(candidate)
                 try:
                     setup(seed);error=replay_prefix(task,spec,trace,step)
