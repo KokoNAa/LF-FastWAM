@@ -29,6 +29,11 @@ def main():
     ap.add_argument('--policy-scope', choices=['all', 'action'], default='all')
     ap.add_argument('--target-tasks', nargs='+', default=['place_a2b_left', 'blocks_ranking_rgb'],
                     choices=['place_a2b_left', 'blocks_ranking_rgb', 'place_empty_cup'])
+    ap.add_argument('--cf-retention-tasks', nargs='+',
+                    default=['place_a2b_right', 'place_burger_fries', 'stack_blocks_two'],
+                    choices=['place_a2b_left', 'blocks_ranking_rgb', 'place_a2b_right',
+                             'place_burger_fries', 'stack_blocks_two'],
+                    help='Declare preserved CF tasks; include the original three when adding target tasks.')
     ap.add_argument('--correction-weight', type=float, default=1.,
                     help='Scale FG slots and their matched ordinary-CF replacements equally.')
     ap.add_argument('--skip-file-hashes', action='store_true',
@@ -43,7 +48,7 @@ def main():
     import torch
     import torch.distributed as dist
     from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint, validate_payload, file_sha256
-    from experiments.robotwin.eraf_fg_data import RawReplay
+    from experiments.robotwin.eraf_fg_data import RawReplay, validate_cf_retention_coverage
     from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream, supervision_payload, FG_OFF_PROTOCOL
     from experiments.robotwin.compact_replay import ReplayPayloads
     from experiments.robotwin.native_teacher import NativeTeacher
@@ -87,12 +92,7 @@ def main():
         raise ValueError('Action training requires complete prepared replay.')
     rows = manifest['states']
     if args.steps > 2:
-        cf_tasks = {r['source_task'] for r in rows if r.get('cf_retention')}
-        if cf_tasks != {'place_a2b_right', 'place_burger_fries', 'stack_blocks_two'}:
-            raise ValueError('CF retention must cover the three previously successful tasks.')
-        for task in cf_tasks:
-            if len({r['scene_seed'] for r in rows if r.get('cf_retention') and r['source_task'] == task}) < 10:
-                raise ValueError('Formal action training requires ten CF-retention scenes per preserved task.')
+        validate_cf_retention_coverage(rows, args.cf_retention_tasks)
         if args.fg != 'off':
             for split in ('train', 'replay_holdout'):
                 if {r['source_task'] for r in rows if r.get('fg_correction') and r['replay_split'] == split} != set(args.target_tasks):
@@ -114,7 +114,7 @@ def main():
     start = 0
     optimization_contract = {k: getattr(args, k) for k in ('stage', 'fg', 'eraf', 'seed',
         'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation',
-        'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks')}
+        'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks', 'cf_retention_tasks')}
     if args.skip_file_hashes:
         p = Path(args.manifest).resolve()
         optimization_contract['manifest_identity'] = {'path': str(p), 'bytes': p.stat().st_size,
@@ -142,7 +142,8 @@ def main():
         elif state['checkpoint_sha256'] != file_sha256(args.checkpoint):
             raise ValueError('Optimizer checkpoint identity changed.')
         old_defaults = {'policy_scope': 'all', 'correction_weight': 1., 'skip_file_hashes': False,
-                        'target_tasks': ['place_a2b_left', 'blocks_ranking_rgb']}
+                        'target_tasks': ['place_a2b_left', 'blocks_ranking_rgb'],
+                        'cf_retention_tasks': ['place_a2b_right', 'place_burger_fries', 'stack_blocks_two']}
         for key, value in optimization_contract.items():
             if state['optimization_contract'].get(key, old_defaults.get(key)) != value:
                 if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
@@ -218,7 +219,7 @@ def main():
                     steps=step, parent=args.checkpoint, fg_supervision=args.fg,
                     provenance={'plan': str(root / 'plan.json'), 'eraf': args.eraf,
                                 'policy_scope': args.policy_scope, 'correction_weight': args.correction_weight,
-                                'target_tasks': args.target_tasks},
+                                'target_tasks': args.target_tasks, 'cf_retention_tasks': args.cf_retention_tasks},
                     record_hashes=not args.skip_file_hashes)
                 optimizer_payload = {'step': step, 'checkpoint': str(checkpoint_path),
                     'parameter_names': list(selected), 'optimization_contract': optimization_contract,

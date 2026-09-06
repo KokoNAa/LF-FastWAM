@@ -27,7 +27,8 @@ def main():
     base = json.loads(Path(args.manifest).read_text())
     from scripts.collect_robotwin_eraf_fg import historical_scene_keys
     from experiments.robotwin.eraf_fg_contract import validate_correction, scene_key
-    from experiments.robotwin.eraf_fg_data import retention_language, validate_retention_scene
+    from experiments.robotwin.eraf_fg_data import (
+        retention_language, validate_retention_scene, verify_retention_capture)
     from experiments.robotwin.cup_full_goal import FORMAT as CUP_FORMAT, validate_cup_correction
     groups = []
     seen = set()
@@ -68,6 +69,8 @@ def main():
         holdout = {scene_key(r) for r in rows if r['replay_split'] == 'replay_holdout'}
         if train & holdout or len({r['id'] for r in base['states'] + rows}) != len(base['states']) + len(rows):
             raise ValueError('Split overlap or duplicate replay IDs.')
+        if 'formal_data_audit' in base:
+            base['parent_formal_data_audit'] = base.pop('formal_data_audit')
         base.update(states=base['states'] + rows, complete=True, parent_manifest=args.manifest,
                     correction_collections=args.collections, preparation_checkpoint=args.checkpoint)
         (root / 'manifest.json').write_text(json.dumps(base, indent=2))
@@ -96,7 +99,9 @@ def main():
         language = 'target' if fg else retention_language(record)
         path = Path(record['frame_path'] if fg else record['capture_path'])
         direct_cup = record.get('format') == CUP_FORMAT
-        if not direct_cup and file_sha256(path) != record['frame_sha256' if fg else 'capture_sha256']:
+        if not fg:
+            verify_retention_capture(record)
+        elif not direct_cup and file_sha256(path) != record['frame_sha256']:
             raise ValueError('Collection archive identity changed.')
         with np.load(path, allow_pickle=False) as arrays:
             actions = arrays['actions'] if fg else None

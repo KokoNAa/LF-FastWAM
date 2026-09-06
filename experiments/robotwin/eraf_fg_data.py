@@ -7,6 +7,24 @@ from pathlib import Path
 import numpy as np
 
 
+def file_metadata(path):
+    """Record file provenance without reading a checkpoint or camera archive."""
+    path = Path(path).resolve()
+    stat = path.stat()
+    return {'path': str(path), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
+
+
+def verify_retention_capture(row):
+    if row.get('retention_format') == 'robotwin_policy_retention_v2':
+        if file_metadata(row['capture_path']) != row['capture_metadata']:
+            raise ValueError('Retention capture metadata changed.')
+    else:
+        # Read historical records without changing their recorded protocol.
+        from experiments.robotwin.eraf_fg_bridge import file_sha256
+        if file_sha256(row['capture_path']) != row['capture_sha256']:
+            raise ValueError('Retention capture archive changed.')
+
+
 def retention_language(row):
     """Admit new retention captures only under their actually executed goal."""
     native, cf = bool(row.get('native_retention')), bool(row.get('cf_retention'))
@@ -25,13 +43,50 @@ def validate_retention_scene(rows):
     if not rows:
         raise ValueError('Empty retention scene.')
     language = retention_language(rows[0])
-    fields = ('source_task', 'task_config', 'scene_seed', 'capture_path', 'capture_sha256',
-              'teacher_checkpoint_sha256', 'source_instruction', 'counterfactual_instruction')
-    if any(retention_language(row) != language or any(row[k] != rows[0][k] for k in fields) for row in rows):
+    fields = ('source_task', 'task_config', 'scene_seed', 'capture_path',
+              'source_instruction', 'counterfactual_instruction', 'retention_format')
+    if rows[0].get('retention_format') == 'robotwin_policy_retention_v2':
+        fields += ('capture_metadata', 'teacher_checkpoint_metadata', 'teacher_checkpoint')
+        for row in rows:
+            for key, path_key in (('capture_metadata', 'capture_path'),
+                                  ('teacher_checkpoint_metadata', 'teacher_checkpoint')):
+                value = row.get(key, {})
+                if (value.get('path') != row.get(path_key) or
+                        not isinstance(value.get('size'), int) or value['size'] <= 0 or
+                        not isinstance(value.get('mtime_ns'), int) or value['mtime_ns'] <= 0):
+                    raise ValueError('Retention file metadata is missing or invalid.')
+    else:
+        fields += ('capture_sha256', 'teacher_checkpoint_sha256')
+        if rows[0].get('retention_format') is not None or any(
+                not row.get(key) for row in rows for key in fields[-2:]):
+            raise ValueError('Unknown or incomplete historical retention provenance.')
+    if any(retention_language(row) != language or any(row.get(k) != rows[0].get(k) for k in fields) for row in rows):
         raise ValueError('Retention scene mixes condition, capture, teacher, or instruction provenance.')
     if sorted(row['frame_index'] for row in rows) != list(range(len(rows))):
         raise ValueError('Retention scene has missing or duplicate captured states.')
     return language
+
+
+def validate_cf_retention_coverage(rows, required_tasks, *, minimum_scenes=10):
+    """Extend preservation to target tasks without dropping the existing three."""
+    previous = {'place_a2b_right', 'place_burger_fries', 'stack_blocks_two'}
+    allowed = previous | {'place_a2b_left', 'blocks_ranking_rgb'}
+    required = set(required_tasks)
+    if (len(required) != len(required_tasks) or not previous <= required <= allowed
+            or minimum_scenes <= 0):
+        raise ValueError('Declare unique CF-retention tasks including all three previous tasks.')
+    scenes = {}
+    for row in rows:
+        if row.get('cf_retention'):
+            retention_language(row)
+            if row['replay_split'] == 'train':
+                scenes.setdefault(row['source_task'], set()).add((row['task_config'], row['scene_seed']))
+    if set(scenes) != required:
+        raise ValueError(f'CF-retention training tasks differ from the declared coverage: {sorted(scenes)}.')
+    counts = {task: len(values) for task, values in scenes.items()}
+    if any(count < minimum_scenes for count in counts.values()):
+        raise ValueError(f'Need {minimum_scenes} CF-retention training scenes per declared task: {counts}.')
+    return counts
 
 
 class RawReplay:

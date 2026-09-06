@@ -94,14 +94,18 @@ def replay_prefix(task, spec, trace, step):
     return verify_replayed_state(trace["states"][step], physical_state(task))
 
 
-def continue_to_goal(task, spec):
+def continue_to_goal(task, spec, *, selected_goal="target"):
     """Release safely and regrasp from the actual failed robot/object state.
 
     Expert helpers plan from current poses. All releases and subsequent motion
     are recorded; there is no teleport, reset, or fresh expert initial scene.
     Late unrecoverable captures are rejected and earlier captures may be tried.
     """
+    if selected_goal not in {'source', 'target'}:
+        raise ValueError('Unknown expert continuation goal.')
+    variant = spec.source_variant if selected_goal == 'source' else spec.counterfactual_variant
     from envs.utils import ArmTag
+    task._pgc_active_variant = variant
     task.need_plan = True
     task.plan_success = True
     for arm in (ArmTag("left"), ArmTag("right")):
@@ -112,14 +116,16 @@ def continue_to_goal(task, spec):
         # blocks need no extra detour through a buffer.
         task.last_gripper = None
         actors = task.pgc_scene_actors()
-        slots = (task.block3_target_pose, task.block2_target_pose, task.block1_target_pose)
+        slots = (task.block1_target_pose, task.block2_target_pose, task.block3_target_pose)
+        if variant == 'bgr':
+            slots = slots[::-1]
         for index, actor in enumerate(actors):
             for other, slot in enumerate(slots):
                 if other != index and np.linalg.norm(actor.get_pose().p[:2] - np.asarray(slot[:2])) < .055:
                     x = -.20 if actor.get_pose().p[0] < 0 else .20
                     task.pick_and_place_block(actor, [x, -.27, .74 + task.table_z_bias, 0, 1, 0, 0])
                     break
-    play_variant(task, spec, spec.counterfactual_variant)
+    play_variant(task, spec, variant)
 
 
 @contextmanager
