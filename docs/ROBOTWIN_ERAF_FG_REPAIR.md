@@ -121,6 +121,11 @@ Grounding accuracy and expert correction success are not policy CF success.
   quotas and exclusion of regression, development and test catalog scenes.
 - `scripts/train_robotwin_eraf_fg_action.py`: interface and joint training.
 - `scripts/eval_robotwin_eraf_fg.py`: catalogs, matched evaluation, summary.
+- `scripts/advance_robotwin_eraf_fg_campaign.py`: bounded continuation of the
+  authorized campaign. It fills idle GPUs with verified-record preparation,
+  waits for all collection/audit requirements, trains interface100 + joint200,
+  and evaluates fixed regression and development. It stops for result review
+  before any checkpoint continuation, ablation selection or locked-test use.
 
 The campaign directory's `launch.json` records exact commands, process IDs and
 code revisions. Each detached job writes its own log and exit marker. Formal
