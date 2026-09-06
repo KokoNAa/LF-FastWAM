@@ -33,6 +33,14 @@ weight checkpoints do not claim to be optimizer-resume checkpoints. Frozen
 VAE/T5 inputs are cached before trainable Video operations; trainable Video and
 action interfaces are recomputed for each gradient graph.
 
+Action training also saves a separate `optimizer_last.pt` with FP32 masters,
+AdamW moments, exact checkpoint hash, parameter names and the training-data
+contract. `--resume-state` continues within the same stage at the next global
+optimizer step and restores its sampling position. This supports evaluation
+after200/400steps before continuing to the next checkpoint. Each ERAF ablation
+must have its own matching interface checkpoint; a full-FG-trained interface
+cannot initialize an FG-off or local-only control.
+
 The global12-example mixture contains4 Correct retention states,2 CF retention
 states,3 old expert pairs and3 FG corrections. Correct teacher weight is2, CF
 teacher weight1, CF-positive weight2, endpoint weight1 and same-observation
