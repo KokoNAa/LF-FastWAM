@@ -96,15 +96,20 @@ def main():
             if fg and array_sha256(actions) != record['correction_action_sha256']:
                 raise ValueError('Correction actions changed.')
             windows = action_windows(actions) if fg else records
+            # NpzFile indexing decompresses the entire named array each time.
+            # Load each camera once per scene, rather than once per window.
+            images = {camera: arrays[camera] for camera in CAMERAS}
+            proprio = actions if fg else arrays['state']
+            retention_references = None if fg else arrays['reference_action_raw']
             parent = parent_path = None
             for window in windows:
                 frame = window.start if fg else window['frame_index']
-                raw = window.action if fg else arrays['reference_action_raw'][frame]
+                raw = window.action if fg else retention_references[frame]
                 if raw.shape != (32, 14) or not np.isfinite(raw).all():
                     raise ValueError('Expected finite 32x14 reference.')
                 valid = window.valid if fg else np.ones(32, dtype=bool)
-                observation = {'observation': {c: {'rgb': arrays[c][frame]} for c in CAMERAS},
-                               'joint_action': {'vector': actions[frame] if fg else arrays['state'][frame]}}
+                observation = {'observation': {c: {'rgb': images[c][frame]} for c in CAMERAS},
+                               'joint_action': {'vector': proprio[frame]}}
                 policy.reset()
                 captured = capture_frozen_inputs(policy, observation, record['counterfactual_instruction'])
                 # The clean capture explicitly carries no gold or teacher memory.
