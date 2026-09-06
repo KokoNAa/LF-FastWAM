@@ -18,6 +18,7 @@ def initialize_geometry(task, direction=1):
     if direction not in (-1, 1):
         raise ValueError('Cup relation direction must be -1 (front) or 1 (behind).')
     task._cup_cf_direction = direction
+    task._cup_cf_initial_arm = 'right' if task.cup.get_pose().p[0] > 0 else 'left'
     task._cup_cf_floor_z = float(task.cup.get_functional_point(0, 'pose').p[2])
     rotation = task.cup.get_pose().to_transformation_matrix()[:3, :3]
     task._cup_cf_local_up = rotation.T @ np.array([0., 0., 1.])
@@ -34,7 +35,11 @@ def counterfactual_success(task):
 
 def play_counterfactual(task):
     from envs.utils import ArmTag
-    arm = ArmTag('right' if task.cup.get_pose().p[0] > 0 else 'left')
+    strategy = getattr(task, '_cup_cf_recovery_arm_strategy', 'current')
+    if strategy not in {'current', 'initial'}:
+        raise ValueError('Unknown expert recovery arm strategy')
+    arm = ArmTag(task._cup_cf_initial_arm if strategy == 'initial' else
+                 ('right' if task.cup.get_pose().p[0] > 0 else 'left'))
     task.move(task.close_gripper(arm, pos=.6))
     task.move(task.grasp_actor(task.cup, arm, pre_grasp_dis=.1,
                               contact_point_id=[0, 2][int(arm == 'left')]))
