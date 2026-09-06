@@ -40,6 +40,12 @@ def install_memory_reset(policy):
     policy._infer_action_chunk = infer_without_history
 
 
+def file_metadata(path):
+    path = Path(path).resolve()
+    stat = path.stat()
+    return {'path': str(path), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('mode', choices=['catalog', 'worker', 'summarize'])
@@ -59,6 +65,8 @@ def main():
     ap.add_argument('--policy-kind', choices=['repair', 'legacy'], default='repair')
     ap.add_argument('--memory-mode', choices=['carry', 'reset'], default='carry')
     ap.add_argument('--videos', action='store_true')
+    ap.add_argument('--skip-file-hashes', action='store_true',
+                    help='Bind checkpoint/catalog file metadata without repeated full-file scans.')
     args = ap.parse_args()
     if args.mode == 'worker' and args.memory_mode == 'reset' and (args.eraf != 'on' or args.policy_kind != 'repair'):
         ap.error('Memory reset requires an ERAF-on repair checkpoint.')
@@ -72,7 +80,8 @@ def main():
     if args.mode == 'summarize':
         from experiments.robotwin.eraf_fg_bridge import file_sha256
         cells = []
-        checkpoint_hash = file_sha256(args.checkpoint)
+        checkpoint_hash = None if args.skip_file_hashes else file_sha256(args.checkpoint)
+        checkpoint_metadata = file_metadata(args.checkpoint) if args.skip_file_hashes else None
         signatures = []
         for task in args.tasks:
             initial_by_condition = []
@@ -81,12 +90,16 @@ def main():
                 report = json.loads((path / 'complete.json').read_text())
                 if not report['complete'] or report['checkpoint'] != args.checkpoint:
                     raise ValueError('Mixed or incomplete checkpoint evaluation.')
-                if report['checkpoint_sha256'] != checkpoint_hash:
+                if bool(report.get('skip_file_hashes', False)) != args.skip_file_hashes:
+                    raise ValueError('Mixed file binding protocols in evaluation.')
+                if (report.get('checkpoint_metadata') != checkpoint_metadata if args.skip_file_hashes
+                        else report['checkpoint_sha256'] != checkpoint_hash):
                     raise ValueError('Evaluation checkpoint changed.')
                 signatures.append((report['eraf'], report['policy_kind'], report.get('memory_mode', 'carry'),
                                    json.dumps(report['deployment'], sort_keys=True)))
                 canonical_path = Path(args.catalog_root) / task / 'demo_clean/correct/episodes.jsonl'
-                if report['canonical_sha256'] != file_sha256(canonical_path):
+                if (report.get('canonical_metadata') != file_metadata(canonical_path) if args.skip_file_hashes
+                        else report['canonical_sha256'] != file_sha256(canonical_path)):
                     raise ValueError('Matched scene/instruction catalog changed.')
                 records = [json.loads(line) for line in (path / 'episodes.jsonl').read_text().splitlines()]
                 canonical = [json.loads(line) for line in canonical_path.read_text().splitlines()]
@@ -128,7 +141,8 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
     pairs = load_intervention_manifest(args.interventions, robotwin_root=Path(args.robotwin_root))
     policy = None
-    checkpoint_hash = file_sha256(args.checkpoint) if args.checkpoint else None
+    checkpoint_hash = file_sha256(args.checkpoint) if args.checkpoint and not args.skip_file_hashes else None
+    checkpoint_metadata = file_metadata(args.checkpoint) if args.checkpoint and args.skip_file_hashes else None
     for task_name in args.tasks:
         task, options = _load_robotwin_args(robotwin_root=Path(args.robotwin_root), task_name=task_name,
                                           task_config='demo_clean', output_root=root)
@@ -235,7 +249,10 @@ def main():
             (directory / 'initial_states.json').write_text(json.dumps(initial_hashes, indent=2))
             (directory / 'complete.json').write_text(json.dumps({'complete': len(records) == args.episodes,
                 'checkpoint': args.checkpoint, 'checkpoint_sha256': checkpoint_hash,
-                'canonical_sha256': file_sha256(canonical_path), 'eraf': args.eraf, 'policy_kind': args.policy_kind,
+                'canonical_sha256': None if args.skip_file_hashes else file_sha256(canonical_path),
+                'checkpoint_metadata': checkpoint_metadata,
+                'canonical_metadata': file_metadata(canonical_path) if args.skip_file_hashes else None,
+                'skip_file_hashes': args.skip_file_hashes, 'eraf': args.eraf, 'policy_kind': args.policy_kind,
                 'memory_mode': args.memory_mode,
                 'deployment': {'action_horizon': 32, 'replan_steps': 24, 'inference_steps': 10}}, indent=2))
     if args.mode == 'catalog':
