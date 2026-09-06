@@ -27,7 +27,8 @@ def same_observation(captured):
 
 def backward_example(model, row, payload, noise, time, *, teachers, coefficient=1.,
                      eraf=True, fg='full', correct_weight=2., cf_weight=1.,
-                     target_weight=2., endpoint_weight=1., conditional_gain=4.):
+                     target_weight=2., endpoint_weight=1., conditional_gain=4.,
+                     gradient_observer=None):
     import torch
     from experiments.robotwin.eraf_fg_bridge import predict, masked_mse
     from experiments.robotwin.same_state_repair import paired_velocity_losses
@@ -64,10 +65,15 @@ def backward_example(model, row, payload, noise, time, *, teachers, coefficient=
                                  scheduler.training_target(refs[language], noise, end))
     metrics = {}
 
-    def backward(loss):
+    def backward(loss, component, *, retain_graph=False):
         if not bool(torch.isfinite(loss)):
             raise ValueError('Nonfinite action objective.')
-        (coefficient * loss).backward()
+        if gradient_observer is None:
+            (coefficient * loss).backward()
+        else:
+            # Diagnostics collect individual gradients without accumulating .grad
+            # or stepping an optimizer. The default training path stays unchanged.
+            gradient_observer(coefficient * loss, component, retain_graph=retain_graph)
 
     def weight(language):
         if retention:
@@ -78,7 +84,8 @@ def backward_example(model, row, payload, noise, time, *, teachers, coefficient=
         x = scheduler.add_noise(refs[language], noise, time)
         prediction = predict(model, captured[language], x, time, eraf=eraf)
         loss = masked_mse(prediction, targets[language][0], valid[language])
-        backward(float(scheduler.training_weight(time).item()) * weight(language) * loss)
+        backward(float(scheduler.training_weight(time).item()) * weight(language) * loss,
+                 'flow_' + language)
         metrics['flow_' + language] = float(loss.detach())
     predictions = {}
     for language in languages:
@@ -86,14 +93,22 @@ def backward_example(model, row, payload, noise, time, *, teachers, coefficient=
             raise ValueError('Expert actions leaked into the endpoint input.')
         predictions[language] = predict(model, captured[language], noise, end, eraf=eraf)
     objective = sum(weight(k) * masked_mse(predictions[k], targets[k][1], valid[k]) for k in languages)
+    endpoint_fit = objective
+    conditional = None
     if gain != 1:
         if not all(bool(v.all()) for v in valid.values()):
             raise ValueError('Paired difference currently requires full real action horizons.')
         parts = paired_velocity_losses(predictions, {k: targets[k][1] for k in languages})
-        objective = objective + (gain - 1.) * parts['conditional_mse']
+        conditional = (gain - 1.) * parts['conditional_mse']
+        objective = objective + conditional
         metrics['conditional_mse'] = float(parts['conditional_mse'].detach())
     metrics['endpoint_objective'] = float(objective.detach())
-    backward(endpoint_weight * objective)
+    if gradient_observer is None:
+        backward(endpoint_weight * objective, 'endpoint_objective')
+    else:
+        backward(endpoint_weight * endpoint_fit, 'endpoint_fit', retain_graph=conditional is not None)
+        if conditional is not None:
+            backward(endpoint_weight * conditional, 'conditional_difference')
     return metrics
 
 
