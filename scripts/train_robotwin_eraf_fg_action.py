@@ -33,7 +33,7 @@ def main():
     import torch.distributed as dist
     from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint, validate_payload, file_sha256
     from experiments.robotwin.eraf_fg_data import RawReplay
-    from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream
+    from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream, supervision_payload, FG_OFF_PROTOCOL
     from experiments.robotwin.compact_replay import ReplayPayloads
     from experiments.robotwin.native_teacher import NativeTeacher
     from experiments.robotwin.same_state_repair import noise_tensor
@@ -103,13 +103,15 @@ def main():
     optimization_contract = {k: getattr(args, k) for k in ('stage', 'fg', 'eraf', 'seed',
         'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation')}
     optimization_contract['manifest_sha256'] = file_sha256(args.manifest)
+    if args.fg == 'off':
+        optimization_contract['fg_off_protocol'] = FG_OFF_PROTOCOL
     adjustments = {}
     if args.resume_state:
         state = torch.load(args.resume_state, map_location='cpu', weights_only=False)
         if state['parameter_names'] != list(selected) or state['checkpoint_sha256'] != file_sha256(args.checkpoint):
             raise ValueError('Optimizer does not belong to this exact checkpoint and parameter scope.')
         for key, value in optimization_contract.items():
-            if state['optimization_contract'][key] != value:
+            if state['optimization_contract'].get(key) != value:
                 if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
                     raise ValueError(f'Resume changed immutable training contract: {key}')
                 adjustments[key] = {'from': state['optimization_contract'][key], 'to': value}
@@ -127,14 +129,16 @@ def main():
         next(stream)
     from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
     seen_contexts = ({} if args.disable_seen_language_augmentation else build_seen_contexts(model, REPO,
-        [r for r in rows if not r.get('native_retention') and not r.get('cf_retention')]))
+        [r for r in rows if not r.get('native_retention') and not r.get('cf_retention')
+         and not (args.fg == 'off' and r.get('fg_correction'))]))
     if rank == 0:
         (root / 'plan.json').write_text(json.dumps(vars(args) | {'world_size': world, 'global_batch': 12,
             'start_optimizer_step': start, 'resume_adjustments': adjustments,
             'optimization_contract': optimization_contract,
             'trainable_parameters': list(selected), 'optimizer_precision': 'FP32 master weights',
             'mixture': {'correct_retention': 4, 'cf_retention': 2,
-                        'expert_pairs': 6 if args.fg == 'off' else 3, 'fg': 0 if args.fg == 'off' else 3}}, indent=2))
+                        'expert_pairs': 3, 'fg': 0 if args.fg == 'off' else 3,
+                        'ordinary_cf_control': 3 if args.fg == 'off' else 0}}, indent=2))
     started = time.monotonic()
     journal = (root / f'rank{rank}.jsonl').open('x', buffering=1)
     for step in range(start + 1, args.steps + 1):
@@ -144,7 +148,7 @@ def main():
         for index, row in enumerate(batch):
             if index % world != rank:
                 continue
-            payload = payloads[row['id']]
+            payload = supervision_payload(row, payloads[row['id']])
             if row.get('frozen_input_protocol') != 'robotwin_eraf_fg_pre_dit_v1':
                 payload = raw.attach_proprio(payload, row, policy)
             seed = args.seed + (step - 1) * 12 + index
@@ -164,7 +168,8 @@ def main():
             report = backward_example(model, row, payload, noise, t, teachers=teachers,
                 coefficient=1. / (12 // world), eraf=args.eraf == 'on', fg=args.fg,
                 correct_weight=args.correct_weight, cf_weight=args.cf_weight)
-            reports.append({'id': row['id'], 'seen_variant': variant_index, **report})
+            reports.append({'id': row['id'], 'seen_variant': variant_index,
+                            'ordinary_cf_control': bool(row.get('ordinary_cf_control')), **report})
         average_gradients(selected.values())
         norm = optimizer.step()
         journal.write(json.dumps({'step': step, 'grad_norm': norm, 'examples': reports,

@@ -13,12 +13,14 @@ sys.path[:0] = [str(REPO), str(REPO / 'src')]
 def audit(root):
     import torch
     from experiments.robotwin.eraf_fg_bridge import file_sha256, validate_payload
-    from experiments.robotwin.eraf_fg_training import mixture_stream
+    from experiments.robotwin.eraf_fg_training import mixture_stream, FG_OFF_PROTOCOL
     root = Path(root)
     read = lambda path: json.loads(Path(path).read_text())
     plan = read(root / 'plan.json')
     if read(root / 'complete.json').get('complete') is not True:
         raise ValueError('Training stage is incomplete.')
+    if plan['fg'] == 'off' and plan['optimization_contract'].get('fg_off_protocol') != FG_OFF_PROTOCOL:
+        raise ValueError('Legacy FG-off sampling is not the declared matched control protocol.')
     checkpoint = root / f"step_{plan['steps']:06d}.pt"
     candidate = validate_payload(torch.load(checkpoint, map_location='cpu', weights_only=False))
     parent = validate_payload(torch.load(plan['checkpoint'], map_location='cpu', weights_only=False))
@@ -69,6 +71,9 @@ def audit(root):
         for rank, journal in enumerate(journals):
             if [r['id'] for r in journal[index]['examples']] != [r['id'] for r in batch[rank::world]]:
                 raise ValueError(f'Actual sampled states differ at step{step}, rank{rank}.')
+            if ([bool(r.get('ordinary_cf_control')) for r in journal[index]['examples']]
+                    != [bool(r.get('ordinary_cf_control')) for r in batch[rank::world]]):
+                raise ValueError('Ordinary CF replacement supervision differs from the matched schedule.')
     return {'complete': True, 'checkpoint_sha256': digest, 'parent_checkpoint': plan['checkpoint'],
         'changed_lora_tensors': counts['mot_trainable'], 'changed_guard_tensors': counts['policy_guard'],
         'unchanged_frozen_tensors': len(frozen), 'unexpected_changes': unexpected,

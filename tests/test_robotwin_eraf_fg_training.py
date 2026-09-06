@@ -115,6 +115,64 @@ def test_local_and_full_draw_identical_scenes_and_preservation_examples():
                 assert a['id'] == b['id']
 
 
+def test_fg_off_replaces_only_target_slots_and_preserves_task_domain_exposure():
+    from experiments.robotwin.eraf_fg_training import mixture_stream
+    rows = []
+    for kind in ('native_retention', 'cf_retention', 'pair', 'fg_correction'):
+        for pair in ('left', 'ranking'):
+            for scene in range(3):
+                for frame in (0, 8, 16):
+                    rows.append(dict(id=f'{kind}_{pair}_{scene}_{frame}', pair_id=pair,
+                        task_config='demo_clean', scene_seed=scene, frame_index=frame,
+                        replay_split='train', **{kind: True}))
+    full, off = mixture_stream(rows, 42, 'full'), mixture_stream(rows, 42, 'off')
+    for _ in range(20):
+        a, b = next(full), next(off)
+        assert sum(bool(r.get('ordinary_cf_control')) for r in b) == 3
+        assert not any(r.get('fg_correction') for r in b)
+        for original, replacement in zip(a, b, strict=True):
+            if original.get('fg_correction'):
+                assert replacement['ordinary_cf_control']
+                assert replacement['pair']
+                assert (original['pair_id'], original['task_config']) == (
+                    replacement['pair_id'], replacement['task_config'])
+            else:
+                assert original == replacement
+    with pytest.raises(ValueError, match='Missing ordinary CF'):
+        next(mixture_stream([r for r in rows if not (r.get('pair') and r['pair_id'] == 'left')], 42, 'off'))
+
+
+def test_ordinary_cf_control_loss_cannot_use_source_labels(case, monkeypatch):
+    from types import SimpleNamespace
+    from experiments.robotwin import eraf_fg_bridge
+    from experiments.robotwin.eraf_fg_training import supervision_payload
+    production, _, noise, time = case
+    model = SimpleNamespace(train_action_scheduler=production.train_action_scheduler,
+                            device='cpu', torch_dtype=torch.float32)
+    parameter = torch.nn.Parameter(torch.tensor(.2))
+    target_capture = {}
+
+    def predict(model, captured, noisy, time, **kwargs):
+        assert captured is target_capture
+        return parameter * noisy
+
+    monkeypatch.setattr(eraf_fg_bridge, 'predict', predict)
+    row = {'ordinary_cf_control': True}
+
+    def run(source):
+        parameter.grad = None
+        payload = supervision_payload(row, {'captured': {'source': None, 'target': target_capture},
+            'references': {'source': source, 'target': torch.zeros_like(noise)}})
+        report = backward_example(model, row, payload, noise, time, teachers={}, eraf=False, fg='off')
+        return report, parameter.grad.clone()
+
+    a, b = run(torch.ones_like(noise)), run(torch.full_like(noise, 10000))
+    assert a[0] == b[0] and torch.equal(a[1], b[1])
+    assert 'conditional_mse' not in a[0]
+    with pytest.raises(ValueError, match='cannot carry'):
+        supervision_payload(row | {'fg_correction': True}, {})
+
+
 def test_resume_preserves_sub_bfloat16_updates_and_optimizer_moments():
     from experiments.robotwin.eraf_fg_bridge import MasterAdamW
     a = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))

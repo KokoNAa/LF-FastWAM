@@ -1,6 +1,23 @@
 """Masked flow, endpoint, same-observation contrast and two-teacher retention."""
 from __future__ import annotations
 
+FG_OFF_PROTOCOL = 'task_domain_matched_target_only_v1'
+
+
+def supervision_payload(row, payload):
+    """The ordinary-CF replacement has the same target-only loss as FG."""
+    if not row.get('ordinary_cf_control'):
+        return payload
+    if any(row.get(k) for k in ('fg_correction', 'native_retention', 'cf_retention')):
+        raise ValueError('An ordinary-CF control cannot carry corrective or retention labels.')
+    if any('target' not in payload[k] for k in ('captured', 'references')):
+        raise ValueError('Ordinary-CF control requires an actual target observation and reference.')
+    result = dict(payload, captured={'target': payload['captured']['target']},
+                  references={'target': payload['references']['target']})
+    if 'valid' in payload:
+        result['valid'] = {k: v for k, v in payload['valid'].items() if k == 'target'}
+    return result
+
 
 def same_observation(captured):
     import torch
@@ -99,16 +116,35 @@ def balanced_group_stream(rows, seed):
 
 
 def mixture_stream(rows, seed, fg='full'):
+    if fg == 'off':
+        # Reuse only the full arm's metadata schedule (task/domain and batch
+        # position). Never return a failed-state row or read its payload.
+        groups = {(r['pair_id'], r['task_config']) for r in rows
+                  if r['replay_split'] == 'train' and r.get('fg_correction')}
+        if not groups:
+            raise ValueError('A matched FG-off control needs the declared target task/domain schedule.')
+        ordinary = {key: [] for key in groups}
+        for row in rows:
+            key = row['pair_id'], row['task_config']
+            if (row['replay_split'] == 'train' and key in ordinary
+                    and not any(row.get(k) for k in ('fg_correction', 'native_retention', 'cf_retention'))):
+                ordinary[key].append(row)
+        if any(not group for group in ordinary.values()):
+            raise ValueError('Missing ordinary CF data for an FG target task/domain.')
+        replacements = {key: balanced_group_stream(ordinary[key], seed + 40009 + index * 1009)
+                        for index, key in enumerate(sorted(groups))}
+        for batch in mixture_stream(rows, seed, 'full'):
+            yield [(next(replacements[row['pair_id'], row['task_config']]) | {'ordinary_cf_control': True})
+                   if row.get('fg_correction') else row for row in batch]
+        return
     buckets = {'correct': [], 'cf': [], 'pair': [], 'fg': []}
     for row in rows:
         if row['replay_split'] != 'train':
             continue
         kind = ('correct' if row.get('native_retention') else 'cf' if row.get('cf_retention')
                 else 'fg' if row.get('fg_correction') else 'pair')
-        if kind == 'fg' and fg == 'off':
-            continue
         buckets[kind].append(row)
-    counts = {'correct': 4, 'cf': 2, 'pair': 6 if fg == 'off' else 3, 'fg': 0 if fg == 'off' else 3}
+    counts = {'correct': 4, 'cf': 2, 'pair': 3, 'fg': 3}
     streams = {k: balanced_group_stream(buckets[k], seed + i * 1009)
                for i, k in enumerate(counts) if counts[k]}
     import random
