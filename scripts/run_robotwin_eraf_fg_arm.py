@@ -2,7 +2,8 @@
 """Train one independent arm and evaluate both declared development catalogs.
 
 Each arm owns a disjoint GPU pool, output directory, and process ledger.
-It never chooses a checkpoint from the locked test or starts a continuation.
+It never chooses a checkpoint from the locked test or starts an automatic
+continuation. An explicit continuation needs its exact optimizer companion.
 """
 from __future__ import annotations
 import argparse
@@ -29,9 +30,13 @@ def main():
     ap.add_argument('--gpus', type=int, choices=range(6), nargs='+', required=True)
     ap.add_argument('--correct-weight', type=float, default=4.)
     ap.add_argument('--cf-weight', type=float, default=2.)
+    ap.add_argument('--steps', type=int, choices=[200, 400, 800], default=200)
+    ap.add_argument('--resume-state', help='Exact optimizer companion for an explicitly selected continuation.')
     args = ap.parse_args()
     if len(set(args.gpus)) != len(args.gpus) or 12 % len(args.gpus):
         ap.error('Distinct GPUs dividing global batch12 required.')
+    if (args.steps > 200) != bool(args.resume_state):
+        ap.error('400/800-step continuation requires its optimizer companion; fresh arms use200.')
     root, output = Path(args.root).resolve(), Path(args.output).resolve()
     if output.parent != root or output == root:
         ap.error('Each arm must own a direct child of the campaign root.')
@@ -46,8 +51,9 @@ def main():
         raise ValueError('Formal replay audit does not match.')
     output.mkdir(exist_ok=False)
     plan = vars(args) | {'checkpoint_sha256': file_sha256(args.checkpoint),
-        'manifest_sha256': audit['manifest_sha256'], 'interface_steps': 100 if args.eraf == 'on' else 0,
-        'joint_steps': 200, 'global_batch': 12, 'seed': 42,
+        'manifest_sha256': audit['manifest_sha256'],
+        'interface_steps': 100 if args.eraf == 'on' and not args.resume_state else 0,
+        'joint_steps': args.steps, 'global_batch': 12, 'seed': 42,
         'code': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(),
         'stop_experiments_hkt': deadline.isoformat(), 'jobs': {}}
     write(output / 'plan.json', plan)
@@ -88,8 +94,8 @@ def main():
     def train(stage, checkpoint):
         template = list(launch['jobs']['interface_smoke']['command'])
         for flag, value in {'--manifest': manifest, '--checkpoint': checkpoint,
-            '--output': output / stage, '--stage': stage, '--steps': 100 if stage == 'interface' else 200,
-            '--save-every': 100 if stage == 'interface' else 200,
+            '--output': output / stage, '--stage': stage, '--steps': 100 if stage == 'interface' else args.steps,
+            '--save-every': 100 if stage == 'interface' else args.steps,
             '--learning-rate': '5e-5' if stage == 'interface' else '1e-5',
             '--fg': args.fg, '--eraf': args.eraf,
             '--correct-weight': args.correct_weight, '--cf-weight': args.cf_weight}.items():
@@ -97,17 +103,19 @@ def main():
                 template[template.index(flag) + 1] = str(value)
             else:
                 template += [flag, str(value)]
+        if stage == 'joint' and args.resume_state:
+            template += ['--resume-state', str(Path(args.resume_state).resolve())]
         command = [sys.executable, '-u', '-m', 'torch.distributed.run', '--standalone',
             f'--nproc_per_node={len(args.gpus)}'] + template[2:]
         start(stage, command, args.gpus)
         while not done(stage):
             budget()
             time.sleep(15)
-        return output / stage / ('step_000100.pt' if stage == 'interface' else 'step_000200.pt')
+        return output / stage / ('step_000100.pt' if stage == 'interface' else f'step_{args.steps:06d}.pt')
 
     try:
         parent = Path(args.checkpoint).resolve()
-        if args.eraf == 'on':
+        if args.eraf == 'on' and not args.resume_state:
             parent = train('interface', parent)
         checkpoint = train('joint', parent)
         fixed = Path('/root/gpufree-data/LF-FastWAM/evaluate_results/robotwin/robotwin_uncond_3cam_384/cf-improvement-20260905-235608-base')
