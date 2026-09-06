@@ -59,9 +59,15 @@ class ReplayPayloads:
         import torch
         from experiments.robotwin.same_state_repair import move_cache
         payload = torch.load(self.paths[key], map_location='cpu', weights_only=True)
-        if payload.get('format') == 'robotwin_compact_replay_v1':
+        if payload.get('format') in {'robotwin_compact_replay_v1', 'robotwin_eraf_fg_compact_v1'}:
             parent = self._parent(payload['parent_payload'])
-            payload = {'references': payload['references'], 'captured': {
-                language: restore_capture(parent['captured'][language], changes)
+            restored = {'references': payload['references'], 'captured': {
+                language: restore_capture({k: v for k, v in parent['captured'][language].items()
+                                           if k in ('video_inputs', 'action_inputs')}, changes)
                 for language, changes in payload['capture_deltas'].items()}}
+            for language, extras in payload.get('capture_extras', {}).items():
+                restored['captured'][language].update(extras)
+            if 'valid' in payload:
+                restored['valid'] = payload['valid']
+            payload = restored
         return move_cache(payload, self.device)

@@ -125,6 +125,7 @@ def record_continuation(task):
     """Record exact simulator controls and ordinary expert camera/qpos samples."""
     controls, frames = [], []
     dense, picture = task.take_dense_action, task._take_picture
+    together = task.together_move_to_pose
 
     def capture():
         obs = task.get_obs()
@@ -133,19 +134,51 @@ def record_continuation(task):
                        "grounding": deepcopy(task.pgc_eraf_snapshot())})
 
     def run(control_seq, save_freq=-1):
-        controls.append({"control_seq": deepcopy(control_seq), "save_freq": save_freq})
-        return dense(control_seq, save_freq=save_freq)
+        row = {"kind": "dense", "control_seq": deepcopy(control_seq), "save_freq": save_freq}
+        controls.append(row)
+        result = dense(control_seq, save_freq=save_freq)
+        row['state_after'] = physical_state(task)
+        return result
 
-    task._take_picture, task.take_dense_action = capture, run
+    def coordinated(*args, **kwargs):
+        # RoboTwin's coordinated-arm path executes physics directly, bypassing
+        # take_dense_action. Preserve its planned paths and its own time warp.
+        if not task.need_plan:
+            raise ValueError('Collection requires fresh expert planning.')
+        row = {'kind': 'together', 'args': deepcopy(args), 'kwargs': deepcopy(kwargs)}
+        controls.append(row)
+        result = together(*args, **kwargs)
+        row.update(left_path=deepcopy(task.left_joint_path[-1]),
+                   right_path=deepcopy(task.right_joint_path[-1]), state_after=physical_state(task))
+        return result
+
+    task._take_picture, task.take_dense_action, task.together_move_to_pose = capture, run, coordinated
     try:
         yield controls, frames
     finally:
-        task._take_picture, task.take_dense_action = picture, dense
+        task._take_picture, task.take_dense_action, task.together_move_to_pose = picture, dense, together
 
 
 def replay_continuation(task, controls):
-    for row in controls:
-        task.take_dense_action(deepcopy(row["control_seq"]), save_freq=row["save_freq"])
+    for index, row in enumerate(controls):
+        if row.get('kind', 'dense') == 'dense':
+            task.take_dense_action(deepcopy(row["control_seq"]), save_freq=row["save_freq"])
+        elif row['kind'] == 'together':
+            saved = (task.need_plan, task.left_joint_path, task.right_joint_path, task.left_cnt, task.right_cnt)
+            try:
+                task.need_plan = False
+                task.left_joint_path, task.right_joint_path = [deepcopy(row['left_path'])], [deepcopy(row['right_path'])]
+                task.left_cnt = task.right_cnt = 0
+                task.together_move_to_pose(*deepcopy(row['args']), **deepcopy(row['kwargs']))
+            finally:
+                task.need_plan, task.left_joint_path, task.right_joint_path, task.left_cnt, task.right_cnt = saved
+        else:
+            raise ValueError('Unknown physical replay control kind.')
+        if 'state_after' in row:
+            try:
+                verify_replayed_state(row['state_after'], physical_state(task))
+            except ValueError as exc:
+                raise ValueError(f'Continuation control {index} ({row.get("kind")}): {exc}') from exc
 
 
 def full_goal(task, spec):
