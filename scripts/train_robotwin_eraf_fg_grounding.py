@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--global-batch", type=int, default=12)
     ap.add_argument("--learning-rate", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--step-offset", type=int, default=0,
+                    help="Prior semantic optimizer steps; extension restarts optimizer explicitly.")
     args = ap.parse_args()
     world, rank, local = (int(os.environ.get(k, d)) for k, d in
                            (("WORLD_SIZE", "1"), ("RANK", "0"), ("LOCAL_RANK", "0")))
@@ -52,11 +54,11 @@ def main():
     torch.cuda.set_device(local)
     torch.manual_seed(args.seed)
     if world > 1:
-        dist.init_process_group("nccl")
+        dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local}"))
 
     def barrier():
         if world > 1:
-            dist.barrier()
+            dist.barrier(device_ids=[local])
 
     root = Path(args.output).resolve()
     if rank == 0:
@@ -79,7 +81,8 @@ def main():
     if rank == 0:
         (root / "plan.json").write_text(json.dumps(vars(args) | {"world_size": world,
             "trainable_parameters": list(selected), "validation_states": len(validation),
-            "policy_frozen": True, "optimizer_precision": "FP32 master weights"}, indent=2))
+            "policy_frozen": True, "optimizer_precision": "FP32 master weights",
+            "optimizer_restart": bool(args.step_offset)}, indent=2))
 
     def evaluate(step):
         reports = []
@@ -110,11 +113,12 @@ def main():
         print(f"[grounding-eval] step={step} roles={role:.4f} relations={relation:.4f}", flush=True)
 
     if rank == 0:
-        evaluate(0)
+        evaluate(args.step_offset)
     barrier()
     start = time.monotonic()
     journal = (root / f"rank{rank}.jsonl").open("x", buffering=1)
     for step in range(1, args.steps + 1):
+        cumulative_step = args.step_offset + step
         optimizer.zero_grad()
         batch = [next(stream) for _ in range(args.global_batch)]
         losses, ids = [], []
@@ -129,7 +133,7 @@ def main():
             losses.append(float(loss.detach())); ids.append([row["id"], language])
         average_gradients(selected.values())
         norm = optimizer.step()
-        record = {"step": step, "mean_loss": sum(losses) / len(losses), "grad_norm": norm,
+        record = {"step": cumulative_step, "local_step": step, "mean_loss": sum(losses) / len(losses), "grad_norm": norm,
                   "samples": ids, "elapsed": time.monotonic() - start}
         journal.write(json.dumps(record) + "\n")
         if rank == 0 and (step == 1 or step % 25 == 0):
@@ -137,13 +141,14 @@ def main():
         if step % args.save_every == 0 or step == args.steps:
             barrier()
             if rank == 0:
-                save_repair_checkpoint(model, root / f"step_{step:06d}.pt", stage="grounding", steps=step,
+                save_repair_checkpoint(model, root / f"step_{cumulative_step:06d}.pt", stage="grounding", steps=cumulative_step,
                     parent=args.checkpoint, fg_supervision="off", provenance={"plan": str(root / "plan.json")})
-                evaluate(step)
+                evaluate(cumulative_step)
             barrier()
     journal.close()
     if rank == 0:
-        (root / "complete.json").write_text(json.dumps({"complete": True, "optimizer_steps": args.steps}))
+        (root / "complete.json").write_text(json.dumps({"complete": True,
+            "optimizer_steps": args.step_offset + args.steps, "local_optimizer_steps": args.steps}))
     if world > 1:
         dist.destroy_process_group()
 

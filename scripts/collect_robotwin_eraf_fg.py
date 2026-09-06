@@ -51,6 +51,7 @@ def main():
     ap.add_argument("--scenes", type=int, default=30)
     ap.add_argument("--holdout-scenes", type=int, default=6)
     ap.add_argument("--max-attempts", type=int, default=120)
+    ap.add_argument("--candidate-order", choices=["late_first", "early_first"], default="late_first")
     args = ap.parse_args()
     if not 80000000 <= args.start_seed < 81000000 or args.start_seed + args.max_attempts >= 81000000:
         ap.error("Use the reserved new-training seed range [80000000,81000000).")
@@ -70,14 +71,15 @@ def main():
         validate_correction, assert_scene_disjoint, scene_key)
     from experiments.robotwin.eraf_fg_collection import (
         run_failure_rollout, replay_prefix, record_continuation, continue_to_goal,
-        replay_continuation, full_goal)
+        replay_continuation, full_goal, physical_state)
     from experiments.robotwin.pgc_data import array_sha256, pair_spec_from_source_task
-    from experiments.robotwin.pgc_task_variants import install_pgc_task_contract
+    from experiments.robotwin.pgc_task_variants import install_pgc_task_contract, play_variant
+    from experiments.robotwin.eraf_fg_contract import verify_replayed_state
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _capture_data_type, _close
     from scripts.train_robotwin_cf_decision_adapter import load_policy
     manifest = json.loads(Path(args.manifest).read_text())
     excluded = historical_scene_keys(manifest["states"])
-    policy = load_policy(SimpleNamespace(checkpoint=args.checkpoint, seed=42), manifest)
+    policy = None
     spec = pair_spec_from_source_task(args.task)
     task, task_args = _load_robotwin_args(robotwin_root=Path(args.robotwin_root).resolve(),
         task_name=args.task, task_config=args.task_config, output_root=root)
@@ -106,15 +108,36 @@ def main():
             try:
                 setup(seed)
                 texts = instructions(task, spec)
+                initial = physical_state(task)
+                play_variant(task, spec, spec.counterfactual_variant)
+                reachable = bool(task.plan_success and full_goal(task, spec))
+                close()
+                screening = scene | {"initial_cf_expert_reachable": reachable,
+                    "purpose": "initial scene feasibility screening only; not an FG correction",
+                    "initial_state_sha256": array_sha256(initial)}
+                (folder / "initial_expert_screen.json").write_text(json.dumps(screening, indent=2))
+                if not reachable:
+                    journal.write(json.dumps(screening | {"status": "initial_expert_rejected"}) + "\n")
+                    print(f"[screen-rejected] {args.task} seed={seed}", flush=True)
+                    continue
+                if policy is None:
+                    policy = load_policy(SimpleNamespace(checkpoint=args.checkpoint, seed=42), manifest)
+                setup(seed)
+                verify_replayed_state(initial, physical_state(task))
                 trace = run_failure_rollout(task, policy, spec, texts["target"])
                 np.savez_compressed(folder / "failure_rollout.npz", initial=trace["initial"], actions=trace["actions"],
                     capture_steps=np.array(list(trace["states"])), states=np.stack(list(trace["states"].values())))
+                (folder / "failure_audit.json").write_text(json.dumps(trace["audit"] | {
+                    "source_instruction": texts["source"], "target_instruction": texts["target"],
+                    "rollout_checkpoint_sha256": checkpoint_hash}, indent=2))
                 close()
                 if trace["audit"]["target"]:
                     journal.write(json.dumps(scene | {"status": "already_cf_success"}) + "\n")
                     continue
                 kind = failure_kind(source_ever_success=trace["audit"]["source"], cf_ever_success=False)
                 candidates = candidate_replans(trace["states"])
+                if args.candidate_order == "early_first":
+                    candidates.sort()
                 obtained = False
                 for tried, step in enumerate(candidates, 1):
                     try:
@@ -122,10 +145,12 @@ def main():
                         error = replay_prefix(task, spec, trace, step)
                         with record_continuation(task) as (controls, frames):
                             continue_to_goal(task, spec)
-                        okay = task.plan_success and full_goal(task, spec) and len(frames) >= 12
+                        details = {"plan_success": bool(task.plan_success),
+                                   "full_goal": full_goal(task, spec), "frames": len(frames)}
+                        okay = details["plan_success"] and details["full_goal"] and len(frames) >= 12
                         close()
                         if not okay:
-                            raise ValueError("Expert continuation did not complete/release the full goal.")
+                            raise ValueError(f"Expert continuation failed: {details}")
                         for _ in range(2):
                             setup(seed)
                             error = max(error, replay_prefix(task, spec, trace, step))
