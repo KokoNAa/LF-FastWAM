@@ -18,12 +18,13 @@ def main():
     parser.add_argument("--step", type=int, default=24)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--robotwin-root", required=True)
+    parser.add_argument("--initial-expert", action="store_true")
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     import numpy as np
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _capture_data_type, _close
     from experiments.robotwin.pgc_data import pair_spec_from_source_task
-    from experiments.robotwin.pgc_task_variants import install_pgc_task_contract
+    from experiments.robotwin.pgc_task_variants import install_pgc_task_contract, play_variant
     from experiments.robotwin.eraf_fg_collection import replay_prefix, record_continuation, continue_to_goal, full_goal
     root = Path(args.trace).resolve().parent
     with np.load(args.trace) as handle:
@@ -36,7 +37,8 @@ def main():
     options.update(data_type=_capture_data_type(options), eval_mode=True, need_plan=True, save_data=False, render_freq=0)
     task._pgc_active_variant = spec.counterfactual_variant
     task.setup_demo(now_ep_num=0, seed=args.seed, **options)
-    print("prefix", args.step, "drift", replay_prefix(task, spec, trace, args.step), flush=True)
+    if not args.initial_expert:
+        print("prefix", args.step, "drift", replay_prefix(task, spec, trace, args.step), flush=True)
     print("actors", [a.get_pose().p.tolist() for a in task.pgc_scene_actors()], flush=True)
     original, count = task.move, 0
 
@@ -50,7 +52,10 @@ def main():
     task.move = move
     with record_continuation(task) as (controls, frames):
         try:
-            continue_to_goal(task, spec)
+            if args.initial_expert:
+                play_variant(task, spec, spec.counterfactual_variant)
+            else:
+                continue_to_goal(task, spec)
         except Exception as exc:
             print("exception", repr(exc), flush=True)
     print(json.dumps({"plan_success": bool(task.plan_success), "full_goal": full_goal(task, spec),

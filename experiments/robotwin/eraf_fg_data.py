@@ -36,7 +36,7 @@ class RawReplay:
 
     def state(self, row, language):
         import h5py
-        if row.get("native_retention"):
+        if row.get("native_retention") or row.get("cf_retention"):
             with np.load(row["capture_path"], allow_pickle=False) as source:
                 return source["state"][row["frame_index"]].copy()
         path, frame = self.locate(row, language)

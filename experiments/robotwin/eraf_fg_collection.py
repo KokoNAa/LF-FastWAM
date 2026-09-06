@@ -15,8 +15,12 @@ def physical_state(task):
     """Include velocities omitted by the historical scene-pose identity check."""
     values = [scene_state_vector(task).astype(np.float64)]
     for actor in task.pgc_scene_actors():
-        dynamic = [c for c in actor.actor.get_components()
+        components = actor.actor.get_components()
+        dynamic = [c for c in components
                    if hasattr(c, "linear_velocity") and hasattr(c, "angular_velocity")]
+        if not dynamic and any(type(c).__name__ == "PhysxRigidStaticComponent" for c in components):
+            values.append(np.zeros(6))
+            continue
         if len(dynamic) != 1:
             raise ValueError("Cannot audit actor linear/angular velocities.")
         values.extend([np.asarray(dynamic[0].linear_velocity), np.asarray(dynamic[0].angular_velocity)])
@@ -102,13 +106,17 @@ def continue_to_goal(task, spec):
         task.move(task.open_gripper(arm_tag=arm))
         task.move(task.move_by_displacement(arm_tag=arm, z=.08))
     if spec.source_task == "blocks_ranking_rgb":
-        # Clear occupied goal slots before reversing the complete ordering.
+        # Clear a slot only when a wrong actor occupies it. Initial scattered
+        # blocks need no extra detour through a buffer.
         task.last_gripper = None
-        buffers = ([-.20, .07, .74 + task.table_z_bias, 0, 1, 0, 0],
-                   [0., .09, .74 + task.table_z_bias, 0, 1, 0, 0],
-                   [.20, .07, .74 + task.table_z_bias, 0, 1, 0, 0])
-        for actor, target in zip(task.pgc_scene_actors(), buffers, strict=True):
-            task.pick_and_place_block(actor, target)
+        actors = task.pgc_scene_actors()
+        slots = (task.block3_target_pose, task.block2_target_pose, task.block1_target_pose)
+        for index, actor in enumerate(actors):
+            for other, slot in enumerate(slots):
+                if other != index and np.linalg.norm(actor.get_pose().p[:2] - np.asarray(slot[:2])) < .055:
+                    x = -.20 if actor.get_pose().p[0] < 0 else .20
+                    task.pick_and_place_block(actor, [x, -.27, .74 + task.table_z_bias, 0, 1, 0, 0])
+                    break
     play_variant(task, spec, spec.counterfactual_variant)
 
 
