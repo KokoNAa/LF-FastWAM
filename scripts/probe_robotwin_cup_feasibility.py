@@ -19,13 +19,14 @@ def main():
     parser.add_argument('--task-config', choices=['demo_clean', 'demo_randomized'], default='demo_clean')
     parser.add_argument('--start-seed', type=int, default=92000000)
     parser.add_argument('--scenes', type=int, default=2)
+    parser.add_argument('--relation', choices=['behind', 'front'], default='behind')
     args = parser.parse_args()
     if not 92000000 <= args.start_seed < 92000100 or not 1 <= args.scenes <= 4:
         parser.error('Use the dedicated diagnostic-only seed range and at most four scenes.')
     import numpy as np
     from experiments.robotwin.cup_counterfactual import (
         initialize_geometry, counterfactual_success, play_counterfactual,
-        SOURCE_INSTRUCTION, TARGET_INSTRUCTION)
+        SOURCE_INSTRUCTION, TARGET_INSTRUCTION, FRONT_INSTRUCTION)
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _close
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -42,7 +43,7 @@ def main():
             task.check_success = MethodType(native_success if variant == 'source' else counterfactual_success, task)
             try:
                 task.setup_demo(now_ep_num=0, seed=seed, **deepcopy(config))
-                initialize_geometry(task)
+                initialize_geometry(task, direction=1 if args.relation == 'behind' else -1)
                 observation = task.get_obs()
                 state = {'qpos': np.array(observation['joint_action']['vector']),
                          'cup': np.r_[task.cup.get_pose().p, task.cup.get_pose().q],
@@ -70,7 +71,8 @@ def main():
                 _close(task)
             (output/'results.json').write_text(json.dumps({'complete': False, 'records': results}, indent=2))
     report = {'complete': True, 'task': 'place_empty_cup', 'task_config': args.task_config,
-              'source_instruction': SOURCE_INSTRUCTION, 'counterfactual_instruction': TARGET_INSTRUCTION,
+              'relation': args.relation, 'source_instruction': SOURCE_INSTRUCTION,
+              'counterfactual_instruction': TARGET_INSTRUCTION if args.relation == 'behind' else FRONT_INSTRUCTION,
               'scope': 'Expert feasibility only. Diagnostic seeds are excluded from training and reported development/test sets.',
               'records': results, 'jointly_feasible_scenes': sum(all(v['success'] for v in results if v['seed']==seed)
                   for seed in range(args.start_seed, args.start_seed+args.scenes))}
