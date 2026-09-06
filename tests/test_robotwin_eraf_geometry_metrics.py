@@ -37,3 +37,28 @@ def test_calibration_excludes_role_attention_and_action_parameters():
                  'guard.entity_relation_affordance.role_decoder.subject_role',
                  'guard.entity_relation_affordance.query_delta_projection.weight'):
         assert not geometry_parameter(name)
+
+
+def test_trajectory_audit_covers_later_phases_without_adding_scenes(tmp_path):
+    import h5py
+    import numpy as np
+    from scripts.audit_robotwin_eraf_fg_semantics import trajectory_queries
+    path = tmp_path / 'expert.h5'
+    with h5py.File(path, 'w') as h:
+        positions = np.zeros((12, 1, 3)); positions[4:, 0, 2] = .1
+        h['pgc_entity_state/entity_positions'] = positions
+        for lang in ('source', 'target'):
+            truth = np.zeros((12, 1)); truth[8:, 0] = 1
+            h[f'pgc_entity_state/{lang}_predicate_truth'] = truth
+            h[f'pgc_entity_state/{lang}_clause_valid'] = np.ones((12, 1), dtype=bool)
+            h[f'pgc_entity_state/{lang}_subject_indices'] = np.zeros((12, 1), dtype=int)
+    class Raw:
+        def locate(self, row, language):
+            return path, 0
+    rows = [{'id': 'heldout', 'scene_seed': 123, 'replay_split': 'replay_holdout'}]
+    queries = trajectory_queries(rows + rows, Raw())
+    assert len(queries) == 10  # Duplicated manifest rows do not duplicate audit frames.
+    for lang in ('source', 'target'):
+        frames = [row[lang + '_frame_index'] for row, language in queries if language == lang]
+        assert frames == [0, 2, 6, 10, 11]
+    assert {row['scene_seed'] for row, _ in queries} == {123}
