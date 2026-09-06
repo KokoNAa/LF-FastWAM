@@ -27,6 +27,8 @@ bash scripts/launch_robotwin_target_cf_retention.sh \
 
 用 `prepare_robotwin_eraf_fg_replay.py worker` 对六个新的 `shard*/manifest.json` 准备缓存，基础银行使用 `bank_full_v2/manifest.json`，缓存教师使用 `grounding3000/step_002250.pt`。随后用同一工具的 `merge` 模式追加。该入口兼容新的文件元数据记录，不要求运行旧的整批哈希汇总工具。
 
+缓存衔接已用本地集成测试覆盖真实 NPZ 读取、紧凑缓存写入/重建及合并；GPU 编码器由测试替身提供，因此这不是上机验证。新缓存分片记录输入文件元数据，合并前检查教师、父银行、采集清单、分片计数和缓存文件是否匹配；旧父银行审计不会冒充追加后的完整审计。
+
 训练时明确指定所有五项 CF 保持任务：
 
 ```text

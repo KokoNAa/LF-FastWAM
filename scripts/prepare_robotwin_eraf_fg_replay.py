@@ -28,7 +28,7 @@ def main():
     from scripts.collect_robotwin_eraf_fg import historical_scene_keys
     from experiments.robotwin.eraf_fg_contract import validate_correction, scene_key
     from experiments.robotwin.eraf_fg_data import (
-        retention_language, validate_retention_scene, verify_retention_capture)
+        retention_language, validate_retention_scene, verify_retention_capture, file_metadata)
     from experiments.robotwin.cup_full_goal import FORMAT as CUP_FORMAT, validate_cup_correction
     groups = []
     seen = set()
@@ -60,9 +60,21 @@ def main():
         rows = []
         for shard in range(args.shards):
             report = json.loads((root / f'shard{shard}/complete.json').read_text())
-            if not report['complete'] or report['collections'] != args.collections:
+            if (not report['complete'] or report['collections'] != args.collections or
+                    report['shard'] != shard or report['shards'] != args.shards):
                 raise ValueError('Cache shard provenance mismatch.')
-            rows.extend(json.loads(line) for line in (root / f'shard{shard}/states.jsonl').read_text().splitlines())
+            if report.get('cache_format') == 'robotwin_eraf_fg_cache_v2':
+                actual = {'parent_manifest': file_metadata(args.manifest),
+                          'checkpoint': file_metadata(args.checkpoint),
+                          'collections': [file_metadata(path) for path in args.collections]}
+                if report['input_metadata'] != actual:
+                    raise ValueError('Cache inputs changed or differ from the requested preparation checkpoint.')
+            shard_rows = [json.loads(line) for line in (root / f'shard{shard}/states.jsonl').read_text().splitlines()]
+            if len(shard_rows) != report['states'] or any(
+                    Path(row['preparation_checkpoint']).resolve() != Path(args.checkpoint).resolve()
+                    or not Path(row['payload']).is_file() for row in shard_rows):
+                raise ValueError('Prepared payload count, file or checkpoint mismatch.')
+            rows.extend(shard_rows)
         if {scene_key(r) for r in rows} != seen:
             raise ValueError('Missing prepared scenes.')
         train = {scene_key(r) for r in rows if r['replay_split'] == 'train'}
@@ -78,6 +90,9 @@ def main():
         return
     if not 0 <= args.shard < args.shards:
         ap.error('Invalid shard.')
+    input_metadata = {'parent_manifest': file_metadata(args.manifest),
+                      'checkpoint': file_metadata(args.checkpoint),
+                      'collections': [file_metadata(path) for path in args.collections]}
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     import numpy as np
     import torch
@@ -155,8 +170,14 @@ def main():
                 count += 1
             print(f'[cache] shard={args.shard} scene={record["scene_seed"]} windows={count}', flush=True)
     journal.close()
+    actual_metadata = {'parent_manifest': file_metadata(args.manifest),
+                       'checkpoint': file_metadata(args.checkpoint),
+                       'collections': [file_metadata(path) for path in args.collections]}
+    if actual_metadata != input_metadata:
+        raise ValueError('Cache inputs changed during preparation.')
     (shard / 'complete.json').write_text(json.dumps({'complete': True, 'states': count,
-        'collections': args.collections, 'shard': args.shard, 'shards': args.shards}))
+        'collections': args.collections, 'shard': args.shard, 'shards': args.shards,
+        'cache_format': 'robotwin_eraf_fg_cache_v2', 'input_metadata': input_metadata}))
 
 
 if __name__ == '__main__':
