@@ -15,6 +15,7 @@ sys.path[:0] = [str(REPO), str(REPO / 'src')]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--robotwin-root', type=Path, default=REPO/'third_party/RoboTwin')
     parser.add_argument('--task-config', choices=['demo_clean', 'demo_randomized'], default='demo_clean')
     parser.add_argument('--start-seed', type=int, default=92000000)
     parser.add_argument('--scenes', type=int, default=2)
@@ -28,7 +29,7 @@ def main():
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _close
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
-    task, config = _load_robotwin_args(robotwin_root=REPO/'third_party/RoboTwin',
+    task, config = _load_robotwin_args(robotwin_root=args.robotwin_root.resolve(),
         task_name='place_empty_cup', task_config=args.task_config, output_root=output)
     config.update(eval_mode=True, need_plan=True, save_data=False, render_freq=0)
     config['data_type'] = dict(config.get('data_type') or {}, rgb=True, qpos=True,
