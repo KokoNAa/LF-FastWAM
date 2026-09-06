@@ -77,3 +77,21 @@ def test_local_and_full_draw_identical_scenes_and_preservation_examples():
                 assert b['frame_index'] == 0
             else:
                 assert a['id'] == b['id']
+
+
+def test_resume_preserves_sub_bfloat16_updates_and_optimizer_moments():
+    from experiments.robotwin.eraf_fg_bridge import MasterAdamW
+    a = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    original = MasterAdamW([a], lr=1e-5)
+    for _ in range(100):
+        original.zero_grad(); a.grad = torch.tensor([.2, -.3], dtype=a.dtype); original.step()
+    state = copy.deepcopy(original.state_dict())
+    b = torch.nn.Parameter(a.detach().clone())
+    resumed = MasterAdamW([b], lr=1e-5)
+    resumed.load_state_dict(state)
+    for index in range(100):
+        grad = torch.tensor([.2 + index * .01, -.3], dtype=a.dtype)
+        for optimizer, live in ((original, a), (resumed, b)):
+            optimizer.zero_grad(); live.grad = grad.clone(); optimizer.step()
+    assert torch.equal(original.master[0], resumed.master[0])
+    assert torch.equal(a, b)

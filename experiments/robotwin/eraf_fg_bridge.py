@@ -321,3 +321,14 @@ class MasterAdamW:
     def state_dict(self):
         return {"optimizer": self.optimizer.state_dict(),
                 "master": [p.detach().cpu().clone() for p in self.master]}
+
+    def load_state_dict(self, state):
+        import torch
+        values = state['master']
+        if len(values) != len(self.master) or any(a.shape != b.shape for a, b in zip(values, self.master, strict=True)):
+            raise ValueError('FP32 optimizer master geometry changed.')
+        self.optimizer.load_state_dict(state['optimizer'])
+        with torch.no_grad():
+            for master, live, value in zip(self.master, self.live, values, strict=True):
+                master.copy_(value.to(master))
+                live.copy_(master)

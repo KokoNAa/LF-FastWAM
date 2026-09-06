@@ -27,10 +27,11 @@ def main():
     ap.add_argument('--cf-weight', type=float, default=1.)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--disable-seen-language-augmentation', action='store_true')
+    ap.add_argument('--resume-state', help='Resume saved FP32 masters and optimizer at the supplied checkpoint.')
     args = ap.parse_args()
     import torch
     import torch.distributed as dist
-    from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint
+    from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint, validate_payload, file_sha256
     from experiments.robotwin.eraf_fg_data import RawReplay
     from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream
     from experiments.robotwin.compact_replay import ReplayPayloads
@@ -43,6 +44,20 @@ def main():
         ap.error('Positive steps and world size dividing global batch12 required.')
     if args.stage == 'interface' and args.eraf == 'off':
         ap.error('ERAF-off has no interface warmup.')
+    parent_payload = validate_payload(torch.load(args.checkpoint, map_location='cpu', weights_only=False))
+    if args.resume_state:
+        if (parent_payload['stage'] != args.stage or parent_payload['fg_supervision'] != args.fg
+                or parent_payload['provenance'].get('eraf') != args.eraf):
+            raise ValueError('Resumed checkpoint must have the same stage and ablation settings.')
+    elif args.stage == 'interface':
+        if parent_payload['stage'] != 'grounding':
+            raise ValueError('Every interface ablation must start from the same semantic checkpoint.')
+    elif args.eraf == 'on':
+        if parent_payload['stage'] != 'interface' or parent_payload['fg_supervision'] != args.fg:
+            raise ValueError('Joint ERAF training needs its own matching interface arm; full FG must not leak into controls.')
+    elif parent_payload['stage'] != 'grounding':
+        raise ValueError('ERAF-off joint controls must start from the common unchanged-policy semantic checkpoint.')
+    del parent_payload
     torch.cuda.set_device(local)
     torch.manual_seed(args.seed)
     if world > 1:
@@ -84,20 +99,45 @@ def main():
     teachers = {'correct': NativeTeacher(model, adapters, args.correct_teacher),
                 'cf': NativeTeacher(model, adapters, args.cf_teacher)}
     optimizer = MasterAdamW(selected.values(), lr=args.learning_rate)
+    start = 0
+    optimization_contract = {k: getattr(args, k) for k in ('stage', 'fg', 'eraf', 'seed',
+        'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation')}
+    optimization_contract['manifest_sha256'] = file_sha256(args.manifest)
+    adjustments = {}
+    if args.resume_state:
+        state = torch.load(args.resume_state, map_location='cpu', weights_only=False)
+        if state['parameter_names'] != list(selected) or state['checkpoint_sha256'] != file_sha256(args.checkpoint):
+            raise ValueError('Optimizer does not belong to this exact checkpoint and parameter scope.')
+        for key, value in optimization_contract.items():
+            if state['optimization_contract'][key] != value:
+                if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
+                    raise ValueError(f'Resume changed immutable training contract: {key}')
+                adjustments[key] = {'from': state['optimization_contract'][key], 'to': value}
+        optimizer.load_state_dict(state['optimizer'])
+        for group in optimizer.optimizer.param_groups:
+            group['lr'] = args.learning_rate
+        start = int(state['step'])
+        if args.steps <= start:
+            raise ValueError('Resume total-step target must exceed saved optimizer steps.')
+        del state
     payloads = ReplayPayloads(rows, model.device)
     raw = RawReplay(args.source_bank)
     stream = mixture_stream(rows, args.seed, args.fg)
+    for _ in range(start):
+        next(stream)
     from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
     seen_contexts = ({} if args.disable_seen_language_augmentation else build_seen_contexts(model, REPO,
         [r for r in rows if not r.get('native_retention') and not r.get('cf_retention')]))
     if rank == 0:
         (root / 'plan.json').write_text(json.dumps(vars(args) | {'world_size': world, 'global_batch': 12,
+            'start_optimizer_step': start, 'resume_adjustments': adjustments,
+            'optimization_contract': optimization_contract,
             'trainable_parameters': list(selected), 'optimizer_precision': 'FP32 master weights',
             'mixture': {'correct_retention': 4, 'cf_retention': 2,
                         'expert_pairs': 6 if args.fg == 'off' else 3, 'fg': 0 if args.fg == 'off' else 3}}, indent=2))
     started = time.monotonic()
     journal = (root / f'rank{rank}.jsonl').open('x', buffering=1)
-    for step in range(1, args.steps + 1):
+    for step in range(start + 1, args.steps + 1):
         optimizer.zero_grad()
         batch = next(stream)
         reports = []
@@ -129,19 +169,26 @@ def main():
         norm = optimizer.step()
         journal.write(json.dumps({'step': step, 'grad_norm': norm, 'examples': reports,
                                   'elapsed': time.monotonic() - started}) + '\n')
-        if rank == 0 and (step == 1 or step % 10 == 0):
-            print(f'[action] step={step}/{args.steps} seconds_per_step={(time.monotonic()-started)/step:.2f} grad={norm:.4f}', flush=True)
+        if rank == 0 and (step == start + 1 or step % 10 == 0):
+            print(f'[action] step={step}/{args.steps} seconds_per_step={(time.monotonic()-started)/(step-start):.2f} grad={norm:.4f}', flush=True)
         if step % args.save_every == 0 or step == args.steps:
             barrier()
             if rank == 0:
-                save_repair_checkpoint(model, root / f'step_{step:06d}.pt', stage=args.stage,
+                checkpoint_path = root / f'step_{step:06d}.pt'
+                save_repair_checkpoint(model, checkpoint_path, stage=args.stage,
                     steps=step, parent=args.checkpoint, fg_supervision=args.fg,
                     provenance={'plan': str(root / 'plan.json'), 'eraf': args.eraf})
+                torch.save({'step': step, 'checkpoint': str(checkpoint_path),
+                    'checkpoint_sha256': file_sha256(checkpoint_path), 'parameter_names': list(selected),
+                    'optimization_contract': optimization_contract, 'optimizer': optimizer.state_dict()},
+                    root / 'optimizer_last.tmp')
+                (root / 'optimizer_last.tmp').replace(root / 'optimizer_last.pt')
                 print(f'[checkpoint] step={step}', flush=True)
             barrier()
     journal.close()
     if rank == 0:
-        (root / 'complete.json').write_text(json.dumps({'complete': True, 'optimizer_steps': args.steps}))
+        (root / 'complete.json').write_text(json.dumps({'complete': True,
+            'optimizer_steps': args.steps, 'local_optimizer_steps': args.steps - start}))
     if world > 1:
         dist.destroy_process_group()
 
