@@ -101,7 +101,7 @@ def mixture_stream(rows, seed, fg='full'):
             continue
         kind = ('correct' if row.get('native_retention') else 'cf' if row.get('cf_retention')
                 else 'fg' if row.get('fg_correction') else 'pair')
-        if kind == 'fg' and (fg == 'off' or (fg == 'local' and row['frame_index'] != 0)):
+        if kind == 'fg' and fg == 'off':
             continue
         buckets[kind].append(row)
     counts = {'correct': 4, 'cf': 2, 'pair': 6 if fg == 'off' else 3, 'fg': 0 if fg == 'off' else 3}
@@ -109,7 +109,14 @@ def mixture_stream(rows, seed, fg='full'):
                for i, k in enumerate(counts) if counts[k]}
     import random
     rng = random.Random(seed)
+    first = {(r['pair_id'], r['task_config'], r['scene_seed']): r
+             for r in buckets['fg'] if r['frame_index'] == 0}
     while True:
         batch = [next(streams[k]) for k, n in counts.items() for _ in range(n)]
+        if fg == 'local':
+            # Draw the identical full-arm schedule, then expose only each
+            # scene's failure-start observation and its first12 actions.
+            batch = [first[r['pair_id'], r['task_config'], r['scene_seed']]
+                     if r.get('fg_correction') else r for r in batch]
         rng.shuffle(batch)
         yield batch

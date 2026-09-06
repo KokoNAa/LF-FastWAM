@@ -58,3 +58,22 @@ def test_local_ablation_rejects_a_later_full_goal_window(case):
         backward_example(model, {'fg_correction': True, 'frame_index': 8},
             {'captured': {'target': captured}, 'references': {'target': noise}},
             noise, time, teachers={}, fg='local')
+
+
+def test_local_and_full_draw_identical_scenes_and_preservation_examples():
+    from experiments.robotwin.eraf_fg_training import mixture_stream
+    rows = []
+    for kind in ('native_retention', 'cf_retention', 'pair', 'fg_correction'):
+        for scene in range(3):
+            for frame in (0, 8, 16):
+                rows.append({'id': f'{kind}_{scene}_{frame}', 'pair_id': kind,
+                             'task_config': 'demo_clean', 'scene_seed': scene,
+                             'replay_split': 'train', 'frame_index': frame, kind: True})
+    full, local = mixture_stream(rows, 42, 'full'), mixture_stream(rows, 42, 'local')
+    for _ in range(10):
+        for a, b in zip(next(full), next(local), strict=True):
+            assert (a['pair_id'], a['scene_seed']) == (b['pair_id'], b['scene_seed'])
+            if a.get('fg_correction'):
+                assert b['frame_index'] == 0
+            else:
+                assert a['id'] == b['id']
