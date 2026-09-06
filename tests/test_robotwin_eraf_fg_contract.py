@@ -111,3 +111,9 @@ def test_goal_requires_both_breakthroughs_native_floor_and_each_old_cf_task():
     bad["cells"].pop()
     with pytest.raises(ValueError, match="complete"):
         acceptance(bad)
+def test_historical_scene_keys_resolve_legacy_pair_metadata():
+    from scripts.collect_robotwin_eraf_fg import historical_scene_keys
+    row = {"pair_id": "place_a2b_left_to_right", "task_config": "demo_clean", "scene_seed": 9}
+    assert historical_scene_keys([row]) == {("place_a2b_left", "demo_clean", 9)}
+    with pytest.raises(ValueError, match="contradicts"):
+        historical_scene_keys([dict(row, source_task="blocks_ranking_rgb")])

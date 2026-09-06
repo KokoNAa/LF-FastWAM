@@ -15,6 +15,19 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "src")]
 
 
+def historical_scene_keys(rows):
+    from experiments.robotwin.pgc_data import ROBOTWIN_ERAF_PAIR_SPECS
+    from experiments.robotwin.eraf_fg_contract import scene_key
+    tasks = {spec.pair_id: spec.source_task for spec in ROBOTWIN_ERAF_PAIR_SPECS}
+    keys = set()
+    for row in rows:
+        task = tasks[row["pair_id"]]
+        if row.get("source_task", task) != task:
+            raise ValueError("Historical scene task contradicts the authoritative pair specification.")
+        keys.add(scene_key(dict(row, source_task=task)))
+    return keys
+
+
 def instructions(task, spec):
     from experiments.robotwin.decision_language_replay import (
         bound_spatial_instruction_pairs, seen_instruction_pairs)
@@ -63,7 +76,7 @@ def main():
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _capture_data_type, _close
     from scripts.train_robotwin_cf_decision_adapter import load_policy
     manifest = json.loads(Path(args.manifest).read_text())
-    excluded = {scene_key(r) for r in manifest["states"]}
+    excluded = historical_scene_keys(manifest["states"])
     policy = load_policy(SimpleNamespace(checkpoint=args.checkpoint, seed=42), manifest)
     spec = pair_spec_from_source_task(args.task)
     task, task_args = _load_robotwin_args(robotwin_root=Path(args.robotwin_root).resolve(),
