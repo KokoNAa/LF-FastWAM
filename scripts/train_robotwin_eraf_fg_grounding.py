@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 from collections import defaultdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -17,8 +18,11 @@ sys.path[:0] = [str(REPO), str(REPO / "src")]
 def balanced_rows(rows, seed):
     groups = defaultdict(list)
     for row in rows:
-        if row["replay_split"] == "train" and not row.get("native_retention"):
+        if row["replay_split"] == "train" and not any(row.get(k) for k in
+                ('native_retention', 'cf_retention', 'fg_correction')):
             groups[row["pair_id"], row["task_config"]].append(row)
+    if not groups:
+        raise ValueError('No original expert training rows.')
     rng = random.Random(seed)
     while True:
         keys = sorted(groups)
@@ -38,11 +42,17 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--step-offset", type=int, default=0,
                     help="Prior semantic optimizer steps; extension restarts optimizer explicitly.")
+    ap.add_argument('--geometry-only', action='store_true')
+    ap.add_argument('--position-weight', type=float)
+    ap.add_argument('--anchor-weight', type=float)
     args = ap.parse_args()
     world, rank, local = (int(os.environ.get(k, d)) for k, d in
                            (("WORLD_SIZE", "1"), ("RANK", "0"), ("LOCAL_RANK", "0")))
     if min(args.steps, args.save_every, args.global_batch) < 1 or args.global_batch % world:
         ap.error("Positive counts and global batch divisible by world size required.")
+    if any(value is not None and (not __import__('math').isfinite(value) or value <= 0)
+           for value in (args.position_weight, args.anchor_weight)):
+        ap.error('Geometry loss weights must be finite and positive.')
     import torch
     import torch.distributed as dist
     from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint
@@ -51,6 +61,7 @@ def main():
     from experiments.robotwin.same_state_repair import move_cache
     from scripts.train_robotwin_cf_decision_adapter import average_gradients
     from fastwam.models.wan22.entity_relation_affordance import entity_relation_affordance_loss, masks_to_patch_targets
+    from experiments.robotwin.eraf_geometry_metrics import geometry_parameter, geometry_errors, summarize_geometry
     torch.cuda.set_device(local)
     torch.manual_seed(args.seed)
     if world > 1:
@@ -69,11 +80,21 @@ def main():
     policy = load_policy(args.checkpoint, manifest, device=f"cuda:{local}", seed=args.seed)
     model = policy.model
     selected = trainable_parameters(model, "grounding")
+    if args.geometry_only:
+        for name, parameter in selected.items():
+            parameter.requires_grad_(geometry_parameter(name))
+        selected = {name: parameter for name, parameter in selected.items() if parameter.requires_grad}
+        if not selected:
+            raise ValueError('Geometry calibration selected no parameters.')
+    overrides = {name: value for name, value in
+        [('position', args.position_weight), ('anchor', args.anchor_weight)] if value is not None}
+    model.policy_guard_eraf_loss_weights = replace(model.policy_guard_eraf_loss_weights, **overrides)
     optimizer = MasterAdamW(selected.values(), lr=args.learning_rate)
     payloads = ReplayPayloads(rows, model.device)
     raw = RawReplay(args.source_bank, label_cache=args.label_cache)
     stream = balanced_rows(rows, args.seed)
-    validation = [r for r in rows if r["replay_split"] == "replay_holdout" and not r.get("native_retention")]
+    validation = [r for r in rows if r["replay_split"] == "replay_holdout" and not any(r.get(k)
+        for k in ('native_retention', 'cf_retention', 'fg_correction'))]
     if args.steps <= 2:
         validation = list({r["pair_id"]: r for r in validation}.values())
     if {r["pair_id"] for r in validation} != {r["pair_id"] for r in rows}:
@@ -82,7 +103,9 @@ def main():
         (root / "plan.json").write_text(json.dumps(vars(args) | {"world_size": world,
             "trainable_parameters": list(selected), "validation_states": len(validation),
             "policy_frozen": True, "optimizer_precision": "FP32 master weights",
-            "optimizer_restart": bool(args.step_offset)}, indent=2))
+            "optimizer_restart": bool(args.step_offset),
+            "loss_weights": asdict(model.policy_guard_eraf_loss_weights),
+            "selection_rule": "Minimum equal-task/language mean of position and goal error cm among role>=.8 and relation>=.9; baseline included; no action-test selection."}, indent=2))
 
     def evaluate(step):
         reports = []
@@ -102,18 +125,21 @@ def main():
                         correct = torch.gather(mask > 0, -1, index.unsqueeze(-1)).squeeze(-1)
                         hit += int((correct & keep).sum()); total += int(keep.sum())
                     relation = ((outputs["predicate_logits"].argmax(-1) == labels["predicate_ids"]) & valid)
-                    reports.append({"id": row["id"], "language": language, "role_hits": hit,
+                    reports.append({"id": row["id"], "pair_id": row['pair_id'], "language": language, "role_hits": hit,
                                     "role_count": total, "relation_hits": int(relation.sum()),
-                                    "relation_count": int(valid.sum())})
+                                    "relation_count": int(valid.sum()),
+                                    "geometry_cm": geometry_errors(outputs, labels)})
         role = sum(r["role_hits"] for r in reports) / max(1, sum(r["role_count"] for r in reports))
         relation = sum(r["relation_hits"] for r in reports) / max(1, sum(r["relation_count"] for r in reports))
         result = {"step": step, "role_accuracy": role, "relation_accuracy": relation,
-                  "eligible": role >= .8 and relation >= .9, "rows": reports}
+                  "eligible": role >= .8 and relation >= .9, "rows": reports,
+                  "geometry": summarize_geometry(reports)}
         (root / f"grounding_eval_{step:06d}.json").write_text(json.dumps(result, indent=2))
-        print(f"[grounding-eval] step={step} roles={role:.4f} relations={relation:.4f}", flush=True)
+        print(f"[grounding-eval] step={step} roles={role:.4f} relations={relation:.4f} geometry_cm={result['geometry']['selection_score_cm']:.3f}", flush=True)
+        return result
 
     if rank == 0:
-        evaluate(args.step_offset)
+        evaluations = [evaluate(args.step_offset)]
     barrier()
     start = time.monotonic()
     journal = (root / f"rank{rank}.jsonl").open("x", buffering=1)
@@ -143,10 +169,19 @@ def main():
             if rank == 0:
                 save_repair_checkpoint(model, root / f"step_{cumulative_step:06d}.pt", stage="grounding", steps=cumulative_step,
                     parent=args.checkpoint, fg_supervision="off", provenance={"plan": str(root / "plan.json")})
-                evaluate(cumulative_step)
+                evaluations.append(evaluate(cumulative_step))
             barrier()
     journal.close()
     if rank == 0:
+        eligible = [r for r in evaluations if r['eligible']]
+        best = min(eligible, key=lambda r: (r['geometry']['selection_score_cm'], r['step'])) if eligible else None
+        (root / 'selection.json').write_text(json.dumps({'complete': True,
+            'selected_step': best['step'] if best else None,
+            'selected_checkpoint': (args.checkpoint if best['step'] == args.step_offset else
+                str(root / f"step_{best['step']:06d}.pt")) if best else None,
+            'baseline_score_cm': evaluations[0]['geometry']['selection_score_cm'],
+            'selected_score_cm': best['geometry']['selection_score_cm'] if best else None,
+            'improved_over_parent': bool(best and best['geometry']['selection_score_cm'] < evaluations[0]['geometry']['selection_score_cm'])}, indent=2))
         (root / "complete.json").write_text(json.dumps({"complete": True,
             "optimizer_steps": args.step_offset + args.steps, "local_optimizer_steps": args.steps}))
     if world > 1:
