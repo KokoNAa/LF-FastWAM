@@ -78,3 +78,43 @@ def test_lora_training_flag_bridge_is_valid_and_does_not_mutate_source():
 def test_tiny_model_cannot_be_published_as_real_robotwin_checkpoint(case):
     with pytest.raises(ValueError, match="14-D"):
         validate_model_geometry(case[0])
+
+
+def test_interface_stage_keeps_semantic_heads_and_experts_frozen(case):
+    from experiments.robotwin.eraf_fg_bridge import trainable_parameters
+    model, captured, noisy, time = case
+    selected = trainable_parameters(model, "interface")
+    assert not any(p.requires_grad for p in model.mot.parameters())
+    assert not any("predicate_head" in n for n in selected)
+    assert any(n.startswith("guard.eraf_action_grounding_bridge.") for n in selected)
+    predict(model, captured, noisy, time).square().mean().backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in selected.values())
+
+
+def test_master_optimizer_accumulates_updates_below_bfloat16_spacing():
+    from experiments.robotwin.eraf_fg_bridge import MasterAdamW
+    live = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+    opt = MasterAdamW([live], lr=1e-5)
+    for _ in range(300):
+        opt.zero_grad()
+        live.grad = torch.ones_like(live)
+        opt.step()
+    assert .996 < opt.master[0].item() < .998
+    assert live.item() < 1
+
+
+def test_semantic_pretraining_path_matches_production_eraf_heads(case):
+    from experiments.robotwin.eraf_fg_data import grounding_outputs
+    model, captured, _, _ = case
+    seen = []
+    hook = model.policy_guard_modules["entity_relation_affordance"].register_forward_hook(
+        lambda module, inputs, output: seen.append(output[2]))
+    try:
+        build_cache(model, captured)
+    finally:
+        hook.remove()
+    production = seen[0]
+    actual, _ = grounding_outputs(model, captured)
+    for key in ("subject_attention", "reference_attention", "predicate_logits",
+                "predicate_truth_logits", "phase_logits", "clause_execution_probability"):
+        assert torch.equal(actual[key], production[key]), key

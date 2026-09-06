@@ -255,3 +255,69 @@ def masked_mse(prediction, target, valid):
         raise ValueError("Every action example needs a nonempty [B,T] validity mask.")
     squared = (prediction.float() - target.float()).square().mean(dim=-1)
     return ((squared * mask).sum(dim=1) / mask.sum(dim=1)).mean()
+
+
+ROUTE_PARTS = {"base_query_projection", "relation_attention", "query_delta_projection",
+               "embedding_delta_projection"}
+INTERFACE_PARTS = {"goal_graph", "goal_query_seeds", "eraf_action_grounding_bridge",
+                   "eraf_action_context_injector"}
+
+
+def trainable_parameters(model, stage: str, *, eraf=True):
+    """Freeze semantic prediction after grounding; train its action interfaces."""
+    import torch
+    if stage not in {"grounding", "interface", "joint"}:
+        raise ValueError("Unknown optimization stage.")
+    model.eval().requires_grad_(False)
+    selected = {}
+    if stage == "joint":
+        for name, p in model.mot.named_parameters():
+            if name.endswith((".lora_A", ".lora_B")):
+                p.data = p.data.to(torch.float32)
+                p.requires_grad_(True)
+                selected["mot." + name] = p
+    if eraf:
+        for name, p in model.policy_guard_modules.named_parameters():
+            parts = name.split(".")
+            interface = (parts[0] in INTERFACE_PARTS or
+                         (parts[0] == "entity_relation_affordance" and parts[1] in ROUTE_PARTS))
+            semantic = parts[0] == "entity_relation_affordance" and not interface
+            if (stage == "grounding" and semantic) or (stage != "grounding" and interface):
+                p.requires_grad_(True)
+                selected["guard." + name] = p
+    if not selected:
+        raise ValueError("The selected arm has no trainable parameters.")
+    return selected
+
+
+class MasterAdamW:
+    """Retain small updates in FP32 while preserving deployed BF16 arithmetic.
+
+    Updating BF16 weights directly at 1e-5 can discard repeated small updates.
+    The master parameters accumulate these updates before each model copy.
+    """
+    def __init__(self, parameters, *, lr, weight_decay=0.):
+        import torch
+        self.live = list(parameters)
+        self.master = [torch.nn.Parameter(p.detach().float().clone()) for p in self.live]
+        self.optimizer = torch.optim.AdamW(self.master, lr=lr, weight_decay=weight_decay)
+
+    def zero_grad(self):
+        self.optimizer.zero_grad(set_to_none=True)
+        for p in self.live:
+            p.grad = None
+
+    def step(self, max_norm=1.):
+        import torch
+        for live, master in zip(self.live, self.master, strict=True):
+            master.grad = live.grad.detach().float() if live.grad is not None else None
+        norm = torch.nn.utils.clip_grad_norm_(self.master, max_norm, error_if_nonfinite=True)
+        self.optimizer.step()
+        with torch.no_grad():
+            for live, master in zip(self.live, self.master, strict=True):
+                live.copy_(master)
+        return float(norm)
+
+    def state_dict(self):
+        return {"optimizer": self.optimizer.state_dict(),
+                "master": [p.detach().cpu().clone() for p in self.master]}
