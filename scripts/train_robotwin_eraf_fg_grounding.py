@@ -61,7 +61,7 @@ def main():
     from experiments.robotwin.same_state_repair import move_cache
     from scripts.train_robotwin_cf_decision_adapter import average_gradients
     from fastwam.models.wan22.entity_relation_affordance import entity_relation_affordance_loss, masks_to_patch_targets
-    from experiments.robotwin.eraf_geometry_metrics import geometry_parameter, geometry_errors, summarize_geometry
+    from experiments.robotwin.eraf_geometry_metrics import geometry_parameter, geometry_errors, summarize_geometry, semantic_qualification
     torch.cuda.set_device(local)
     torch.manual_seed(args.seed)
     if world > 1:
@@ -105,7 +105,7 @@ def main():
             "policy_frozen": True, "optimizer_precision": "FP32 master weights",
             "optimizer_restart": bool(args.step_offset),
             "loss_weights": asdict(model.policy_guard_eraf_loss_weights),
-            "selection_rule": "Minimum equal-task/language mean of position and goal error cm among role>=.8 and relation>=.9; baseline included; no action-test selection."}, indent=2))
+            "selection_rule": "Minimum equal-task/language mean of position and goal error cm among global AND EACH TARGET TASK role>=.8 and relation>=.9; baseline included; no action-test selection."}, indent=2))
 
     def evaluate(step):
         reports = []
@@ -131,8 +131,10 @@ def main():
                                     "geometry_cm": geometry_errors(outputs, labels)})
         role = sum(r["role_hits"] for r in reports) / max(1, sum(r["role_count"] for r in reports))
         relation = sum(r["relation_hits"] for r in reports) / max(1, sum(r["relation_count"] for r in reports))
+        qualification = semantic_qualification(reports)
         result = {"step": step, "role_accuracy": role, "relation_accuracy": relation,
-                  "eligible": role >= .8 and relation >= .9, "rows": reports,
+                  "eligible": role >= .8 and relation >= .9 and qualification['target_tasks_eligible'],
+                  "qualification": qualification, "rows": reports,
                   "geometry": summarize_geometry(reports)}
         (root / f"grounding_eval_{step:06d}.json").write_text(json.dumps(result, indent=2))
         print(f"[grounding-eval] step={step} roles={role:.4f} relations={relation:.4f} geometry_cm={result['geometry']['selection_score_cm']:.3f}", flush=True)

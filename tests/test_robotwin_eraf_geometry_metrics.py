@@ -1,6 +1,16 @@
 import pytest
 import torch
-from experiments.robotwin.eraf_geometry_metrics import geometry_errors, summarize_geometry, geometry_parameter
+from experiments.robotwin.eraf_geometry_metrics import geometry_errors, summarize_geometry, geometry_parameter, semantic_qualification
+
+
+def test_high_average_cannot_admit_a_failed_target_task():
+    rows = [dict(pair_id='place_a2b_left_to_right', role_hits=7, role_count=10, relation_hits=10, relation_count=10),
+            dict(pair_id='blocks_ranking_rgb_to_bgr', role_hits=10, role_count=10, relation_hits=10, relation_count=10)]
+    assert sum(r['role_hits'] for r in rows) / sum(r['role_count'] for r in rows) == .85
+    assert not semantic_qualification(rows)['target_tasks_eligible']
+    rows[0]['role_hits'] = 8
+    assert semantic_qualification(rows)['target_tasks_eligible']
+    assert not semantic_qualification(rows[1:])['target_tasks_eligible']
 
 
 def test_world_coordinate_scale_and_invalid_clause_exclusion():

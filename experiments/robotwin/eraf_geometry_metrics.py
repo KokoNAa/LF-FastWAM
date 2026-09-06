@@ -2,6 +2,23 @@
 from collections import defaultdict
 import math
 
+TARGET_PAIRS = ('place_a2b_left_to_right', 'blocks_ranking_rgb_to_bgr')
+
+
+def semantic_qualification(rows):
+    """The initial campaign requires each target task, not just the average."""
+    grouped = defaultdict(lambda: dict(role_hits=0, role_count=0, relation_hits=0, relation_count=0))
+    for row in rows:
+        for key in grouped[row['pair_id']]:
+            grouped[row['pair_id']][key] += row[key]
+    cells = {pair: dict(role_accuracy=counts['role_hits'] / max(1, counts['role_count']),
+                       relation_accuracy=counts['relation_hits'] / max(1, counts['relation_count']),
+                       **counts) for pair, counts in grouped.items()}
+    failures = [pair for pair in TARGET_PAIRS if pair not in cells
+                or cells[pair]['role_accuracy'] < .8 or cells[pair]['relation_accuracy'] < .9]
+    return {'target_tasks_eligible': not failures, 'failed_target_pairs': failures, 'per_pair': cells,
+            'rule': 'Each target task must have role accuracy>=.8 and relation accuracy>=.9.'}
+
 
 def geometry_parameter(name):
     return name.startswith((
