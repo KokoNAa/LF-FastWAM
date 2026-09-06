@@ -91,10 +91,20 @@ ROBOTWIN_ERAF_PAIR_SPECS = (
 
 ROBOTWIN_ERAF_PAIR_IDS = tuple(spec.pair_id for spec in ROBOTWIN_ERAF_PAIR_SPECS)
 
+# Explicitly selected replacement tasks do not alter the historical five-task defaults.
+ROBOTWIN_REPLACEMENT_PAIR_SPECS = (
+    RoboTwinPairSpec(pair_id='place_empty_cup_on_to_front', source_task='place_empty_cup',
+        counterfactual_task='place_empty_cup_front', source_variant='on_coaster',
+        counterfactual_variant='front_coaster', source_instruction='Place the empty cup on the coaster.',
+        counterfactual_instruction='Place the empty cup in front of the coaster on the table.',
+        strict_conflict_type='mutually_exclusive_spatial_relation', entity_names=('cup', 'coaster')),
+)
+
 
 def pair_spec_from_source_task(task_name: str) -> RoboTwinPairSpec:
     matches = [
-        spec for spec in ROBOTWIN_ERAF_PAIR_SPECS if spec.source_task == task_name
+        spec for spec in (*ROBOTWIN_ERAF_PAIR_SPECS, *ROBOTWIN_REPLACEMENT_PAIR_SPECS)
+        if spec.source_task == task_name
     ]
     if len(matches) != 1:
         raise ValueError(

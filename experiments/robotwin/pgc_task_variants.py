@@ -35,6 +35,8 @@ PREDICATE_IDS = {
 
 
 def _actors(task: Any, spec: RoboTwinPairSpec) -> list[Any]:
+    if spec.source_task == 'place_empty_cup':
+        return [task.cup, task.coaster]
     if spec.source_task.startswith("place_a2b_"):
         return [task.object, task.target_object]
     if spec.source_task == "stack_blocks_two":
@@ -198,6 +200,23 @@ def _burger_clauses(task: Any, variant: str) -> list[dict[str, Any]]:
 
 
 def _clauses(task: Any, spec: RoboTwinPairSpec, variant: str) -> list[dict[str, Any]]:
+    if spec.source_task == 'place_empty_cup':
+        from experiments.robotwin.cup_counterfactual import behind_goal
+        cup = np.asarray(task.cup.get_functional_point(0, 'pose').p)
+        coaster = np.asarray(task.coaster.get_functional_point(0, 'pose').p)
+        goal = coaster.copy()
+        if variant == 'on_coaster':
+            truth = np.linalg.norm(cup[:2]-coaster[:2]) < .035 and abs(cup[2]-coaster[2]) < .015
+            predicate = 'on'
+        elif variant == 'front_coaster':
+            goal[1] -= .13; goal[2] = task._cup_cf_floor_z
+            rotation = task.cup.get_pose().to_transformation_matrix()[:3,:3]
+            upright = float((rotation @ task._cup_cf_local_up)[2])
+            truth = behind_goal(cup, coaster, task._cup_cf_floor_z, upright, True, True, -1)
+            predicate = 'front'
+        else:
+            raise ValueError('Unknown cup relation variant')
+        return [_clause(subject=0, reference=1, predicate=predicate, goal=goal, truth=truth)]
     if spec.source_task.startswith("place_a2b_"):
         return _place_clauses(task, variant)
     if spec.source_task == "stack_blocks_two":
@@ -258,6 +277,14 @@ def eraf_snapshot(task: Any, spec: RoboTwinPairSpec) -> dict[str, np.ndarray]:
 def install_pgc_observation_contract(task: Any, spec: RoboTwinPairSpec) -> Any:
     """Attach read-only scene/entity hooks without changing success semantics."""
     task._pgc_pair_spec = spec
+    if spec.source_task == 'place_empty_cup' and not getattr(task, '_cup_geometry_hook', False):
+        original_load = task.load_actors
+        def load_cup_actors(bound_task):
+            original_load()
+            from experiments.robotwin.cup_counterfactual import initialize_geometry
+            initialize_geometry(bound_task, direction=-1)
+        task.load_actors = MethodType(load_cup_actors, task)
+        task._cup_geometry_hook = True
 
     def scene_actors(bound_task: Any) -> list[Any]:
         return _actors(bound_task, bound_task._pgc_pair_spec)
@@ -397,6 +424,11 @@ def play_variant(task: Any, spec: RoboTwinPairSpec, variant: str) -> dict[str, A
     # Bind it to the executed semantic variant so an opposite native goal can
     # never truncate a counterfactual replay.
     task._pgc_active_variant = variant
+    if spec.source_task == 'place_empty_cup':
+        if variant == 'on_coaster':
+            return task.play_once()
+        from experiments.robotwin.cup_counterfactual import play_counterfactual
+        return play_counterfactual(task)
     if spec.source_task.startswith("place_a2b_"):
         return task.play_once_direction(variant)
     if spec.source_task == "stack_blocks_two":
