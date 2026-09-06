@@ -56,6 +56,30 @@ def audit_native_cache(collection, cache):
             'language': 'source', 'compact_payloads_restored': len(rows)}
 
 
+def verified_snapshot_done(data, name, job):
+    """Admit complete individual FG records without relabeling a failed parent."""
+    if not job.get('verified_snapshot'):
+        return False
+    from experiments.robotwin.eraf_fg_contract import validate_correction, scene_key
+    path = data / name / 'manifest.json'
+    source = read(path)
+    if sha(path) != job['snapshot_sha256'] or not source.get('complete'):
+        raise ValueError('Verified-record recovery snapshot changed.')
+    records = [validate_correction(r) for r in source['records']]
+    if len(records) != job['scenes'] or len({scene_key(r) for r in records}) != len(records):
+        raise ValueError('Verified-record recovery quota differs.')
+    originals = []
+    for path, digest in source['record_paths_sha256'].items():
+        if sha(path) != digest:
+            raise ValueError('Recovered source record changed.')
+        originals.append(validate_correction(read(path)))
+    if len(source['record_paths_sha256']) != len(records):
+        raise ValueError('Missing independent source record provenance.')
+    if sorted(records, key=scene_key) != sorted(originals, key=scene_key):
+        raise ValueError('Recovery snapshot differs from its verified source records.')
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--root', required=True)
@@ -134,7 +158,8 @@ def main():
     try:
         while True:
             budget()
-            finished = {name for name, j in jobs.items() if 'pid' in j and done(name, j)}
+            finished = {name for name, j in jobs.items() if verified_snapshot_done(data, name, j)
+                        or ('pid' in j and done(name, j))}
             cached = {name for name, j in caches.items() if done(name, j)}
             for name in SMOKES:
                 marker = data / (name + '_cache_audit.json')
@@ -160,7 +185,7 @@ def main():
             busy.update(j['gpu'] for n, j in caches.items() if n not in cached)
             ready_caches = sorted(finished - {name.removeprefix('cache_') for name in caches},
                                   key=lambda n: (n not in SMOKES, n))
-            ready_collections = [name for name, j in jobs.items() if 'pid' not in j
+            ready_collections = [name for name, j in jobs.items() if 'pid' not in j and name not in finished
                                  and (j['kind'] == 'fg' or smoke_ok or name in SMOKES)]
             for gpu in sorted(pools - busy):
                 if ready_caches:
