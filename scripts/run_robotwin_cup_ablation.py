@@ -86,6 +86,12 @@ def main():
                 correction_weight=.25, global_batch=12, learning_rate=1e-5, correct_weight=4., cf_weight=2.)
     processes = {}
 
+    def interrupted(signum, frame):
+        raise InterruptedError(f'Experiment interrupted by signal {signum}')
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+
     def save():
         (args.output/'driver.json').write_text(json.dumps(plan, indent=2)+'\n')
 
