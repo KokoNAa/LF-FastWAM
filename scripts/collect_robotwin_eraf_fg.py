@@ -16,9 +16,9 @@ sys.path[:0] = [str(REPO), str(REPO / "src")]
 
 
 def historical_scene_keys(rows):
-    from experiments.robotwin.pgc_data import ROBOTWIN_ERAF_PAIR_SPECS
+    from experiments.robotwin.pgc_data import ROBOTWIN_ERAF_PAIR_SPECS, ROBOTWIN_REPLACEMENT_PAIR_SPECS
     from experiments.robotwin.eraf_fg_contract import scene_key
-    tasks = {spec.pair_id: spec.source_task for spec in ROBOTWIN_ERAF_PAIR_SPECS}
+    tasks = {spec.pair_id: spec.source_task for spec in (*ROBOTWIN_ERAF_PAIR_SPECS,*ROBOTWIN_REPLACEMENT_PAIR_SPECS)}
     keys = set()
     for row in rows:
         task = tasks[row["pair_id"]]

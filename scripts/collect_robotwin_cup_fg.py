@@ -32,6 +32,7 @@ def main():
         setattr(args,key,getattr(args,key).resolve())
     import numpy as np
     from experiments.robotwin.cup_counterfactual import SOURCE_INSTRUCTION,FRONT_INSTRUCTION
+    from experiments.robotwin.cup_full_goal import validate_cup_correction
     from experiments.robotwin.eraf_fg_collection import (
         physical_state,run_failure_rollout,replay_prefix,record_continuation,
         continue_to_goal,replay_continuation,full_goal)
@@ -121,6 +122,7 @@ def main():
                          'rollout_path':str(folder/'failure_rollout.npz'),'rollout_checkpoint':str(args.checkpoint),
                          'verification_binding':'direct_physics_replay','image_color_space':'RGB'}
                     if not 0<=error<=1e-7:raise ValueError('Replay drift')
+                    row=validate_cup_correction(row)
                     (folder/'record.json').write_text(json.dumps(row,indent=2)+'\n')
                     report['records'].append(row)
                     print('[verified]',seed,'prefix',step,'frames',len(frames),flush=True)

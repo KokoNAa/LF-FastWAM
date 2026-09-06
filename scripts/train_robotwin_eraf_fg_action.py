@@ -27,6 +27,8 @@ def main():
     ap.add_argument('--correct-weight', type=float, default=2.)
     ap.add_argument('--cf-weight', type=float, default=1.)
     ap.add_argument('--policy-scope', choices=['all', 'action'], default='all')
+    ap.add_argument('--target-tasks', nargs='+', default=['place_a2b_left', 'blocks_ranking_rgb'],
+                    choices=['place_a2b_left', 'blocks_ranking_rgb', 'place_empty_cup'])
     ap.add_argument('--correction-weight', type=float, default=1.,
                     help='Scale FG slots and their matched ordinary-CF replacements equally.')
     ap.add_argument('--skip-file-hashes', action='store_true',
@@ -37,6 +39,7 @@ def main():
     args = ap.parse_args()
     if not math.isfinite(args.correction_weight) or args.correction_weight <= 0:
         ap.error('--correction-weight must be positive and finite')
+    if len(set(args.target_tasks)) != len(args.target_tasks):ap.error('Duplicate target tasks')
     import torch
     import torch.distributed as dist
     from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint, validate_payload, file_sha256
@@ -92,10 +95,10 @@ def main():
                 raise ValueError('Formal action training requires ten CF-retention scenes per preserved task.')
         if args.fg != 'off':
             for split in ('train', 'replay_holdout'):
-                if {r['source_task'] for r in rows if r.get('fg_correction') and r['replay_split'] == split} != {'place_a2b_left', 'blocks_ranking_rgb'}:
+                if {r['source_task'] for r in rows if r.get('fg_correction') and r['replay_split'] == split} != set(args.target_tasks):
                     raise ValueError('FG train and holdout must cover both target tasks.')
                 minimum = 24 if split == 'train' else 6
-                for task in ('place_a2b_left', 'blocks_ranking_rgb'):
+                for task in args.target_tasks:
                     count = len({r['scene_seed'] for r in rows if r.get('fg_correction')
                                  and r['source_task'] == task and r['replay_split'] == split})
                     if count < minimum:
@@ -111,7 +114,7 @@ def main():
     start = 0
     optimization_contract = {k: getattr(args, k) for k in ('stage', 'fg', 'eraf', 'seed',
         'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation',
-        'policy_scope', 'correction_weight', 'skip_file_hashes')}
+        'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks')}
     if args.skip_file_hashes:
         p = Path(args.manifest).resolve()
         optimization_contract['manifest_identity'] = {'path': str(p), 'bytes': p.stat().st_size,
@@ -133,7 +136,8 @@ def main():
                 raise ValueError('Optimizer master tensors do not match the loaded checkpoint.')
         elif state['checkpoint_sha256'] != file_sha256(args.checkpoint):
             raise ValueError('Optimizer checkpoint identity changed.')
-        old_defaults = {'policy_scope': 'all', 'correction_weight': 1., 'skip_file_hashes': False}
+        old_defaults = {'policy_scope': 'all', 'correction_weight': 1., 'skip_file_hashes': False,
+                        'target_tasks': ['place_a2b_left', 'blocks_ranking_rgb']}
         for key, value in optimization_contract.items():
             if state['optimization_contract'].get(key, old_defaults.get(key)) != value:
                 if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
@@ -208,7 +212,8 @@ def main():
                 save_repair_checkpoint(model, checkpoint_path, stage=args.stage,
                     steps=step, parent=args.checkpoint, fg_supervision=args.fg,
                     provenance={'plan': str(root / 'plan.json'), 'eraf': args.eraf,
-                                'policy_scope': args.policy_scope, 'correction_weight': args.correction_weight},
+                                'policy_scope': args.policy_scope, 'correction_weight': args.correction_weight,
+                                'target_tasks': args.target_tasks},
                     record_hashes=not args.skip_file_hashes)
                 optimizer_payload = {'step': step, 'checkpoint': str(checkpoint_path),
                     'parameter_names': list(selected), 'optimization_contract': optimization_contract,

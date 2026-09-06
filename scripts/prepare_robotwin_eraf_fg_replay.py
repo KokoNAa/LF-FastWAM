@@ -28,6 +28,7 @@ def main():
     from scripts.collect_robotwin_eraf_fg import historical_scene_keys
     from experiments.robotwin.eraf_fg_contract import validate_correction, scene_key
     from experiments.robotwin.eraf_fg_data import retention_language, validate_retention_scene
+    from experiments.robotwin.cup_full_goal import FORMAT as CUP_FORMAT, validate_cup_correction
     groups = []
     seen = set()
     for path in args.collections:
@@ -35,7 +36,9 @@ def main():
         if collection.get('complete') is not True:
             raise ValueError(f'Incomplete collection: {path}')
         if 'records' in collection:
-            items = [[validate_correction(r)] for r in collection['records']]
+            validator = validate_cup_correction if collection.get('format') == CUP_FORMAT else validate_correction
+            items = [[validator(r)] for r in collection['records']]
+            if not items:raise ValueError(f'No verified records in collection: {path}')
         else:
             scenes = defaultdict(list)
             for row in collection['states']:
@@ -92,16 +95,20 @@ def main():
         fg = not (record.get('cf_retention') or record.get('native_retention'))
         language = 'target' if fg else retention_language(record)
         path = Path(record['frame_path'] if fg else record['capture_path'])
-        if file_sha256(path) != record['frame_sha256' if fg else 'capture_sha256']:
+        direct_cup = record.get('format') == CUP_FORMAT
+        if not direct_cup and file_sha256(path) != record['frame_sha256' if fg else 'capture_sha256']:
             raise ValueError('Collection archive identity changed.')
         with np.load(path, allow_pickle=False) as arrays:
             actions = arrays['actions'] if fg else None
-            if fg and array_sha256(actions) != record['correction_action_sha256']:
+            if fg and not direct_cup and array_sha256(actions) != record['correction_action_sha256']:
                 raise ValueError('Correction actions changed.')
             windows = action_windows(actions) if fg else records
             # NpzFile indexing decompresses the entire named array each time.
             # Load each camera once per scene, rather than once per window.
             images = {camera: arrays[camera] for camera in CAMERAS}
+            if direct_cup and (len(actions) != record['recorded_action_count']
+                               or any(len(v) != len(actions) for v in images.values())):
+                raise ValueError('Cup correction frame/action lengths changed')
             proprio = actions if fg else arrays['state']
             retention_references = None if fg else arrays['reference_action_raw']
             parent = parent_path = None
@@ -122,6 +129,8 @@ def main():
                 references = {language: norm.forward(torch.from_numpy(raw).unsqueeze(0)).cpu()}
                 validity = {language: torch.from_numpy(valid).unsqueeze(0)}
                 ident = f'eraf_fg_{record["source_task"]}_{record["scene_seed"]}_{frame}' if fg else window['id']
+                if direct_cup:
+                    ident = f'cup_fg_{record["task_config"]}_{record["scene_seed"]}_{frame}'
                 target = shard / 'payloads' / (ident + '.pt')
                 body = {k: captured[k] for k in ('video_inputs', 'action_inputs')}
                 extras = {k: captured[k] for k in ('proprio', 'policy_guard_state')}
