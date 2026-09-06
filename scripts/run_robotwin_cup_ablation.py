@@ -62,6 +62,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     for key in ('root', 'output', 'manifest', 'checkpoint', 'source-bank'):
         ap.add_argument('--'+key, type=Path, required=True)
+    teacher_root = '/root/gpufree-data/LF-FastWAM/runs/robotwin_cf_dense/20260906-native-retention-v1'
+    ap.add_argument('--correct-teacher', type=Path, default=teacher_root+'/repair-dense-native/step_000600.pt')
+    ap.add_argument('--cf-teacher', type=Path, default=teacher_root+'/repair-shared-decisions/step_000400.pt')
     ap.add_argument('--fg', choices=['off', 'local', 'full'], required=True)
     ap.add_argument('--gpus', type=int, nargs='+', required=True)
     ap.add_argument('--steps', type=int, choices=[2, 200], default=200)
@@ -70,7 +73,7 @@ def main():
     args = ap.parse_args()
     if len(set(args.gpus)) != len(args.gpus) or any(g not in range(6) for g in args.gpus) or 12 % len(args.gpus):
         ap.error('Use distinct assigned GPUs and a world size dividing12')
-    for key in ('root', 'output', 'manifest', 'checkpoint', 'source_bank'):
+    for key in ('root', 'output', 'manifest', 'checkpoint', 'source_bank', 'correct_teacher', 'cf_teacher'):
         setattr(args, key, getattr(args, key).resolve())
     deadline = datetime.fromisoformat(args.deadline).timestamp()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -112,6 +115,7 @@ def main():
             '--stage', 'joint', '--steps', args.steps, '--save-every', 2 if args.steps == 2 else 100,
             '--learning-rate', '1e-5', '--manifest', args.manifest, '--checkpoint', args.checkpoint,
             '--source-bank', args.source_bank, '--output', args.output/'joint', '--eraf', 'off',
+            '--correct-teacher', args.correct_teacher, '--cf-teacher', args.cf_teacher,
             '--fg', args.fg, '--correct-weight', '4', '--cf-weight', '2', '--policy-scope', 'action',
             '--correction-weight', '.25', '--target-tasks', 'place_a2b_left', 'place_empty_cup',
             '--skip-file-hashes']
