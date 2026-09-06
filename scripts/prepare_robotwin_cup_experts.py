@@ -51,8 +51,8 @@ def main():
         all_rows = retained + rows
         if len({r['id'] for r in all_rows}) != len(all_rows):
             raise ValueError('Duplicated ordinary expert cache IDs')
-        if ({scene_key(r) for r in all_rows if r['replay_split'] == 'train'} &
-                {scene_key(r) for r in all_rows if r['replay_split'] == 'replay_holdout'}):
+        if (historical_scene_keys([r for r in all_rows if r['replay_split'] == 'train']) &
+                historical_scene_keys([r for r in all_rows if r['replay_split'] == 'replay_holdout'])):
             raise ValueError('Prepared train and holdout scenes overlap')
         base.update(states=all_rows, complete=True, parent_manifest=args.manifest,
                     cup_ordinary_collections=args.collections, target_tasks=args.target_tasks,
