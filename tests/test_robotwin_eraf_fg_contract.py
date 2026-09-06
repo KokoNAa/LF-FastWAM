@@ -117,3 +117,23 @@ def test_historical_scene_keys_resolve_legacy_pair_metadata():
     assert historical_scene_keys([row]) == {("place_a2b_left", "demo_clean", 9)}
     with pytest.raises(ValueError, match="contradicts"):
         historical_scene_keys([dict(row, source_task="blocks_ranking_rgb")])
+
+
+def test_bank_audit_rejects_missing_goal_tail_padded_loss_and_scene_leakage():
+    from scripts.assemble_robotwin_eraf_fg_bank import audit_rows
+    record = correction() | {'pair_id': 'blocks_ranking_rgb_to_bgr', 'fg_correction': True}
+    rows = [record | {'id': str(frame), 'payload': str(frame), 'frame_index': frame,
+                      'reference_valid_actions': min(32, 83 - frame)}
+            for frame in range(0, 83, 8)]
+    assert audit_rows(rows, formal=False)['fg_scenes'][0]['windows'] == 11
+    with pytest.raises(ValueError, match='windows'):
+        audit_rows(rows[:-1], formal=False)
+    invalid = copy.deepcopy(rows)
+    invalid[-1]['reference_valid_actions'] = 32
+    with pytest.raises(ValueError, match='tail mask'):
+        audit_rows(invalid, formal=False)
+    leaked = rows + [rows[0] | {'id': 'heldout', 'replay_split': 'replay_holdout'}]
+    with pytest.raises(ValueError, match='overlap'):
+        audit_rows(leaked, formal=False)
+    with pytest.raises(ValueError, match='exactly24'):
+        audit_rows(rows)

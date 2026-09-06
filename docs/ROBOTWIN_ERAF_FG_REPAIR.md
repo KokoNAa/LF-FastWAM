@@ -116,6 +116,9 @@ Grounding accuracy and expert correction success are not policy CF success.
 - `scripts/collect_robotwin_eraf_fg.py`: verified failure corrections.
 - `scripts/collect_robotwin_cf_retention.py`: successful CF retention states.
 - `scripts/prepare_robotwin_eraf_fg_replay.py`: frozen-input preparation/merge.
+- `scripts/assemble_robotwin_eraf_fg_bank.py`: incremental-cache assembly with
+  source-record matching, full-window/tail checks, archive hashes, exact scene
+  quotas and exclusion of regression, development and test catalog scenes.
 - `scripts/train_robotwin_eraf_fg_action.py`: interface and joint training.
 - `scripts/eval_robotwin_eraf_fg.py`: catalogs, matched evaluation, summary.
 
