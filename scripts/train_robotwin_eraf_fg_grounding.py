@@ -85,7 +85,7 @@ def main():
     from scripts.train_robotwin_cf_decision_adapter import average_gradients
     from fastwam.models.wan22.entity_relation_affordance import entity_relation_affordance_loss, masks_to_patch_targets
     from experiments.robotwin.eraf_geometry_metrics import geometry_parameter, geometry_errors, summarize_geometry, semantic_qualification
-    from experiments.robotwin.fg_geometry_replay import SCHEMA, geometry_mixture, partial_geometry_loss
+    from experiments.robotwin.fg_geometry_replay import SCHEMA, geometry_mixture, partial_geometry_loss, validate_scene_splits
     torch.cuda.set_device(local)
     torch.manual_seed(args.seed)
     if world > 1:
@@ -121,11 +121,7 @@ def main():
         slots=args.geometry_replay_slots, mode=args.geometry_replay, task_balanced=args.task_balanced)
         if args.geometry_replay != 'off' else None)
     # Audit whole-scene separation before consuming either correction or expert data.
-    splits = defaultdict(set)
-    for row in rows:
-        splits[row['source_task'], row['task_config'], row['scene_seed']].add(row['replay_split'])
-    if any(len(values) != 1 for values in splits.values()):
-        raise ValueError('Semantic replay mixes train and holdout observations of one scene.')
+    validate_scene_splits(rows)
     fg_validation = [r for r in rows if r['replay_split'] == 'replay_holdout' and r.get('fg_correction')]
     if args.geometry_replay != 'off' and not fg_validation:
         raise ValueError('Geometry replay requires separate FG holdout observations.')
@@ -133,6 +129,7 @@ def main():
         for k in ('native_retention', 'cf_retention', 'fg_correction'))]
     if args.steps <= 2:
         validation = list({r["pair_id"]: r for r in validation}.values())
+        fg_validation = list({r['pair_id']: r for r in fg_validation}.values())
     if {r["pair_id"] for r in validation} != {r["pair_id"] for r in rows}:
         raise ValueError("Grounding holdout must cover every replay task.")
     if not set(required_pairs) <= {r['pair_id'] for r in validation}:

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from experiments.robotwin.fg_geometry_replay import (
-    CorrectionGeometry, geometry_labels, geometry_mixture, partial_geometry_loss,
+    CorrectionGeometry, geometry_labels, geometry_mixture, partial_geometry_loss, validate_scene_splits,
 )
 from test_robotwin_eraf_fg_contract import correction
 
@@ -24,6 +24,14 @@ def capture():
             'grounding/target_goal_positions': positions.copy(),
             'grounding/target_predicate_truth': np.zeros((2, 4), np.float32),
             'grounding/target_clause_valid': np.tile([True, False, False, False], (2, 1))}
+
+
+def test_scene_split_audit_accepts_legacy_rows_and_rejects_cross_kind_leakage():
+    ordinary = dict(pair_id='left', task_config='demo_clean', scene_seed=5, replay_split='train')
+    fg = ordinary | {'fg_correction': True, 'source_task': 'place_a2b_left'}
+    validate_scene_splits([ordinary, fg])
+    with pytest.raises(ValueError, match='one scene'):
+        validate_scene_splits([ordinary, fg | {'replay_split': 'replay_holdout'}])
 
 
 def test_geometry_preserves_observed_frame_and_does_not_invent_segmentation_or_phase(tmp_path):

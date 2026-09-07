@@ -13,6 +13,15 @@ import numpy as np
 SCHEMA = 'robotwin_fg_partial_geometry_v1'
 
 
+def validate_scene_splits(rows):
+    # Legacy expert rows have pair_id, but do not all have source_task.
+    splits = defaultdict(set)
+    for row in rows:
+        splits[row['pair_id'], row['task_config'], row['scene_seed']].add(row['replay_split'])
+    if any(len(values) != 1 for values in splits.values()):
+        raise ValueError('Semantic replay mixes train and holdout observations of one scene.')
+
+
 class CorrectionGeometry:
     def __init__(self):
         self.cache = OrderedDict()
