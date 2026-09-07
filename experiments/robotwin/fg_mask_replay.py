@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import numpy as np
 
 from experiments.robotwin.eraf_fg_contract import CAMERAS
+from experiments.robotwin.closed_loop_capture import CAMERA_GEOMETRY
 
 SCHEMA = 'robotwin_fg_verified_mask_replay_v1'
 
@@ -31,8 +32,10 @@ class VerifiedMaskFrames:
             segmentation = np.asarray(view['actor_segmentation_ids'])
             if segmentation.ndim != 2 or segmentation.dtype.kind not in 'ui':
                 raise ValueError('Expected a raw integer actor-segmentation image.')
-            if segmentation.shape != np.asarray(view['rgb']).shape[:2]:
-                raise ValueError('Actor segmentation and RGB camera geometry differ.')
+            # RoboTwin get_obs stores integer actor IDs at the exact ERAF
+            # head/wrist patch geometry; raw full-resolution IDs are also valid.
+            if segmentation.shape not in (CAMERA_GEOMETRY[camera], np.asarray(view['rgb']).shape[:2]):
+                raise ValueError(f'Unexpected actor segmentation geometry for {camera}: {segmentation.shape}.')
             handle[f'observation/{camera}/actor_segmentation_ids'] = segmentation[None]
         for name, value in snapshot.items():
             value = np.asarray(value)

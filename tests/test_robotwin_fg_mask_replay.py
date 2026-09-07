@@ -68,6 +68,24 @@ def test_capture_callback_restored_when_replay_fails():
     assert task._take_picture is old
 
 
+def test_production_patch_grid_actor_ids_match_existing_mask_geometry():
+    from experiments.robotwin.closed_loop_capture import CAMERA_GEOMETRY
+    arrays, observation, snapshot = fixture()
+    for c, shape in CAMERA_GEOMETRY.items():
+        segmentation = np.full(shape, 11, np.uint32)
+        segmentation[shape[0] // 2:] = 22
+        observation['observation'][c]['actor_segmentation_ids'] = segmentation
+    frames = VerifiedMaskFrames(arrays, 'left')
+    frames.append(observation, snapshot)
+    frames.append(observation, snapshot)
+    labels = frames.finish()
+    assert labels['subject_mask_valid'][:, 0].all()
+    assert labels['reference_mask_valid'][:, 0].all()
+    observation['observation'][CAMERAS[0]]['actor_segmentation_ids'] = np.zeros((13, 19), np.uint32)
+    with pytest.raises(ValueError, match='Unexpected actor segmentation geometry'):
+        VerifiedMaskFrames(arrays, 'left').append(observation, snapshot)
+
+
 def test_pilot_deduplicates_frame_rows_without_crossing_splits():
     rows = []
     for task in ['blocks_ranking_rgb', 'place_a2b_left']:
