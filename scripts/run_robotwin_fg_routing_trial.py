@@ -42,10 +42,65 @@ def protocol(primary, primary_root, output, deadline, code):
 
 def command(plan, output, arm):
     spec = plan['arms'][arm]
-    parent = plan['interface_parent'] if spec['eraf'] == 'on' else plan['checkpoint']
+    parent = spec.get('resume_checkpoint') or (plan['interface_parent'] if spec['eraf'] == 'on' else plan['checkpoint'])
     result = training_command(plan, output, arm, 'joint', parent, warm=spec['eraf'] == 'off')
     result[result.index('--nproc_per_node=2')] = f"--nproc_per_node={len(spec['gpus'])}"
+    if spec.get('resume_state'):
+        result += ['--resume-state', spec['resume_state']]
     return result + ['--fg-gradient-route', spec['route']]
+
+
+def final_checkpoint(plan, output, arm):
+    spec = plan['arms'][arm]
+    if spec.get('resume_step') == plan['joint_steps']:
+        return Path(spec['resume_checkpoint'])
+    return output / arm / 'joint/step_000200.pt'
+
+
+def bind_recovery(plan, source):
+    """Bind each saved optimizer to its exact checkpoint after its producer stopped."""
+    import torch
+    source = source.resolve()
+    old = json.loads((source / 'protocol.json').read_text())
+    if old['format'] != plan['format']:
+        raise ValueError('Resume source is not this mechanism trial')
+    for key in ('primary_root', 'checkpoint', 'interface_parent', 'manifest', 'source_bank',
+                'correct_teacher', 'cf_teacher', 'joint_steps', 'correction_weight',
+                'joint_learning_rate', 'interface_joint_learning_rate', 'mixture', 'seed'):
+        if old[key] != plan[key]:
+            raise ValueError(f'Recovery changed the experiment: {key}')
+    driver = json.loads((source / 'driver.json').read_text())
+    for job in driver['jobs'].values():
+        if 'exit_code' not in job:
+            raise ValueError('Source has no recorded terminal exit for every job')
+        cmdline = Path(f"/proc/{job['pid']}/cmdline")
+        if cmdline.exists() and str(source).encode() in cmdline.read_bytes():
+            raise ValueError('Source producer still exists; do not race its checkpoint writes')
+    for arm, spec in plan['arms'].items():
+        for key in ('eraf', 'fg', 'route', 'gpus'):
+            if spec[key] != old['arms'][arm][key]:
+                raise ValueError(f'Recovery changed {arm}/{key}')
+        folder = source / arm / 'joint'
+        optimizer_path = folder / 'optimizer_last.pt'
+        if not optimizer_path.exists() and old['arms'][arm].get('resume_step') == plan['joint_steps']:
+            optimizer_path = Path(old['arms'][arm]['resume_state'])
+            folder = optimizer_path.parent
+        state = torch.load(optimizer_path, map_location='cpu', weights_only=False)
+        checkpoint = Path(state['checkpoint']).resolve(strict=True)
+        identity = dict(path=str(checkpoint), bytes=checkpoint.stat().st_size,
+                        mtime_ns=checkpoint.stat().st_mtime_ns)
+        if state['checkpoint_identity'] != identity or not 0 < int(state['step']) <= plan['joint_steps']:
+            raise ValueError('Recovery optimizer is not bound to an intact checkpoint')
+        saved_plan = json.loads((folder / 'plan.json').read_text())
+        if state['optimization_contract'] != saved_plan['optimization_contract']:
+            raise ValueError('Recovery optimizer contract changed')
+        if state['optimization_contract']['fg_gradient_route'] != spec['route']:
+            raise ValueError('Recovery cannot change FG gradient routing')
+        spec.update(resume_checkpoint=str(checkpoint), resume_state=str(optimizer_path),
+                    resume_step=int(state['step']))
+        del state
+    plan['resume_trial'] = str(source)
+    plan['recovery_scope'] = 'Continue the exact saved FP32 optimizer masters/moments and global sample/noise schedule to total200. Preserve source journals; any logged updates after the saved step were discarded and are not inherited.'
 
 
 def cells_for(arm):
@@ -58,6 +113,7 @@ def main():
     ap.add_argument('--primary-root', type=Path, required=True)
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--deadline', required=True)
+    ap.add_argument('--resume-trial', type=Path, help='Stopped source trial with exact saved checkpoint/optimizer companions.')
     ap.add_argument('--execute', action='store_true')
     args = ap.parse_args()
     cutoff = datetime.fromisoformat(args.deadline)
@@ -67,6 +123,8 @@ def main():
     primary = json.loads((primary_root / 'protocol.json').read_text())
     code = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip()
     plan = protocol(primary, primary_root, output, args.deadline, code)
+    if args.resume_trial:
+        bind_recovery(plan, args.resume_trial)
     output.mkdir(parents=True, exist_ok=False)
     write(output / 'protocol.json', plan)
     if not args.execute:
@@ -122,7 +180,11 @@ def main():
     try:
         for arm, spec in plan['arms'].items():
             (output / arm).mkdir()
-            start(arm + '_joint', command(plan, output, arm), spec['gpus'], 'train', arm)
+            if spec.get('resume_step') == plan['joint_steps']:
+                completed_training.add(arm)
+                pending.extend(cells_for(arm))
+            else:
+                start(arm + '_joint', command(plan, output, arm), spec['gpus'], 'train', arm)
         while running or pending:
             budget()
             for name, job in list(running.items()):
@@ -151,7 +213,7 @@ def main():
                 catalog = plan['old_catalog' if group == 'original_five' else 'new_catalog']
                 dest = output / ('eval_' + group) / (arm + '_200') / 'dev'
                 cmd = [sys.executable, '-u', REPO / 'scripts/eval_robotwin_eraf_fg.py', 'worker',
-                    '--output', dest, '--checkpoint', output / arm / 'joint/step_000200.pt',
+                    '--output', dest, '--checkpoint', final_checkpoint(plan, output, arm),
                     '--manifest', plan['manifest'], '--catalog-root', catalog, '--episodes', str(episodes),
                     '--tasks', task, '--policy-kind', 'repair', '--eraf', plan['arms'][arm]['eraf'],
                     '--conditions', 'counterfactual', '--gpu', str(gpu), '--videos', '--skip-file-hashes',
@@ -171,7 +233,7 @@ def main():
                 dest = output / ('eval_' + group) / (arm + '_200') / 'dev'
                 name = f'summarize_{group}_{arm}'
                 start(name, [sys.executable, REPO / 'scripts/eval_robotwin_eraf_fg.py', 'summarize',
-                    '--output', dest, '--checkpoint', output / arm / 'joint/step_000200.pt',
+                    '--output', dest, '--checkpoint', final_checkpoint(plan, output, arm),
                     '--catalog-root', catalog, '--episodes', str(episodes), '--tasks', *tasks,
                     '--conditions', 'counterfactual', '--skip-file-hashes'], [], 'summary', arm)
                 while processes[name].poll() is None:

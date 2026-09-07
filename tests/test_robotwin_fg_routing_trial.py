@@ -2,7 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from scripts.run_robotwin_cf_priority_campaign import build_protocol
-from scripts.run_robotwin_fg_routing_trial import command, protocol
+from scripts.run_robotwin_fg_routing_trial import command, final_checkpoint, protocol
 
 
 def test_routing_comparison_changes_only_declared_gradient_route():
@@ -31,3 +31,14 @@ def test_routing_comparison_changes_only_declared_gradient_route():
     assert original['correction_weight'] == 1.0
     assert plan['correction_weight'] == 0.1
     assert plan['strongest_comparator']['ten_task_macro_cf'] == 0.35
+    # A power-window recovery continues the saved optimizer to total200.
+    plan['arms']['eraf_fg_routed'].update(resume_checkpoint='/old/routed/step_000100.pt',
+        resume_state='/old/routed/optimizer_last.pt', resume_step=100)
+    resumed = command(plan, Path('/next'), 'eraf_fg_routed')
+    assert resumed[resumed.index('--checkpoint') + 1] == '/old/routed/step_000100.pt'
+    assert resumed[resumed.index('--resume-state') + 1] == '/old/routed/optimizer_last.pt'
+    assert resumed[resumed.index('--steps') + 1] == '200'
+    assert resumed[resumed.index('--fg-gradient-route') + 1] == 'eraf_only'
+    assert final_checkpoint(plan, Path('/next'), 'eraf_fg_routed') == Path('/next/eraf_fg_routed/joint/step_000200.pt')
+    plan['arms']['eraf_fg_routed'].update(resume_checkpoint='/old/routed/step_000200.pt', resume_step=200)
+    assert final_checkpoint(plan, Path('/next'), 'eraf_fg_routed') == Path('/old/routed/step_000200.pt')

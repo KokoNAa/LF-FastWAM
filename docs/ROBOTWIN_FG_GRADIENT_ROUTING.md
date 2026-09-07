@@ -77,3 +77,15 @@ not perform an independent test or ERAF bypass; those remain required
 follow-up evidence for a promising candidate. It stops at the explicit
 work cutoff and preserves partial records. Formal80-scene data expansion
 is kept separate from this mechanism experiment.
+
+Use `--resume-trial <stopped-source-root>` with a new output directory and
+new explicit deadline to continue across power windows. The runner rejects
+active producers, missing terminal records, changed recipe fields, changed
+routes/world sizes, or changed checkpoint file identities. The action trainer
+then validates FP32 master tensors against saved weights and restores AdamW
+moments. It advances the deterministic sampler to the saved step and retains
+the total target200. The policy is in eval mode during adapter training, and
+sample/noise seeds are explicit per global step; dropout RNG is not active.
+Already completed200-step arms are evaluated without additional updates.
+Original journals remain intact; updates logged after the last save are
+reported as discarded work and never added to the inherited optimizer budget.
