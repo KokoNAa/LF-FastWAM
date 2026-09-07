@@ -63,7 +63,10 @@ def main():
     ap.add_argument('--geometry-replay', choices=['off', 'ordinary', 'fg'], default='off',
                     help='Replace declared slots with matched target-only partial geometry supervision.')
     ap.add_argument('--geometry-replay-slots', type=int, default=3)
+    ap.add_argument('--fg-role-masks', help='Complete verified mask-replay index; enables matched role losses on partial slots.')
     args = ap.parse_args()
+    if args.fg_role_masks and args.geometry_replay == 'off':
+        ap.error('Corrective role masks require matched geometry replay.')
     if len(set(args.qualification_tasks)) != len(args.qualification_tasks):
         ap.error('Duplicate qualification task')
     required_pairs = [pair_spec_from_source_task(task).pair_id for task in args.qualification_tasks]
@@ -103,6 +106,11 @@ def main():
     barrier()
     manifest = json.loads(Path(args.manifest).read_text())
     rows = manifest["states"]
+    from experiments.robotwin.fg_role_masks import VerifiedCorrectionMasks, partial_geometry_role_loss, SCHEMA as mask_schema
+    fg_masks = VerifiedCorrectionMasks(args.fg_role_masks, args.manifest) if args.fg_role_masks else None
+    if fg_masks is not None:
+        fg_masks.validate_coverage(rows)
+    partial_loss = partial_geometry_role_loss if fg_masks is not None else partial_geometry_loss
     policy = load_policy(args.checkpoint, manifest, device=f"cuda:{local}", seed=args.seed)
     model = policy.model
     selected = trainable_parameters(model, "grounding")
@@ -117,7 +125,7 @@ def main():
     model.policy_guard_eraf_loss_weights = replace(model.policy_guard_eraf_loss_weights, **overrides)
     optimizer = MasterAdamW(selected.values(), lr=args.learning_rate)
     payloads = ReplayPayloads(rows, model.device)
-    raw = RawReplay(args.source_bank, label_cache=args.label_cache, fg_geometry=args.geometry_replay != 'off')
+    raw = RawReplay(args.source_bank, label_cache=args.label_cache, fg_geometry=args.geometry_replay != 'off', fg_masks=fg_masks)
     stream = balanced_rows(rows, args.seed, task_balanced=args.task_balanced)
     geometry_stream = (geometry_mixture(rows, args.seed, batch_size=args.global_batch,
         slots=args.geometry_replay_slots, mode=args.geometry_replay, task_balanced=args.task_balanced, world_size=world)
@@ -139,6 +147,8 @@ def main():
     if rank == 0:
         (root / "plan.json").write_text(json.dumps(vars(args) | {"world_size": world,
             "geometry_replay_schema": SCHEMA if geometry_stream is not None else None,
+            "fg_role_mask_schema": mask_schema if fg_masks is not None else None,
+            "fg_role_mask_index_sha256": fg_masks.index_sha256 if fg_masks is not None else None,
             "geometry_replay_collective_schedule": "rank_group_aligned_v1" if geometry_stream is not None else None,
             "code_commit": __import__("subprocess").check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
             "manifest_sha256": __import__("hashlib").sha256(Path(args.manifest).read_bytes()).hexdigest(),
@@ -187,10 +197,25 @@ def main():
                     payload = raw.attach_proprio(payloads[row['id']], row, policy)
                     labels = move_cache(raw.grounding(row, 'target'), model.device)
                     outputs, _ = grounding_outputs(model, payload['captured']['target'])
-                    loss, _ = partial_geometry_loss(outputs, labels, model.policy_guard_eraf_loss_weights)
+                    loss, _ = partial_loss(outputs, labels, model.policy_guard_eraf_loss_weights)
                     partial_reports.append({'id': row['id'], 'pair_id': row['pair_id'], 'language': 'target',
                                             'loss': float(loss), 'geometry_cm': geometry_errors(outputs, labels)})
+                    if fg_masks is not None:
+                        hits = count = 0
+                        for role in ('subject', 'reference'):
+                            mask, present = masks_to_patch_targets(labels[role + '_masks'],
+                                token_count=outputs[role + '_attention'].shape[-1])
+                            keep = labels['clause_valid'].bool() & present & labels[role + '_mask_valid'].bool()
+                            index = outputs[role + '_attention'].argmax(-1)
+                            hit = torch.gather(mask > 0, -1, index.unsqueeze(-1)).squeeze(-1)
+                            hits += int((hit & keep).sum()); count += int(keep.sum())
+                        partial_reports[-1].update(role_hits=hits, role_count=count)
             result['fg_geometry_holdout'] = {'rows': partial_reports, 'geometry': summarize_geometry(partial_reports)}
+            if fg_masks is not None:
+                hits = sum(r['role_hits'] for r in partial_reports)
+                count = sum(r['role_count'] for r in partial_reports)
+                result['fg_geometry_holdout'].update(role_hits=hits, role_count=count,
+                    role_accuracy=hits / count if count else None)
         (root / f"grounding_eval_{step:06d}.json").write_text(json.dumps(result, indent=2))
         print(f"[grounding-eval] step={step} roles={role:.4f} relations={relation:.4f} geometry_cm={result['geometry']['selection_score_cm']:.3f}", flush=True)
         return result
@@ -210,7 +235,7 @@ def main():
             payload = raw.attach_proprio(payloads[row["id"]], row, policy)
             labels = move_cache(raw.grounding(row, language), model.device)
             outputs, _ = grounding_outputs(model, payload["captured"][language])
-            loss_fn = partial_geometry_loss if partial else entity_relation_affordance_loss
+            loss_fn = partial_loss if partial else entity_relation_affordance_loss
             loss, metrics = loss_fn(outputs, labels, weights=model.policy_guard_eraf_loss_weights)
             if not bool(torch.isfinite(loss)):
                 raise ValueError("Non-finite ERAF grounding loss.")
@@ -230,7 +255,9 @@ def main():
             if rank == 0:
                 save_repair_checkpoint(model, root / f"step_{cumulative_step:06d}.pt", stage="grounding", steps=cumulative_step,
                     parent=args.checkpoint, fg_supervision="full" if args.geometry_replay == 'fg' else "off",
-                    provenance={"plan": str(root / "plan.json"), "geometry_replay_schema": SCHEMA if geometry_stream is not None else None},
+                    provenance={"plan": str(root / "plan.json"), "geometry_replay_schema": SCHEMA if geometry_stream is not None else None,
+                                "fg_role_mask_schema": mask_schema if fg_masks is not None else None,
+                                "fg_role_mask_index_sha256": fg_masks.index_sha256 if fg_masks is not None else None},
                     record_hashes=not args.skip_file_hashes)
                 evaluations.append(evaluate(cumulative_step))
             barrier()
