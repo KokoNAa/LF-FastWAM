@@ -9,16 +9,17 @@ from pathlib import Path
 import pickle
 import sys
 import traceback
-from types import SimpleNamespace
+import subprocess
+from datetime import datetime
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "src")]
 
 
 def historical_scene_keys(rows):
-    from experiments.robotwin.pgc_data import ROBOTWIN_ERAF_PAIR_SPECS, ROBOTWIN_REPLACEMENT_PAIR_SPECS
+    from experiments.robotwin.pgc_data import ROBOTWIN_TEN_TASK_SPECS
     from experiments.robotwin.eraf_fg_contract import scene_key
-    tasks = {spec.pair_id: spec.source_task for spec in (*ROBOTWIN_ERAF_PAIR_SPECS,*ROBOTWIN_REPLACEMENT_PAIR_SPECS)}
+    tasks = {spec.pair_id: spec.source_task for spec in ROBOTWIN_TEN_TASK_SPECS}
     keys = set()
     for row in rows:
         task = tasks[row["pair_id"]]
@@ -39,11 +40,21 @@ def instructions(task, spec):
 
 
 def main():
+    from experiments.robotwin.expanded_fg import (
+        FORMAT as EXPANDED_FORMAT, TASKS, validate_scope, canonical_instructions,
+        load_collection_policy, check_budget, CollectionBudgetExceeded)
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--task", choices=["place_a2b_left", "blocks_ranking_rgb"], required=True)
+    ap.add_argument("--task", choices=["place_a2b_left", "blocks_ranking_rgb", *TASKS], required=True)
+    ap.add_argument('--protocol', choices=['legacy_v1', 'expanded_v2'], default='legacy_v1')
+    ap.add_argument('--split', choices=['train', 'replay_holdout'], default='train')
+    ap.add_argument('--policy-kind', choices=['legacy', 'repair'], default='legacy')
+    ap.add_argument('--eraf', choices=['on', 'off'], default='off')
+    ap.add_argument('--candidates', type=int, default=20)
+    ap.add_argument('--deadline', help='Absolute timezone-aware cutoff; no server shutdown.')
+    ap.add_argument('--reserve-gib', type=float, default=3.)
     ap.add_argument("--task-config", choices=["demo_clean", "demo_randomized"], default="demo_clean")
     ap.add_argument("--robotwin-root", default=str(REPO / "third_party/RoboTwin"))
     ap.add_argument("--gpu", type=int, default=0)
@@ -53,8 +64,26 @@ def main():
     ap.add_argument("--max-attempts", type=int, default=120)
     ap.add_argument("--candidate-order", choices=["late_first", "early_first"], default="late_first")
     args = ap.parse_args()
-    if not 80000000 <= args.start_seed < 81000000 or args.start_seed + args.max_attempts >= 81000000:
-        ap.error("Use the reserved new-training seed range [80000000,81000000).")
+    expanded = args.protocol == 'expanded_v2'
+    if expanded:
+        try:
+            validate_scope(args.task, args.split, args.start_seed, args.max_attempts)
+        except ValueError as exc:
+            ap.error(str(exc))
+        if args.holdout_scenes != 0 or args.deadline is None:
+            ap.error('Expanded collection requires --holdout-scenes 0, explicit --split and --deadline.')
+    elif (args.task not in ['place_a2b_left', 'blocks_ranking_rgb']
+          or not 80000000 <= args.start_seed < 81000000
+          or args.start_seed + args.max_attempts >= 81000000):
+        ap.error('Legacy collection retains the original tasks and [80000000,81000000) seeds.')
+    if args.policy_kind == 'legacy' and args.eraf != 'off':
+        ap.error('ERAF requires --policy-kind repair.')
+    if not 1 <= args.candidates <= 20 or args.reserve_gib < 1:
+        ap.error('Require 1..20 candidates and at least 1GiB reserve.')
+    if args.deadline is not None:
+        cutoff = datetime.fromisoformat(args.deadline)
+        if cutoff.tzinfo is None or cutoff <= datetime.now().astimezone():
+            ap.error('Deadline must be future and timezone-aware.')
     if not 0 <= args.holdout_scenes < args.scenes or args.scenes > args.max_attempts:
         ap.error("Require 0 <= holdout < scenes <= attempts.")
     args.output = str(Path(args.output).resolve())
@@ -76,7 +105,6 @@ def main():
     from experiments.robotwin.pgc_task_variants import install_pgc_task_contract, play_variant
     from experiments.robotwin.eraf_fg_contract import verify_replayed_state
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _capture_data_type, _close
-    from scripts.train_robotwin_cf_decision_adapter import load_policy
     manifest = json.loads(Path(args.manifest).read_text())
     excluded = historical_scene_keys(manifest["states"])
     policy = None
@@ -87,8 +115,20 @@ def main():
     task_args.update(data_type=_capture_data_type(task_args), eval_mode=True,
                      need_plan=True, save_data=False, render_freq=0)
     checkpoint_hash = file_sha256(args.checkpoint)
-    (root / "plan.json").write_text(json.dumps(vars(args) | {"rollout_checkpoint_sha256": checkpoint_hash}, indent=2))
+    lineage = dict(policy_kind=args.policy_kind, eraf_mode=args.eraf, memory_mode='carry', policy_seed=42,
+                   collector_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(),
+                   input_manifest_sha256=file_sha256(args.manifest))
+    protocol_format = EXPANDED_FORMAT if expanded else FORMAT
+    (root / "plan.json").write_text(json.dumps(vars(args) | lineage | {"rollout_checkpoint_sha256": checkpoint_hash}, indent=2))
     accepted, failures = [], []
+    def save_result():
+        result = {"format": protocol_format, "complete": len(accepted) == args.scenes,
+                  "records": accepted, "failures": failures, "requested_scenes": args.scenes}
+        temp = root / 'manifest.json.tmp'
+        temp.write_text(json.dumps(result, indent=2))
+        temp.replace(root / 'manifest.json')
+        return result
+    save_result()
 
     def setup(seed):
         task._pgc_active_variant = spec.counterfactual_variant
@@ -106,9 +146,12 @@ def main():
             folder = root / f"scene_{seed}"
             folder.mkdir()
             try:
+                check_budget(root, args.deadline, args.reserve_gib)
                 setup(seed)
-                texts = instructions(task, spec)
+                texts = canonical_instructions(spec) if expanded else instructions(task, spec)
                 initial = physical_state(task)
+                if expanded and (full_goal(task, spec) or full_goal(task, spec, selected_goal='source')):
+                    raise ValueError('An initial goal is already satisfied.')
                 play_variant(task, spec, spec.counterfactual_variant)
                 reachable = bool(task.plan_success and full_goal(task, spec))
                 close()
@@ -121,7 +164,9 @@ def main():
                     print(f"[screen-rejected] {args.task} seed={seed}", flush=True)
                     continue
                 if policy is None:
-                    policy = load_policy(SimpleNamespace(checkpoint=args.checkpoint, seed=42), manifest)
+                    policy = load_collection_policy(args.checkpoint, manifest,
+                        policy_kind=args.policy_kind, eraf_mode=args.eraf,
+                        task=args.task, task_config=args.task_config)
                 setup(seed)
                 verify_replayed_state(initial, physical_state(task))
                 trace = run_failure_rollout(task, policy, spec, texts["target"])
@@ -129,18 +174,19 @@ def main():
                     capture_steps=np.array(list(trace["states"])), states=np.stack(list(trace["states"].values())))
                 (folder / "failure_audit.json").write_text(json.dumps(trace["audit"] | {
                     "source_instruction": texts["source"], "target_instruction": texts["target"],
-                    "rollout_checkpoint_sha256": checkpoint_hash}, indent=2))
+                    "rollout_checkpoint_sha256": checkpoint_hash, **lineage}, indent=2))
                 close()
                 if trace["audit"]["target"]:
                     journal.write(json.dumps(scene | {"status": "already_cf_success"}) + "\n")
                     continue
                 kind = failure_kind(source_ever_success=trace["audit"]["source"], cf_ever_success=False)
-                candidates = candidate_replans(trace["states"])
+                candidates = candidate_replans(trace["states"], limit=args.candidates)
                 if args.candidate_order == "early_first":
                     candidates.sort()
                 obtained = False
                 for tried, step in enumerate(candidates, 1):
                     try:
+                        check_budget(root, args.deadline, args.reserve_gib)
                         setup(seed)
                         error = replay_prefix(task, spec, trace, step)
                         with record_continuation(task) as (controls, frames):
@@ -154,14 +200,14 @@ def main():
                         for _ in range(2):
                             setup(seed)
                             error = max(error, replay_prefix(task, spec, trace, step))
-                            replay_continuation(task, controls)
+                            error = max(error, replay_continuation(task, controls))
                             verified = full_goal(task, spec)
                             close()
                             if not verified:
                                 raise ValueError("Full-goal control replay failed.")
                         actions = np.stack([f["qpos"] for f in frames]).astype(np.float32)
-                        record = validate_correction(scene | {
-                            "format": FORMAT, "pair_id": spec.pair_id, "failure_kind": kind,
+                        record = validate_correction(scene | lineage | {
+                            "format": protocol_format, "pair_id": spec.pair_id, "failure_kind": kind,
                             "capture_origin": FAILURE_ORIGINS[kind], "capture_action_index": step,
                             "prefix_action_count": step, "source_goal_ever_success": trace["audit"]["source"],
                             "counterfactual_goal_ever_success": False,
@@ -175,7 +221,7 @@ def main():
                             "captured_state_count": len(trace["states"]), "candidate_count": tried,
                             "recorded_action_count": len(actions), "state_atol": 1e-7,
                             "replay_state_max_abs": error,
-                            "replay_split": "replay_holdout" if len(accepted) < args.holdout_scenes else "train",
+                            "replay_split": args.split if expanded else ("replay_holdout" if len(accepted) < args.holdout_scenes else "train"),
                             "source_instruction": texts["source"], "counterfactual_instruction": texts["target"],
                             "frame_path": str(folder / "correction.npz"), "image_color_space": "RGB",
                             "save_freq": task_args.get("save_freq")})
@@ -183,6 +229,7 @@ def main():
                         arrays.update({c: np.stack([f["images"][c] for f in frames]) for c in CAMERAS})
                         arrays.update({"grounding/" + k: np.stack([f["grounding"][k] for f in frames])
                                        for k in frames[0]["grounding"]})
+                        check_budget(root, args.deadline, args.reserve_gib)
                         np.savez_compressed(folder / "correction.npz", **arrays)
                         with (folder / "controls.pkl").open("xb") as handle:
                             pickle.dump(controls, handle, protocol=5)
@@ -190,10 +237,13 @@ def main():
                         record["controls_sha256"] = file_sha256(folder / "controls.pkl")
                         (folder / "record.json").write_text(json.dumps(record, indent=2))
                         accepted.append(record)
+                        save_result()
                         journal.write(json.dumps(record | {"status": "verified"}) + "\n")
                         print(f"[verified] {args.task} seed={seed} prefix={step} frames={len(frames)} scenes={len(accepted)}/{args.scenes}", flush=True)
                         obtained = True
                         break
+                    except CollectionBudgetExceeded:
+                        raise
                     except Exception as exc:
                         try:
                             close()
@@ -203,6 +253,11 @@ def main():
                                                          "error": repr(exc)}) + "\n")
                 if not obtained:
                     failures.append(scene | {"reason": "all_corrections_rejected"})
+            except CollectionBudgetExceeded as exc:
+                failures.append(scene | {'reason': str(exc), 'budget_stop': True})
+                journal.write(json.dumps(failures[-1]) + '\n')
+                save_result()
+                break
             except Exception as exc:
                 try:
                     close()
@@ -211,9 +266,9 @@ def main():
                 traceback.print_exc()
                 failures.append(scene | {"reason": repr(exc)})
                 journal.write(json.dumps(failures[-1] | {"status": "scene_failed"}) + "\n")
-    result = {"format": FORMAT, "complete": len(accepted) == args.scenes,
-              "records": accepted, "failures": failures, "requested_scenes": args.scenes}
-    (root / "manifest.json").write_text(json.dumps(result, indent=2))
+            finally:
+                save_result()
+    result = save_result()
     if not result["complete"]:
         raise RuntimeError(f"FG collection incomplete: {len(accepted)}/{args.scenes}; inspect events.jsonl")
 

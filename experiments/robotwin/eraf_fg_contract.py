@@ -108,9 +108,12 @@ def action_windows(actions: np.ndarray, *, supervision: str = "full", stride: in
 
 def validate_correction(record: Mapping[str, Any]) -> dict[str, Any]:
     row = dict(record)
-    if row.get("format") != FORMAT:
+    from experiments.robotwin.expanded_fg import FORMAT as EXPANDED_FORMAT, validate_header
+    if row.get("format") == EXPANDED_FORMAT:
+        validate_header(row)
+    elif row.get("format") != FORMAT:
         raise ValueError("Unknown failure-replay protocol.")
-    if scene_key(row)[0] not in TARGET_TASKS:
+    elif scene_key(row)[0] not in TARGET_TASKS:
         raise ValueError("This corrective experiment targets left placement and ranking.")
     kind = failure_kind(source_ever_success=row["source_goal_ever_success"],
                         cf_ever_success=row["counterfactual_goal_ever_success"])
