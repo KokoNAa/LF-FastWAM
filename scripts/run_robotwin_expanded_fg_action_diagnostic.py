@@ -41,7 +41,7 @@ def main():
             pass
     if any(v.get('exit_code') != 0 for v in driver['jobs'].values()):
         raise ValueError('Source trial contains nonzero exits.')
-    plan = read(source/'plan.json'); hashes = read(source/'final_checkpoint_hashes.json')
+    plan = read(source/'protocol.json'); hashes = read(source/'final_checkpoint_hashes.json')
     if not hashes['complete'] or not read(source/'comparison.json')['complete']:
         raise ValueError('Missing completed comparison or hash ledger.')
     models = {'strongest': dict(path=plan['strongest_checkpoint'], sha256=plan['source_policy_sha256'], eraf='off')}
@@ -56,7 +56,7 @@ def main():
         p = root/name; temp = p.with_suffix('.tmp')
         temp.write_text(json.dumps(value, indent=2)+'\n');temp.replace(p)
     state = dict(complete=False, terminal=False, stage='diagnostic', jobs={})
-    write('protocol.json', dict(models=models, source_root=str(source), source_plan_sha256=file_sha256(source/'plan.json'),
+    write('protocol.json', dict(models=models, source_root=str(source), source_plan_sha256=file_sha256(source/'protocol.json'),
         source_comparison_sha256=file_sha256(source/'comparison.json'), manifest=plan['manifest'],
         manifest_sha256=plan['manifest_sha256'], deadline=args.deadline, optimizer_updates=0,
         code_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(), platform_shutdown=None))
