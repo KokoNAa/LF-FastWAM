@@ -20,6 +20,8 @@ def main():
     ap.add_argument('--root', type=Path, required=True)
     ap.add_argument('--collection', type=Path, required=True)
     ap.add_argument('--deadline', required=True)
+    ap.add_argument('--ranking-scenes', type=int, choices=[10, 11, 12], default=12)
+    ap.add_argument('--driver-name', default='remaining_driver')
     args = ap.parse_args()
     deadline = datetime.fromisoformat(args.deadline)
     if deadline.tzinfo is None:
@@ -29,10 +31,12 @@ def main():
     parent = R / 'grounding3000/step_002250.pt'
     source = D.parent / 'robotwin_cf_cause_audit/decision-bank-20260905-220457'
     sources = [C / name / 'manifest.json' for name in ('shard3', 'shard4', 'shard5', 'ranking_backfill4')]
-    root = D / 'remaining_driver'
+    if Path(args.driver_name).name != args.driver_name or args.driver_name in {'', '.', '..'}:
+        ap.error('Use a plain new driver directory name')
+    root = D / args.driver_name
     root.mkdir(exist_ok=False)
-    state = dict(complete=False, deadline=args.deadline, phase='waiting_for_12_ranking_successes',
-                 jobs={}, test_opened=False, ranking_scene_quota=12)
+    state = dict(complete=False, deadline=args.deadline, phase='waiting_for_ranking_successes',
+                 jobs={}, test_opened=False, ranking_scene_quota=args.ranking_scenes)
     processes = {}
     env = os.environ.copy()
     env.update(PATH='/opt/conda/bin:' + env['PATH'], PYTHONPATH=str(REPO / 'src') + ':' + str(REPO),
@@ -110,7 +114,7 @@ def main():
             count = sum(json.loads(p.read_text())['successful_scenes'] for p in sources if p.exists())
             state['available_ranking_scenes'] = count
             save()
-            if count >= 12 and all(p.exists() for p in sources):
+            if count >= args.ranking_scenes and all(p.exists() for p in sources):
                 break
             if all(p.exists() for p in sources) and all(
                     json.loads(p.read_text()).get('complete') for p in sources):
@@ -143,7 +147,7 @@ def main():
             raise RuntimeError('Owned collector supervisors did not exit after quota stop')
         start('curate', [sys.executable, 'scripts/curate_robotwin_retention_pool.py',
             '--collections', *sources, '--parent-manifest', D / 'cache_left_cf/manifest.json',
-            '--output', D / 'ranking_pool/manifest.json', '--task', 'blocks_ranking_rgb', '--scenes', 12])
+            '--output', D / 'ranking_pool/manifest.json', '--task', 'blocks_ranking_rgb', '--scenes', args.ranking_scenes])
         while not done('curate'):
             budget(); time.sleep(1)
         state['phase'] = 'cache_ranking'; save()
