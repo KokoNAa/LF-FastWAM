@@ -1,0 +1,52 @@
+"""Cross-arm actual sample audit for the expanded FG four-arm action trial."""
+from collections import Counter
+import json
+import math
+from pathlib import Path
+
+
+def audit_action_pairing(root):
+    from experiments.robotwin.eraf_fg_training import mixture_stream
+    root=Path(root);read=lambda p:json.loads(Path(p).read_text())
+    protocol=read(root/'protocol.json');rows=read(protocol['manifest'])['states']
+    plans={a:read(root/a/'joint/plan.json') for a in protocol['arms']}
+    streams={};journals={};counts={a:Counter() for a in plans}
+    for a,p in plans.items():
+        assert (p['steps']==200 and p['start_optimizer_step']==0 and p['global_batch']==12
+                and p['seed']==42 and p['correction_weight']==1 and p['task_balanced']
+                and p['correct_count']==2 and p['cf_count']==4 and p['disable_seen_language_augmentation'])
+        report=read(root/a/'joint/freeze_audit.json')
+        assert report['complete'] and report['optimizer_checkpoint_and_contract_match'] and not report['unexpected_changes']
+        journals[a]=[[read_line for read_line in map(json.loads,(root/a/'joint'/f'rank{rank}.jsonl').read_text().splitlines())]
+                     for rank in range(p['world_size'])]
+        assert all([r['step'] for r in j]==list(range(1,201)) for j in journals[a])
+        streams[a]=mixture_stream(rows,42,p['fg'],task_balanced=True,correct_count=2,cf_count=4)
+    shared=replaced=0
+    for i in range(200):
+        batches={a:next(s) for a,s in streams.items()}
+        for a,batch in batches.items():
+            p=plans[a];assert len({j[i]['grad_norm'] for j in journals[a]})==1
+            assert all(math.isfinite(j[i]['grad_norm']) and j[i]['grad_norm']>0 for j in journals[a])
+            for rank,j in enumerate(journals[a]):
+                examples=j[i]['examples'];expected=batch[rank::p['world_size']]
+                assert [e['id'] for e in examples]==[r['id'] for r in expected]
+                assert [e['ordinary_cf_control'] for e in examples]==[bool(r.get('ordinary_cf_control')) for r in expected]
+                assert all(e['seen_variant'] is None for e in examples)
+                assert all(math.isfinite(v) for e in examples for k,v in e.items() if k.startswith('flow_') or k=='endpoint_objective')
+            for r in batch:
+                assert r['replay_split']=='train'
+                kind='fg' if r.get('fg_correction') else 'ordinary_cf_control' if r.get('ordinary_cf_control') else 'common'
+                counts[a][kind+'|'+r['pair_id']]+=1
+        assert batches['eraf_fg']==batches['fg_only']
+        assert batches['eraf_only']==batches['no_eraf']
+        for full,ordinary in zip(batches['eraf_fg'],batches['eraf_only'],strict=True):
+            if full.get('fg_correction'):
+                assert ordinary.get('ordinary_cf_control') and not ordinary.get('fg_correction')
+                assert (full['pair_id'],full['task_config'])==(ordinary['pair_id'],ordinary['task_config'])
+                replaced+=1
+            else:assert full==ordinary;shared+=1
+    assert shared==1800 and replaced==600
+    return dict(complete=True,actual_optimizer_steps_per_arm=200,actual_examples_per_arm=2400,
+        common_examples_per_arm=shared,matched_fg_or_ordinary_slots_per_arm=replaced,
+        actual_sample_ids_and_rank_norms_verified=True,all_sampled_rows_train=True,
+        identical_batches_within_fg_setting=True,counts={a:dict(c) for a,c in counts.items()})
