@@ -6,7 +6,46 @@ import torch
 from test_robotwin_eraf_fg_bridge import case
 from experiments.robotwin.eraf_fg_training import backward_example
 from experiments.robotwin.eraf_fg_bridge import trainable_parameters
-from experiments.robotwin.gradient_diagnostic import GradientCollector
+from experiments.robotwin.gradient_diagnostic import GradientCollector, bucket, diagnostic_recipe
+
+
+def test_saved_plan_recovers_current_cf_priority_recipe_and_rejects_drift():
+    plan = dict(stage='joint', fg='full', eraf='on', seed=42, global_batch=12,
+                correct_weight=1., cf_weight=4., correction_weight=1., policy_scope='action',
+                correct_count=2, cf_count=4, task_balanced=True,
+                disable_seen_language_augmentation=True,
+                mixture=dict(correct_retention=2, cf_retention=4, expert_pairs=3,
+                             fg=3, ordinary_cf_control=0))
+    plan['optimization_contract'] = {k: v for k, v in plan.items() if k != 'mixture'}
+    recovered = diagnostic_recipe(plan)
+    assert recovered['eraf'] == 'on' and recovered['policy_scope'] == 'action'
+    assert recovered['correct_count'] == 2 and recovered['cf_count'] == 4
+    assert recovered['correct_weight'] == 1. and recovered['cf_weight'] == 4.
+    assert recovered['task_balanced'] and recovered['disable_seen_language_augmentation']
+    with pytest.raises(ValueError, match='optimization contract'):
+        diagnostic_recipe(plan | {'cf_weight': 2.})
+    with pytest.raises(ValueError, match='mixture'):
+        diagnostic_recipe(plan | {'mixture': plan['mixture'] | {'cf_retention': 2}})
+    with pytest.raises(ValueError, match='Incomplete'):
+        diagnostic_recipe({})
+    legacy = diagnostic_recipe()
+    assert legacy['policy_scope'] == 'all' and legacy['eraf'] == 'off'
+    assert legacy['correct_count'] == 4 and legacy['cf_count'] == 2
+    assert legacy['correct_weight'] == 4. and legacy['cf_weight'] == 2.
+
+
+def test_control_gradient_and_eraf_interface_are_reported_separately():
+    action = torch.nn.Parameter(torch.ones(2))
+    interface = torch.nn.Parameter(torch.ones(2))
+    collector = GradientCollector({'mot.mixtures.action.p': action, 'guard.goal_graph.p': interface})
+    group = bucket({'ordinary_cf_control': True})
+    assert group == 'ordinary_cf_control'
+    collector.observer(group, 'control')((action + 2 * interface).sum(), 'endpoint')
+    report = collector.summary()['scopes']
+    assert report['action']['norms'][group] == pytest.approx(2 ** .5)
+    assert report['eraf']['norms'][group] == pytest.approx(8 ** .5)
+    assert report['other']['norms'][group] == 0
+    assert action.grad is None and interface.grad is None
 
 
 def test_cosines_detect_opposition_and_zero_without_mutation():

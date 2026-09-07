@@ -5,14 +5,53 @@ import math
 
 def bucket(row):
     for flag, label in (('native_retention', 'correct_retention'),
-                        ('cf_retention', 'cf_retention'), ('fg_correction', 'fg')):
+                        ('cf_retention', 'cf_retention'), ('fg_correction', 'fg'),
+                        ('ordinary_cf_control', 'ordinary_cf_control')):
         if row.get(flag):
             return label
     return 'expert_pair'
 
 
 def scope(name):
+    if name.startswith('guard.'):
+        return 'eraf'
     return 'video' if '.video.' in name else 'action' if '.action.' in name else 'other'
+
+
+def diagnostic_recipe(plan=None):
+    """Recover the executed action recipe; retain historical probe defaults."""
+    from experiments.robotwin.eraf_fg_training import mixture_counts
+    recipe = dict(stage='joint', fg='full', eraf='off', seed=42, policy_scope='all',
+                  correct_count=4, cf_count=2, correct_weight=4., cf_weight=2.,
+                  correction_weight=1., task_balanced=False,
+                  disable_seen_language_augmentation=False)
+    if plan is not None:
+        required = {'stage', 'fg', 'eraf', 'seed', 'correct_weight', 'cf_weight', 'global_batch'}
+        if required - plan.keys():
+            raise ValueError(f'Incomplete training plan: {sorted(required - plan.keys())}')
+        if plan['global_batch'] != 12:
+            raise ValueError('Diagnostic expects the executed global batch of 12.')
+        recipe.update({k: plan[k] for k in recipe if k in plan})
+        for key, value in recipe.items():
+            if key in plan.get('optimization_contract', {}) and plan['optimization_contract'][key] != value:
+                raise ValueError(f'Training plan disagrees with optimization contract: {key}')
+    if recipe['stage'] not in {'joint', 'interface'} or recipe['fg'] not in {'off', 'local', 'full'}:
+        raise ValueError('Require a supported action-training recipe.')
+    if recipe['eraf'] not in {'off', 'on'} or recipe['policy_scope'] not in {'all', 'action'}:
+        raise ValueError('Invalid ERAF or policy scope.')
+    if recipe['stage'] == 'interface' and recipe['eraf'] == 'off':
+        raise ValueError('ERAF-off has no trainable interface.')
+    for key in ('correct_weight', 'cf_weight', 'correction_weight'):
+        if not math.isfinite(recipe[key]) or recipe[key] <= 0:
+            raise ValueError(f'Invalid loss weight: {key}')
+    counts = mixture_counts(recipe['correct_count'], recipe['cf_count'])
+    if plan is not None and 'mixture' in plan:
+        expected = dict(correct_retention=counts['correct'], cf_retention=counts['cf'],
+                        expert_pairs=3, fg=0 if recipe['fg'] == 'off' else 3,
+                        ordinary_cf_control=3 if recipe['fg'] == 'off' else 0)
+        if plan['mixture'] != expected:
+            raise ValueError('Training plan mixture disagrees with recovered recipe.')
+    return recipe
 
 
 class GradientCollector:
@@ -50,7 +89,7 @@ class GradientCollector:
     def summary(self):
         names = sorted(self.groups)
         result = {}
-        for category in ('all', 'video', 'action', 'other'):
+        for category in ('all', 'video', 'action', 'eraf', 'other'):
             def dot(a, b):
                 return sum(float((v * b[k]).sum()) for k, v in a.items()
                            if k in b and (category == 'all' or scope(k) == category))

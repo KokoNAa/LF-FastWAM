@@ -6,6 +6,8 @@ import gc
 import json
 from pathlib import Path
 import random
+import hashlib
+import subprocess
 import sys
 import time
 
@@ -13,7 +15,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / 'src')]
 
 
-def action_probe(policy, rows, payloads, raw, output, check_budget):
+def action_probe(policy, rows, payloads, raw, output, check_budget, *, eraf=False):
     import h5py
     import numpy as np
     import torch
@@ -34,7 +36,7 @@ def action_probe(policy, rows, payloads, raw, output, check_budget):
     records, arrays = [], {}
     enabled = model.policy_guard_enabled
     try:
-        model.policy_guard_enabled = False
+        model.policy_guard_enabled = eraf
         for row in selected.values():
             observations, predictions, errors = {}, {}, {}
             payload = payloads[row['id']]
@@ -79,7 +81,7 @@ def action_probe(policy, rows, payloads, raw, output, check_budget):
     finally:
         model.policy_guard_enabled = enabled
         policy.reset()
-    result = {'complete': True, 'seed': policy.seed if hasattr(policy, 'seed') else 42,
+    result = {'complete': True, 'seed': policy.seed if hasattr(policy, 'seed') else 42, 'eraf': eraf,
               'inference_steps': 10, 'records': records,
               'scope': 'Existing initial data holdout only; action error is not closed-loop task success.'}
     (output / 'action_probe.json').write_text(json.dumps(result, indent=2))
@@ -94,17 +96,36 @@ def main():
     parser.add_argument('--batches', type=int, default=12)
     parser.add_argument('--start-batch', type=int, default=1)
     parser.add_argument('--max-seconds', type=int, default=2100)
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--training-plan', help='Read the actual sampler, losses, ERAF and parameter scope from a saved action plan.')
     parser.add_argument('--skip-actions', action='store_true', help='Second disjoint gradient shard; avoid duplicate action probes.')
     args = parser.parse_args()
     if not 1 <= args.batches <= 12 or args.start_batch < 1 or args.start_batch + args.batches - 1 > 12 or args.max_seconds <= 0:
         parser.error('Use1–12 fixed global batches and a positive runtime limit.')
+    from experiments.robotwin.gradient_diagnostic import diagnostic_recipe
+    plan_text = Path(args.training_plan).read_text() if args.training_plan else None
+    plan = json.loads(plan_text) if plan_text else None
+    recipe = diagnostic_recipe(plan)
+    if args.seed is not None:
+        if plan is not None and args.seed != recipe['seed']:
+            parser.error('A training-plan probe must use that plan seed.')
+        recipe['seed'] = args.seed
+    args.seed = recipe['seed']
+    if plan is not None:
+        for key in ('manifest', 'source_bank', 'correct_teacher', 'cf_teacher'):
+            if Path(plan[key]).resolve() != Path(getattr(args, key)).resolve():
+                parser.error(f'{key} differs from the saved training plan.')
     started = time.monotonic()
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     result = {'complete': False, 'settings': vars(args), 'optimizer_updates': 0,
+              'recipe': recipe,
+              'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(),
               'checkpoint': str(Path(args.checkpoint).resolve()), 'batches_completed': 0,
-              'scope': 'Fixed-input diagnosis, ERAF off, original Correct4/CF2 and full FG; no model selection.'}
+              'scope': 'Fixed-input weighted raw gradients; no AdamW preconditioning, optimizer update or success-based model selection.'}
+    if plan_text is not None:
+        (output / 'training_plan.json').write_text(plan_text)
+        result['training_plan_sha256'] = hashlib.sha256(plan_text.encode()).hexdigest()
     def check_budget():
         if time.monotonic() - started >= args.max_seconds:
             raise TimeoutError('Diagnostic runtime limit reached; no automatic extension.')
@@ -127,14 +148,21 @@ def main():
         model = policy.model
         payloads, raw = ReplayPayloads(rows, model.device), RawReplay(args.source_bank)
         if not args.skip_actions:
-            result['action_probe_complete'] = action_probe(policy, rows, payloads, raw, output, check_budget)['complete']
-        selected = trainable_parameters(model, 'joint', eraf=False)
+            result['action_probe_complete'] = action_probe(policy, rows, payloads, raw, output, check_budget,
+                                                          eraf=recipe['eraf'] == 'on')['complete']
+        selected = trainable_parameters(model, recipe['stage'], eraf=recipe['eraf'] == 'on',
+                                        policy_scope=recipe['policy_scope'])
+        if plan is not None and list(selected) != plan['trainable_parameters']:
+            raise ValueError('Diagnostic parameter selection differs from the executed training plan.')
         original = {n: p.detach().cpu().clone() for n, p in selected.items()}
         adapters = {n: p for n, p in model.mot.named_parameters() if n.endswith(('.lora_A', '.lora_B'))}
         teachers = {'correct': NativeTeacher(model, adapters, args.correct_teacher),
                     'cf': NativeTeacher(model, adapters, args.cf_teacher)}
-        seen = build_seen_contexts(model, REPO, [r for r in rows if not r.get('native_retention') and not r.get('cf_retention')])
-        stream = mixture_stream(rows, args.seed, 'full')
+        seen = ({} if recipe['disable_seen_language_augmentation'] else build_seen_contexts(model, REPO,
+            [r for r in rows if not r.get('native_retention') and not r.get('cf_retention')
+             and not (recipe['fg'] == 'off' and r.get('fg_correction'))]))
+        stream = mixture_stream(rows, args.seed, recipe['fg'], task_balanced=recipe['task_balanced'],
+                                correct_count=recipe['correct_count'], cf_count=recipe['cf_count'])
         for _ in range(args.start_batch - 1):
             next(stream)
         with (output / 'gradients.jsonl').open('x', buffering=1) as journal:
@@ -161,10 +189,13 @@ def main():
                     timestep = (scheduler._phi(u, scheduler.shift) * scheduler.num_train_timesteps).to(model.device, model.torch_dtype)
                     group = bucket(row)
                     report = backward_example(model, row, payload, noise, timestep, teachers=teachers,
-                        coefficient=1/12, eraf=False, fg='full', correct_weight=4., cf_weight=2.,
+                        coefficient=1/12, eraf=recipe['eraf'] == 'on', fg=recipe['fg'],
+                        correct_weight=recipe['correct_weight'], cf_weight=recipe['cf_weight'],
+                        correction_weight=recipe['correction_weight'],
                         gradient_observer=collector.observer(group, row['id']))
                     entries.append({'id': row['id'], 'group': group, 'pair_id': row['pair_id'],
                                     'scene_seed': row['scene_seed'], 'seed': seed, 'seen_variant': variant_index,
+                                    'ordinary_cf_control': bool(row.get('ordinary_cf_control')),
                                     'timestep': float(timestep), 'metrics': report})
                 journal.write(json.dumps({'batch': step, 'examples': entries, **collector.summary()}) + '\n')
                 if any(p.grad is not None for p in selected.values()):
