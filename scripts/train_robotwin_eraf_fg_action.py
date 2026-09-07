@@ -33,6 +33,8 @@ def main():
     ap.add_argument('--correct-weight', type=float, default=2.)
     ap.add_argument('--cf-weight', type=float, default=1.)
     ap.add_argument('--policy-scope', choices=['all', 'action'], default='all')
+    ap.add_argument('--interface-scope', choices=['all', 'route_outputs'], default='all',
+                    help='Open only the two semantic-to-action query outputs during interface warmup.')
     ap.add_argument('--target-tasks', nargs='+', default=['place_a2b_left', 'blocks_ranking_rgb'],
                     choices=['place_a2b_left', 'blocks_ranking_rgb', 'place_empty_cup'])
     ap.add_argument('--cf-retention-tasks', nargs='+',
@@ -110,7 +112,7 @@ def main():
     policy = load_policy(args.checkpoint, manifest, device=f'cuda:{local}', seed=args.seed)
     model = policy.model
     selected = trainable_parameters(model, args.stage, eraf=args.eraf == 'on',
-                                    policy_scope=args.policy_scope)
+                                    policy_scope=args.policy_scope, interface_scope=args.interface_scope)
     adapters = {n: p for n, p in model.mot.named_parameters() if n.endswith(('.lora_A', '.lora_B'))}
     teachers = {'correct': NativeTeacher(model, adapters, args.correct_teacher),
                 'cf': NativeTeacher(model, adapters, args.cf_teacher)}
@@ -121,7 +123,7 @@ def main():
     optimization_contract = {k: getattr(args, k) for k in ('stage', 'fg', 'eraf', 'seed',
         'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation',
         'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks', 'cf_retention_tasks', 'task_balanced',
-        'interface_learning_rate', 'correct_count', 'cf_count', 'fg_gradient_route')}
+        'interface_learning_rate', 'correct_count', 'cf_count', 'fg_gradient_route', 'interface_scope')}
     if args.skip_file_hashes:
         p = Path(args.manifest).resolve()
         optimization_contract['manifest_identity'] = {'path': str(p), 'bytes': p.stat().st_size,
@@ -148,7 +150,7 @@ def main():
                 raise ValueError('Optimizer master tensors do not match the loaded checkpoint.')
         elif state['checkpoint_sha256'] != file_sha256(args.checkpoint):
             raise ValueError('Optimizer checkpoint identity changed.')
-        old_defaults = {'policy_scope': 'all', 'correction_weight': 1., 'skip_file_hashes': False,
+        old_defaults = {'policy_scope': 'all', 'interface_scope': 'all', 'correction_weight': 1., 'skip_file_hashes': False,
                         'target_tasks': ['place_a2b_left', 'blocks_ranking_rgb'],
                         'cf_retention_tasks': ['place_a2b_right', 'place_burger_fries', 'stack_blocks_two'],
                         'task_balanced': False, 'interface_learning_rate': None,
@@ -227,7 +229,8 @@ def main():
                 save_repair_checkpoint(model, checkpoint_path, stage=args.stage,
                     steps=step, parent=args.checkpoint, fg_supervision=args.fg,
                     provenance={'plan': str(root / 'plan.json'), 'eraf': args.eraf,
-                                'policy_scope': args.policy_scope, 'correction_weight': args.correction_weight,
+                                'policy_scope': args.policy_scope, 'interface_scope': args.interface_scope,
+                                'correction_weight': args.correction_weight,
                                 'target_tasks': args.target_tasks, 'cf_retention_tasks': args.cf_retention_tasks,
                                 'warm_policy_initialization': args.warm_policy,
                                 'interface_learning_rate': args.interface_learning_rate,

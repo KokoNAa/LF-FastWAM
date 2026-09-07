@@ -266,13 +266,17 @@ INTERFACE_PARTS = {"goal_graph", "goal_query_seeds", "eraf_action_grounding_brid
                    "eraf_action_context_injector"}
 
 
-def trainable_parameters(model, stage: str, *, eraf=True, policy_scope='all'):
+def trainable_parameters(model, stage: str, *, eraf=True, policy_scope='all', interface_scope='all'):
     """Freeze semantic prediction after grounding; train its action interfaces."""
     import torch
     if stage not in {"grounding", "interface", "joint"}:
         raise ValueError("Unknown optimization stage.")
     if policy_scope not in {'all', 'action'}:
         raise ValueError('Unknown policy parameter scope.')
+    if interface_scope not in {'all', 'route_outputs'}:
+        raise ValueError('Unknown interface parameter scope.')
+    if interface_scope == 'route_outputs' and (stage != 'interface' or not eraf):
+        raise ValueError('Route-output warmup requires the ERAF-on interface stage.')
     model.eval().requires_grad_(False)
     selected = {}
     if stage == "joint":
@@ -289,6 +293,11 @@ def trainable_parameters(model, stage: str, *, eraf=True, policy_scope='all'):
             interface = (parts[0] in INTERFACE_PARTS or
                          (parts[0] == "entity_relation_affordance" and parts[1] in ROUTE_PARTS))
             semantic = parts[0] == "entity_relation_affordance" and not interface
+            if interface_scope == 'route_outputs':
+                # These zero-initialized outputs block semantics from reaching
+                # deployed action queries. Keep GoalGraph/context injection fixed.
+                interface = (parts[0] in {'entity_relation_affordance', 'eraf_action_grounding_bridge'}
+                             and parts[1] == 'query_delta_projection')
             if (stage == "grounding" and semantic) or (stage != "grounding" and interface):
                 p.requires_grad_(True)
                 selected["guard." + name] = p

@@ -103,6 +103,46 @@ def test_master_optimizer_accumulates_updates_below_bfloat16_spacing():
     assert live.item() < 1
 
 
+def test_route_output_warmup_opens_semantic_action_path_and_freezes_other_weights(case):
+    from experiments.robotwin.eraf_fg_bridge import trainable_parameters, MasterAdamW
+    model, captured, noisy, time = case
+    selected = trainable_parameters(model, 'interface', interface_scope='route_outputs')
+    assert set(selected) == {f'guard.{module}.query_delta_projection.{part}'
+        for module in ('entity_relation_affordance', 'eraf_action_grounding_bridge')
+        for part in ('weight', 'bias')}
+    assert all(p.count_nonzero() == 0 for p in selected.values())
+    before = {k: p.detach().clone() for k, p in model.named_parameters() if not p.requires_grad}
+    bridge = model.policy_guard_modules['eraf_action_grounding_bridge']
+    def intervene(module, args, kwargs):
+        outputs = dict(kwargs['eraf_outputs'])
+        outputs['goal_anchor'] = outputs['goal_anchor'] + .2
+        return args, dict(kwargs, eraf_outputs=outputs)
+    def changed_action():
+        hook = bridge.register_forward_pre_hook(intervene, with_kwargs=True)
+        try:
+            return predict(model, captured, noisy, time, checkpoint=False)
+        finally:
+            hook.remove()
+    with torch.no_grad():
+        assert torch.equal(predict(model, captured, noisy, time, checkpoint=False), changed_action())
+    optimizer = MasterAdamW(selected.values(), lr=.003)
+    optimizer.zero_grad()
+    predict(model, captured, noisy, time, checkpoint=False).square().mean().backward()
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in selected.values())
+    optimizer.step()
+    assert all(p.count_nonzero() > 0 for p in selected.values())
+    with torch.no_grad():
+        assert not torch.equal(predict(model, captured, noisy, time, checkpoint=False), changed_action())
+    assert all(torch.equal(before[k], p) for k, p in model.named_parameters() if k in before)
+
+
+@pytest.mark.parametrize('stage,eraf', [('joint', True), ('grounding', True), ('interface', False)])
+def test_route_output_scope_rejects_wrong_stage(case, stage, eraf):
+    from experiments.robotwin.eraf_fg_bridge import trainable_parameters
+    with pytest.raises(ValueError, match='Route-output warmup'):
+        trainable_parameters(case[0], stage, eraf=eraf, interface_scope='route_outputs')
+
+
 def test_semantic_pretraining_path_matches_production_eraf_heads(case):
     from experiments.robotwin.eraf_fg_data import grounding_outputs
     model, captured, _, _ = case
