@@ -15,6 +15,12 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "src")]
 
 
+def evaluation_log_line(result):
+    return (f"[grounding-eval] step={result['step']} "
+            f"roles={result['role_accuracy']:.4f} relations={result['relation_accuracy']:.4f} "
+            f"geometry_cm={result['geometry']['selection_score_cm']:.3f}")
+
+
 def balanced_rows(rows, seed, *, task_balanced=False):
     if task_balanced:
         from experiments.robotwin.eraf_fg_training import balanced_group_stream
@@ -217,7 +223,7 @@ def main():
                 result['fg_geometry_holdout'].update(role_hits=hits, role_count=count,
                     role_accuracy=hits / count if count else None)
         (root / f"grounding_eval_{step:06d}.json").write_text(json.dumps(result, indent=2))
-        print(f"[grounding-eval] step={step} roles={role:.4f} relations={relation:.4f} geometry_cm={result['geometry']['selection_score_cm']:.3f}", flush=True)
+        print(evaluation_log_line(result), flush=True)
         return result
 
     if rank == 0:

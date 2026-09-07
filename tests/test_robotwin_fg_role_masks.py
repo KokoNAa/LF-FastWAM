@@ -14,6 +14,15 @@ from test_robotwin_eraf_fg_contract import correction
 from test_robotwin_fg_geometry_replay import capture
 
 
+def test_role_validation_logging_uses_saved_metrics_after_role_iteration():
+    from scripts.train_robotwin_eraf_fg_grounding import evaluation_log_line
+    report={'step':0,'role_accuracy':.8125,'relation_accuracy':1.,
+            'geometry':{'selection_score_cm':15.52},
+            'fg_geometry_holdout':{'role_accuracy':.4,'rows':[]}}
+    assert evaluation_log_line(report)==('[grounding-eval] step=0 roles=0.8125 '
+        'relations=1.0000 geometry_cm=15.520')
+
+
 def index_fixture(tmp_path):
     manifest = tmp_path / 'manifest.json'; manifest.write_text('{}')
     path = tmp_path / 'masks.npz'
