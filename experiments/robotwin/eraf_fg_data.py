@@ -90,10 +90,13 @@ def validate_cf_retention_coverage(rows, required_tasks, *, minimum_scenes=10):
 
 
 class RawReplay:
-    def __init__(self, source_bank, *, label_cache=None, fg_geometry=False):
+    def __init__(self, source_bank, *, label_cache=None, fg_geometry=False, fg_masks=None):
         self.raw = {}
         from experiments.robotwin.fg_geometry_replay import CorrectionGeometry
         self.corrections = CorrectionGeometry() if fg_geometry else None
+        if fg_masks is not None and self.corrections is None:
+            raise ValueError('Corrective masks require the explicit geometry protocol.')
+        self.fg_masks = fg_masks
         self.label_cache = Path(label_cache) if label_cache else None
         if self.label_cache:
             self.label_cache.mkdir(parents=True, exist_ok=True)
@@ -152,7 +155,8 @@ class RawReplay:
         if row.get('fg_correction'):
             if self.corrections is None:
                 raise ValueError('FG labels require the explicit partial geometry protocol.')
-            return self.corrections.labels(row, language)
+            labels = self.corrections.labels(row, language)
+            return self.fg_masks.attach(labels, row) if self.fg_masks is not None else labels
         from scripts.build_pgc_robotwin_entity_relations import _generic_role_arrays, _entity_id, _phase_ids
         path, frame = self.locate(row, language)
         key = f"one_frame_v1:{path}:{frame}"
