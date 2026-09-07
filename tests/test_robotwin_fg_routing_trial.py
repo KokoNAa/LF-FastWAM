@@ -1,8 +1,10 @@
 from pathlib import Path
 from types import SimpleNamespace
+import json
+import pytest
 
 from scripts.run_robotwin_cf_priority_campaign import build_protocol
-from scripts.run_robotwin_fg_routing_trial import command, final_checkpoint, protocol
+from scripts.run_robotwin_fg_routing_trial import bind_recovery, command, final_checkpoint, protocol
 
 
 def test_routing_comparison_changes_only_declared_gradient_route():
@@ -42,3 +44,17 @@ def test_routing_comparison_changes_only_declared_gradient_route():
     assert final_checkpoint(plan, Path('/next'), 'eraf_fg_routed') == Path('/next/eraf_fg_routed/joint/step_000200.pt')
     plan['arms']['eraf_fg_routed'].update(resume_checkpoint='/old/routed/step_000200.pt', resume_step=200)
     assert final_checkpoint(plan, Path('/next'), 'eraf_fg_routed') == Path('/old/routed/step_000200.pt')
+
+
+@pytest.mark.parametrize('field,value', [('cf_weight', 8.0), ('correct_weight', 2.0),
+    ('old_catalog', '/different/scenes'), ('seen_language_augmentation', True)])
+def test_recovery_rejects_changed_retention_and_evaluation_contract(tmp_path, field, value):
+    args = SimpleNamespace(checkpoint=Path('/data/all5.pt'), manifest=Path('/data/bank.json'),
+        source_bank=Path('/data/raw'), correct_teacher=Path('/data/dense600.pt'),
+        old_catalog=Path('/data/old'), new_catalog=Path('/data/new'),
+        deadline='2026-09-07T19:15:00+08:00', steps=400, interface_steps=100)
+    plan = protocol(build_protocol(args, 'base'), Path('/primary'), Path('/trial'), args.deadline, 'route')
+    (tmp_path / 'protocol.json').write_text(json.dumps(plan))
+    plan[field] = value
+    with pytest.raises(ValueError, match=field):
+        bind_recovery(plan, tmp_path)

@@ -66,7 +66,9 @@ def bind_recovery(plan, source):
         raise ValueError('Resume source is not this mechanism trial')
     for key in ('primary_root', 'checkpoint', 'interface_parent', 'manifest', 'source_bank',
                 'correct_teacher', 'cf_teacher', 'joint_steps', 'correction_weight',
-                'joint_learning_rate', 'interface_joint_learning_rate', 'mixture', 'seed'):
+                'joint_learning_rate', 'interface_joint_learning_rate', 'mixture', 'seed',
+                'correct_weight', 'cf_weight', 'task_balanced', 'policy_scope',
+                'seen_language_augmentation', 'old_catalog', 'new_catalog'):
         if old[key] != plan[key]:
             raise ValueError(f'Recovery changed the experiment: {key}')
     driver = json.loads((source / 'driver.json').read_text())
