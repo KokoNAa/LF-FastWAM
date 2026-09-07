@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Data collection only. Does not start instances, train, or consume test scenes.
 set -Eeuo pipefail
-if [[ $# != 1 ]]; then
-  echo "Usage: bash scripts/launch_robotwin_target_cf_retention.sh NEW_OUTPUT_DIRECTORY" >&2
+if (( $# < 1 || $# > 2 )); then
+  echo "Usage: bash scripts/launch_robotwin_target_cf_retention.sh NEW_OUTPUT_DIRECTORY [EXPLICIT_AUTHORIZED_WORK_DEADLINE]" >&2
   exit 2
 fi
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -13,6 +13,7 @@ export DIFFSYNTH_MODEL_BASE_PATH=/root/gpufree-data/fastwam/FastWAM/checkpoints
 export VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json
 export OMP_NUM_THREADS=2
 phase_output=$1
+authorized_work_deadline=${2:-2026-09-07T11:30:00+08:00}
 base_manifest=/root/gpufree-data/LF-FastWAM/runs/robotwin_eraf_fg/20260906-warm400-v1/bank_full_v2/manifest.json
 teacher=/root/gpufree-data/LF-FastWAM/runs/robotwin_cf_dense/20260906-native-retention-v1/repair-shared-decisions/step_000400.pt
 robotwin_root=/root/gpufree-data/LF-FastWAM/third_party/RoboTwin
@@ -20,13 +21,17 @@ test -f "$base_manifest"
 test -f "$teacher"
 test -d "$robotwin_root/assets"
 command -v timeout >/dev/null
-# Preserve the original campaign cutoff, even when this command starts late.
-collection_budget=$(python - <<'PY'
+# The original cutoff stays the default. A new window must be explicitly
+# supplied after authorization; never derive it by resetting elapsed time.
+collection_budget=$(python - "$authorized_work_deadline" <<'PY'
+import sys
 from datetime import datetime, timezone
-deadline = datetime.fromisoformat('2026-09-07T11:30:00+08:00')
+deadline = datetime.fromisoformat(sys.argv[1])
+if deadline.tzinfo is None:
+    raise SystemExit('The authorized work deadline must include its timezone.')
 remaining = int((deadline - datetime.now(timezone.utc)).total_seconds()) - 45
 if remaining < 900:
-    raise SystemExit('Insufficient time before the original 11:30 HKT work cutoff.')
+    raise SystemExit('Insufficient time before the authorized work cutoff.')
 print(min(4200, remaining))
 PY
 )
