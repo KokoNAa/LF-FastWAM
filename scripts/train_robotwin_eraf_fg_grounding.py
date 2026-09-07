@@ -73,6 +73,8 @@ def main():
         ap.error("Positive counts and global batch divisible by world size required.")
     if args.geometry_replay != 'off' and not 0 < args.geometry_replay_slots < args.global_batch:
         ap.error('Geometry replay needs positive slots and a nonempty ordinary expert core.')
+    if args.geometry_replay != 'off' and args.geometry_replay_slots % world:
+        ap.error('Partial geometry slots must be divisible by the number of ranks for collective alignment.')
     if any(value is not None and (not __import__('math').isfinite(value) or value <= 0)
            for value in (args.position_weight, args.anchor_weight)):
         ap.error('Geometry loss weights must be finite and positive.')
@@ -118,7 +120,7 @@ def main():
     raw = RawReplay(args.source_bank, label_cache=args.label_cache, fg_geometry=args.geometry_replay != 'off')
     stream = balanced_rows(rows, args.seed, task_balanced=args.task_balanced)
     geometry_stream = (geometry_mixture(rows, args.seed, batch_size=args.global_batch,
-        slots=args.geometry_replay_slots, mode=args.geometry_replay, task_balanced=args.task_balanced)
+        slots=args.geometry_replay_slots, mode=args.geometry_replay, task_balanced=args.task_balanced, world_size=world)
         if args.geometry_replay != 'off' else None)
     # Audit whole-scene separation before consuming either correction or expert data.
     validate_scene_splits(rows)
@@ -137,6 +139,7 @@ def main():
     if rank == 0:
         (root / "plan.json").write_text(json.dumps(vars(args) | {"world_size": world,
             "geometry_replay_schema": SCHEMA if geometry_stream is not None else None,
+            "geometry_replay_collective_schedule": "rank_group_aligned_v1" if geometry_stream is not None else None,
             "code_commit": __import__("subprocess").check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
             "manifest_sha256": __import__("hashlib").sha256(Path(args.manifest).read_bytes()).hexdigest(),
             "geometry_replay_validation_states": len(fg_validation) if geometry_stream is not None else 0,

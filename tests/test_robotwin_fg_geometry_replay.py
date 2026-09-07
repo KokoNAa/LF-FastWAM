@@ -81,7 +81,8 @@ def test_partial_loss_leaves_visibility_and_phase_outputs_without_gradients():
     assert torch.equal(loss.detach(), partial_geometry_loss(changed, labels, weights)[0].detach())
 
 
-def test_matched_geometry_arms_share_expert_core_and_task_domain_without_holdout():
+@pytest.mark.parametrize('world_size', [1, 3])
+def test_matched_geometry_arms_share_expert_core_and_task_domain_without_holdout(world_size):
     rows = []
     for task in ['left', 'rgb']:
         for kind in ['ordinary', 'fg']:
@@ -90,10 +91,13 @@ def test_matched_geometry_arms_share_expert_core_and_task_domain_without_holdout
                     rows.append(dict(id=f'{task}_{kind}_{split}_{frame}', pair_id=task, task_config='demo_clean',
                         scene_seed=1 if split == 'train' else 2, replay_split=split, frame_index=frame,
                         fg_correction=kind == 'fg'))
-    a, b = [geometry_mixture(rows, 42, batch_size=12, slots=3, mode=m, task_balanced=True) for m in ['ordinary', 'fg']]
+    a, b = [geometry_mixture(rows, 42, batch_size=12, slots=3, mode=m, task_balanced=True, world_size=world_size) for m in ['ordinary', 'fg']]
     for _ in range(5):
         x, y = next(a), next(b)
         assert sum(p for _, _, p in x) == 3
+        for batch in (x, y):
+            routes = [[partial for _, _, partial in batch[rank::world_size]] for rank in range(world_size)]
+            assert all(route == routes[0] for route in routes)
         for (ra, la, pa), (rb, lb, pb) in zip(x, y):
             assert pa == pb and la == lb
             assert ra['replay_split'] == rb['replay_split'] == 'train'
@@ -102,3 +106,9 @@ def test_matched_geometry_arms_share_expert_core_and_task_domain_without_holdout
                 assert ra['pair_id'] == rb['pair_id'] and ra['task_config'] == rb['task_config']
             else:
                 assert ra == rb and not ra['fg_correction']
+
+
+def test_unalignable_rank_groups_fail_before_training():
+    stream = geometry_mixture([], 42, batch_size=12, slots=3, mode='fg', world_size=2)
+    with pytest.raises(ValueError, match='rank groups'):
+        next(stream)

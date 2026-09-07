@@ -142,12 +142,14 @@ as a negative observation, which is wrong when segmentation was not captured.
                    'active': active.detach(), 'truth': truth.detach()}
 
 
-def geometry_mixture(rows, seed, *, batch_size, slots, mode, task_balanced=False):
+def geometry_mixture(rows, seed, *, batch_size, slots, mode, task_balanced=False, world_size=1):
     """Identical ordinary core and task/domain schedule in the two arms."""
     from experiments.robotwin.eraf_fg_training import balanced_group_stream
     from scripts.train_robotwin_eraf_fg_grounding import balanced_rows
     if mode not in {'ordinary', 'fg'} or not 0 < slots < batch_size:
         raise ValueError('Declare a geometry mode and a nonempty expert core.')
+    if world_size < 1 or batch_size % world_size or slots % world_size:
+        raise ValueError('Geometry slots and batch size must divide into complete rank groups.')
     train = [r for r in rows if r['replay_split'] == 'train']
     fg = [r for r in train if r.get('fg_correction')]
     groups = {(r['pair_id'], r['task_config']) for r in fg}
@@ -170,4 +172,13 @@ def geometry_mixture(rows, seed, *, batch_size, slots, mode, task_balanced=False
                 r = next(replacements[r['pair_id'], r['task_config']])
             batch.append((r, 'target', True))
         rng.shuffle(batch)
+        if world_size > 1:
+            # The full ERAF loss contains collectives; the partial loss does not.
+            # All ranks must enter the same loss type at every microbatch, not
+            # merely the same number of optimizer steps. Preserve randomized
+            # samples inside each type, then shuffle complete rank groups.
+            batch.sort(key=lambda item: item[2])
+            groups = [batch[i:i + world_size] for i in range(0, batch_size, world_size)]
+            rng.shuffle(groups)
+            batch = [sample for group in groups for sample in group]
         yield batch
