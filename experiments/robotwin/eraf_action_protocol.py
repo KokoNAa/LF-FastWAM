@@ -18,7 +18,11 @@ def validate_action_parent(parent, *, stage, eraf, fg, resume=False, warm_policy
             raise ValueError('Warm ERAF joint training requires a matching interface warmup first.')
         return
     if stage == 'interface':
-        if parent['stage'] != 'grounding':
+        residual_bootstrap = (parent['stage'] == 'bootstrap'
+            and parent.get('context_injection_mode') == 'context_residual_v1'
+            and parent.get('provenance', {}).get('context_residual_initialization') is True
+            and parent['optimizer_steps'] == 0)
+        if parent['stage'] != 'grounding' and not residual_bootstrap:
             raise ValueError('Interface training needs a semantic checkpoint or explicit warm policy.')
     elif eraf == 'on':
         if parent['stage'] != 'interface' or parent['fg_supervision'] != fg:

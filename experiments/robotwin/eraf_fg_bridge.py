@@ -89,6 +89,8 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("Unknown FG ablation.")
     if int(payload.get("optimizer_steps", -1)) < 0:
         raise ValueError("Invalid stage optimizer count.")
+    if payload.get('context_injection_mode', 'append_v1') not in {'append_v1', 'context_residual_v1'}:
+        raise ValueError('Unknown checkpoint context injection mode.')
     return dict(payload)
 
 
@@ -103,6 +105,7 @@ def load_repair_checkpoint(model, path: str | Path, *, payload=None) -> dict[str
     model.load_checkpoint(str(base))
     restore_policy_adapter(model, payload)
     model.policy_guard_modules.load_state_dict(payload["policy_guard"], strict=True)
+    model.policy_guard_modules['eraf_action_context_injector'].injection_mode = payload.get('context_injection_mode', 'append_v1')
     model.lora_base_checkpoint = str(base.resolve())
     model.policy_guard_base_checkpoint = str(base.resolve())
     return payload
@@ -152,6 +155,7 @@ def save_repair_checkpoint(model, path: str | Path, *, stage: str, steps: int,
     payload = {
         "format": CHECKPOINT_FORMAT, "protocol": PROTOCOL, "stage": stage,
         "optimizer_steps": int(steps), "fg_supervision": fg_supervision,
+        "context_injection_mode": model.policy_guard_modules['eraf_action_context_injector'].injection_mode,
         "base_checkpoint": model.lora_base_checkpoint,
         "parent_checkpoint": str(Path(parent).resolve()),
         "guard_config": eraf_guard_config(), "lora_config": dict(model.lora_config),

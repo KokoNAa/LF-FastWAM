@@ -2575,6 +2575,7 @@ class ERAFActionContextInjector(nn.Module):
         self.goal_dim = int(goal_dim)
         self.text_dim = int(text_dim)
         self.hidden_dim = int(hidden_dim)
+        self.injection_mode = 'append_v1'
         self.goal_norm = nn.LayerNorm(self.goal_dim)
         self.projection = nn.Sequential(
             nn.Linear(self.goal_dim, self.hidden_dim),
@@ -2645,11 +2646,28 @@ class ERAFActionContextInjector(nn.Module):
             self.projection(self.goal_norm(goal_queries.to(module_dtype)))
         ) * scale
         tokens = tokens.to(device=context.device, dtype=context.dtype)
-        token_mask = torch.ones(
-            tokens.shape[:2], device=context_mask.device, dtype=torch.bool
-        )
-        augmented_context = torch.cat((context, tokens), dim=1)
-        augmented_mask = torch.cat((context_mask, token_mask), dim=1)
+        if self.injection_mode == 'context_residual_v1':
+            # RoboTwin's final context token is normalized proprioception.
+            # Keep it and all padding untouched. A zero final projection gives
+            # exact original context/mask with a learnable output gradient.
+            if context.shape[1] < 2:
+                raise ValueError('Residual ERAF context requires language and a final state token.')
+            query = F.normalize(context.float(), dim=-1, eps=1e-3)
+            key = F.normalize(tokens.float(), dim=-1, eps=1e-3)
+            attention = (8.0 * torch.matmul(query, key.transpose(-2, -1))).softmax(-1)
+            residual = torch.matmul(attention, tokens.float()).to(context.dtype)
+            language_mask = context_mask.clone()
+            language_mask[:, -1] = False
+            residual = residual * language_mask.unsqueeze(-1).to(residual.dtype)
+            augmented_context, augmented_mask = context + residual, context_mask
+            added_tokens = 0
+        elif self.injection_mode == 'append_v1':
+            token_mask = torch.ones(tokens.shape[:2], device=context_mask.device, dtype=torch.bool)
+            augmented_context = torch.cat((context, tokens), dim=1)
+            augmented_mask = torch.cat((context_mask, token_mask), dim=1)
+            added_tokens = tokens.shape[1]
+        else:
+            raise ValueError('Unknown ERAF context injection mode.')
         return augmented_context, augmented_mask, {
             "pgc_v925_action_context_token_rms": (
                 tokens.float().square().mean().sqrt()
@@ -2662,7 +2680,7 @@ class ERAFActionContextInjector(nn.Module):
                 learned_scale.float()
             ),
             "pgc_v925_action_context_token_count": tokens.new_tensor(
-                float(tokens.shape[1]), dtype=torch.float32
+                float(added_tokens), dtype=torch.float32
             ),
             "pgc_v925_post_action_residual_enabled": tokens.new_zeros(
                 (), dtype=torch.float32

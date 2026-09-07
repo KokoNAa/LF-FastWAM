@@ -17,7 +17,7 @@ sys.path[:0] = [str(REPO), str(REPO / 'src')]
 
 @contextmanager
 def injection_mode(model, mode):
-    scales = {'schedule_zero': 0., 'near_zero_tokens': 1e-6, 'full': 1.}
+    scales = {'schedule_zero': 0., 'near_zero_tokens': 1e-6, 'full': 1., 'repeat_full': 1.}
     module = model.policy_guard_modules['eraf_action_context_injector']
     original, enabled = module.forward, model.policy_guard_enabled
     measurements = []
@@ -41,6 +41,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     for name in ('manifest', 'source-bank', 'checkpoint', 'output'):
         ap.add_argument('--' + name, required=True)
+    ap.add_argument('--require-residual-identity', action='store_true',
+                    help='Require a zero-step residual bootstrap and bitwise full-inference OFF identity.')
     args = ap.parse_args()
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
@@ -65,6 +67,15 @@ def main():
         raise ValueError('Require one existing initial holdout scene per task/domain.')
     policy = load_policy(args.checkpoint, manifest, seed=42)
     policy.model.requires_grad_(False)
+    if args.require_residual_identity:
+        from experiments.robotwin.context_residual import ZEROED, MODE
+        payload = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        if (payload.get('context_injection_mode') != MODE or payload['stage'] != 'bootstrap'
+                or payload['optimizer_steps'] != 0
+                or any(payload['policy_guard'][key].count_nonzero() for key in ZEROED)
+                or policy.model.policy_guard_modules['eraf_action_context_injector'].injection_mode != MODE):
+            raise ValueError('Identity audit requires an actually loaded zero-output residual bootstrap.')
+        del payload
     norm = policy.processor.normalizer.normalizers['action'][policy.processor.shape_meta['action'][0]['key']]
     raw = RawReplay(args.source_bank)
     records, arrays = [], {}
@@ -76,8 +87,9 @@ def main():
                     'observation': {c: {'rgb': decode_legacy_robotwin_rgb(h[f'observation/{c}/rgb'][frame])}
                                     for c in CAMERAS}}
             instruction = row['source_instruction' if language == 'source' else 'counterfactual_instruction']
-            predictions, metrics = {}, {}
-            for mode in ('off', 'schedule_zero', 'near_zero_tokens', 'full'):
+            predictions, metrics, raw_actions = {}, {}, {}
+            modes = ('off', 'full', 'repeat_full') if args.require_residual_identity else ('off', 'schedule_zero', 'near_zero_tokens', 'full')
+            for mode in modes:
                 policy.reset()
                 with injection_mode(policy.model, mode) as measured, torch.no_grad():
                     actions = policy._infer_action_chunk(observation, instruction)
@@ -85,12 +97,15 @@ def main():
                 if normalized.shape != (32, 14) or not np.isfinite(normalized).all():
                     raise ValueError('Invalid predicted action chunk.')
                 predictions[mode] = normalized
+                raw_actions[mode] = np.asarray(actions).copy()
                 metrics[mode] = measured[-1] if measured else {}
                 arrays[f'q{len(records):03d}_{mode}'] = normalized
             comparisons = {}
-            for mode in ('schedule_zero', 'near_zero_tokens', 'full'):
+            for mode in modes[1:]:
                 delta = predictions[mode] - predictions['off']
                 comparisons[mode] = {'max_abs': float(np.abs(delta).max()),
+                    'raw_actions_exact': bool(np.array_equal(raw_actions[mode], raw_actions['off'])),
+                    'normalized_actions_exact': bool(np.array_equal(predictions[mode], predictions['off'])),
                     **{f'rmse_first{n}': float(np.sqrt(np.mean(delta[:n] ** 2))) for n in (12, 24, 32)}}
             record = {'pair_id': row['pair_id'], 'task_config': row['task_config'],
                 'scene_seed': row['scene_seed'], 'language': language, 'instruction': instruction,
@@ -99,8 +114,20 @@ def main():
                 'rgb_sha256': {c: array_sha256(observation['observation'][c]['rgb']) for c in CAMERAS},
                 'comparisons_to_eraf_off': comparisons, 'injection_metrics': metrics}
             records.append(record)
-            print(f'[token-probe] queries={len(records)}/20 identity={comparisons["schedule_zero"]["max_abs"]:.6g} near_zero_rmse24={comparisons["near_zero_tokens"]["rmse_first24"]:.6g}', flush=True)
+            print(f'[token-probe] queries={len(records)}/20 full_vs_off_max_abs={comparisons["full"]["max_abs"]:.6g}', flush=True)
     np.savez_compressed(output / 'normalized_actions.npz', **arrays)
+    if args.require_residual_identity:
+        exact = all(v['raw_actions_exact'] and v['normalized_actions_exact']
+                    for r in records for v in r['comparisons_to_eraf_off'].values())
+        result = {'complete': exact, 'checkpoint': args.checkpoint,
+            'checkpoint_sha256': file_sha256(args.checkpoint), 'queries': len(records),
+            'denoising_steps': 10, 'seed': 42, 'full_eraf_equals_off_exactly': exact,
+            'scope': 'Five tasks, two domains, both instructions; original and normalized 32x14 actions, repeated full ERAF. No closed-loop efficacy claim.',
+            'records': records}
+        (output / 'summary.json').write_text(json.dumps(result, indent=2))
+        print(json.dumps({k: v for k, v in result.items() if k != 'records'}), flush=True)
+        if not exact: raise RuntimeError('Residual bootstrap changed deployed OFF actions.')
+        return
     identity = max(r['comparisons_to_eraf_off']['schedule_zero']['max_abs'] for r in records)
     result = {'complete': True, 'checkpoint': args.checkpoint, 'checkpoint_sha256': file_sha256(args.checkpoint),
         'queries': len(records), 'denoising_steps': 10, 'seed': 42,
