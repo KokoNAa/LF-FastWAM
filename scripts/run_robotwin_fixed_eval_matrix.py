@@ -31,6 +31,9 @@ def main():
         ap.error('Assign distinct GPUs in 0..5')
     plan = json.loads(args.plan.read_text())
     models, catalogs = plan['models'], plan['catalogs']
+    tasks = plan.get('tasks', TASKS)
+    if not tasks or len(set(tasks)) != len(tasks) or not set(tasks) <= set(TASKS):
+        ap.error('Declare unique supported evaluation tasks')
     if not models or not catalogs:
         ap.error('Specify at least one model and catalog')
     for name in [*models, *catalogs]:
@@ -48,7 +51,7 @@ def main():
         catalog['path'] = str(Path(catalog['path']).resolve(strict=True))
         if catalog['episodes'] <= 0:
             ap.error('Episode count must be positive')
-        for task in TASKS:
+        for task in tasks:
             path = Path(catalog['path']) / task / 'demo_clean/correct/episodes.jsonl'
             if len(path.read_text().splitlines()) != catalog['episodes']:
                 ap.error('Catalog count differs from the declared fixed budget')
@@ -100,7 +103,9 @@ def main():
         return True
 
     try:
-        queue = [(m, c, t) for m in models for t in TASKS for c in catalogs]
+        # Put declared expensive tasks first across all models, avoiding a
+        # long ranking tail after shorter placement jobs in a final matrix.
+        queue = [(m, c, t) for t in tasks for m in models for c in catalogs]
         running = {}
         while queue or running:
             budget()
@@ -128,13 +133,13 @@ def main():
                 start(name, [sys.executable, 'scripts/eval_robotwin_eraf_fg.py', 'summarize',
                     '--output', output / model_name / catalog_name,
                     '--checkpoint', model['checkpoint'], '--catalog-root', catalog['path'],
-                    '--episodes', catalog['episodes'], '--skip-file-hashes'], None)
+                    '--episodes', catalog['episodes'], '--tasks', *tasks, '--skip-file-hashes'], None)
                 while not done(name):
                     budget()
                     time.sleep(1)
         # Confirm identical physical initialization across every model/condition.
         for catalog_name in catalogs:
-            for task in TASKS:
+            for task in tasks:
                 initial = []
                 for model_name in models:
                     for condition in ('correct', 'counterfactual'):
