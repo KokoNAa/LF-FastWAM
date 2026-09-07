@@ -1622,7 +1622,14 @@ class PhaseSafeClauseMemory(nn.Module):
         next_state_ids = torch.where(
             completed,
             torch.full_like(predicted_state_ids, self.COMPLETED),
-            predicted_state_ids,
+            # A raw COMPLETED classification is only a proposal. If the
+            # guarded completion condition rejected it, carrying it would
+            # silently turn it into sticky history on the next replan.
+            torch.where(
+                predicted_state_ids == self.COMPLETED,
+                torch.full_like(predicted_state_ids, self.PENDING),
+                predicted_state_ids,
+            ),
         )
         # A learned COMPLETED prediction must not leak around the guarded
         # ``completed`` condition above.  In particular, spatial overlap can
