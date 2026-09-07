@@ -48,6 +48,10 @@ def main():
                     help='Declare preserved CF tasks; include the original three when adding target tasks.')
     ap.add_argument('--correction-weight', type=float, default=1.,
                     help='Scale FG slots and their matched ordinary-CF replacements equally.')
+    ap.add_argument('--correction-task-weights', type=json.loads, default={},
+                    help='JSON task multipliers, applied equally to FG and matched ordinary controls.')
+    ap.add_argument('--initial-expert-tasks', nargs='+', default=[],
+                    help='Use one existing expert slot per batch for ordinary same-state initial pairs of these tasks.')
     ap.add_argument('--fg-gradient-route', choices=['joint', 'eraf_only'], default='joint',
                     help='Optionally send only FG corrective gradients to ERAF interfaces; ordinary/retention losses keep their full route.')
     ap.add_argument('--skip-file-hashes', action='store_true',
@@ -58,6 +62,8 @@ def main():
     ap.add_argument('--disable-seen-language-augmentation', action='store_true')
     ap.add_argument('--resume-state', help='Resume saved FP32 masters and optimizer at the supplied checkpoint.')
     args = ap.parse_args()
+    from experiments.robotwin.initial_anchor import validate_weights, effective_weight
+    validate_weights(args.correction_task_weights)
     if args.zero_context_joint != bool(args.identity_audit):
         ap.error('--zero-context-joint and --identity-audit must be supplied together')
     if not math.isfinite(args.correction_weight) or args.correction_weight <= 0:
@@ -135,7 +141,8 @@ def main():
     optimization_contract = {k: getattr(args, k) for k in ('stage', 'fg', 'eraf', 'seed',
         'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation',
         'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks', 'cf_retention_tasks', 'task_balanced',
-        'interface_learning_rate', 'correct_count', 'cf_count', 'fg_gradient_route', 'interface_scope')}
+        'interface_learning_rate', 'correct_count', 'cf_count', 'fg_gradient_route', 'interface_scope',
+        'correction_task_weights', 'initial_expert_tasks')}
     if args.skip_file_hashes:
         p = Path(args.manifest).resolve()
         optimization_contract['manifest_identity'] = {'path': str(p), 'bytes': p.stat().st_size,
@@ -166,7 +173,8 @@ def main():
                         'target_tasks': ['place_a2b_left', 'blocks_ranking_rgb'],
                         'cf_retention_tasks': ['place_a2b_right', 'place_burger_fries', 'stack_blocks_two'],
                         'task_balanced': False, 'interface_learning_rate': None,
-                        'correct_count': 4, 'cf_count': 2, 'fg_gradient_route': 'joint'}
+                        'correct_count': 4, 'cf_count': 2, 'fg_gradient_route': 'joint',
+                        'correction_task_weights': {}, 'initial_expert_tasks': []}
         for key, value in optimization_contract.items():
             if state['optimization_contract'].get(key, old_defaults.get(key)) != value:
                 if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
@@ -181,7 +189,8 @@ def main():
     payloads = ReplayPayloads(rows, model.device)
     raw = RawReplay(args.source_bank)
     stream = mixture_stream(rows, args.seed, args.fg, task_balanced=args.task_balanced,
-                            correct_count=args.correct_count, cf_count=args.cf_count)
+                            correct_count=args.correct_count, cf_count=args.cf_count,
+                            initial_expert_tasks=args.initial_expert_tasks)
     for _ in range(start):
         next(stream)
     from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
@@ -225,8 +234,11 @@ def main():
             report = backward_example(model, row, payload, noise, t, teachers=teachers,
                 coefficient=1. / (12 // world), eraf=args.eraf == 'on', fg=args.fg,
                 correct_weight=args.correct_weight, cf_weight=args.cf_weight,
-                correction_weight=args.correction_weight, fg_gradient_route=args.fg_gradient_route)
+                correction_weight=effective_weight(row, args.correction_weight, args.correction_task_weights),
+                fg_gradient_route=args.fg_gradient_route)
             reports.append({'id': row['id'], 'seen_variant': variant_index,
+                            'initial_expert_anchor': bool(row.get('initial_expert_anchor')),
+                            'effective_correction_weight': effective_weight(row, args.correction_weight, args.correction_task_weights),
                             'ordinary_cf_control': bool(row.get('ordinary_cf_control')), **report})
         average_gradients(selected.values())
         norm = optimizer.step()
@@ -243,6 +255,8 @@ def main():
                     provenance={'plan': str(root / 'plan.json'), 'eraf': args.eraf,
                                 'policy_scope': args.policy_scope, 'interface_scope': args.interface_scope,
                                 'correction_weight': args.correction_weight,
+                                'correction_task_weights': args.correction_task_weights,
+                                'initial_expert_tasks': args.initial_expert_tasks,
                                 'target_tasks': args.target_tasks, 'cf_retention_tasks': args.cf_retention_tasks,
                                 'warm_policy_initialization': args.warm_policy,
                                 'zero_context_joint_initialization': args.zero_context_joint,

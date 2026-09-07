@@ -53,16 +53,19 @@ def action_command(plan,root,arm):
     cmd=train_command(plan,root,arm)
     cmd[cmd.index('--correction-weight')+1]='1'
     cmd += ['--target-tasks',*TARGETS]
+    if plan.get('initial_expert_tasks'):
+        cmd += ['--initial-expert-tasks',*plan['initial_expert_tasks'],
+                '--correction-task-weights',json.dumps(plan['correction_task_weights'],sort_keys=True)]
     if plan['arms'][arm]['eraf']=='on':
         mode='fg' if arm=='eraf_fg' else 'ordinary'
         cmd += ['--zero-context-joint','--identity-audit',str(Path(plan.get('identity_root',root/'identity'))/mode/'summary.json')]
     return cmd
 
 
-def comparison_config(previous,root,groups):
+def comparison_config(previous,root,groups,history_prefix='pre_expanded_fg_'):
     methods=dict(previous['methods'])
     for arm in ARMS:
-        alias='pre_expanded_fg_'+arm
+        alias=history_prefix+arm
         if alias in methods:raise ValueError('Historical comparison alias already exists.')
         methods[alias]=methods[arm]
         methods[arm]={g:str(root/('eval_'+g)/arm/'dev') for g in groups}
@@ -102,7 +105,7 @@ def run_action_stages(plan,root,previous,*,group,write,launch,budget,processes,s
                 '--catalog-root',s['catalog'],'--episodes',str(s['episodes']),'--tasks',*s['tasks'],
                 '--conditions','counterfactual','--skip-file-hashes'],[])
     group('summarizing',commands)
-    config=comparison_config(previous,root,plan['groups'])
+    config=comparison_config(previous,root,plan['groups'],plan.get('comparison_history_prefix','pre_expanded_fg_'))
     write('comparison_config.json',config);write('comparison.json',build_report(config))
     state.update(complete=True,terminal=True,stage='complete')
 

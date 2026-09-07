@@ -14,6 +14,7 @@ def audit(root):
     import torch
     from experiments.robotwin.eraf_fg_bridge import file_sha256, validate_payload
     from experiments.robotwin.eraf_fg_training import mixture_stream, FG_OFF_PROTOCOL
+    from experiments.robotwin.initial_anchor import effective_weight
     root = Path(root)
     read = lambda path: json.loads(Path(path).read_text())
     plan = read(root / 'plan.json')
@@ -79,7 +80,8 @@ def audit(root):
         raise ValueError('Missing, duplicated or discontinuous optimizer steps.')
     stream = mixture_stream(read(plan['manifest'])['states'], plan['seed'], plan['fg'],
                             task_balanced=plan.get('task_balanced', False),
-                            correct_count=plan.get('correct_count', 4), cf_count=plan.get('cf_count', 2))
+                            correct_count=plan.get('correct_count', 4), cf_count=plan.get('cf_count', 2),
+                            initial_expert_tasks=plan.get('initial_expert_tasks', []))
     for _ in range(start):
         next(stream)
     for index, step in enumerate(expected_steps):
@@ -92,6 +94,11 @@ def audit(root):
             if ([bool(r.get('ordinary_cf_control')) for r in journal[index]['examples']]
                     != [bool(r.get('ordinary_cf_control')) for r in batch[rank::world]]):
                 raise ValueError('Ordinary CF replacement supervision differs from the matched schedule.')
+            if plan.get('initial_expert_tasks') or plan.get('correction_task_weights'):
+                for example,row in zip(journal[index]['examples'],batch[rank::world],strict=True):
+                    if (example.get('initial_expert_anchor') != bool(row.get('initial_expert_anchor'))
+                        or example.get('effective_correction_weight') != effective_weight(row,plan['correction_weight'],plan['correction_task_weights'])):
+                        raise ValueError('Actual initial anchors or task weights differ from the immutable contract.')
     return {'complete': True, 'checkpoint_sha256': digest, 'checkpoint_identity': metadata(checkpoint),
         'hash_scans': not skip_hashes, 'parent_checkpoint': plan['checkpoint'],
         'changed_lora_tensors': counts['mot_trainable'], 'changed_guard_tensors': counts['policy_guard'],

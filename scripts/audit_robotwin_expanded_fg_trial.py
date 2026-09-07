@@ -7,6 +7,7 @@ from pathlib import Path
 
 def audit_action_pairing(root):
     from experiments.robotwin.eraf_fg_training import mixture_stream
+    from experiments.robotwin.initial_anchor import effective_weight
     root=Path(root);read=lambda p:json.loads(Path(p).read_text())
     protocol=read(root/'protocol.json');rows=read(protocol['manifest'])['states']
     plans={a:read(root/a/'joint/plan.json') for a in protocol['arms']}
@@ -20,7 +21,10 @@ def audit_action_pairing(root):
         journals[a]=[[read_line for read_line in map(json.loads,(root/a/'joint'/f'rank{rank}.jsonl').read_text().splitlines())]
                      for rank in range(p['world_size'])]
         assert all([r['step'] for r in j]==list(range(1,201)) for j in journals[a])
-        streams[a]=mixture_stream(rows,42,p['fg'],task_balanced=True,correct_count=2,cf_count=4)
+        assert p.get('initial_expert_tasks',[])==protocol.get('initial_expert_tasks',[])
+        assert p.get('correction_task_weights',{})==protocol.get('correction_task_weights',{})
+        streams[a]=mixture_stream(rows,42,p['fg'],task_balanced=True,correct_count=2,cf_count=4,
+                                 initial_expert_tasks=p.get('initial_expert_tasks',[]))
     shared=replaced=0
     for i in range(200):
         batches={a:next(s) for a,s in streams.items()}
@@ -32,11 +36,15 @@ def audit_action_pairing(root):
                 assert [e['id'] for e in examples]==[r['id'] for r in expected]
                 assert [e['ordinary_cf_control'] for e in examples]==[bool(r.get('ordinary_cf_control')) for r in expected]
                 assert all(e['seen_variant'] is None for e in examples)
+                if p.get('initial_expert_tasks'):
+                    assert [e['initial_expert_anchor'] for e in examples]==[bool(r.get('initial_expert_anchor')) for r in expected]
+                    assert [e['effective_correction_weight'] for e in examples]==[effective_weight(r,p['correction_weight'],p['correction_task_weights']) for r in expected]
                 assert all(math.isfinite(v) for e in examples for k,v in e.items() if k.startswith('flow_') or k=='endpoint_objective')
             for r in batch:
                 assert r['replay_split']=='train'
                 kind='fg' if r.get('fg_correction') else 'ordinary_cf_control' if r.get('ordinary_cf_control') else 'common'
                 counts[a][kind+'|'+r['pair_id']]+=1
+                if r.get('initial_expert_anchor'):counts[a]['initial_expert_anchor|'+r['pair_id']]+=1
         assert batches['eraf_fg']==batches['fg_only']
         assert batches['eraf_only']==batches['no_eraf']
         for full,ordinary in zip(batches['eraf_fg'],batches['eraf_only'],strict=True):

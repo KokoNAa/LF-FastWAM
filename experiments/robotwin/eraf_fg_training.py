@@ -171,7 +171,8 @@ def balanced_group_stream(rows, seed, *, task_balanced=False):
             yield rng.choice(scenes[rng.choice(sorted(scenes))])
 
 
-def mixture_stream(rows, seed, fg='full', *, task_balanced=False, correct_count=4, cf_count=2):
+def mixture_stream(rows, seed, fg='full', *, task_balanced=False, correct_count=4, cf_count=2,
+                   initial_expert_tasks=()):
     counts = mixture_counts(correct_count, cf_count)
     if fg == 'off':
         # Reuse only the full arm's metadata schedule (task/domain and batch
@@ -191,7 +192,8 @@ def mixture_stream(rows, seed, fg='full', *, task_balanced=False, correct_count=
         replacements = {key: balanced_group_stream(ordinary[key], seed + 40009 + index * 1009)
                         for index, key in enumerate(sorted(groups))}
         for batch in mixture_stream(rows, seed, 'full', task_balanced=task_balanced,
-                                   correct_count=correct_count, cf_count=cf_count):
+                                   correct_count=correct_count, cf_count=cf_count,
+                                   initial_expert_tasks=initial_expert_tasks):
             yield [(next(replacements[row['pair_id'], row['task_config']]) | {'ordinary_cf_control': True})
                    if row.get('fg_correction') else row for row in batch]
         return
@@ -206,10 +208,19 @@ def mixture_stream(rows, seed, fg='full', *, task_balanced=False, correct_count=
                for i, k in enumerate(counts) if counts[k]}
     import random
     rng = random.Random(seed)
+    anchor_stream = None
+    if initial_expert_tasks:
+        from experiments.robotwin.initial_anchor import initial_rows
+        anchor_stream = balanced_group_stream(initial_rows(rows, initial_expert_tasks), seed + 50021,
+                                              task_balanced=True)
     first = {(r['pair_id'], r['task_config'], r['scene_seed']): r
              for r in buckets['fg'] if r['frame_index'] == 0}
     while True:
         batch = [next(streams[k]) for k, n in counts.items() for _ in range(n)]
+        if anchor_stream is not None:
+            # Consume the original stream unchanged, then replace one of its
+            # three expert slots. Retention and FG schedules remain identical.
+            batch[counts['correct'] + counts['cf']] = dict(next(anchor_stream), initial_expert_anchor=True)
         if fg == 'local':
             # Draw the identical full-arm schedule, then expose only each
             # scene's failure-start observation and its first12 actions.
