@@ -13,6 +13,21 @@ def test_high_average_cannot_admit_a_failed_target_task():
     assert not semantic_qualification(rows[1:])['target_tasks_eligible']
 
 
+def test_new_task_cf_failure_cannot_be_masked_by_source_or_old_task_scores():
+    pairs = ['place_a2b_left_to_right', 'blocks_ranking_rgb_to_bgr', 'cup_front']
+    rows = [dict(pair_id=pair, language=language, role_hits=100, role_count=100,
+                 relation_hits=100, relation_count=100)
+            for pair in pairs for language in ('source', 'target')]
+    rows[-1].update(role_hits=7, role_count=10, relation_hits=8, relation_count=10)
+    assert semantic_qualification(rows, pairs)['target_tasks_eligible']
+    report = semantic_qualification(rows, pairs, each_language=True)
+    assert report['failed_task_languages'] == [{'pair_id': 'cup_front', 'language': 'target'}]
+    assert not report['target_tasks_eligible']
+    assert not semantic_qualification(rows[:-1], pairs, each_language=True)['target_tasks_eligible']
+    with pytest.raises(ValueError, match='source/target'):
+        semantic_qualification([rows[0] | {'language': None}], pairs, each_language=True)
+
+
 def test_world_coordinate_scale_and_invalid_clause_exclusion():
     outputs = {name: torch.tensor([[[.1, 0., 0.], [99., 99., 99.]]])
                for name in ('subject_position', 'reference_position', 'goal_anchor')}

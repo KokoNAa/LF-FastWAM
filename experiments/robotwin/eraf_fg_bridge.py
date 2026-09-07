@@ -303,11 +303,32 @@ class MasterAdamW:
     Updating BF16 weights directly at 1e-5 can discard repeated small updates.
     The master parameters accumulate these updates before each model copy.
     """
-    def __init__(self, parameters, *, lr, weight_decay=0.):
+    def __init__(self, parameters, *, lr, weight_decay=0., learning_rates=None):
         import torch
         self.live = list(parameters)
         self.master = [torch.nn.Parameter(p.detach().float().clone()) for p in self.live]
-        self.optimizer = torch.optim.AdamW(self.master, lr=lr, weight_decay=weight_decay)
+        if learning_rates is None:
+            groups = self.master
+        else:
+            import math
+            rates = list(learning_rates)
+            if len(rates) != len(self.master) or any(not math.isfinite(r) or r <= 0 for r in rates):
+                raise ValueError('Every master parameter needs a positive finite learning rate.')
+            groups = [{'params': [p for p, value in zip(self.master, rates, strict=True) if value == rate],
+                       'lr': rate} for rate in sorted(set(rates))]
+        self.optimizer = torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
+
+    def set_learning_rates(self, rates):
+        """Restore group rates after loading optimizer moments without merging scopes."""
+        rates = list(rates)
+        if len(rates) != len(self.master):
+            raise ValueError('Learning-rate assignment does not cover every parameter.')
+        mapping = {id(p): rate for p, rate in zip(self.master, rates, strict=True)}
+        for group in self.optimizer.param_groups:
+            values = {mapping[id(p)] for p in group['params']}
+            if len(values) != 1:
+                raise ValueError('Resume would change optimizer parameter grouping.')
+            group['lr'] = values.pop()
 
     def zero_grad(self):
         self.optimizer.zero_grad(set_to_none=True)

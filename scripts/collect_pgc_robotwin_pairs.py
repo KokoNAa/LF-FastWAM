@@ -47,6 +47,12 @@ from fastwam.datasets.pgc_libero import PGC_DATA_FORMAT
 
 
 COLLECTION_PROFILES = {
+    'joint_expert': {
+        kind: {'artifact_role': 'joint_expert_supervision',
+               'allowed_training_stages': ['grounding', 'joint'],
+               'forbidden_training_stages': ['full_goal_correction']}
+        for kind in ('native', 'counterfactual')
+    },
     "grounding": {
         "native": {
             "artifact_role": "eraf_grounding_supervision",

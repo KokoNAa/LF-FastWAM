@@ -33,6 +33,10 @@ def main():
     plan = json.loads(args.plan.read_text())
     models, catalogs = plan['models'], plan['catalogs']
     tasks = plan.get('tasks', TASKS)
+    conditions = plan.get('conditions', ['correct', 'counterfactual'])
+    if (not conditions or len(set(conditions)) != len(conditions)
+            or not set(conditions) <= {'correct', 'counterfactual'}):
+        ap.error('Declare unique correct/counterfactual conditions')
     from experiments.robotwin.pgc_data import ROBOTWIN_TEN_TASK_NAMES
     if not tasks or len(set(tasks)) != len(tasks) or not set(tasks) <= set(ROBOTWIN_TEN_TASK_NAMES):
         ap.error('Declare unique supported evaluation tasks')
@@ -125,6 +129,7 @@ def main():
                     '--checkpoint', model['checkpoint'], '--manifest', model['manifest'],
                     '--catalog-root', catalog['path'], '--episodes', catalog['episodes'],
                     '--tasks', task, '--policy-kind', model['policy_kind'], '--eraf', model['eraf'],
+                    '--conditions', *conditions,
                     '--gpu', gpu, '--videos', '--skip-file-hashes',
                     *(['--interventions', plan['interventions']] if plan.get('interventions') else [])], gpu)
                 running[gpu] = name
@@ -136,7 +141,8 @@ def main():
                 start(name, [sys.executable, 'scripts/eval_robotwin_eraf_fg.py', 'summarize',
                     '--output', output / model_name / catalog_name,
                     '--checkpoint', model['checkpoint'], '--catalog-root', catalog['path'],
-                    '--episodes', catalog['episodes'], '--tasks', *tasks, '--skip-file-hashes'], None)
+                    '--episodes', catalog['episodes'], '--tasks', *tasks,
+                    '--conditions', *conditions, '--skip-file-hashes'], None)
                 while not done(name):
                     budget()
                     time.sleep(1)
@@ -145,7 +151,7 @@ def main():
             for task in tasks:
                 initial = []
                 for model_name in models:
-                    for condition in ('correct', 'counterfactual'):
+                    for condition in conditions:
                         path = output / model_name / catalog_name / task / 'demo_clean' / condition / 'initial_states.json'
                         initial.append(json.loads(path.read_text()))
                 if any(value != initial[0] for value in initial[1:]):

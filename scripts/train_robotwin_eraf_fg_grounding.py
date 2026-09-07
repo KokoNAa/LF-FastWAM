@@ -15,7 +15,16 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "src")]
 
 
-def balanced_rows(rows, seed):
+def balanced_rows(rows, seed, *, task_balanced=False):
+    if task_balanced:
+        from experiments.robotwin.eraf_fg_training import balanced_group_stream
+        from random import Random
+        selected = [r for r in rows if r['replay_split'] == 'train' and not any(r.get(k)
+                    for k in ('native_retention', 'cf_retention', 'fg_correction'))]
+        languages = Random(seed + 7919)
+        for row in balanced_group_stream(selected, seed, task_balanced=True):
+            yield row, languages.choice(('source', 'target'))
+        return
     groups = defaultdict(list)
     for row in rows:
         if row["replay_split"] == "train" and not any(row.get(k) for k in
@@ -45,7 +54,16 @@ def main():
     ap.add_argument('--geometry-only', action='store_true')
     ap.add_argument('--position-weight', type=float)
     ap.add_argument('--anchor-weight', type=float)
+    from experiments.robotwin.pgc_data import ROBOTWIN_TEN_TASK_NAMES, pair_spec_from_source_task
+    ap.add_argument('--qualification-tasks', nargs='+', choices=ROBOTWIN_TEN_TASK_NAMES,
+                    default=['place_a2b_left', 'blocks_ranking_rgb'])
+    ap.add_argument('--qualify-each-language', action='store_true')
+    ap.add_argument('--task-balanced', action='store_true')
+    ap.add_argument('--skip-file-hashes', action='store_true')
     args = ap.parse_args()
+    if len(set(args.qualification_tasks)) != len(args.qualification_tasks):
+        ap.error('Duplicate qualification task')
+    required_pairs = [pair_spec_from_source_task(task).pair_id for task in args.qualification_tasks]
     world, rank, local = (int(os.environ.get(k, d)) for k, d in
                            (("WORLD_SIZE", "1"), ("RANK", "0"), ("LOCAL_RANK", "0")))
     if min(args.steps, args.save_every, args.global_batch) < 1 or args.global_batch % world:
@@ -92,20 +110,23 @@ def main():
     optimizer = MasterAdamW(selected.values(), lr=args.learning_rate)
     payloads = ReplayPayloads(rows, model.device)
     raw = RawReplay(args.source_bank, label_cache=args.label_cache)
-    stream = balanced_rows(rows, args.seed)
+    stream = balanced_rows(rows, args.seed, task_balanced=args.task_balanced)
     validation = [r for r in rows if r["replay_split"] == "replay_holdout" and not any(r.get(k)
         for k in ('native_retention', 'cf_retention', 'fg_correction'))]
     if args.steps <= 2:
         validation = list({r["pair_id"]: r for r in validation}.values())
     if {r["pair_id"] for r in validation} != {r["pair_id"] for r in rows}:
-        raise ValueError("Grounding holdout must cover all five tasks.")
+        raise ValueError("Grounding holdout must cover every replay task.")
+    if not set(required_pairs) <= {r['pair_id'] for r in validation}:
+        raise ValueError('A declared semantic qualification task has no holdout observations.')
     if rank == 0:
         (root / "plan.json").write_text(json.dumps(vars(args) | {"world_size": world,
             "trainable_parameters": list(selected), "validation_states": len(validation),
             "policy_frozen": True, "optimizer_precision": "FP32 master weights",
             "optimizer_restart": bool(args.step_offset),
             "loss_weights": asdict(model.policy_guard_eraf_loss_weights),
-            "selection_rule": "Minimum equal-task/language mean of position and goal error cm among EACH TARGET TASK role>=.8 and relation>=.9; baseline included; no action-test selection."}, indent=2))
+            "qualification_pairs": required_pairs,
+            "selection_rule": "Minimum equal-task/language position and goal error after the declared semantic qualification; baseline included; no action-test selection."}, indent=2))
 
     def evaluate(step):
         reports = []
@@ -131,7 +152,7 @@ def main():
                                     "geometry_cm": geometry_errors(outputs, labels)})
         role = sum(r["role_hits"] for r in reports) / max(1, sum(r["role_count"] for r in reports))
         relation = sum(r["relation_hits"] for r in reports) / max(1, sum(r["relation_count"] for r in reports))
-        qualification = semantic_qualification(reports)
+        qualification = semantic_qualification(reports, required_pairs, each_language=args.qualify_each_language)
         result = {"step": step, "role_accuracy": role, "relation_accuracy": relation,
                   "eligible": qualification['target_tasks_eligible'],
                   "qualification": qualification, "rows": reports,
@@ -170,7 +191,8 @@ def main():
             barrier()
             if rank == 0:
                 save_repair_checkpoint(model, root / f"step_{cumulative_step:06d}.pt", stage="grounding", steps=cumulative_step,
-                    parent=args.checkpoint, fg_supervision="off", provenance={"plan": str(root / "plan.json")})
+                    parent=args.checkpoint, fg_supervision="off", provenance={"plan": str(root / "plan.json")},
+                    record_hashes=not args.skip_file_hashes)
                 evaluations.append(evaluate(cumulative_step))
             barrier()
     journal.close()

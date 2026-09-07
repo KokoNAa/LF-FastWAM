@@ -4,6 +4,15 @@ from __future__ import annotations
 FG_OFF_PROTOCOL = 'task_domain_matched_target_only_v1'
 
 
+def mixture_counts(correct=4, cf=2):
+    """Keep expert/FG exposure fixed while reallocating the six retention slots."""
+    if isinstance(correct, bool) or isinstance(cf, bool) or not isinstance(correct, int) or not isinstance(cf, int):
+        raise ValueError('Retention counts must be integers.')
+    if min(correct, cf) < 1 or correct + cf != 6:
+        raise ValueError('Positive Correct/CF counts must sum to six retention slots.')
+    return {'correct': correct, 'cf': cf, 'pair': 3, 'fg': 3}
+
+
 def supervision_payload(row, payload):
     """The ordinary-CF replacement has the same target-only loss as FG."""
     if not row.get('ordinary_cf_control'):
@@ -117,7 +126,7 @@ def backward_example(model, row, payload, noise, time, *, teachers, coefficient=
     return metrics
 
 
-def balanced_group_stream(rows, seed):
+def balanced_group_stream(rows, seed, *, task_balanced=False):
     """Sample task/domain, then scene, then frame to avoid long-clip dominance."""
     from collections import defaultdict
     import random
@@ -129,13 +138,21 @@ def balanced_group_stream(rows, seed):
     rng = random.Random(seed)
     while True:
         keys = sorted(groups)
-        rng.shuffle(keys)
+        if task_balanced:
+            # A task with two domains must not receive twice the weight of
+            # a newly collected task with only one domain.
+            tasks = sorted({key[0] for key in keys})
+            rng.shuffle(tasks)
+            keys = [rng.choice([key for key in keys if key[0] == task]) for task in tasks]
+        else:
+            rng.shuffle(keys)
         for key in keys:
             scenes = groups[key]
             yield rng.choice(scenes[rng.choice(sorted(scenes))])
 
 
-def mixture_stream(rows, seed, fg='full'):
+def mixture_stream(rows, seed, fg='full', *, task_balanced=False, correct_count=4, cf_count=2):
+    counts = mixture_counts(correct_count, cf_count)
     if fg == 'off':
         # Reuse only the full arm's metadata schedule (task/domain and batch
         # position). Never return a failed-state row or read its payload.
@@ -153,7 +170,8 @@ def mixture_stream(rows, seed, fg='full'):
             raise ValueError('Missing ordinary CF data for an FG target task/domain.')
         replacements = {key: balanced_group_stream(ordinary[key], seed + 40009 + index * 1009)
                         for index, key in enumerate(sorted(groups))}
-        for batch in mixture_stream(rows, seed, 'full'):
+        for batch in mixture_stream(rows, seed, 'full', task_balanced=task_balanced,
+                                   correct_count=correct_count, cf_count=cf_count):
             yield [(next(replacements[row['pair_id'], row['task_config']]) | {'ordinary_cf_control': True})
                    if row.get('fg_correction') else row for row in batch]
         return
@@ -164,8 +182,7 @@ def mixture_stream(rows, seed, fg='full'):
         kind = ('correct' if row.get('native_retention') else 'cf' if row.get('cf_retention')
                 else 'fg' if row.get('fg_correction') else 'pair')
         buckets[kind].append(row)
-    counts = {'correct': 4, 'cf': 2, 'pair': 3, 'fg': 3}
-    streams = {k: balanced_group_stream(buckets[k], seed + i * 1009)
+    streams = {k: balanced_group_stream(buckets[k], seed + i * 1009, task_balanced=task_balanced)
                for i, k in enumerate(counts) if counts[k]}
     import random
     rng = random.Random(seed)

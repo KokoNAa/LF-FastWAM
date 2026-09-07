@@ -5,19 +5,43 @@ import math
 TARGET_PAIRS = ('place_a2b_left_to_right', 'blocks_ranking_rgb_to_bgr')
 
 
-def semantic_qualification(rows):
-    """The initial campaign requires each target task, not just the average."""
+def semantic_qualification(rows, required_pairs=TARGET_PAIRS, *, each_language=False):
+    """Qualify every declared task, optionally separating source and CF."""
+    required_pairs = tuple(required_pairs)
+    if not required_pairs or len(set(required_pairs)) != len(required_pairs):
+        raise ValueError('Declare distinct semantic qualification tasks.')
     grouped = defaultdict(lambda: dict(role_hits=0, role_count=0, relation_hits=0, relation_count=0))
+    language_groups = defaultdict(lambda: dict(role_hits=0, role_count=0, relation_hits=0, relation_count=0))
     for row in rows:
+        if each_language and row.get('language') not in {'source', 'target'}:
+            raise ValueError('Per-language qualification requires source/target labels.')
         for key in grouped[row['pair_id']]:
             grouped[row['pair_id']][key] += row[key]
+            if each_language:
+                language_groups[row['pair_id'], row['language']][key] += row[key]
     cells = {pair: dict(role_accuracy=counts['role_hits'] / max(1, counts['role_count']),
                        relation_accuracy=counts['relation_hits'] / max(1, counts['relation_count']),
                        **counts) for pair, counts in grouped.items()}
-    failures = [pair for pair in TARGET_PAIRS if pair not in cells
+    failures = [pair for pair in required_pairs if pair not in cells
                 or cells[pair]['role_accuracy'] < .8 or cells[pair]['relation_accuracy'] < .9]
+    per_language, failed_languages = {}, []
+    if each_language:
+        for pair in required_pairs:
+            per_language[pair] = {}
+            for language in ('source', 'target'):
+                counts = language_groups[pair, language]
+                cell = dict(role_accuracy=counts['role_hits'] / max(1, counts['role_count']),
+                            relation_accuracy=counts['relation_hits'] / max(1, counts['relation_count']), **counts)
+                per_language[pair][language] = cell
+                if cell['role_accuracy'] < .8 or cell['relation_accuracy'] < .9:
+                    failed_languages.append({'pair_id': pair, 'language': language})
+                    if pair not in failures:
+                        failures.append(pair)
     return {'target_tasks_eligible': not failures, 'failed_target_pairs': failures, 'per_pair': cells,
-            'rule': 'Each target task must have role accuracy>=.8 and relation accuracy>=.9.'}
+            'required_pairs': list(required_pairs), 'per_language': per_language,
+            'failed_task_languages': failed_languages,
+            'rule': 'Each declared task' + (' and each source/target language' if each_language else '')
+                    + ' must have role accuracy>=.8 and relation accuracy>=.9.'}
 
 
 def geometry_parameter(name):

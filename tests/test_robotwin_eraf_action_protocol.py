@@ -1,0 +1,77 @@
+import copy
+from collections import Counter
+from itertools import islice
+
+import pytest
+import torch
+
+from experiments.robotwin.eraf_action_protocol import parameter_learning_rates, validate_action_parent
+from experiments.robotwin.eraf_fg_bridge import MasterAdamW
+from experiments.robotwin.eraf_fg_training import balanced_group_stream, mixture_counts, mixture_stream
+
+
+def test_common_warm_policy_does_not_leak_fg_training_into_off_controls():
+    parent = dict(stage='joint', fg_supervision='off', provenance={'eraf': 'off'})
+    for stage, eraf, fg in [('joint', 'off', 'off'), ('joint', 'off', 'full'), ('interface', 'on', 'full')]:
+        validate_action_parent(parent, stage=stage, eraf=eraf, fg=fg, warm_policy=True)
+    with pytest.raises(ValueError, match='warmup'):
+        validate_action_parent(parent, stage='joint', eraf='on', fg='full', warm_policy=True)
+    with pytest.raises(ValueError, match='common warm policy'):
+        validate_action_parent(parent | {'fg_supervision': 'full'}, stage='joint', eraf='off', fg='off', warm_policy=True)
+    with pytest.raises(ValueError, match='different operations'):
+        validate_action_parent(parent, stage='joint', eraf='off', fg='off', warm_policy=True, resume=True)
+    with pytest.raises(ValueError, match='matching interface'):
+        validate_action_parent(dict(stage='interface', fg_supervision='full'), stage='joint', eraf='on', fg='off')
+
+
+def test_interface_can_learn_faster_without_accelerating_policy_and_resume_is_exact():
+    names = ['mot.x', 'guard.y', 'mot.z']
+    rates = parameter_learning_rates(names, 1e-5, 1e-3)
+    assert rates == [1e-5, 1e-3, 1e-5]
+    live = [torch.nn.Parameter(torch.ones(1)) for _ in names]
+    opt = MasterAdamW(live, lr=1e-5, learning_rates=rates)
+    for p in live: p.grad = torch.ones_like(p)
+    opt.step()
+    assert 50 < float((1 - live[1]).detach() / (1 - live[0]).detach()) < 150
+    state = copy.deepcopy(opt.state_dict())
+    restored = [torch.nn.Parameter(p.detach().clone()) for p in live]
+    other = MasterAdamW(restored, lr=1e-5, learning_rates=rates)
+    other.load_state_dict(state); other.set_learning_rates(rates)
+    for optimizer, params in [(opt, live), (other, restored)]:
+        optimizer.zero_grad()
+        for p in params: p.grad = torch.full_like(p, .3)
+        optimizer.step()
+    assert all(torch.equal(a, b) for a, b in zip(live, restored, strict=True))
+    with pytest.raises(ValueError, match='positive'):
+        parameter_learning_rates(names, 0, 1e-3)
+
+
+def test_task_balancing_does_not_double_old_tasks_with_two_domains():
+    rows = [dict(id=f'{task}_{domain}_{i}', pair_id=task, task_config=domain, scene_seed=i)
+            for task, domains in [('old', ['clean', 'randomized']), ('new', ['clean'])]
+            for domain in domains for i in range(3)]
+    draws = list(islice(balanced_group_stream(rows, 42, task_balanced=True), 100))
+    assert Counter(r['pair_id'] for r in draws) == {'old': 50, 'new': 50}
+    assert {r['task_config'] for r in draws if r['pair_id'] == 'old'} == {'clean', 'randomized'}
+
+
+def test_cf_priority_mixture_keeps_matched_fg_positions_and_expert_exposure():
+    rows = [dict(id=f'{kind}_{task}_{i}', pair_id=task, task_config='clean', scene_seed=i,
+                 replay_split='train', frame_index=0, **{kind: True})
+            for kind in ('native_retention', 'cf_retention', 'pair', 'fg_correction')
+            for task in ('left', 'rank') for i in range(3)]
+    full = mixture_stream(rows, 42, 'full', correct_count=2, cf_count=4, task_balanced=True)
+    off = mixture_stream(rows, 42, 'off', correct_count=2, cf_count=4, task_balanced=True)
+    for _ in range(10):
+        a, b = next(full), next(off)
+        assert len(a) == len(b) == 12
+        assert sum(bool(r.get('native_retention')) for r in a) == 2
+        assert sum(bool(r.get('cf_retention')) for r in a) == 4
+        assert sum(bool(r.get('pair')) for r in a) == 3
+        assert sum(bool(r.get('ordinary_cf_control')) for r in b) == 3
+        assert not any(r.get('fg_correction') for r in b)
+        for x, y in zip(a, b, strict=True):
+            assert (x['pair_id'], x['task_config']) == (y['pair_id'], y['task_config'])
+            if not x.get('fg_correction'): assert x == y
+    for counts in [(0, 6), (3, 4), (2.5, 3.5)]:
+        with pytest.raises(ValueError): mixture_counts(*counts)

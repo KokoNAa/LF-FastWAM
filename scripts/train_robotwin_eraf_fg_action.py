@@ -24,6 +24,12 @@ def main():
     ap.add_argument('--steps', type=int, default=800)
     ap.add_argument('--save-every', type=int, default=200)
     ap.add_argument('--learning-rate', type=float, default=1e-5)
+    ap.add_argument('--interface-learning-rate', type=float,
+                    help='Separate ERAF interface rate while retaining a small policy rate.')
+    ap.add_argument('--warm-policy', action='store_true',
+                    help='Explicitly start a fresh arm from a trained FG-off/ERAF-off policy.')
+    ap.add_argument('--correct-count', type=int, default=4)
+    ap.add_argument('--cf-count', type=int, default=2)
     ap.add_argument('--correct-weight', type=float, default=2.)
     ap.add_argument('--cf-weight', type=float, default=1.)
     ap.add_argument('--policy-scope', choices=['all', 'action'], default='all')
@@ -39,6 +45,8 @@ def main():
     ap.add_argument('--skip-file-hashes', action='store_true',
                     help='Use manifest metadata and direct optimizer/model tensor binding on resume.')
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--task-balanced', action='store_true',
+                    help='Give each task equal mixture weight despite different domain counts.')
     ap.add_argument('--disable-seen-language-augmentation', action='store_true')
     ap.add_argument('--resume-state', help='Resume saved FP32 masters and optimizer at the supplied checkpoint.')
     args = ap.parse_args()
@@ -49,7 +57,8 @@ def main():
     import torch.distributed as dist
     from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint, validate_payload, file_sha256
     from experiments.robotwin.eraf_fg_data import RawReplay, validate_cf_retention_coverage
-    from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream, supervision_payload, FG_OFF_PROTOCOL
+    from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream, mixture_counts, supervision_payload, FG_OFF_PROTOCOL
+    from experiments.robotwin.eraf_action_protocol import validate_action_parent, parameter_learning_rates
     from experiments.robotwin.compact_replay import ReplayPayloads
     from experiments.robotwin.native_teacher import NativeTeacher
     from experiments.robotwin.same_state_repair import noise_tensor
@@ -60,19 +69,11 @@ def main():
         ap.error('Positive steps and world size dividing global batch12 required.')
     if args.stage == 'interface' and args.eraf == 'off':
         ap.error('ERAF-off has no interface warmup.')
+    counts = mixture_counts(args.correct_count, args.cf_count)
+    parameter_learning_rates([], args.learning_rate, args.interface_learning_rate)
     parent_payload = validate_payload(torch.load(args.checkpoint, map_location='cpu', weights_only=False))
-    if args.resume_state:
-        if (parent_payload['stage'] != args.stage or parent_payload['fg_supervision'] != args.fg
-                or parent_payload['provenance'].get('eraf') != args.eraf):
-            raise ValueError('Resumed checkpoint must have the same stage and ablation settings.')
-    elif args.stage == 'interface':
-        if parent_payload['stage'] != 'grounding':
-            raise ValueError('Every interface ablation must start from the same semantic checkpoint.')
-    elif args.eraf == 'on':
-        if parent_payload['stage'] != 'interface' or parent_payload['fg_supervision'] != args.fg:
-            raise ValueError('Joint ERAF training needs its own matching interface arm; full FG must not leak into controls.')
-    elif parent_payload['stage'] != 'grounding':
-        raise ValueError('ERAF-off joint controls must start from the common unchanged-policy semantic checkpoint.')
+    validate_action_parent(parent_payload, stage=args.stage, eraf=args.eraf, fg=args.fg,
+                           resume=bool(args.resume_state), warm_policy=args.warm_policy)
     del parent_payload
     torch.cuda.set_device(local)
     torch.manual_seed(args.seed)
@@ -110,11 +111,14 @@ def main():
     adapters = {n: p for n, p in model.mot.named_parameters() if n.endswith(('.lora_A', '.lora_B'))}
     teachers = {'correct': NativeTeacher(model, adapters, args.correct_teacher),
                 'cf': NativeTeacher(model, adapters, args.cf_teacher)}
-    optimizer = MasterAdamW(selected.values(), lr=args.learning_rate)
+    rates = parameter_learning_rates(selected, args.learning_rate, args.interface_learning_rate)
+    optimizer = MasterAdamW(selected.values(), lr=args.learning_rate,
+                           learning_rates=rates if args.interface_learning_rate is not None else None)
     start = 0
     optimization_contract = {k: getattr(args, k) for k in ('stage', 'fg', 'eraf', 'seed',
         'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation',
-        'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks', 'cf_retention_tasks')}
+        'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks', 'cf_retention_tasks', 'task_balanced',
+        'interface_learning_rate', 'correct_count', 'cf_count')}
     if args.skip_file_hashes:
         p = Path(args.manifest).resolve()
         optimization_contract['manifest_identity'] = {'path': str(p), 'bytes': p.stat().st_size,
@@ -143,22 +147,24 @@ def main():
             raise ValueError('Optimizer checkpoint identity changed.')
         old_defaults = {'policy_scope': 'all', 'correction_weight': 1., 'skip_file_hashes': False,
                         'target_tasks': ['place_a2b_left', 'blocks_ranking_rgb'],
-                        'cf_retention_tasks': ['place_a2b_right', 'place_burger_fries', 'stack_blocks_two']}
+                        'cf_retention_tasks': ['place_a2b_right', 'place_burger_fries', 'stack_blocks_two'],
+                        'task_balanced': False, 'interface_learning_rate': None,
+                        'correct_count': 4, 'cf_count': 2}
         for key, value in optimization_contract.items():
             if state['optimization_contract'].get(key, old_defaults.get(key)) != value:
                 if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
                     raise ValueError(f'Resume changed immutable training contract: {key}')
                 adjustments[key] = {'from': state['optimization_contract'][key], 'to': value}
         optimizer.load_state_dict(state['optimizer'])
-        for group in optimizer.optimizer.param_groups:
-            group['lr'] = args.learning_rate
+        optimizer.set_learning_rates(rates)
         start = int(state['step'])
         if args.steps <= start:
             raise ValueError('Resume total-step target must exceed saved optimizer steps.')
         del state
     payloads = ReplayPayloads(rows, model.device)
     raw = RawReplay(args.source_bank)
-    stream = mixture_stream(rows, args.seed, args.fg)
+    stream = mixture_stream(rows, args.seed, args.fg, task_balanced=args.task_balanced,
+                            correct_count=args.correct_count, cf_count=args.cf_count)
     for _ in range(start):
         next(stream)
     from experiments.robotwin.decision_language_replay import build_seen_contexts, replace_language
@@ -170,7 +176,7 @@ def main():
             'start_optimizer_step': start, 'resume_adjustments': adjustments,
             'optimization_contract': optimization_contract,
             'trainable_parameters': list(selected), 'optimizer_precision': 'FP32 master weights',
-            'mixture': {'correct_retention': 4, 'cf_retention': 2,
+            'mixture': {'correct_retention': counts['correct'], 'cf_retention': counts['cf'],
                         'expert_pairs': 3, 'fg': 0 if args.fg == 'off' else 3,
                         'ordinary_cf_control': 3 if args.fg == 'off' else 0}}, indent=2))
     started = time.monotonic()
@@ -219,7 +225,10 @@ def main():
                     steps=step, parent=args.checkpoint, fg_supervision=args.fg,
                     provenance={'plan': str(root / 'plan.json'), 'eraf': args.eraf,
                                 'policy_scope': args.policy_scope, 'correction_weight': args.correction_weight,
-                                'target_tasks': args.target_tasks, 'cf_retention_tasks': args.cf_retention_tasks},
+                                'target_tasks': args.target_tasks, 'cf_retention_tasks': args.cf_retention_tasks,
+                                'warm_policy_initialization': args.warm_policy,
+                                'interface_learning_rate': args.interface_learning_rate,
+                                'mixture_counts': counts, 'task_balanced': args.task_balanced},
                     record_hashes=not args.skip_file_hashes)
                 optimizer_payload = {'step': step, 'checkpoint': str(checkpoint_path),
                     'parameter_names': list(selected), 'optimization_contract': optimization_contract,
