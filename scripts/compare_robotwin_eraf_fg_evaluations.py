@@ -12,6 +12,24 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
+def file_binding(report, name):
+    """Compare recorded identities without requiring local model downloads."""
+    if report.get('skip_file_hashes', False):
+        metadata = report.get(name + '_metadata')
+        if (not isinstance(metadata, dict) or not isinstance(metadata.get('path'), str)
+                or not metadata['path'] or type(metadata.get('size')) is not int
+                or metadata['size'] <= 0 or type(metadata.get('mtime_ns')) is not int
+                or metadata['mtime_ns'] <= 0):
+            raise ValueError(f'Missing or invalid {name} metadata binding.')
+        if name == 'checkpoint' and metadata['path'] != report['checkpoint']:
+            raise ValueError('Checkpoint metadata path differs from the evaluated checkpoint.')
+        return ('metadata', metadata['path'], metadata['size'], metadata['mtime_ns'])
+    digest = report.get(name + '_sha256')
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+        raise ValueError(f'Missing or invalid {name} hash binding.')
+    return ('sha256', digest)
+
+
 def evaluation(root):
     root = Path(root)
     summary = read(root / 'summary.json')
@@ -34,8 +52,8 @@ def evaluation(root):
         cells[key] = (episodes, initial, complete)
     if sum(len(c[0]) for c in cells.values()) != summary['episodes']:
         raise ValueError('Aggregate episode count differs from audited cells.')
-    if len({c[2]['checkpoint_sha256'] for c in cells.values()}) != 1:
-        raise ValueError('One evaluation contains multiple checkpoint hashes.')
+    if len({file_binding(c[2], 'checkpoint') for c in cells.values()}) != 1:
+        raise ValueError('One evaluation contains multiple checkpoint identities.')
     return summary, cells
 
 
@@ -57,7 +75,7 @@ def compare(baseline_root, candidate_root, tasks=None):
         left, initial_a, meta_a = a[(task, condition)]
         right, initial_b, meta_b = b[(task, condition)]
         if (len(left) != len(right) or initial_a != initial_b
-                or meta_a['canonical_sha256'] != meta_b['canonical_sha256']
+                or file_binding(meta_a, 'canonical') != file_binding(meta_b, 'canonical')
                 or meta_a['deployment'] != meta_b['deployment']):
             raise ValueError(f'Physical state, catalog, or deployment mismatch: {task}/{condition}')
         gained, lost = [], []
@@ -87,6 +105,7 @@ def compare(baseline_root, candidate_root, tasks=None):
     return {'complete': True, 'baseline': baseline['checkpoint'], 'candidate': candidate['checkpoint'],
             'matched_episodes': len(pairs), 'cells': cells,
             'explicit_task_subset': sorted(set(tasks)) if tasks is not None else None,
+            'identity_scope': 'Recorded checkpoint/catalog identities and actual episode/physical-state records are checked. Metadata binding does not rehash model contents.',
             'interpretation': 'Paired descriptive results; no component attribution from one comparison.'}, pairs
 
 
