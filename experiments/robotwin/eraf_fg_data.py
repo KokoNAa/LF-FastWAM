@@ -90,8 +90,10 @@ def validate_cf_retention_coverage(rows, required_tasks, *, minimum_scenes=10):
 
 
 class RawReplay:
-    def __init__(self, source_bank, *, label_cache=None):
+    def __init__(self, source_bank, *, label_cache=None, fg_geometry=False):
         self.raw = {}
+        from experiments.robotwin.fg_geometry_replay import CorrectionGeometry
+        self.corrections = CorrectionGeometry() if fg_geometry else None
         self.label_cache = Path(label_cache) if label_cache else None
         if self.label_cache:
             self.label_cache.mkdir(parents=True, exist_ok=True)
@@ -118,6 +120,10 @@ class RawReplay:
 
     def state(self, row, language):
         import h5py
+        if row.get('fg_correction'):
+            if self.corrections is None or language != 'target':
+                raise ValueError('FG proprio requires the explicit target geometry protocol.')
+            return self.corrections.state(row)
         if row.get("native_retention") or row.get("cf_retention"):
             with np.load(row["capture_path"], allow_pickle=False) as source:
                 return source["state"][row["frame_index"]].copy()
@@ -143,6 +149,10 @@ class RawReplay:
     def grounding(self, row, language):
         import h5py
         import torch
+        if row.get('fg_correction'):
+            if self.corrections is None:
+                raise ValueError('FG labels require the explicit partial geometry protocol.')
+            return self.corrections.labels(row, language)
         from scripts.build_pgc_robotwin_entity_relations import _generic_role_arrays, _entity_id, _phase_ids
         path, frame = self.locate(row, language)
         key = f"one_frame_v1:{path}:{frame}"

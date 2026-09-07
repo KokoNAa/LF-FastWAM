@@ -60,6 +60,9 @@ def main():
     ap.add_argument('--qualify-each-language', action='store_true')
     ap.add_argument('--task-balanced', action='store_true')
     ap.add_argument('--skip-file-hashes', action='store_true')
+    ap.add_argument('--geometry-replay', choices=['off', 'ordinary', 'fg'], default='off',
+                    help='Replace declared slots with matched target-only partial geometry supervision.')
+    ap.add_argument('--geometry-replay-slots', type=int, default=3)
     args = ap.parse_args()
     if len(set(args.qualification_tasks)) != len(args.qualification_tasks):
         ap.error('Duplicate qualification task')
@@ -68,6 +71,8 @@ def main():
                            (("WORLD_SIZE", "1"), ("RANK", "0"), ("LOCAL_RANK", "0")))
     if min(args.steps, args.save_every, args.global_batch) < 1 or args.global_batch % world:
         ap.error("Positive counts and global batch divisible by world size required.")
+    if args.geometry_replay != 'off' and not 0 < args.geometry_replay_slots < args.global_batch:
+        ap.error('Geometry replay needs positive slots and a nonempty ordinary expert core.')
     if any(value is not None and (not __import__('math').isfinite(value) or value <= 0)
            for value in (args.position_weight, args.anchor_weight)):
         ap.error('Geometry loss weights must be finite and positive.')
@@ -80,6 +85,7 @@ def main():
     from scripts.train_robotwin_cf_decision_adapter import average_gradients
     from fastwam.models.wan22.entity_relation_affordance import entity_relation_affordance_loss, masks_to_patch_targets
     from experiments.robotwin.eraf_geometry_metrics import geometry_parameter, geometry_errors, summarize_geometry, semantic_qualification
+    from experiments.robotwin.fg_geometry_replay import SCHEMA, geometry_mixture, partial_geometry_loss
     torch.cuda.set_device(local)
     torch.manual_seed(args.seed)
     if world > 1:
@@ -109,8 +115,20 @@ def main():
     model.policy_guard_eraf_loss_weights = replace(model.policy_guard_eraf_loss_weights, **overrides)
     optimizer = MasterAdamW(selected.values(), lr=args.learning_rate)
     payloads = ReplayPayloads(rows, model.device)
-    raw = RawReplay(args.source_bank, label_cache=args.label_cache)
+    raw = RawReplay(args.source_bank, label_cache=args.label_cache, fg_geometry=args.geometry_replay != 'off')
     stream = balanced_rows(rows, args.seed, task_balanced=args.task_balanced)
+    geometry_stream = (geometry_mixture(rows, args.seed, batch_size=args.global_batch,
+        slots=args.geometry_replay_slots, mode=args.geometry_replay, task_balanced=args.task_balanced)
+        if args.geometry_replay != 'off' else None)
+    # Audit whole-scene separation before consuming either correction or expert data.
+    splits = defaultdict(set)
+    for row in rows:
+        splits[row['source_task'], row['task_config'], row['scene_seed']].add(row['replay_split'])
+    if any(len(values) != 1 for values in splits.values()):
+        raise ValueError('Semantic replay mixes train and holdout observations of one scene.')
+    fg_validation = [r for r in rows if r['replay_split'] == 'replay_holdout' and r.get('fg_correction')]
+    if args.geometry_replay != 'off' and not fg_validation:
+        raise ValueError('Geometry replay requires separate FG holdout observations.')
     validation = [r for r in rows if r["replay_split"] == "replay_holdout" and not any(r.get(k)
         for k in ('native_retention', 'cf_retention', 'fg_correction'))]
     if args.steps <= 2:
@@ -121,6 +139,11 @@ def main():
         raise ValueError('A declared semantic qualification task has no holdout observations.')
     if rank == 0:
         (root / "plan.json").write_text(json.dumps(vars(args) | {"world_size": world,
+            "geometry_replay_schema": SCHEMA if geometry_stream is not None else None,
+            "code_commit": __import__("subprocess").check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
+            "manifest_sha256": __import__("hashlib").sha256(Path(args.manifest).read_bytes()).hexdigest(),
+            "geometry_replay_validation_states": len(fg_validation) if geometry_stream is not None else 0,
+            "geometry_replay_selection": "Report FG holdout separately; retain original expert qualification and geometry selection.",
             "trainable_parameters": list(selected), "validation_states": len(validation),
             "policy_frozen": True, "optimizer_precision": "FP32 master weights",
             "optimizer_restart": bool(args.step_offset),
@@ -157,6 +180,17 @@ def main():
                   "eligible": qualification['target_tasks_eligible'],
                   "qualification": qualification, "rows": reports,
                   "geometry": summarize_geometry(reports)}
+        if geometry_stream is not None:
+            partial_reports = []
+            with torch.no_grad():
+                for row in fg_validation:
+                    payload = raw.attach_proprio(payloads[row['id']], row, policy)
+                    labels = move_cache(raw.grounding(row, 'target'), model.device)
+                    outputs, _ = grounding_outputs(model, payload['captured']['target'])
+                    loss, _ = partial_geometry_loss(outputs, labels, model.policy_guard_eraf_loss_weights)
+                    partial_reports.append({'id': row['id'], 'pair_id': row['pair_id'], 'language': 'target',
+                                            'loss': float(loss), 'geometry_cm': geometry_errors(outputs, labels)})
+            result['fg_geometry_holdout'] = {'rows': partial_reports, 'geometry': summarize_geometry(partial_reports)}
         (root / f"grounding_eval_{step:06d}.json").write_text(json.dumps(result, indent=2))
         print(f"[grounding-eval] step={step} roles={role:.4f} relations={relation:.4f} geometry_cm={result['geometry']['selection_score_cm']:.3f}", flush=True)
         return result
@@ -169,13 +203,15 @@ def main():
     for step in range(1, args.steps + 1):
         cumulative_step = args.step_offset + step
         optimizer.zero_grad()
-        batch = [next(stream) for _ in range(args.global_batch)]
+        batch = (next(geometry_stream) if geometry_stream is not None else
+                 [(r, language, False) for r, language in (next(stream) for _ in range(args.global_batch))])
         losses, ids = [], []
-        for row, language in batch[rank::world]:
+        for row, language, partial in batch[rank::world]:
             payload = raw.attach_proprio(payloads[row["id"]], row, policy)
             labels = move_cache(raw.grounding(row, language), model.device)
             outputs, _ = grounding_outputs(model, payload["captured"][language])
-            loss, metrics = entity_relation_affordance_loss(outputs, labels, weights=model.policy_guard_eraf_loss_weights)
+            loss_fn = partial_geometry_loss if partial else entity_relation_affordance_loss
+            loss, metrics = loss_fn(outputs, labels, weights=model.policy_guard_eraf_loss_weights)
             if not bool(torch.isfinite(loss)):
                 raise ValueError("Non-finite ERAF grounding loss.")
             (loss / (args.global_batch // world)).backward()
@@ -184,6 +220,8 @@ def main():
         norm = optimizer.step()
         record = {"step": cumulative_step, "local_step": step, "mean_loss": sum(losses) / len(losses), "grad_norm": norm,
                   "samples": ids, "elapsed": time.monotonic() - start}
+        if geometry_stream is not None:
+            record['partial_geometry_slots'] = [partial for _, _, partial in batch[rank::world]]
         journal.write(json.dumps(record) + "\n")
         if rank == 0 and (step == 1 or step % 25 == 0):
             print(f"[grounding] step={step} loss={record['mean_loss']:.6f} elapsed={record['elapsed']:.1f}s", flush=True)
@@ -191,7 +229,8 @@ def main():
             barrier()
             if rank == 0:
                 save_repair_checkpoint(model, root / f"step_{cumulative_step:06d}.pt", stage="grounding", steps=cumulative_step,
-                    parent=args.checkpoint, fg_supervision="off", provenance={"plan": str(root / "plan.json")},
+                    parent=args.checkpoint, fg_supervision="full" if args.geometry_replay == 'fg' else "off",
+                    provenance={"plan": str(root / "plan.json"), "geometry_replay_schema": SCHEMA if geometry_stream is not None else None},
                     record_hashes=not args.skip_file_hashes)
                 evaluations.append(evaluate(cumulative_step))
             barrier()
