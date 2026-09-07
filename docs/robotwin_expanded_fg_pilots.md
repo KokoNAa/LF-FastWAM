@@ -35,3 +35,25 @@ manifests are written atomically during collection. Models stay on the server.
 No controller shuts down the platform. Further expansion, fresh verified mask
 replay and matched FG/no-FG training follow only after actual pilot evidence.
 Performance validation keeps the historical controls and CF criteria unchanged.
+
+## First expansion decision
+
+All6initial pilots completed on2026-09-08 at04:52:38. Cup, mouse, stapler and
+pill corrections succeeded at the first scene; size required an earlier
+nonzero prefix. Raw camera/action/physical-state hash audits passed. Cup and
+pill pilots were source-directed failures, directly matching the old-goal
+behavior seen in development. Prior paired terminal probes also showed
+instruction-dependent truth margins for these tasks. These observations
+motivate prioritizing cup and pill; they do not establish a performance gain.
+
+Opt-in `cup_pill_expansion` allocates24train+6replay_holdout scenes per task
+across6GPUs. Each task has two12scene train shards and one6scene holdout shard;
+all candidate ranges exclude the pilots and the original replay bank. The
+operator requires complete pilot collections, identical collection checkpoint
+and input manifest, and successful exactRGB/physical-state mask replays for
+cup train/holdout and pill train before starting. It hashes the evidence.
+The additional4GiB allocation is separate from a3GiB reserve; job cutoff remains
+at most one hour and never powers off the server. Further failed scene attempts
+are retained. No benchmark, baseline score, Correct criterion or model weight
+is changed by collection. Matched training and unchanged ten-task CF evaluation
+are required afterward, followed by independent verification of any lead.
