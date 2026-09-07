@@ -119,8 +119,8 @@ def main():
         summary = {'complete': True, 'checkpoint': args.checkpoint, 'cells': cells,
                    'episodes': sum(r['episodes'] for r in cells)}
         (root / 'summary.json').write_text(json.dumps(summary, indent=2))
-        if args.episodes == 3 and len(args.tasks) == 5 and len(args.conditions) == 2:
-            from experiments.robotwin.eraf_fg_contract import acceptance
+        from experiments.robotwin.eraf_fg_contract import CF_MINIMUM, acceptance
+        if args.episodes == 3 and set(args.tasks) == set(CF_MINIMUM) and len(args.conditions) == 2:
             decision = acceptance(summary)
             (root / 'acceptance.json').write_text(json.dumps(decision, indent=2))
             print(json.dumps(decision), flush=True)
