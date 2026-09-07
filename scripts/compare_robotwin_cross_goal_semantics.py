@@ -18,9 +18,10 @@ def identity(row):
     return result
 
 
-def compare(reports, *, expected_queries=80, expected_scenes=20):
+def compare(reports, *, expected_queries=80, expected_scenes=20, allow_distinct_manifests=False):
     baseline = None
     models = {}
+    manifests = {}
     for name, report in reports.items():
         if not report['complete'] or report['action_quality_evaluated']:
             raise ValueError('Require complete semantic-only reports.')
@@ -32,8 +33,10 @@ def compare(reports, *, expected_queries=80, expected_scenes=20):
         if len({k[:3] for k in keys}) != expected_scenes:
             raise ValueError('Unexpected scene count.')
         ordered = sorted(rows, key=lambda r: json.dumps(identity(r), sort_keys=True))
-        inputs = dict(manifest_sha256=report['manifest_sha256'],
-                      records=[identity(r) for r in ordered])
+        manifests[name] = report['manifest_sha256']
+        inputs = dict(records=[identity(r) for r in ordered])
+        if not allow_distinct_manifests:
+            inputs['manifest_sha256'] = report['manifest_sha256']
         if baseline is None:
             baseline = inputs
         elif inputs != baseline:
@@ -69,8 +72,9 @@ def compare(reports, *, expected_queries=80, expected_scenes=20):
             cells=[dict(pair_id=k[0], crossed=k[1], **v) for k, v in sorted(groups.items()) if k[0] != 'all'])
     if baseline is None:
         raise ValueError('No reports supplied.')
-    return dict(complete=True, format='robotwin_cross_goal_terminal_comparison_v2',
+    return dict(complete=True, format='robotwin_cross_goal_terminal_comparison_v3' if allow_distinct_manifests else 'robotwin_cross_goal_terminal_comparison_v2',
         matched_queries=expected_queries, matched_scenes=expected_scenes, inputs_and_labels_match=True,
+        manifest_sha256_by_model=manifests, distinct_training_manifests_allowed=allow_distinct_manifests,
         query_sha256=hashlib.sha256(json.dumps(baseline, sort_keys=True).encode()).hexdigest(),
         models=models, action_quality_evaluated=False,
         scope='Fixed held-out own/opposite-goal semantic endpoints. Report recall and specificity together; this is not a CF rollout score.')
@@ -80,8 +84,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--reports', type=Path, required=True, help='JSON mapping of model names to report paths')
     ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--allow-distinct-manifests', action='store_true',
+                    help='Permit changed training banks while still matching every actual diagnostic input and label.')
     args = ap.parse_args()
-    result = compare({k: json.loads(Path(v).read_text()) for k, v in json.loads(args.reports.read_text()).items()})
+    result = compare({k: json.loads(Path(v).read_text()) for k, v in json.loads(args.reports.read_text()).items()},
+                     allow_distinct_manifests=args.allow_distinct_manifests)
     with args.output.open('x') as out:
         out.write(json.dumps(result, indent=2)+'\n')
 

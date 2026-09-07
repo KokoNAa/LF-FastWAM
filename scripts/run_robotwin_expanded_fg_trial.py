@@ -55,7 +55,7 @@ def action_command(plan,root,arm):
     cmd += ['--target-tasks',*TARGETS]
     if plan['arms'][arm]['eraf']=='on':
         mode='fg' if arm=='eraf_fg' else 'ordinary'
-        cmd += ['--zero-context-joint','--identity-audit',str(root/'identity'/mode/'summary.json')]
+        cmd += ['--zero-context-joint','--identity-audit',str(Path(plan.get('identity_root',root/'identity'))/mode/'summary.json')]
     return cmd
 
 
@@ -67,6 +67,44 @@ def comparison_config(previous,root,groups):
         methods[alias]=methods[arm]
         methods[arm]={g:str(root/('eval_'+g)/arm/'dev') for g in groups}
     return dict(target='eraf_fg',methods=methods)
+
+
+def run_action_stages(plan,root,previous,*,group,write,launch,budget,processes,state):
+    from scripts.compare_robotwin_ten_task_methods import build_report
+    group('joint_training',{a:(action_command(plan,root,a),s['gpus']) for a,s in plan['arms'].items()})
+    group('auditing_joint',{a+'_audit':([sys.executable,str(REPO/'scripts/audit_robotwin_eraf_fg_action_stage.py'),
+        '--output',str(root/a/'joint')],[]) for a in ARMS})
+    from scripts.audit_robotwin_expanded_fg_trial import audit_action_pairing
+    write('paired_action_audit.json',audit_action_pairing(root))
+    state['stage']='evaluating';pending=[(g,t,a) for g,s in plan['groups'].items() for t in s['tasks'] for a in ARMS];active={}
+    while pending or active:
+        budget()
+        for name,gpu in list(active.items()):
+            rc=processes[name].poll()
+            if rc is not None:
+                state['jobs'][name]['exit_code']=rc;del active[name];write('driver.json',state)
+                if rc:raise RuntimeError(name+' failed: '+str(rc))
+        for gpu in sorted(set(range(6))-set(active.values())):
+            if not pending:break
+            g,t,a=pending.pop(0);s=plan['groups'][g];name=f'eval_{g}_{a}_{t}'
+            cmd=[sys.executable,'-u',str(REPO/'scripts/eval_robotwin_eraf_fg.py'),'worker',
+                '--output',str(root/('eval_'+g)/a/'dev'),'--checkpoint',str(root/a/'joint/step_000200.pt'),
+                '--manifest',plan['manifest'],'--catalog-root',s['catalog'],'--episodes',str(s['episodes']),
+                '--tasks',t,'--policy-kind','repair','--eraf',plan['arms'][a]['eraf'],'--conditions','counterfactual',
+                '--gpu',str(gpu),'--videos','--skip-file-hashes','--interventions',str(REPO/'configs/eval/robotwin_cis_ten_tasks.json')]
+            launch(name,cmd,[gpu]);active[name]=gpu
+        if active:time.sleep(5)
+    commands={}
+    for g,s in plan['groups'].items():
+        for a in ARMS:
+            commands['summarize_'+g+'_'+a]=([sys.executable,str(REPO/'scripts/eval_robotwin_eraf_fg.py'),'summarize',
+                '--output',str(root/('eval_'+g)/a/'dev'),'--checkpoint',str(root/a/'joint/step_000200.pt'),
+                '--catalog-root',s['catalog'],'--episodes',str(s['episodes']),'--tasks',*s['tasks'],
+                '--conditions','counterfactual','--skip-file-hashes'],[])
+    group('summarizing',commands)
+    config=comparison_config(previous,root,plan['groups'])
+    write('comparison_config.json',config);write('comparison.json',build_report(config))
+    state.update(complete=True,terminal=True,stage='complete')
 
 
 def main():
@@ -211,45 +249,12 @@ def main():
         old_probe=RUNS/'robotwin_cross_goal_semantics/20260908-paired500-terminal-audit'
         reports={m+'_1000':json.loads((old_probe/(m+'.json')).read_text()) for m in ('ordinary','fg')}
         reports.update({m+'_1500':json.loads((root/'terminal'/(m+'.json')).read_text()) for m in ('ordinary','fg')})
-        write('terminal_comparison.json',semantic_compare(reports))
+        write('terminal_comparison.json',semantic_compare(reports,allow_distinct_manifests=True))
         for mode in ('ordinary','fg'):
             audit=json.loads((root/'identity'/mode/'summary.json').read_text())
             validate_joint_identity_audit(audit,checkpoint_sha256=file_sha256(root/'semantic'/mode/'step_001500.pt'),
                                          manifest_sha256=plan['manifest_sha256'])
-        group('joint_training',{a:(action_command(plan,root,a),s['gpus']) for a,s in plan['arms'].items()})
-        group('auditing_joint',{a+'_audit':([sys.executable,str(REPO/'scripts/audit_robotwin_eraf_fg_action_stage.py'),
-            '--output',str(root/a/'joint')],[]) for a in ARMS})
-        from scripts.audit_robotwin_expanded_fg_trial import audit_action_pairing
-        write('paired_action_audit.json',audit_action_pairing(root))
-        state['stage']='evaluating';pending=[(g,t,a) for g,s in plan['groups'].items() for t in s['tasks'] for a in ARMS];active={}
-        while pending or active:
-            budget()
-            for name,gpu in list(active.items()):
-                rc=processes[name].poll()
-                if rc is not None:
-                    state['jobs'][name]['exit_code']=rc;del active[name];write('driver.json',state)
-                    if rc:raise RuntimeError(name+' failed: '+str(rc))
-            for gpu in sorted(set(range(6))-set(active.values())):
-                if not pending:break
-                g,t,a=pending.pop(0);s=plan['groups'][g];name=f'eval_{g}_{a}_{t}'
-                cmd=[sys.executable,'-u',str(REPO/'scripts/eval_robotwin_eraf_fg.py'),'worker',
-                    '--output',str(root/('eval_'+g)/a/'dev'),'--checkpoint',str(root/a/'joint/step_000200.pt'),
-                    '--manifest',plan['manifest'],'--catalog-root',s['catalog'],'--episodes',str(s['episodes']),
-                    '--tasks',t,'--policy-kind','repair','--eraf',plan['arms'][a]['eraf'],'--conditions','counterfactual',
-                    '--gpu',str(gpu),'--videos','--skip-file-hashes','--interventions',str(REPO/'configs/eval/robotwin_cis_ten_tasks.json')]
-                launch(name,cmd,[gpu]);active[name]=gpu
-            if active:time.sleep(5)
-        commands={}
-        for g,s in plan['groups'].items():
-            for a in ARMS:
-                commands['summarize_'+g+'_'+a]=([sys.executable,str(REPO/'scripts/eval_robotwin_eraf_fg.py'),'summarize',
-                    '--output',str(root/('eval_'+g)/a/'dev'),'--checkpoint',str(root/a/'joint/step_000200.pt'),
-                    '--catalog-root',s['catalog'],'--episodes',str(s['episodes']),'--tasks',*s['tasks'],
-                    '--conditions','counterfactual','--skip-file-hashes'],[])
-        group('summarizing',commands)
-        config=comparison_config(previous,root,plan['groups'])
-        write('comparison_config.json',config);write('comparison.json',build_report(config))
-        state.update(complete=True,terminal=True,stage='complete')
+        run_action_stages(plan,root,previous,group=group,write=write,launch=launch,budget=budget,processes=processes,state=state)
     except BaseException as error:
         state.update(stage='stopped',error=repr(error));raise
     finally:

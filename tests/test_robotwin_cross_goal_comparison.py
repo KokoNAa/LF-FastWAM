@@ -53,3 +53,17 @@ def test_reject_missing_queries_changed_labels_and_nonfinite_scores():
     b['records'][0]['clauses'][0]['truth_probability'] = float('nan')
     with pytest.raises(ValueError, match='Invalid'):
         run(dict(b=b))
+
+
+def test_distinct_training_banks_need_opt_in_but_actual_queries_still_match():
+    a,b=report(),report();b['manifest_sha256']='expanded-bank'
+    with pytest.raises(ValueError,match='differ'):run(dict(a=a,b=b))
+    result=compare(dict(a=a,b=b),expected_queries=2,expected_scenes=1,allow_distinct_manifests=True)
+    assert result['inputs_and_labels_match'] and result['manifest_sha256_by_model']==dict(a='manifest',b='expanded-bank')
+    for field,value in [('instruction','changed'),('state_sha256','other'),('rgb_sha256',{'head':'other'})]:
+        changed=deepcopy(b);changed['records'][0][field]=value
+        with pytest.raises(ValueError,match='differ'):
+            compare(dict(a=a,b=changed),expected_queries=2,expected_scenes=1,allow_distinct_manifests=True)
+    b['records'][0]['clauses'][0]['truth_label']=False
+    with pytest.raises(ValueError,match='differ'):
+        compare(dict(a=a,b=b),expected_queries=2,expected_scenes=1,allow_distinct_manifests=True)
