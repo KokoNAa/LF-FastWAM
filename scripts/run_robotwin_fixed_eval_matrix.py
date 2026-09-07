@@ -39,6 +39,9 @@ def main():
     for model in models.values():
         if model['policy_kind'] not in {'legacy', 'repair'}:
             ap.error('Unknown policy kind')
+        model.setdefault('eraf', 'off')
+        if model['eraf'] not in {'on', 'off'} or (model['eraf'] == 'on' and model['policy_kind'] != 'repair'):
+            ap.error('ERAF-on evaluation requires a repair checkpoint')
         for key in ('checkpoint', 'manifest'):
             model[key] = str(Path(model[key]).resolve(strict=True))
     for catalog in catalogs.values():
@@ -57,7 +60,7 @@ def main():
                DIFFSYNTH_MODEL_BASE_PATH='/root/gpufree-data/fastwam/FastWAM/checkpoints',
                VK_ICD_FILENAMES='/etc/vulkan/icd.d/nvidia_icd.json', OMP_NUM_THREADS='2')
     report = dict(plan=plan, gpus=args.gpus, deadline=args.deadline, complete=False,
-                  optimizer_updates=0, eraf='off', jobs={})
+                  optimizer_updates=0, eraf_by_model={name: model['eraf'] for name, model in models.items()}, jobs={})
     processes = {}
 
     def save():
@@ -114,7 +117,7 @@ def main():
                     '--output', output / model_name / catalog_name,
                     '--checkpoint', model['checkpoint'], '--manifest', model['manifest'],
                     '--catalog-root', catalog['path'], '--episodes', catalog['episodes'],
-                    '--tasks', task, '--policy-kind', model['policy_kind'], '--eraf', 'off',
+                    '--tasks', task, '--policy-kind', model['policy_kind'], '--eraf', model['eraf'],
                     '--gpu', gpu, '--videos', '--skip-file-hashes'], gpu)
                 running[gpu] = name
             if running:
