@@ -12,12 +12,13 @@ sys.path[:0] = [str(REPO), str(REPO / 'src')]
 
 def compose(policy, interface, selected):
     import torch
-    from experiments.robotwin.eraf_fg_bridge import validate_payload
+    from experiments.robotwin.eraf_fg_bridge import validate_payload, INTERFACE_PARTS, ROUTE_PARTS
     validate_payload(policy)
     validate_payload(interface)
     if (policy['stage'] != 'joint' or policy['fg_supervision'] != 'full'
             or policy['provenance'].get('eraf') != 'off' or policy['provenance'].get('policy_scope') != 'action'
-            or interface['stage'] != 'interface' or interface['fg_supervision'] != 'full'):
+            or interface['stage'] != 'interface' or interface['fg_supervision'] != 'full'
+            or interface['provenance'].get('eraf') != 'on'):
         raise ValueError('Expected an action-only FG policy and its independent full-FG interface')
     for key in ('parent_checkpoint', 'base_checkpoint', 'guard_config', 'lora_config', 'geometry'):
         if policy[key] != interface[key]:
@@ -30,7 +31,10 @@ def compose(policy, interface, selected):
         if value.shape != other.shape or value.dtype != other.dtype:
             raise ValueError('Guard tensor geometry differs: ' + key)
         if not torch.equal(value, other):
-            if 'guard.' + key not in selected:
+            parts = key.split('.')
+            is_interface = (parts[0] in INTERFACE_PARTS or
+                            (len(parts) > 1 and parts[0] == 'entity_relation_affordance' and parts[1] in ROUTE_PARTS))
+            if not is_interface or 'guard.' + key not in selected:
                 raise ValueError('A frozen semantic parameter differs: ' + key)
             changed.append(key)
     if not changed:
