@@ -30,3 +30,15 @@ def test_partial_or_wrong_budget_matrix_is_not_a_complete_score():
     partial['place_empty_cup']['episodes'] = 2
     with pytest.raises(ValueError, match='Incomplete'):
         score_cells(partial)
+
+
+def test_equal_scores_cannot_gain_a_strict_lead_from_task_completion_order():
+    from itertools import permutations
+    values = fixture()
+    tasks = ['blocks_ranking_rgb', 'stack_blocks_two', 'place_a2b_left', 'place_a2b_right', 'place_burger_fries']
+    for task, successes in zip(tasks, [2, 5, 5, 3, 3]):
+        values[task]['successes'] = successes
+    extra = {task: cell for task, cell in values.items() if task not in tasks}
+    scores = {score_cells({**{task: values[task] for task in order}, **extra})
+              for order in permutations(tasks)}
+    assert scores == {0.3}

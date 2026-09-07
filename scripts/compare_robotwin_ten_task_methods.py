@@ -2,6 +2,7 @@
 """Compare complete ten-task development matrices using paired episode evidence."""
 from __future__ import annotations
 import argparse
+from fractions import Fraction
 import hashlib
 import json
 from pathlib import Path
@@ -25,7 +26,10 @@ def score_cells(cells):
     for task, cell in cells.items():
         if cell['episodes'] != expected[task] or not 0 <= cell['successes'] <= cell['episodes']:
             raise ValueError('Incomplete or invalid task count: ' + task)
-    return sum(c['successes'] / c['episodes'] for c in cells.values()) / len(expected)
+    # An exact tie must stay a tie regardless of completion/dictionary order.
+    # Floating accumulation previously made equal30% scores differ by1e-17.
+    return float(sum((Fraction(c['successes'], c['episodes']) for c in cells.values()),
+                     Fraction()) / len(expected))
 
 
 def build_report(config):
@@ -87,6 +91,7 @@ def build_report(config):
         target_strictly_exceeds_all_listed_dev_controls=all(r['macro_delta'] > 0 for r in paired.values()),
         matched_episodes_per_comparison=45, supplementary_final_slots=slots,
         independent_test=False, goal_achievement_claim=False,
+        macro_arithmetic='Exact rational task fractions, converted once to float; task order cannot break ties.',
         scope='Complete development CF matrices only; equal-task macro is primary. Paired gains/losses and slot ownership are descriptive. A development lead alone does not establish independent superiority or complete the user goal.')
 
 
