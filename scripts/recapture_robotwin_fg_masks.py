@@ -8,6 +8,7 @@ from pathlib import Path
 import pickle
 import subprocess
 import sys
+import traceback
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / 'src')]
@@ -93,6 +94,8 @@ def main():
                 phase_labels_valid=False, temporal_labels_valid=False)
         except Exception as e:
             report['error'] = repr(e)
+            report['error_detail'] = str(e)
+            report['traceback'] = traceback.format_exc()
         finally:
             if task is not None:
                 try:
