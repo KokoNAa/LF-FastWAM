@@ -21,7 +21,11 @@ def main():
     ap.add_argument('--robotwin-root', default=str(REPO / 'third_party/RoboTwin'))
     ap.add_argument('--gpu', type=int, default=0)
     ap.add_argument('--limit-per-cell', type=int, default=1)
+    ap.add_argument('--num-shards', type=int, default=1)
+    ap.add_argument('--shard-index', type=int, default=0)
     args = ap.parse_args()
+    if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
+        ap.error('Require a positive shard count and a valid shard index.')
     args.manifest, args.output = str(Path(args.manifest).resolve()), str(Path(args.output).resolve())
     args.robotwin_root = str(Path(args.robotwin_root).resolve())
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
@@ -35,10 +39,14 @@ def main():
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _capture_data_type, _close
     root = Path(args.output)
     root.mkdir(parents=True, exist_ok=False)
-    rows = select_replay_scenes(json.loads(Path(args.manifest).read_text())['states'], limit_per_cell=args.limit_per_cell)
+    all_rows = select_replay_scenes(json.loads(Path(args.manifest).read_text())['states'], limit_per_cell=args.limit_per_cell)
+    rows = all_rows[args.shard_index::args.num_shards]
+    if not rows:
+        raise ValueError('Selected mask replay shard is empty.')
     (root / 'plan.json').write_text(json.dumps(vars(args) | {'schema': SCHEMA,
         'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(),
         'manifest_sha256': file_sha256(args.manifest), 'source_records': rows,
+        'unsharded_scene_count': len(all_rows),
         'optimizer_updates': 0, 'source_captures_modified': False,
         'acceptance': 'All original RGB frames identical; qpos and semantic geometry within1e-7; original prefix and control states verified; full goal remains true.'}, indent=2))
     reports = []
