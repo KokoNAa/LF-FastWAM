@@ -65,7 +65,9 @@ def test_collector_saves_only_selected_goal_success_and_real_action_trace(tmp_pa
     manifest.write_text(json.dumps({'states': []}))
     checkpoint.write_bytes(b'teacher')
     task = SimpleNamespace(take_action_cnt=0)
-    task.setup_demo = lambda **kwargs: setattr(task, 'scene_seed', kwargs['seed'])
+    def setup(**kwargs):
+        task.scene_seed, task.goal_complete = kwargs['seed'], False
+    task.setup_demo = setup
     policy = SimpleNamespace(_infer_action_chunk=lambda observation, instruction: np.ones((32, 14)))
     original = policy._infer_action_chunk
     monkeypatch.setattr(training, 'load_policy', lambda *args: policy)
@@ -78,6 +80,7 @@ def test_collector_saves_only_selected_goal_success_and_real_action_trace(tmp_pa
 
     def rollout(task, policy, spec, instruction, *, selected_goal):
         calls.append((instruction, selected_goal))
+        task.goal_complete = task.scene_seed == 80800001
         policy._infer_action_chunk({'joint_action': {'vector': np.zeros(14)},
             'observation': {c: {'rgb': np.zeros((3, 4, 3), dtype=np.uint8)} for c in CAMERAS}}, instruction)
         return {'initial': np.arange(50), 'actions': np.full((24, 14), 7),
@@ -85,7 +88,7 @@ def test_collector_saves_only_selected_goal_success_and_real_action_trace(tmp_pa
 
     monkeypatch.setattr(eraf_fg_collection, 'run_failure_rollout', rollout)
     monkeypatch.setattr(eraf_fg_collection, 'full_goal',
-                        lambda task, spec, selected_goal: task.scene_seed == 80800001)
+                        lambda task, spec, selected_goal: task.goal_complete)
     monkeypatch.setattr(sys, 'argv', ['collect', '--manifest', str(manifest), '--checkpoint', str(checkpoint),
         '--output', str(output), '--robotwin-root', str(tmp_path), '--task', task_name,
         '--start-seed', '80800000', '--max-attempts', '2', '--scenes', '1'])

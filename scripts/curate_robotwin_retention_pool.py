@@ -19,8 +19,9 @@ def initial_cf_relation(task, state):
         return bool(a[0] > b[0] and .08 < np.linalg.norm(a[:2] - b[:2]) < .2
                     and abs(a[1] - b[1]) < .05)
     if task == 'blocks_ranking_rgb':
+        state = np.asarray(state, dtype=np.float32)
         red, green, blue = state[:3], state[7:10], state[14:17]
-        eps = np.array([.13, .03])
+        eps = np.array([.13, .03], dtype=np.float32)
         return bool(blue[0] < green[0] < red[0]
                     and np.all(abs(red[:2] - green[:2]) < eps)
                     and np.all(abs(green[:2] - blue[:2]) < eps))
