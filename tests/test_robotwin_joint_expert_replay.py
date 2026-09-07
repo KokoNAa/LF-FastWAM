@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from experiments.robotwin.joint_expert_replay import collect_scenes, masked_window, validate_prepared_rows
+from experiments.robotwin.joint_expert_replay import collect_scenes, masked_window, validate_prepared_rows, validate_grounding_capture
 from experiments.robotwin.pgc_data import array_sha256, pair_spec_from_source_task
 
 
@@ -104,6 +104,12 @@ def test_prepare_merge_preserves_expert_branch_observations_and_raw_grounding_pa
                 h['joint_action/vector'] = actions
                 for camera in ('head_camera', 'left_camera', 'right_camera'):
                     h[f'observation/{camera}/rgb'] = np.asarray([buffer.getvalue()] * 35, dtype='S1000')
+                    h[f'observation/{camera}/actor_segmentation_ids'] = np.zeros((35, 4, 4), dtype=np.int32)
+                for name in ('entity_positions', 'entity_actor_ids', 'entity_valid'):
+                    h['pgc_entity_state/' + name] = np.zeros((35, 4, 3) if name == 'entity_positions' else (35, 4))
+                for prefix in ('source', 'target'):
+                    for name in ('subject_indices', 'reference_indices', 'predicate_ids', 'predicate_truth', 'clause_valid', 'goal_positions'):
+                        h[f'pgc_entity_state/{prefix}_{name}'] = np.zeros((35, 4, 3) if name == 'goal_positions' else (35, 4))
         journal.write_text('\n'.join(json.dumps(row) for row in rows))
     parent = tmp_path / 'parent.json'; write(parent, dict(complete=True, states=[]))
     checkpoint = tmp_path / 'checkpoint.pt'; checkpoint.write_bytes(b'fixture')
@@ -133,3 +139,7 @@ def test_prepare_merge_preserves_expert_branch_observations_and_raw_grounding_pa
     assert set(tail_row['raw_paths']) == {'native', 'counterfactual'}
     assert {r['scene_seed'] for r in rows if r['replay_split'] == 'train'}.isdisjoint(
         {r['scene_seed'] for r in rows if r['replay_split'] == 'replay_holdout'})
+    with h5py.File(tail_row['raw_paths']['counterfactual'], 'a') as h:
+        del h['pgc_entity_state/target_predicate_ids']
+        with pytest.raises(ValueError, match='entity/relation'):
+            validate_grounding_capture(h, 35)

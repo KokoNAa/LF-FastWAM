@@ -131,3 +131,21 @@ def masked_window(actions, frame, horizon=32):
     real = actions[frame:frame + horizon]
     value = np.concatenate((real, np.repeat(real[-1:], horizon - len(real), axis=0)))
     return value, np.arange(horizon) < len(real)
+
+
+def validate_grounding_capture(handle, length):
+    """Reject missing/misaligned relation labels before expensive input caching."""
+    shapes = {'entity_positions': (length, 4, 3), 'entity_actor_ids': (length, 4),
+              'entity_valid': (length, 4)}
+    for prefix in ('source', 'target'):
+        for name in ('subject_indices', 'reference_indices', 'predicate_ids', 'predicate_truth', 'clause_valid'):
+            shapes[f'{prefix}_{name}'] = (length, 4)
+        shapes[f'{prefix}_goal_positions'] = (length, 4, 3)
+    if any(f'pgc_entity_state/{key}' not in handle or handle[f'pgc_entity_state/{key}'].shape != shape
+           for key, shape in shapes.items()):
+        raise ValueError('Missing or misaligned ERAF entity/relation capture.')
+    for camera in ('head_camera', 'left_camera', 'right_camera'):
+        for field in ('rgb', 'actor_segmentation_ids'):
+            key = f'observation/{camera}/{field}'
+            if key not in handle or len(handle[key]) != length:
+                raise ValueError('Camera or segmentation capture does not cover the action trajectory.')

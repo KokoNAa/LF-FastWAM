@@ -28,7 +28,7 @@ def main():
     args = ap.parse_args()
     if args.stride < 1 or not 0 <= args.shard < args.shards:
         ap.error('Positive stride and valid shard required.')
-    from experiments.robotwin.joint_expert_replay import read, collect_scenes, masked_window, scene_keys, validate_prepared_rows
+    from experiments.robotwin.joint_expert_replay import read, collect_scenes, masked_window, scene_keys, validate_prepared_rows, validate_grounding_capture
     from experiments.robotwin.eraf_fg_data import file_metadata
     base = read(args.manifest)
     if not base.get('complete'):
@@ -101,6 +101,8 @@ def main():
             with h5py.File(scene['raw_paths']['native']) as source, h5py.File(scene['raw_paths']['counterfactual']) as target:
                 actions = {k: validate_action_array(h['joint_action/vector'][:])
                            for k, h in [('source', source), ('target', target)]}
+                validate_grounding_capture(source, len(actions['source']))
+                validate_grounding_capture(target, len(actions['target']))
                 for language, kind in [('source', 'native'), ('target', 'counterfactual')]:
                     row = scene['raw_records'][kind]
                     if len(actions[language]) != row['action_count'] or array_sha256(actions[language]) != row['action_sha256']:
