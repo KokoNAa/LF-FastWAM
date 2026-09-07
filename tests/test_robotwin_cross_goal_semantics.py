@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from experiments.robotwin.cross_goal_semantics import cross_capture, semantic_labels, semantic_row
+from experiments.robotwin.cross_goal_semantics import cross_capture, semantic_labels, semantic_row, paired_cross_goal_batch
 
 
 def capture(text, state, image):
@@ -52,3 +52,19 @@ def test_crossed_labels_use_actual_scene_other_predicate_and_no_invented_history
     assert row['raw_paths']['counterfactual'] == 'target.h5'
     with pytest.raises(ValueError):
         semantic_row(raw, dict(row, fg_correction=True), 'source', 'target')
+
+
+def test_paired_groups_preserve_collective_schedule_and_full_goal_samples():
+    batch = [(dict(id=i), 'source' if i % 2 else 'target', 3 <= i < 6) for i in range(12)]
+    out = paired_cross_goal_batch(batch, 3)
+    for rank in range(3):
+        assert out[6 + rank][0] is out[rank][0]
+        assert out[6 + rank][1] == out[rank][1]
+        assert out[6 + rank][3] != out[rank][3]
+    assert out[3:6] == [(r, l, p, l) for r, l, p in batch[3:6]]
+    assert out[9:] == [(r, l, p, l) for r, l, p in batch[9:]]
+    assert [sum(x[1] != x[3] for x in out[r::3]) for r in range(3)] == [1, 1, 1]
+    with pytest.raises(ValueError):
+        paired_cross_goal_batch([(dict(id=i), 'source', i == 0) for i in range(12)], 3)
+    with pytest.raises(ValueError):
+        paired_cross_goal_batch(batch[:6], 3)

@@ -2,6 +2,33 @@
 from __future__ import annotations
 
 
+def paired_cross_goal_batch(batch, world_size):
+    """Pair one common rank group with its opposite goal; keep FG slots intact.
+
+    Three ranks must enter the same loss/validity branch together. Replacing
+    an entire common group preserves the existing collective call schedule.
+    """
+    if world_size < 1 or len(batch) % world_size:
+        raise ValueError('The semantic batch must contain complete rank groups.')
+    common = []
+    for start in range(0, len(batch), world_size):
+        kinds = {bool(partial) for _, _, partial in batch[start:start + world_size]}
+        if len(kinds) != 1:
+            raise ValueError('Ranks would enter different semantic loss branches.')
+        if kinds == {False}:
+            common.append(start)
+    if len(common) < 2:
+        raise ValueError('Cross-goal pairing needs at least two common rank groups.')
+    result = [(row, language, partial, language) for row, language, partial in batch]
+    source, target = common[:2]
+    for rank in range(world_size):
+        row, language, partial = batch[source + rank]
+        if language not in ('source', 'target') or any(row.get(k) for k in ('fg_correction', 'native_retention', 'cf_retention')):
+            raise ValueError('Only ordinary expert observations may be paired across goals.')
+        result[target + rank] = (row, language, False, 'target' if language == 'source' else 'source')
+    return result
+
+
 def semantic_row(raw, row, observation_language, instruction_language):
     if observation_language not in ('source', 'target') or instruction_language not in ('source', 'target'):
         raise ValueError('Declare physical trajectory and instruction branches separately.')

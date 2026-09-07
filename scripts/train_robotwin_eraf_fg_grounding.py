@@ -70,7 +70,11 @@ def main():
                     help='Replace declared slots with matched target-only partial geometry supervision.')
     ap.add_argument('--geometry-replay-slots', type=int, default=3)
     ap.add_argument('--fg-role-masks', help='Complete verified mask-replay index; enables matched role losses on partial slots.')
+    ap.add_argument('--paired-cross-goals', action='store_true',
+                    help='Replace one common rank group with opposite-goal semantic labels on the identical paired observations; no action labels are used.')
     args = ap.parse_args()
+    if args.paired_cross_goals and (args.geometry_replay == 'off' or not args.task_balanced):
+        ap.error('Paired cross-goals require the matched task-balanced semantic replay schedule')
     if args.fg_role_masks and args.geometry_replay == 'off':
         ap.error('Corrective role masks require matched geometry replay.')
     if len(set(args.qualification_tasks)) != len(args.qualification_tasks):
@@ -78,6 +82,8 @@ def main():
     required_pairs = [pair_spec_from_source_task(task).pair_id for task in args.qualification_tasks]
     world, rank, local = (int(os.environ.get(k, d)) for k, d in
                            (("WORLD_SIZE", "1"), ("RANK", "0"), ("LOCAL_RANK", "0")))
+    if args.paired_cross_goals and (args.global_batch != 4 * world or args.geometry_replay_slots != world):
+        ap.error('Paired cross-goals require three common rank groups and one partial rank group')
     if min(args.steps, args.save_every, args.global_batch) < 1 or args.global_batch % world:
         ap.error("Positive counts and global batch divisible by world size required.")
     if args.geometry_replay != 'off' and not 0 < args.geometry_replay_slots < args.global_batch:
@@ -236,23 +242,33 @@ def main():
         optimizer.zero_grad()
         batch = (next(geometry_stream) if geometry_stream is not None else
                  [(r, language, False) for r, language in (next(stream) for _ in range(args.global_batch))])
-        losses, ids = [], []
-        for row, language, partial in batch[rank::world]:
+        from experiments.robotwin.cross_goal_semantics import paired_cross_goal_batch, cross_capture, semantic_labels
+        semantic_batch = (paired_cross_goal_batch(batch, world) if args.paired_cross_goals else
+                          [(r, language, partial, language) for r, language, partial in batch])
+        losses, ids, crossed_slots, instruction_languages = [], [], [], []
+        for row, language, partial, instruction_language in semantic_batch[rank::world]:
             payload = raw.attach_proprio(payloads[row["id"]], row, policy)
-            labels = move_cache(raw.grounding(row, language), model.device)
-            outputs, _ = grounding_outputs(model, payload["captured"][language])
+            crossed = language != instruction_language
+            labels = move_cache(semantic_labels(raw, row, language, instruction_language) if crossed
+                                else raw.grounding(row, language), model.device)
+            captured = cross_capture(payload['captured'], language, instruction_language) if crossed else payload['captured'][language]
+            outputs, _ = grounding_outputs(model, captured)
             loss_fn = partial_loss if partial else entity_relation_affordance_loss
             loss, metrics = loss_fn(outputs, labels, weights=model.policy_guard_eraf_loss_weights)
             if not bool(torch.isfinite(loss)):
                 raise ValueError("Non-finite ERAF grounding loss.")
             (loss / (args.global_batch // world)).backward()
             losses.append(float(loss.detach())); ids.append([row["id"], language])
+            crossed_slots.append(crossed); instruction_languages.append(instruction_language)
         average_gradients(selected.values())
         norm = optimizer.step()
         record = {"step": cumulative_step, "local_step": step, "mean_loss": sum(losses) / len(losses), "grad_norm": norm,
                   "samples": ids, "elapsed": time.monotonic() - start}
         if geometry_stream is not None:
-            record['partial_geometry_slots'] = [partial for _, _, partial in batch[rank::world]]
+            record['partial_geometry_slots'] = [partial for _, _, partial, _ in semantic_batch[rank::world]]
+        if args.paired_cross_goals:
+            record['cross_goal_slots'] = crossed_slots
+            record['instruction_languages'] = instruction_languages
         journal.write(json.dumps(record) + "\n")
         if rank == 0 and (step == 1 or step % 25 == 0):
             print(f"[grounding] step={step} loss={record['mean_loss']:.6f} elapsed={record['elapsed']:.1f}s", flush=True)
@@ -263,6 +279,7 @@ def main():
                     parent=args.checkpoint, fg_supervision="full" if args.geometry_replay == 'fg' else "off",
                     provenance={"plan": str(root / "plan.json"), "geometry_replay_schema": SCHEMA if geometry_stream is not None else None,
                                 "fg_role_mask_schema": mask_schema if fg_masks is not None else None,
+                                "paired_cross_goals": args.paired_cross_goals,
                                 "fg_role_mask_index_sha256": fg_masks.index_sha256 if fg_masks is not None else None},
                     record_hashes=not args.skip_file_hashes)
                 evaluations.append(evaluate(cumulative_step))
