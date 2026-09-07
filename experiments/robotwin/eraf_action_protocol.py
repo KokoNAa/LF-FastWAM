@@ -2,16 +2,28 @@
 import math
 
 
+def is_zero_context_parent(parent):
+    """Accept explicit bootstraps or semantically trained zero-output residuals.
+
+    Semantic steps remain recorded as grounding steps; they are never relabeled
+    as zero training. The caller must still bind a deployed identity audit.
+    """
+    from experiments.robotwin.context_residual import MODE, ZEROED
+    provenance = parent.get('provenance', {})
+    bootstrap = (parent.get('stage') == 'bootstrap' and parent.get('optimizer_steps') == 0
+                 and provenance.get('context_residual_initialization') is True)
+    calibrated = (parent.get('stage') == 'grounding' and parent.get('optimizer_steps', 0) > 0
+                  and provenance.get('paired_cross_goals') is True)
+    return bool((bootstrap or calibrated) and parent.get('context_injection_mode') == MODE
+        and all(k in parent.get('policy_guard', {}) and not parent['policy_guard'][k].count_nonzero()
+                for k in ZEROED))
+
+
 def validate_action_parent(parent, *, stage, eraf, fg, resume=False, warm_policy=False, zero_context_joint=False):
     if zero_context_joint:
-        from experiments.robotwin.context_residual import MODE, ZEROED
         if (resume or warm_policy or stage != 'joint' or eraf != 'on'
-                or parent['stage'] != 'bootstrap' or parent.get('optimizer_steps') != 0
-                or parent.get('context_injection_mode') != MODE or parent.get('fg_supervision') != fg
-                or parent.get('provenance', {}).get('context_residual_initialization') is not True
-                or any(k not in parent.get('policy_guard', {}) or parent['policy_guard'][k].count_nonzero()
-                       for k in ZEROED)):
-            raise ValueError('Zero-context joint start requires its own untouched residual bootstrap.')
+                or parent.get('fg_supervision') != fg or not is_zero_context_parent(parent)):
+            raise ValueError('Zero-context joint start requires its own untouched residual bootstrap or paired semantic zero-output checkpoint.')
         return
     if warm_policy and resume:
         raise ValueError('Warm policy initialization and optimizer resume are different operations.')

@@ -22,6 +22,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--deadline', required=True)
+    ap.add_argument('--identity-root', type=Path,
+                    help='Use a separately audited residual semantic preparation.')
+    ap.add_argument('--prior-comparison-config', type=Path,
+                    help='Preserve all prior controls when extending a completed comparison.')
     args = ap.parse_args()
     cutoff = datetime.fromisoformat(args.deadline)
     if cutoff.tzinfo is None:
@@ -31,10 +35,18 @@ def main():
     if subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip():
         raise ValueError('GPUs are occupied.')
     runs = Path('/root/gpufree-data/LF-FastWAM/runs')
-    identity = runs / 'robotwin_calibrated_context_identity/20260908-semantic500'
+    identity = args.identity_root or runs / 'robotwin_calibrated_context_identity/20260908-semantic500'
     prior = runs / 'robotwin_ten_task_action_expansion/20260908-0005-joint200'
     previous = json.loads((prior / 'protocol.json').read_text())
     bootstraps = json.loads((identity / 'plan.json').read_text())
+    semantic_audit = (json.loads(Path(bootstraps['training_audit']).read_text())
+                      if bootstraps.get('training_audit') else None)
+    if semantic_audit is not None:
+        if not semantic_audit['complete'] or not semantic_audit['actual_samples_and_instruction_branches_verified']:
+            raise ValueError('Semantic preparation has not passed its paired training audit.')
+        comparison = json.loads(Path(bootstraps['terminal_comparison']).read_text())
+        if not comparison['complete'] or not comparison['inputs_and_labels_match'] or comparison['matched_queries'] != 80:
+            raise ValueError('Complete matched terminal semantic comparison required.')
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
 
@@ -55,7 +67,9 @@ def main():
         global_batch=12, seed=42, correction_weight=.1, correct_count=2, cf_count=4, correct_weight=1, cf_weight=4,
         initialization='Opt-in zero_context_joint: exact30-query residual identity, no interface-warmup updates.',
         semantic_qualification_passed=False,
-        scientific_scope='Exploratory CF trial after matched semantic500 calibration. Both new arms share policy initialization, action steps, data schedule and learning rates. This changes semantic preparation and removes interface warmup relative to the older joint200 trial; no single-factor attribution. All historic strongest controls remain in the comparison.',
+        scientific_scope='Exploratory CF trial after the recorded matched semantic preparation. Both new arms share policy initialization, action steps, data schedule and learning rates. Historical controls remain in the comparison; semantic diagnostics alone do not establish CF superiority.',
+        semantic_training_audit=bootstraps.get('training_audit'),
+        terminal_semantic_comparison=bootstraps.get('terminal_comparison'),
         checkpoint_selection='Predeclared final joint200 only, fresh optimizer. No checkpoint chosen from partial CF results.',
         total_eval_episodes=90, correct_evaluated=False, independent_test=False,
         deadline=args.deadline, platform_shutdown=None, model_storage='server_only')
@@ -89,7 +103,14 @@ def main():
     try:
         budget()
         # Actual prior joint files provide the storage estimate for identical scopes.
-        expected_bytes = sum((prior / arm / 'joint' / name).stat().st_size
+        def original_bytes(path):
+            if path.exists():
+                return path.stat().st_size
+            receipt = json.loads(path.with_suffix('.compacted.json').read_text())
+            if not receipt['exact_tensors_and_metadata_verified_after_readback']:
+                raise ValueError('Unverified compacted size reference.')
+            return receipt['original_bytes']
+        expected_bytes = sum(original_bytes(prior / arm / 'joint' / name)
                              for arm in plan['arms'] for name in ('step_000200.pt', 'optimizer_last.pt'))
         if shutil.disk_usage(root).free < 5 * 1024**3 + expected_bytes + 160 * 1024**2:
             raise RuntimeError('Insufficient reserve for both final models, optimizers and evaluation media.')
@@ -102,6 +123,15 @@ def main():
             mode = 'ordinary' if arm == 'eraf_only' else 'fg'
             assert json.loads((identity / (mode + '.exit.json')).read_text())['exit_code'] == 0
             payload = torch.load(spec['parent'], map_location='cpu', weights_only=False)
+            if payload['stage'] == 'grounding':
+                if semantic_audit is None:
+                    raise ValueError('Grounding parents require their completed paired training audit.')
+                evidence = semantic_audit['arms'][mode]
+                if (evidence['checkpoint_sha256'] != file_sha256(spec['parent'])
+                        or not evidence['policy_tensors_identical'] or not evidence['only_declared_semantics_changed']
+                        or not evidence['residual_output_still_zero']
+                        or comparison['models'][mode + '_paired500']['checkpoint_sha256'] != evidence['checkpoint_sha256']):
+                    raise ValueError('Semantic or diagnostic evidence does not bind this actual parent.')
             validate_action_parent(payload, stage='joint', eraf='on', fg=spec['fg'], zero_context_joint=True)
             proof = json.loads(Path(spec['identity_audit']).read_text())
             validate_joint_identity_audit(proof, checkpoint_sha256=file_sha256(spec['parent']),
@@ -172,10 +202,14 @@ def main():
                     '--catalog-root', spec['catalog'], '--episodes', str(spec['episodes']), '--tasks', *spec['tasks'],
                     '--conditions', 'counterfactual', '--skip-file-hashes'], cwd=REPO, env=env, check=True,
                     timeout=60, stdout=subprocess.DEVNULL)
-        config = json.loads((runs / 'robotwin_ten_task_semantic_audit/20260908-post-joint200/plan.json').read_text())['comparison']
+        config = (json.loads(args.prior_comparison_config.read_text()) if args.prior_comparison_config else
+                  json.loads((runs / 'robotwin_ten_task_semantic_audit/20260908-post-joint200/plan.json').read_text())['comparison'])
         methods = dict(config['methods'])
         for arm in plan['arms']:
-            methods['previous_' + arm] = methods[arm]
+            archive_name = ('pre_cross_goal_' if args.prior_comparison_config else 'previous_') + arm
+            if archive_name in methods:
+                raise ValueError('Historical comparison name already exists: ' + archive_name)
+            methods[archive_name] = methods[arm]
             methods[arm] = {group: str(root / ('eval_' + group) / arm / 'dev') for group in plan['groups']}
         config = dict(target='eraf_fg', methods=methods)
         write('comparison_config.json', config)

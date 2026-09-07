@@ -63,7 +63,7 @@ def main():
     for name in ('manifest', 'source-bank', 'checkpoint', 'output'):
         ap.add_argument('--' + name, required=True)
     ap.add_argument('--require-residual-identity', action='store_true',
-                    help='Require a zero-step residual bootstrap and bitwise full-inference OFF identity.')
+                    help='Require an explicit zero-output residual parent and bitwise full-inference OFF identity.')
     ap.add_argument('--include-expanded-tasks', action='store_true',
                     help='Cover all ten tasks and every expert-holdout domain in the expanded manifest.')
     args = ap.parse_args()
@@ -82,13 +82,12 @@ def main():
     policy = load_policy(args.checkpoint, manifest, seed=42)
     policy.model.requires_grad_(False)
     if args.require_residual_identity:
-        from experiments.robotwin.context_residual import ZEROED, MODE
+        from experiments.robotwin.context_residual import MODE
+        from experiments.robotwin.eraf_action_protocol import is_zero_context_parent
         payload = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-        if (payload.get('context_injection_mode') != MODE or payload['stage'] != 'bootstrap'
-                or payload['optimizer_steps'] != 0
-                or any(payload['policy_guard'][key].count_nonzero() for key in ZEROED)
+        if (not is_zero_context_parent(payload)
                 or policy.model.policy_guard_modules['eraf_action_context_injector'].injection_mode != MODE):
-            raise ValueError('Identity audit requires an actually loaded zero-output residual bootstrap.')
+            raise ValueError('Identity audit requires an actually loaded zero-output residual parent.')
         del payload
     norm = policy.processor.normalizer.normalizers['action'][policy.processor.shape_meta['action'][0]['key']]
     raw = RawReplay(args.source_bank)

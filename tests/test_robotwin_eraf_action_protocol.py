@@ -49,6 +49,19 @@ def test_joint_identity_requires_exact_matching_repeated_ten_task_evidence():
         validate_joint_identity_audit(changed, checkpoint_sha256='a'*64, manifest_sha256='b'*64)
 
 
+def test_semantically_trained_residual_keeps_its_steps_and_requires_zero_output():
+    from experiments.robotwin.context_residual import ZEROED
+    from experiments.robotwin.eraf_action_protocol import is_zero_context_parent
+    parent = dict(stage='grounding', optimizer_steps=1000, context_injection_mode='context_residual_v1',
+        fg_supervision='full', provenance={'paired_cross_goals': True},
+        policy_guard={key: torch.zeros(2) for key in ZEROED})
+    validate_action_parent(parent, stage='joint', eraf='on', fg='full', zero_context_joint=True)
+    assert parent['stage'] == 'grounding' and parent['optimizer_steps'] == 1000
+    for patch in ({'stage': 'joint'}, {'optimizer_steps': 0}, {'provenance': {}},
+                  {'policy_guard': {key: torch.ones(2) for key in ZEROED}}):
+        assert not is_zero_context_parent(parent | patch)
+
+
 def test_common_warm_policy_does_not_leak_fg_training_into_off_controls():
     parent = dict(stage='joint', fg_supervision='off', provenance={'eraf': 'off'})
     for stage, eraf, fg in [('joint', 'off', 'off'), ('joint', 'off', 'full'), ('interface', 'on', 'full')]:
