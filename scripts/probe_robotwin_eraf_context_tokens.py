@@ -15,6 +15,27 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / 'src')]
 
 
+def identity_rows(rows, *, include_expanded_tasks=False):
+    from experiments.robotwin.pgc_data import ROBOTWIN_ERAF_PAIR_IDS, ROBOTWIN_TEN_TASK_SPECS
+    heldout = [r for r in rows if r['replay_split'] == 'replay_holdout' and not any(r.get(k)
+               for k in ('native_retention', 'cf_retention', 'fg_correction'))]
+    expected_pairs = ({s.pair_id for s in ROBOTWIN_TEN_TASK_SPECS} if include_expanded_tasks
+                      else set(ROBOTWIN_ERAF_PAIR_IDS))
+    expected_groups = {(r['pair_id'], r['task_config']) for r in heldout}
+    if {pair for pair, domain in expected_groups} != expected_pairs:
+        raise ValueError('Identity manifest does not cover exactly the declared task set.')
+    if not include_expanded_tasks and len(expected_groups) != 10:
+        raise ValueError('Historical identity requires five tasks in two domains.')
+    selected = {}
+    for row in heldout:
+        if any(row.get(lang + '_frame_index', row.get('frame_index', 0)) != 0 for lang in ('source', 'target')):
+            continue
+        selected.setdefault((row['pair_id'], row['task_config']), row)
+    if set(selected) != expected_groups:
+        raise ValueError('Each declared task/domain needs an initial held-out scene.')
+    return selected
+
+
 @contextmanager
 def injection_mode(model, mode):
     scales = {'schedule_zero': 0., 'near_zero_tokens': 1e-6, 'full': 1., 'repeat_full': 1.}
@@ -43,6 +64,8 @@ def main():
         ap.add_argument('--' + name, required=True)
     ap.add_argument('--require-residual-identity', action='store_true',
                     help='Require a zero-step residual bootstrap and bitwise full-inference OFF identity.')
+    ap.add_argument('--include-expanded-tasks', action='store_true',
+                    help='Cover all ten tasks and every expert-holdout domain in the expanded manifest.')
     args = ap.parse_args()
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
@@ -55,16 +78,7 @@ def main():
     from experiments.robotwin.image_io import decode_legacy_robotwin_rgb
     from experiments.robotwin.pgc_data import array_sha256
     manifest = json.loads(Path(args.manifest).read_text())
-    selected = {}
-    for row in manifest['states']:
-        if row['replay_split'] != 'replay_holdout' or any(row.get(k)
-                for k in ('native_retention', 'cf_retention', 'fg_correction')):
-            continue
-        if any(row.get(lang + '_frame_index', row.get('frame_index', 0)) != 0 for lang in ('source', 'target')):
-            continue
-        selected.setdefault((row['pair_id'], row['task_config']), row)
-    if len(selected) != 10 or len({k[0] for k in selected}) != 5:
-        raise ValueError('Require one existing initial holdout scene per task/domain.')
+    selected = identity_rows(manifest['states'], include_expanded_tasks=args.include_expanded_tasks)
     policy = load_policy(args.checkpoint, manifest, seed=42)
     policy.model.requires_grad_(False)
     if args.require_residual_identity:
@@ -114,7 +128,7 @@ def main():
                 'rgb_sha256': {c: array_sha256(observation['observation'][c]['rgb']) for c in CAMERAS},
                 'comparisons_to_eraf_off': comparisons, 'injection_metrics': metrics}
             records.append(record)
-            print(f'[token-probe] queries={len(records)}/20 full_vs_off_max_abs={comparisons["full"]["max_abs"]:.6g}', flush=True)
+            print(f'[token-probe] queries={len(records)}/{2*len(selected)} full_vs_off_max_abs={comparisons["full"]["max_abs"]:.6g}', flush=True)
     np.savez_compressed(output / 'normalized_actions.npz', **arrays)
     if args.require_residual_identity:
         exact = all(v['raw_actions_exact'] and v['normalized_actions_exact']
@@ -122,7 +136,9 @@ def main():
         result = {'complete': exact, 'checkpoint': args.checkpoint,
             'checkpoint_sha256': file_sha256(args.checkpoint), 'queries': len(records),
             'denoising_steps': 10, 'seed': 42, 'full_eraf_equals_off_exactly': exact,
-            'scope': 'Five tasks, two domains, both instructions; original and normalized 32x14 actions, repeated full ERAF. No closed-loop efficacy claim.',
+            'task_count': len({k[0] for k in selected}), 'task_domain_count': len(selected),
+            'manifest_sha256': file_sha256(args.manifest), 'include_expanded_tasks': args.include_expanded_tasks,
+            'scope': 'Every declared task/domain, both instructions; original and normalized 32x14 actions, repeated full ERAF. No closed-loop efficacy claim.',
             'records': records}
         (output / 'summary.json').write_text(json.dumps(result, indent=2))
         print(json.dumps({k: v for k, v in result.items() if k != 'records'}), flush=True)
