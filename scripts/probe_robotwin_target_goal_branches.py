@@ -21,7 +21,7 @@ def main():
     for key in ('record', 'output', 'robotwin-root'):
         ap.add_argument('--' + key, type=Path, required=True)
     ap.add_argument('--prefix-steps', type=int)
-    ap.add_argument('--continuation', choices=['release-regrasp', 'held-placement'], default='release-regrasp')
+    ap.add_argument('--continuation', choices=['release-regrasp', 'held-placement', 'open-gripper-expert'], default='release-regrasp')
     ap.add_argument('--held-arm', choices=['left', 'right'])
     args = ap.parse_args()
     import numpy as np
@@ -30,7 +30,8 @@ def main():
     from experiments.robotwin.eraf_fg_collection import (
         physical_state, replay_prefix, record_continuation, replay_continuation, full_goal, continue_to_goal)
     from experiments.robotwin.target_goal_branches import (
-        FORMAT, action_difference, require_same_observation, continue_held_placement)
+        FORMAT, action_difference, require_same_observation, continue_held_placement,
+        continue_open_gripper_expert)
     from experiments.robotwin.pgc_data import pair_spec_from_source_task
     from experiments.robotwin.pgc_task_variants import install_pgc_task_contract
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _capture_data_type, _close
@@ -114,6 +115,8 @@ def main():
                 if args.continuation == 'held-placement':
                     continue_held_placement(task, spec, selected_goal=language, arm_name=args.held_arm,
                                            initial_object_z=float(trace['initial'][2]))
+                elif args.continuation == 'open-gripper-expert':
+                    continue_open_gripper_expert(task, spec, selected_goal=language)
                 else:
                     continue_to_goal(task, spec, selected_goal=language)
             row.update(plan_success=bool(task.plan_success),

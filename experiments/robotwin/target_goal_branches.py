@@ -26,6 +26,18 @@ def require_same_observation(first, second, cameras):
         raise ValueError('Goal branches changed the real policy observation.')
 
 
+def continue_open_gripper_expert(task, spec, *, selected_goal):
+    """Plan directly at an early open-gripper state, without a release prefix."""
+    if selected_goal not in {'source', 'target'}:
+        raise ValueError('Unknown expert continuation goal.')
+    if not task.is_left_gripper_open() or not task.is_right_gripper_open():
+        raise ValueError('Direct expert continuation requires both grippers open.')
+    from experiments.robotwin.pgc_task_variants import play_variant
+    variant = spec.source_variant if selected_goal == 'source' else spec.counterfactual_variant
+    task.need_plan, task.plan_success = True, True
+    play_variant(task, spec, variant)
+
+
 def continue_held_placement(task, spec, *, selected_goal, arm_name, initial_object_z):
     """Try a direct placement from an elevated real policy state; verify later."""
     if spec.source_task != 'place_a2b_left' or selected_goal not in {'source', 'target'}:
