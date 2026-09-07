@@ -58,6 +58,9 @@ def main():
     plan=deepcopy(old)
     plan.update(format='robotwin_initial_anchor_fourarm_v1',code_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
         source_trial=str(source),source_action_diagnostic=str(diagnostic),initial_expert_tasks=INITIAL_TASKS,
+        historical_semantic_refresh=dict(parents=old['semantic_parents'],steps=old['semantic_steps'],step_offset=old['semantic_step_offset']),
+        semantic_parents={mode:old['arms'][arm]['parent'] for mode,arm in [('ordinary','eraf_only'),('fg','eraf_fg')]},
+        semantic_steps=0,semantic_step_offset=1500,semantic_training_this_trial=False,
         correction_task_weights=TASK_WEIGHTS,comparison_history_prefix='pre_initial_anchor_',
         prior_comparison_config=str(source/'comparison_config.json'),deadline=args.deadline,
         recipe_change='Replace one of three expert slots by a train-only same-state cup/pill initial pair; old left/RGB corrective and matched ordinary multipliers0.2, new cup/pill1. All four arms share the changes. Not a single-factor ablation.',
