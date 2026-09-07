@@ -66,7 +66,8 @@ Controls start from all5_off200. Two ERAF arms each use two GPUs; controls
 use one each. Global example/noise schedules match, while floating-point
 reduction order and elapsed compute can differ across world sizes.
 
-Step200 is selected in advance; step100 is only a recovery checkpoint.
+Step200 is selected in advance; intermediate saves every50 steps are only
+recovery checkpoints for continuation across bounded power windows.
 The GPU queue evaluates completed models while other training continues:
 all original5 tasks at6 CF episodes each and extra5 at3 each,180 episodes
 total. Compare initial states with the strongest archived ordinaryCF200,

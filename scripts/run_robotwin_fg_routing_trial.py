@@ -21,10 +21,10 @@ from scripts.run_robotwin_cf_priority_campaign import OLD_TASKS, NEW_TASKS, trai
 def protocol(primary, primary_root, output, deadline, code):
     plan = dict(primary)
     plan.update(format='robotwin_fg_weight_routing_trial_v1', code_commit=code,
-        deadline=deadline, joint_steps=200, checkpoints=[100, 200], correction_weight=0.1,
+        deadline=deadline, joint_steps=200, checkpoints=[50, 200], correction_weight=0.1,
         interface_parent=str(primary_root / 'eraf_fg/interface/step_000100.pt'),
         primary_root=str(primary_root), output=str(output),
-        selection='Evaluate the predeclared final step200 only; step100 is a recovery checkpoint.',
+        selection='Evaluate the predeclared final step200 only; save every50 steps for recovery across bounded power windows.',
         arms={
             'ordinary_cf': dict(eraf='off', fg='off', route='joint', gpus=[0]),
             'fg_only': dict(eraf='off', fg='full', route='joint', gpus=[1]),
