@@ -21,15 +21,21 @@ def main():
     ap.add_argument('--start-seed', type=int, required=True)
     ap.add_argument('--episodes', type=int, default=3)
     ap.add_argument('--max-attempts', type=int, default=25)
+    ap.add_argument('--split', choices=['dev', 'test'], default='dev')
+    ap.add_argument('--exclude-records', action='append', default=[],
+                    help='Training JSON manifest or prior catalog JSONL; repeat for every source. Required for test.')
     ap.add_argument('--gpu', type=int, required=True)
     ap.add_argument('--deadline', required=True)
     ap.add_argument('--robotwin-root', type=Path, default=Path('/root/gpufree-data/LF-FastWAM/third_party/RoboTwin'))
     args = ap.parse_args()
     cutoff = datetime.fromisoformat(args.deadline)
-    if cutoff.tzinfo is None or not 91300000 <= args.start_seed < 91400000:
-        ap.error('Declare an absolute deadline and reserved ten-task development seeds')
+    if cutoff.tzinfo is None:
+        ap.error('Declare an absolute deadline.')
     if args.episodes < 1 or args.max_attempts < args.episodes:
         ap.error('Invalid episode or attempt count')
+    from experiments.robotwin.catalog_protocol import validate_namespace, excluded_scene_records
+    validate_namespace(args.split, args.start_seed, args.max_attempts)
+    excluded, exclusion_receipts = excluded_scene_records(args.exclude_records, split=args.split)
     os.environ.update(CUDA_VISIBLE_DEVICES=str(args.gpu), VK_ICD_FILENAMES='/etc/vulkan/icd.d/nvidia_icd.json')
     import numpy as np
     from scripts.collect_pgc_robotwin_pairs import _load_robotwin_args, _close
@@ -51,6 +57,9 @@ def main():
         for seed in range(args.start_seed, args.start_seed + args.max_attempts):
             if time.time() >= cutoff.timestamp():
                 raise TimeoutError('Authorized work cutoff reached')
+            if seed in excluded:
+                events.write(json.dumps({'seed': seed, 'accepted': False, 'error': 'Excluded training/development seed'})+'\n')
+                continue
             states, audit, source_info = [], [], None
             scene_open = False
             try:
@@ -84,6 +93,7 @@ def main():
                     instruction_goal='source', selected_goal='source', initial_source_goal_success=False,
                     initial_counterfactual_goal_success=False, initial_physical_state_sha256=array_sha256(states[0]),
                     catalog_only=True, selection='both expert goals feasible; no learned policy selection',
+                    catalog_split=args.split,
                     expert_checks=audit, matched_expert_initial_states=True)
                 journal.write(json.dumps(row)+'\n'); count += 1
                 events.write(json.dumps({'seed':seed,'accepted':True,'expert_checks':audit})+'\n')
@@ -96,8 +106,11 @@ def main():
             if count == args.episodes:
                 break
     report = dict(complete=count == args.episodes, episodes=count, required_episodes=args.episodes,
-                  selection='both experts, matched physical starts, mutually exclusive goals; no policy selection',
-                  control_replay_verified=False, start_seed=args.start_seed)
+                  selection='matched physical starts; both expert endpoints satisfy their selected goal and reject the opposite; no policy selection',
+                  control_replay_verified=False, start_seed=args.start_seed, catalog_split=args.split,
+                  max_attempts=args.max_attempts, exclusion_records=exclusion_receipts,
+                  excluded_seed_count=len(excluded),
+                  code_commit=__import__('subprocess').check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip())
     (root/'catalog_complete.json').write_text(json.dumps(report,indent=2)+'\n')
     if not report['complete']:
         raise RuntimeError(f'Incomplete expert-validated catalog: {count}/{args.episodes}')
