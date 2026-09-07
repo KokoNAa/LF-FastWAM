@@ -13,6 +13,7 @@ import sys
 import time
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 TASKS = ['place_a2b_left', 'place_a2b_right', 'place_burger_fries',
          'stack_blocks_two', 'blocks_ranking_rgb']
 
@@ -32,7 +33,8 @@ def main():
     plan = json.loads(args.plan.read_text())
     models, catalogs = plan['models'], plan['catalogs']
     tasks = plan.get('tasks', TASKS)
-    if not tasks or len(set(tasks)) != len(tasks) or not set(tasks) <= set(TASKS):
+    from experiments.robotwin.pgc_data import ROBOTWIN_TEN_TASK_NAMES
+    if not tasks or len(set(tasks)) != len(tasks) or not set(tasks) <= set(ROBOTWIN_TEN_TASK_NAMES):
         ap.error('Declare unique supported evaluation tasks')
     if not models or not catalogs:
         ap.error('Specify at least one model and catalog')
@@ -123,7 +125,8 @@ def main():
                     '--checkpoint', model['checkpoint'], '--manifest', model['manifest'],
                     '--catalog-root', catalog['path'], '--episodes', catalog['episodes'],
                     '--tasks', task, '--policy-kind', model['policy_kind'], '--eraf', model['eraf'],
-                    '--gpu', gpu, '--videos', '--skip-file-hashes'], gpu)
+                    '--gpu', gpu, '--videos', '--skip-file-hashes',
+                    *(['--interventions', plan['interventions']] if plan.get('interventions') else [])], gpu)
                 running[gpu] = name
             if running:
                 time.sleep(5)

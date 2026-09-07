@@ -122,7 +122,17 @@ def _validate_goal_spec(raw: Any, *, context: str) -> dict[str, Any]:
         raise ManifestError(f"{context}: goal must be a JSON object")
     goal = dict(raw)
     goal_type = str(goal.get("type", "")).strip()
-    if goal_type == "relative_pose":
+    if goal_type == 'registered_task_variant':
+        from experiments.robotwin.pgc_data import pair_spec_from_source_task
+        task_name = _nonempty(goal, 'source_task', context=context)
+        variant = _nonempty(goal, 'variant', context=context)
+        try:
+            spec = pair_spec_from_source_task(task_name)
+        except ValueError as error:
+            raise ManifestError(str(error)) from error
+        if variant not in {spec.source_variant, spec.counterfactual_variant}:
+            raise ManifestError(f'{context}: variant is not registered for this task')
+    elif goal_type == "relative_pose":
         for field in ("actor", "reference"):
             _nonempty(goal, field, context=context)
         axis = str(goal.get("axis", "")).strip().lower()
@@ -535,7 +545,17 @@ def evaluate_goal(env: Any, goal: Mapping[str, Any]) -> GoalEvaluation:
 
     goal_type = str(goal.get("type"))
     grippers_open = _grippers_open(env, goal)
-    if goal_type == "relative_pose":
+    if goal_type == 'registered_task_variant':
+        from experiments.robotwin.pgc_data import pair_spec_from_source_task
+        from experiments.robotwin.pgc_task_variants import check_variant, _clauses
+        spec = pair_spec_from_source_task(goal['source_task'])
+        installed = getattr(env, '_pgc_pair_spec', None)
+        if installed is None or installed.source_task != spec.source_task:
+            raise ValueError('Task variant goal does not match the installed scene contract')
+        success = bool(check_variant(env, spec, goal['variant']))
+        details = {'source_task': spec.source_task, 'variant': goal['variant'],
+                   'clause_truth': [bool(c['truth']) for c in _clauses(env, spec, goal['variant'])]}
+    elif goal_type == "relative_pose":
         actor_position = _actor_position(env, str(goal["actor"]))
         reference_position = _actor_position(env, str(goal["reference"]))
         delta = tuple(

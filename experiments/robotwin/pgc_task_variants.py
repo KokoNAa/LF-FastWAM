@@ -35,13 +35,16 @@ PREDICATE_IDS = {
 
 
 def _actors(task: Any, spec: RoboTwinPairSpec) -> list[Any]:
+    from experiments.robotwin.pad_counterfactual import PAD_ACTORS, actors
+    if spec.source_task in PAD_ACTORS:
+        return actors(task, spec.source_task)
     if spec.source_task == 'place_empty_cup':
         return [task.cup, task.coaster]
     if spec.source_task.startswith("place_a2b_"):
         return [task.object, task.target_object]
     if spec.source_task == "stack_blocks_two":
         return [task.block1, task.block2]
-    if spec.source_task == "blocks_ranking_rgb":
+    if spec.source_task in {"blocks_ranking_rgb", "blocks_ranking_size"}:
         return [task.block1, task.block2, task.block3]
     if spec.source_task == "place_burger_fries":
         return [task.hamburg, task.frenchfries, task.tray]
@@ -139,9 +142,9 @@ def _ranking_clauses(task: Any, variant: str) -> list[dict[str, Any]]:
         np.asarray(task.block2_target_pose[:3], dtype=np.float32),
         np.asarray(task.block3_target_pose[:3], dtype=np.float32),
     ]
-    if variant == "rgb":
+    if variant in {"rgb", "large_to_small"}:
         order = (0, 1, 2)
-    elif variant == "bgr":
+    elif variant in {"bgr", "small_to_large"}:
         order = (2, 1, 0)
     else:
         raise ValueError(f"Unsupported block-ranking variant: {variant!r}.")
@@ -200,6 +203,11 @@ def _burger_clauses(task: Any, variant: str) -> list[dict[str, Any]]:
 
 
 def _clauses(task: Any, spec: RoboTwinPairSpec, variant: str) -> list[dict[str, Any]]:
+    from experiments.robotwin.pad_counterfactual import PAD_ACTORS, geometry
+    if spec.source_task in PAD_ACTORS:
+        truth, goal = geometry(task, spec.source_task, variant)
+        return [_clause(subject=0, reference=1, predicate='on' if variant == 'native_pad' else 'front',
+                        goal=goal, truth=truth)]
     if spec.source_task == 'place_empty_cup':
         from experiments.robotwin.cup_counterfactual import behind_goal
         cup = np.asarray(task.cup.get_functional_point(0, 'pose').p)
@@ -221,7 +229,7 @@ def _clauses(task: Any, spec: RoboTwinPairSpec, variant: str) -> list[dict[str, 
         return _place_clauses(task, variant)
     if spec.source_task == "stack_blocks_two":
         return _stack_clauses(task, variant)
-    if spec.source_task == "blocks_ranking_rgb":
+    if spec.source_task in {"blocks_ranking_rgb", "blocks_ranking_size"}:
         return _ranking_clauses(task, variant)
     if spec.source_task == "place_burger_fries":
         return _burger_clauses(task, variant)
@@ -348,18 +356,19 @@ def _play_ranking(task: Any, variant: str) -> dict[str, Any]:
         task.block2_target_pose,
         task.block3_target_pose,
     )
-    order = (0, 1, 2) if variant == "rgb" else (2, 1, 0)
-    if variant not in {"rgb", "bgr"}:
+    order = (0, 1, 2) if variant in {"rgb", "large_to_small"} else (2, 1, 0)
+    if variant not in {"rgb", "bgr", "large_to_small", "small_to_large"}:
         raise ValueError(f"Unsupported block-ranking variant: {variant!r}.")
     task.last_gripper = None
     arm_by_actor = {}
     for slot, actor_index in zip(slots, order):
         actor = actors[actor_index]
         arm_by_actor[actor_index] = task.pick_and_place_block(actor, slot)
+    size_order = variant in {'large_to_small', 'small_to_large'}
     task.info["info"] = {
-        "{A}": "red block",
-        "{B}": "green block",
-        "{C}": "blue block",
+        "{A}": "large block" if size_order else "red block",
+        "{B}": "medium block" if size_order else "green block",
+        "{C}": "small block" if size_order else "blue block",
         "{a}": arm_by_actor[0],
         "{b}": arm_by_actor[1],
         "{c}": arm_by_actor[2],
@@ -424,6 +433,9 @@ def play_variant(task: Any, spec: RoboTwinPairSpec, variant: str) -> dict[str, A
     # Bind it to the executed semantic variant so an opposite native goal can
     # never truncate a counterfactual replay.
     task._pgc_active_variant = variant
+    from experiments.robotwin.pad_counterfactual import PAD_ACTORS, play_front
+    if spec.source_task in PAD_ACTORS:
+        return task.play_once() if variant == 'native_pad' else play_front(task, spec.source_task)
     if spec.source_task == 'place_empty_cup':
         if variant == 'on_coaster':
             return task.play_once()
@@ -433,7 +445,7 @@ def play_variant(task: Any, spec: RoboTwinPairSpec, variant: str) -> dict[str, A
         return task.play_once_direction(variant)
     if spec.source_task == "stack_blocks_two":
         return _play_stack(task, variant)
-    if spec.source_task == "blocks_ranking_rgb":
+    if spec.source_task in {"blocks_ranking_rgb", "blocks_ranking_size"}:
         return _play_ranking(task, variant)
     if spec.source_task == "place_burger_fries":
         return _play_burger(task, variant)

@@ -101,9 +101,30 @@ ROBOTWIN_REPLACEMENT_PAIR_SPECS = (
 )
 
 
+ROBOTWIN_TEN_TASK_EXTRA_SPECS = (
+    RoboTwinPairSpec(pair_id='blocks_ranking_size_large_to_small_to_small_to_large',
+        source_task='blocks_ranking_size', counterfactual_task='blocks_ranking_size_reverse',
+        source_variant='large_to_small', counterfactual_variant='small_to_large',
+        source_instruction='Arrange the large, medium, and small blocks from left to right.',
+        counterfactual_instruction='Arrange the small, medium, and large blocks from left to right.',
+        strict_conflict_type='mutually_exclusive_row_order',
+        entity_names=('large_block', 'medium_block', 'small_block')),
+    *(RoboTwinPairSpec(pair_id=task+'_on_to_front', source_task=task,
+        counterfactual_task=task+'_front', source_variant='native_pad',
+        counterfactual_variant='front_pad', source_instruction=f'Place the {obj} on the pad.',
+        counterfactual_instruction=f'Place the {obj} in front of the pad on the table.',
+        strict_conflict_type='mutually_exclusive_spatial_relation', entity_names=(obj, 'pad'))
+      for task, obj in [('place_mouse_pad', 'mouse'), ('move_stapler_pad', 'stapler'),
+                        ('move_pillbottle_pad', 'pill bottle')]),
+)
+ROBOTWIN_TEN_TASK_SPECS = (*ROBOTWIN_ERAF_PAIR_SPECS, *ROBOTWIN_REPLACEMENT_PAIR_SPECS,
+                         *ROBOTWIN_TEN_TASK_EXTRA_SPECS)
+ROBOTWIN_TEN_TASK_NAMES = tuple(spec.source_task for spec in ROBOTWIN_TEN_TASK_SPECS)
+
+
 def pair_spec_from_source_task(task_name: str) -> RoboTwinPairSpec:
     matches = [
-        spec for spec in (*ROBOTWIN_ERAF_PAIR_SPECS, *ROBOTWIN_REPLACEMENT_PAIR_SPECS)
+        spec for spec in ROBOTWIN_TEN_TASK_SPECS
         if spec.source_task == task_name
     ]
     if len(matches) != 1:

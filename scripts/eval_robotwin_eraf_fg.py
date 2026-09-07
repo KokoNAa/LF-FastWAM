@@ -251,6 +251,8 @@ def main():
                 'checkpoint': args.checkpoint, 'checkpoint_sha256': checkpoint_hash,
                 'canonical_sha256': None if args.skip_file_hashes else file_sha256(canonical_path),
                 'checkpoint_metadata': checkpoint_metadata,
+                'interventions': args.interventions,
+                'interventions_metadata': file_metadata(args.interventions),
                 'canonical_metadata': file_metadata(canonical_path) if args.skip_file_hashes else None,
                 'skip_file_hashes': args.skip_file_hashes, 'eraf': args.eraf, 'policy_kind': args.policy_kind,
                 'memory_mode': args.memory_mode,
