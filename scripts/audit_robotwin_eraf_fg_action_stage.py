@@ -24,8 +24,12 @@ def audit(root):
     checkpoint = root / f"step_{plan['steps']:06d}.pt"
     candidate = validate_payload(torch.load(checkpoint, map_location='cpu', weights_only=False))
     parent = validate_payload(torch.load(plan['checkpoint'], map_location='cpu', weights_only=False))
-    if (candidate['parent_sha256'] != file_sha256(plan['checkpoint'])
-            or candidate['optimizer_steps'] != plan['steps'] or candidate['stage'] != plan['stage']
+    skip_hashes = plan.get('skip_file_hashes', False)
+    metadata = lambda path: {'path': str(Path(path).resolve()), 'bytes': Path(path).stat().st_size,
+                             'mtime_ns': Path(path).stat().st_mtime_ns}
+    parent_matches = (Path(candidate['parent_checkpoint']).resolve() == Path(plan['checkpoint']).resolve()
+                      if skip_hashes else candidate['parent_sha256'] == file_sha256(plan['checkpoint']))
+    if (not parent_matches or candidate['optimizer_steps'] != plan['steps'] or candidate['stage'] != plan['stage']
             or candidate['fg_supervision'] != plan['fg'] or candidate['provenance']['eraf'] != plan['eraf']):
         raise ValueError('Checkpoint lineage/stage does not match the run plan.')
     allowed = set(plan['trainable_parameters'])
@@ -47,12 +51,24 @@ def audit(root):
         raise ValueError(f'Unexpected or absent parameter changes: {unexpected}')
     if (plan['stage'] == 'interface' and counts['mot_trainable']) or (plan['eraf'] == 'off' and counts['policy_guard']):
         raise ValueError('Ablation parameter isolation failed.')
-    digest = file_sha256(checkpoint)
+    digest = None if skip_hashes else file_sha256(checkpoint)
     optimizer = torch.load(root / 'optimizer_last.pt', map_location='cpu', weights_only=False)
-    if (optimizer['checkpoint_sha256'] != digest or optimizer['step'] != plan['steps']
+    if skip_hashes:
+        saved = {'mot.' + k: v for k, v in candidate['mot_trainable'].items()}
+        saved.update({'guard.' + k: v for k, v in candidate['policy_guard'].items()})
+        masters = optimizer['optimizer']['master']
+        bound = (optimizer.get('checkpoint_identity') == metadata(checkpoint)
+                 and len(masters) == len(plan['trainable_parameters'])
+                 and all(torch.equal(value.to(saved[name]), saved[name]) for name, value in
+                         zip(plan['trainable_parameters'], masters, strict=True)))
+        manifest_matches = plan['optimization_contract'].get('manifest_identity') == metadata(plan['manifest'])
+    else:
+        bound = optimizer['checkpoint_sha256'] == digest
+        manifest_matches = plan['optimization_contract']['manifest_sha256'] == file_sha256(plan['manifest'])
+    if (not bound or optimizer['step'] != plan['steps']
             or optimizer['parameter_names'] != plan['trainable_parameters']
             or optimizer['optimization_contract'] != plan['optimization_contract']
-            or plan['optimization_contract']['manifest_sha256'] != file_sha256(plan['manifest'])):
+            or not manifest_matches):
         raise ValueError('Optimizer companion or immutable data contract mismatch.')
     del parent, candidate, optimizer
     world, start = plan['world_size'], plan['start_optimizer_step']
@@ -61,7 +77,9 @@ def audit(root):
     expected_steps = list(range(start + 1, plan['steps'] + 1))
     if any([r['step'] for r in journal] != expected_steps for journal in journals):
         raise ValueError('Missing, duplicated or discontinuous optimizer steps.')
-    stream = mixture_stream(read(plan['manifest'])['states'], plan['seed'], plan['fg'])
+    stream = mixture_stream(read(plan['manifest'])['states'], plan['seed'], plan['fg'],
+                            task_balanced=plan.get('task_balanced', False),
+                            correct_count=plan.get('correct_count', 4), cf_count=plan.get('cf_count', 2))
     for _ in range(start):
         next(stream)
     for index, step in enumerate(expected_steps):
@@ -74,7 +92,8 @@ def audit(root):
             if ([bool(r.get('ordinary_cf_control')) for r in journal[index]['examples']]
                     != [bool(r.get('ordinary_cf_control')) for r in batch[rank::world]]):
                 raise ValueError('Ordinary CF replacement supervision differs from the matched schedule.')
-    return {'complete': True, 'checkpoint_sha256': digest, 'parent_checkpoint': plan['checkpoint'],
+    return {'complete': True, 'checkpoint_sha256': digest, 'checkpoint_identity': metadata(checkpoint),
+        'hash_scans': not skip_hashes, 'parent_checkpoint': plan['checkpoint'],
         'changed_lora_tensors': counts['mot_trainable'], 'changed_guard_tensors': counts['policy_guard'],
         'unchanged_frozen_tensors': len(frozen), 'unexpected_changes': unexpected,
         'optimizer_checkpoint_and_contract_match': True, 'all_rank_gradient_norms_equal': True,
