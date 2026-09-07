@@ -116,6 +116,9 @@ def main():
         try:
             task._pgc_active_variant = spec.source_variant if native else spec.counterfactual_variant
             task.setup_demo(now_ep_num=0, seed=seed, **deepcopy(options))
+            initial_goal = full_goal(task, spec, selected_goal=language)
+            if initial_goal:
+                raise ValueError('The selected retention goal is already complete before any action.')
             texts = ({"source": spec.source_instruction, "target": spec.counterfactual_instruction}
                      if args.task == "place_burger_fries" else instructions(task, spec))
             policy._infer_action_chunk = infer
@@ -141,6 +144,7 @@ def main():
                     'capture_action_index': int(items[i]['step']),
                     "capture_metadata": metadata, "teacher_checkpoint": args.checkpoint,
                     "teacher_checkpoint_metadata": checkpoint_metadata, "full_" + kind + "_episode_success": True,
+                    "initial_selected_goal_success": False,
                     "image_color_space": "RGB", "reference_kind": f"deployed_successful_{kind}_policy_32_actions"}
                     for i in range(len(items))]
                 validate_retention_scene(rows)
