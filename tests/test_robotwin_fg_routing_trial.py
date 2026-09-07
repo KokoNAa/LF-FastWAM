@@ -45,6 +45,21 @@ def test_routing_comparison_changes_only_declared_gradient_route():
     plan['arms']['eraf_fg_routed'].update(resume_checkpoint='/old/routed/step_000200.pt', resume_step=200)
     assert final_checkpoint(plan, Path('/next'), 'eraf_fg_routed') == Path('/old/routed/step_000200.pt')
 
+    # Exercise the real trainer parent validator for every resumed arm.
+    # ERAF-off controls must not combine fresh warm initialization with resume.
+    from experiments.robotwin.eraf_action_protocol import validate_action_parent
+    for arm, spec in plan['arms'].items():
+        spec.update(resume_checkpoint=f'/old/{arm}/step_000050.pt',
+                    resume_state=f'/old/{arm}/optimizer_last.pt', resume_step=50)
+        argv = command(plan, Path('/next'), arm)
+        validate_action_parent(
+            dict(stage='joint', fg_supervision=spec['fg'], provenance={'eraf': spec['eraf']}),
+            stage=argv[argv.index('--stage') + 1], eraf=argv[argv.index('--eraf') + 1],
+            fg=argv[argv.index('--fg') + 1], resume='--resume-state' in argv,
+            warm_policy='--warm-policy' in argv)
+        assert argv[argv.index('--resume-state') + 1] == spec['resume_state']
+        assert argv[argv.index('--checkpoint') + 1] == spec['resume_checkpoint']
+
 
 @pytest.mark.parametrize('field,value', [('cf_weight', 8.0), ('correct_weight', 2.0),
     ('old_catalog', '/different/scenes'), ('seen_language_augmentation', True)])

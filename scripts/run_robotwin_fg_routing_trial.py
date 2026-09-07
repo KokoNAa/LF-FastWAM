@@ -43,7 +43,8 @@ def protocol(primary, primary_root, output, deadline, code):
 def command(plan, output, arm):
     spec = plan['arms'][arm]
     parent = spec.get('resume_checkpoint') or (plan['interface_parent'] if spec['eraf'] == 'on' else plan['checkpoint'])
-    result = training_command(plan, output, arm, 'joint', parent, warm=spec['eraf'] == 'off')
+    result = training_command(plan, output, arm, 'joint', parent,
+                              warm=spec['eraf'] == 'off' and not spec.get('resume_state'))
     result[result.index('--nproc_per_node=2')] = f"--nproc_per_node={len(spec['gpus'])}"
     if spec.get('resume_state'):
         result += ['--resume-state', spec['resume_state']]
