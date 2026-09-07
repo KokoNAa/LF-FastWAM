@@ -28,6 +28,9 @@ def main():
                     help='Separate ERAF interface rate while retaining a small policy rate.')
     ap.add_argument('--warm-policy', action='store_true',
                     help='Explicitly start a fresh arm from a trained FG-off/ERAF-off policy.')
+    ap.add_argument('--zero-context-joint', action='store_true',
+                    help='Opt in to joint training directly from an exact-identity residual bootstrap, without interface warmup.')
+    ap.add_argument('--identity-audit', help='Hash-bound complete ten-task full-denoising identity report for --zero-context-joint.')
     ap.add_argument('--correct-count', type=int, default=4)
     ap.add_argument('--cf-count', type=int, default=2)
     ap.add_argument('--correct-weight', type=float, default=2.)
@@ -54,6 +57,8 @@ def main():
     ap.add_argument('--disable-seen-language-augmentation', action='store_true')
     ap.add_argument('--resume-state', help='Resume saved FP32 masters and optimizer at the supplied checkpoint.')
     args = ap.parse_args()
+    if args.zero_context_joint != bool(args.identity_audit):
+        ap.error('--zero-context-joint and --identity-audit must be supplied together')
     if not math.isfinite(args.correction_weight) or args.correction_weight <= 0:
         ap.error('--correction-weight must be positive and finite')
     if len(set(args.target_tasks)) != len(args.target_tasks):ap.error('Duplicate target tasks')
@@ -62,7 +67,7 @@ def main():
     from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint, validate_payload, file_sha256
     from experiments.robotwin.eraf_fg_data import RawReplay, validate_cf_retention_coverage
     from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream, mixture_counts, supervision_payload, FG_OFF_PROTOCOL, validate_fg_gradient_route
-    from experiments.robotwin.eraf_action_protocol import validate_action_parent, parameter_learning_rates
+    from experiments.robotwin.eraf_action_protocol import validate_action_parent, parameter_learning_rates, validate_joint_identity_audit
     from experiments.robotwin.compact_replay import ReplayPayloads
     from experiments.robotwin.native_teacher import NativeTeacher
     from experiments.robotwin.same_state_repair import noise_tensor
@@ -78,7 +83,13 @@ def main():
     parameter_learning_rates([], args.learning_rate, args.interface_learning_rate)
     parent_payload = validate_payload(torch.load(args.checkpoint, map_location='cpu', weights_only=False))
     validate_action_parent(parent_payload, stage=args.stage, eraf=args.eraf, fg=args.fg,
-                           resume=bool(args.resume_state), warm_policy=args.warm_policy)
+                           resume=bool(args.resume_state), warm_policy=args.warm_policy,
+                           zero_context_joint=args.zero_context_joint)
+    if args.zero_context_joint:
+        validate_joint_identity_audit(json.loads(Path(args.identity_audit).read_text()),
+                                      checkpoint_sha256=file_sha256(args.checkpoint),
+                                      manifest_sha256=file_sha256(args.manifest))
+    args.identity_audit_sha256 = file_sha256(args.identity_audit) if args.identity_audit else None
     del parent_payload
     torch.cuda.set_device(local)
     torch.manual_seed(args.seed)
@@ -233,6 +244,8 @@ def main():
                                 'correction_weight': args.correction_weight,
                                 'target_tasks': args.target_tasks, 'cf_retention_tasks': args.cf_retention_tasks,
                                 'warm_policy_initialization': args.warm_policy,
+                                'zero_context_joint_initialization': args.zero_context_joint,
+                                'identity_audit_sha256': args.identity_audit_sha256,
                                 'interface_learning_rate': args.interface_learning_rate,
                                 'mixture_counts': counts, 'task_balanced': args.task_balanced,
                                 'fg_gradient_route': args.fg_gradient_route},

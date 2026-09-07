@@ -2,7 +2,17 @@
 import math
 
 
-def validate_action_parent(parent, *, stage, eraf, fg, resume=False, warm_policy=False):
+def validate_action_parent(parent, *, stage, eraf, fg, resume=False, warm_policy=False, zero_context_joint=False):
+    if zero_context_joint:
+        from experiments.robotwin.context_residual import MODE, ZEROED
+        if (resume or warm_policy or stage != 'joint' or eraf != 'on'
+                or parent['stage'] != 'bootstrap' or parent.get('optimizer_steps') != 0
+                or parent.get('context_injection_mode') != MODE or parent.get('fg_supervision') != fg
+                or parent.get('provenance', {}).get('context_residual_initialization') is not True
+                or any(k not in parent.get('policy_guard', {}) or parent['policy_guard'][k].count_nonzero()
+                       for k in ZEROED)):
+            raise ValueError('Zero-context joint start requires its own untouched residual bootstrap.')
+        return
     if warm_policy and resume:
         raise ValueError('Warm policy initialization and optimizer resume are different operations.')
     if resume:
@@ -29,6 +39,35 @@ def validate_action_parent(parent, *, stage, eraf, fg, resume=False, warm_policy
             raise ValueError('Joint ERAF training needs its own matching interface arm.')
     elif parent['stage'] != 'grounding':
         raise ValueError('ERAF-off controls need a common semantic checkpoint or explicit warm policy.')
+
+
+def validate_joint_identity_audit(audit, *, checkpoint_sha256, manifest_sha256):
+    """The opt-in joint start must bind actual full-denoising ten-task evidence."""
+    from experiments.robotwin.pgc_data import ROBOTWIN_TEN_TASK_SPECS
+    if (audit.get('complete') is not True or audit.get('full_eraf_equals_off_exactly') is not True
+            or audit.get('include_expanded_tasks') is not True or audit.get('task_count') != 10
+            or audit.get('checkpoint_sha256') != checkpoint_sha256
+            or audit.get('manifest_sha256') != manifest_sha256
+            or audit.get('denoising_steps') != 10 or audit.get('seed') != 42):
+        raise ValueError('Zero-context joint start needs matching exact ten-task identity evidence.')
+    records = audit.get('records', [])
+    groups = {}
+    for row in records:
+        key = row['pair_id'], row['task_config']
+        languages = groups.setdefault(key, set())
+        if row['language'] in languages or row['language'] not in ('source', 'target'):
+            raise ValueError('Identity evidence has duplicated or invalid instruction branches.')
+        languages.add(row['language'])
+        comparisons = row.get('comparisons_to_eraf_off', {})
+        if set(comparisons) != {'full', 'repeat_full'} or any(
+                c.get('raw_actions_exact') is not True or c.get('normalized_actions_exact') is not True
+                or c.get('max_abs') != 0 for c in comparisons.values()):
+            raise ValueError('Identity evidence contains a changed deployed action.')
+    if ({pair for pair, domain in groups} != {s.pair_id for s in ROBOTWIN_TEN_TASK_SPECS}
+            or any(languages != {'source', 'target'} for languages in groups.values())
+            or len(groups) != audit.get('task_domain_count')
+            or len(records) != audit.get('queries') or len(records) != 2 * len(groups)):
+        raise ValueError('Identity evidence does not cover every declared task/domain branch.')
 
 
 def parameter_learning_rates(names, policy_lr, interface_lr=None):

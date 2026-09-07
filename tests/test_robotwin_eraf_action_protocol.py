@@ -10,6 +10,45 @@ from experiments.robotwin.eraf_fg_bridge import MasterAdamW
 from experiments.robotwin.eraf_fg_training import balanced_group_stream, mixture_counts, mixture_stream
 
 
+def test_joint_zero_context_is_explicit_and_cannot_accept_an_updated_or_wrong_arm():
+    from experiments.robotwin.context_residual import ZEROED
+    parent = dict(stage='bootstrap', optimizer_steps=0, context_injection_mode='context_residual_v1',
+                  fg_supervision='full', provenance={'context_residual_initialization': True},
+                  policy_guard={key: torch.zeros(2) for key in ZEROED})
+    with pytest.raises(ValueError, match='matching interface'):
+        validate_action_parent(parent, stage='joint', eraf='on', fg='full')
+    validate_action_parent(parent, stage='joint', eraf='on', fg='full', zero_context_joint=True)
+    for patch in [{'optimizer_steps': 1}, {'fg_supervision': 'off'}, {'context_injection_mode': 'append_v1'},
+                  {'provenance': {}}, {'policy_guard': {key: torch.ones(2) for key in ZEROED}}]:
+        with pytest.raises(ValueError, match='untouched residual bootstrap'):
+            validate_action_parent(parent | patch, stage='joint', eraf='on', fg='full', zero_context_joint=True)
+    for kwargs in [{'resume': True}, {'warm_policy': True}]:
+        with pytest.raises(ValueError, match='untouched residual bootstrap'):
+            validate_action_parent(parent, stage='joint', eraf='on', fg='full', zero_context_joint=True, **kwargs)
+
+
+def test_joint_identity_requires_exact_matching_repeated_ten_task_evidence():
+    from experiments.robotwin.pgc_data import ROBOTWIN_TEN_TASK_SPECS
+    from experiments.robotwin.eraf_action_protocol import validate_joint_identity_audit
+    records = [dict(pair_id=s.pair_id, task_config='demo_clean', language=language,
+                    comparisons_to_eraf_off={mode: dict(raw_actions_exact=True, normalized_actions_exact=True, max_abs=0.)
+                                             for mode in ('full', 'repeat_full')})
+               for s in ROBOTWIN_TEN_TASK_SPECS for language in ('source', 'target')]
+    audit = dict(complete=True, full_eraf_equals_off_exactly=True, include_expanded_tasks=True,
+                 task_count=10, task_domain_count=10, queries=20, records=records,
+                 checkpoint_sha256='a'*64, manifest_sha256='b'*64, denoising_steps=10, seed=42)
+    validate_joint_identity_audit(audit, checkpoint_sha256='a'*64, manifest_sha256='b'*64)
+    for patch in [{'checkpoint_sha256': 'c'*64}, {'manifest_sha256': 'c'*64}, {'complete': False},
+                  {'denoising_steps': 1}, {'task_count': 5}, {'records': records[:-1]},
+                  {'records': records + records[:1]}]:
+        with pytest.raises(ValueError):
+            validate_joint_identity_audit(audit | patch, checkpoint_sha256='a'*64, manifest_sha256='b'*64)
+    changed = copy.deepcopy(audit)
+    changed['records'][0]['comparisons_to_eraf_off']['repeat_full']['raw_actions_exact'] = False
+    with pytest.raises(ValueError, match='changed deployed action'):
+        validate_joint_identity_audit(changed, checkpoint_sha256='a'*64, manifest_sha256='b'*64)
+
+
 def test_common_warm_policy_does_not_leak_fg_training_into_off_controls():
     parent = dict(stage='joint', fg_supervision='off', provenance={'eraf': 'off'})
     for stage, eraf, fg in [('joint', 'off', 'off'), ('joint', 'off', 'full'), ('interface', 'on', 'full')]:
