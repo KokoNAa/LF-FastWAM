@@ -60,6 +60,8 @@ def main():
     ap.add_argument('--qualify-each-language', action='store_true')
     ap.add_argument('--task-balanced', action='store_true')
     ap.add_argument('--skip-file-hashes', action='store_true')
+    ap.add_argument('--ranking-terminal-clause', action='store_true',
+                    help='Add an expert-endpoint goal clause for the third ranking block; separate label cache schema.')
     args = ap.parse_args()
     if len(set(args.qualification_tasks)) != len(args.qualification_tasks):
         ap.error('Duplicate qualification task')
@@ -109,7 +111,8 @@ def main():
     model.policy_guard_eraf_loss_weights = replace(model.policy_guard_eraf_loss_weights, **overrides)
     optimizer = MasterAdamW(selected.values(), lr=args.learning_rate)
     payloads = ReplayPayloads(rows, model.device)
-    raw = RawReplay(args.source_bank, label_cache=args.label_cache)
+    raw = RawReplay(args.source_bank, label_cache=args.label_cache,
+                    ranking_terminal_clause=args.ranking_terminal_clause)
     stream = balanced_rows(rows, args.seed, task_balanced=args.task_balanced)
     validation = [r for r in rows if r["replay_split"] == "replay_holdout" and not any(r.get(k)
         for k in ('native_retention', 'cf_retention', 'fg_correction'))]
@@ -120,7 +123,9 @@ def main():
     if not set(required_pairs) <= {r['pair_id'] for r in validation}:
         raise ValueError('A declared semantic qualification task has no holdout observations.')
     if rank == 0:
+        from experiments.robotwin.ranking_terminal_clause import LABEL_SCHEMA
         (root / "plan.json").write_text(json.dumps(vars(args) | {"world_size": world,
+            "grounding_label_schema": LABEL_SCHEMA if args.ranking_terminal_clause else 'one_frame_v1',
             "trainable_parameters": list(selected), "validation_states": len(validation),
             "policy_frozen": True, "optimizer_precision": "FP32 master weights",
             "optimizer_restart": bool(args.step_offset),

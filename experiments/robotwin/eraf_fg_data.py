@@ -90,8 +90,9 @@ def validate_cf_retention_coverage(rows, required_tasks, *, minimum_scenes=10):
 
 
 class RawReplay:
-    def __init__(self, source_bank, *, label_cache=None):
+    def __init__(self, source_bank, *, label_cache=None, ranking_terminal_clause=False):
         self.raw = {}
+        self.ranking_terminal_clause = ranking_terminal_clause
         self.label_cache = Path(label_cache) if label_cache else None
         if self.label_cache:
             self.label_cache.mkdir(parents=True, exist_ok=True)
@@ -144,8 +145,11 @@ class RawReplay:
         import h5py
         import torch
         from scripts.build_pgc_robotwin_entity_relations import _generic_role_arrays, _entity_id, _phase_ids
+        from experiments.robotwin.ranking_terminal_clause import RANKING_PAIRS, LABEL_SCHEMA, terminal_clause_arrays
         path, frame = self.locate(row, language)
-        key = f"one_frame_v1:{path}:{frame}"
+        terminal = self.ranking_terminal_clause and row['pair_id'] in RANKING_PAIRS
+        schema = LABEL_SCHEMA + ':' + language if terminal else 'one_frame_v1'
+        key = f"{schema}:{path}:{frame}"
         if key not in self.labels:
             import hashlib
             stem = hashlib.sha256(key.encode()).hexdigest()
@@ -157,12 +161,18 @@ class RawReplay:
                 value = stored["labels"]
             else:
                 with h5py.File(path, "r") as handle:
+                    overrides = terminal_clause_arrays(handle, language) if terminal else {}
+
+                    def history(name):
+                        return overrides[name] if name in overrides else handle[name][:]
+
                     class FrameView:
                         def __contains__(self, name):
                             return name in handle
 
                         def __getitem__(self, name):
-                            return handle[name][frame:frame + 1]
+                            source = overrides[name] if name in overrides else handle[name]
+                            return source[frame:frame + 1]
 
                     # Decode segmentation only at this frame. Phase labels
                     # still use the complete recorded position/truth history.
@@ -171,8 +181,8 @@ class RawReplay:
                              for prefix in ("source", "target")}
                     positions = handle["pgc_entity_state/entity_positions"][:]
                     for prefix, arrays in value.items():
-                        indices = handle[f"pgc_entity_state/{prefix}_subject_indices"][0]
-                        truth = handle[f"pgc_entity_state/{prefix}_predicate_truth"][:]
+                        indices = history(f"pgc_entity_state/{prefix}_subject_indices")[0]
+                        truth = history(f"pgc_entity_state/{prefix}_predicate_truth")
                         for clause in np.flatnonzero(arrays["clause_valid"][0]):
                             phase = _phase_ids(positions[:, indices[clause]], truth[:, clause])
                             arrays["phase_ids"][0, clause] = phase[frame]
