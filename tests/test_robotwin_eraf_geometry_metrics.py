@@ -87,3 +87,35 @@ def test_trajectory_audit_covers_later_phases_without_adding_scenes(tmp_path):
         frames = [row[lang + '_frame_index'] for row, language in queries if language == lang]
         assert frames == [0, 2, 6, 10, 11]
     assert {row['scene_seed'] for row, _ in queries} == {123}
+
+
+def test_reversal_audit_catches_relations_broken_between_phase_midpoints(tmp_path):
+    import h5py
+    import numpy as np
+    from scripts.audit_robotwin_eraf_fg_semantics import trajectory_queries
+    path = tmp_path / 'nonmonotone_expert.h5'
+    truth = np.zeros((20, 2)); truth[4:] = 1; truth[7:10] = 0
+    with h5py.File(path, 'w') as h:
+        positions = np.zeros((20, 1, 3)); positions[2:, 0, 2] = .1
+        h['pgc_entity_state/entity_positions'] = positions
+        for lang in ('source', 'target'):
+            h[f'pgc_entity_state/{lang}_predicate_truth'] = truth
+            valid = np.ones((20, 2), dtype=bool); valid[:, 1] = False
+            h[f'pgc_entity_state/{lang}_clause_valid'] = valid
+            h[f'pgc_entity_state/{lang}_subject_indices'] = np.zeros((20, 2), dtype=int)
+    class Raw:
+        def locate(self, row, language):
+            return path, 0
+    rows = [{'id': 'heldout', 'scene_seed': 123, 'replay_split': 'replay_holdout'}]
+    ordinary = trajectory_queries(rows, Raw())
+    expanded = trajectory_queries(rows + rows, Raw(), include_truth_reversals=True)
+    for lang in ('source', 'target'):
+        before = {r[lang + '_frame_index'] for r, language in ordinary if language == lang}
+        after = [r[lang + '_frame_index'] for r, language in expanded if language == lang]
+        assert not before.intersection({7, 8, 9})
+        assert set(after) == before | {7, 8, 9}
+        assert after == sorted(set(after))
+    assert {r['scene_seed'] for r, _ in expanded} == {123}
+    assert rows == [{'id': 'heldout', 'scene_seed': 123, 'replay_split': 'replay_holdout'}]
+    with h5py.File(path, 'r') as h:
+        np.testing.assert_array_equal(h['pgc_entity_state/target_predicate_truth'][:], truth)

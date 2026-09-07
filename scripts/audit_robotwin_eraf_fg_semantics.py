@@ -11,7 +11,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / 'src')]
 
 
-def trajectory_queries(rows, raw):
+def trajectory_queries(rows, raw, *, include_truth_reversals=False):
     """Sample existing held-out expert scenes at each observed semantic phase.
 
     Simulator labels select offline audit frames only; they are never policy
@@ -39,6 +39,15 @@ def trajectory_queries(rows, raw):
                     matching = np.flatnonzero(valid[:, clause] & (phase == value))
                     if len(matching):
                         frames.add(int(matching[len(matching) // 2]))
+                if include_truth_reversals:
+                    # A relation can break after its first satisfaction while
+                    # the existing phase label remains 2. Cover each such
+                    # interval explicitly; phase midpoints can miss it entirely.
+                    broken = valid[:, clause] & (phase == 2) & (truth[:, clause] < .5)
+                    starts = np.flatnonzero(broken & ~np.r_[False, broken[:-1]])
+                    ends = np.flatnonzero(broken & ~np.r_[broken[1:], False])
+                    for start, end in zip(starts, ends, strict=True):
+                        frames.update((int(start), int((start + end) // 2), int(end)))
             for frame in sorted(frames):
                 queries.append((dict(row, **{language + '_frame_index': frame}), language))
     return queries
@@ -51,7 +60,11 @@ def main():
     ap.add_argument('--label-cache')
     ap.add_argument('--trajectory-holdout', action='store_true',
                     help='Audit all observed phases of the same held-out expert scenes, without training.')
+    ap.add_argument('--include-truth-reversals', action='store_true',
+                    help='Also inspect intervals where an expert relation breaks after first satisfaction; labels remain unchanged.')
     args = ap.parse_args()
+    if args.include_truth_reversals and not args.trajectory_holdout:
+        ap.error('--include-truth-reversals requires --trajectory-holdout')
     output = Path(args.output)
     if output.exists():
         raise FileExistsError(output)
@@ -73,13 +86,15 @@ def main():
     model = policy.model
     payloads = ReplayPayloads(rows, model.device)
     raw = RawReplay(args.source_bank, label_cache=args.label_cache)
-    queries = trajectory_queries(rows, raw) if args.trajectory_holdout else [
+    queries = trajectory_queries(rows, raw, include_truth_reversals=args.include_truth_reversals) if args.trajectory_holdout else [
         (row, language) for row in rows for language in ('source', 'target')]
     query_records = []
     policy.num_inference_steps = 1  # Only frozen semantic inputs are captured in trajectory mode.
     scale = torch.tensor((WORKSPACE_MAX - WORKSPACE_MIN) / 2, device=model.device)
     grouped = defaultdict(lambda: {'phase_confusion': np.zeros((3, 3), dtype=int),
-        'truth_confusion': np.zeros((2, 2), dtype=int), 'positions': [], 'goals': []})
+        'truth_confusion': np.zeros((2, 2), dtype=int), 'positions': [], 'goals': [],
+        'phase2_current_false': 0, 'phase2_current_false_predicted_true': 0,
+        'phase2_current_false_predicted_phase2': 0})
     with torch.no_grad():
         for i, (row, language) in enumerate(queries):
             path, frame = raw.locate(row, language)
@@ -115,6 +130,19 @@ def main():
             keep = valid & labels['predicate_truth_valid'].bool()
             for truth, guess in zip((labels['predicate_truth'][keep] >= .5).long().tolist(), truth_pred[keep].long().tolist()):
                 group['truth_confusion'][truth, guess] += 1
+            broken = (keep & labels['phase_valid'].bool() & (labels['phase_ids'] == 2)
+                      & (labels['predicate_truth'] < .5))
+            group['phase2_current_false'] += int(broken.sum())
+            group['phase2_current_false_predicted_true'] += int((broken & truth_pred).sum())
+            group['phase2_current_false_predicted_phase2'] += int((broken & (phase == 2)).sum())
+            if args.trajectory_holdout:
+                query_records[-1]['clause_predictions'] = [
+                    {'clause': int(c), 'phase_valid': bool(labels['phase_valid'][b, c]),
+                     'phase_label': int(labels['phase_ids'][b, c]), 'phase_prediction': int(phase[b, c]),
+                     'truth_valid': bool(labels['predicate_truth_valid'][b, c]),
+                     'truth_label': float(labels['predicate_truth'][b, c]),
+                     'truth_probability': float(pred['predicate_truth_logits'][b, c].sigmoid())}
+                    for b, c in valid.nonzero().tolist()]
             for role in ('subject', 'reference'):
                 keep = valid & labels[role + '_position_valid'].bool()
                 delta = (pred[role + '_position'].float() - labels[role + '_positions'].float()) * scale
@@ -127,6 +155,9 @@ def main():
     cells = []
     for (pair, language), group in sorted(grouped.items()):
         cell = {'pair_id': pair, 'language': language}
+        cell['phase2_current_false_audit'] = {key: group[key] for key in (
+            'phase2_current_false', 'phase2_current_false_predicted_true',
+            'phase2_current_false_predicted_phase2')}
         for key in ('phase', 'truth'):
             confusion = group[key + '_confusion']
             cell[key + '_confusion_true_rows_predicted_columns'] = confusion.tolist()
@@ -138,9 +169,14 @@ def main():
         cells.append(cell)
     report = {'complete': True, 'checkpoint': args.checkpoint,
         'checkpoint_sha256': file_sha256(args.checkpoint), 'holdout_states': len(rows),
+        'manifest': args.manifest, 'manifest_sha256': file_sha256(args.manifest),
+        'audit_script_sha256': file_sha256(__file__),
         'scene_count': len({(r['pair_id'], r['task_config'], r['scene_seed']) for r in rows}),
         'scope': 'Offline expert holdout; no policy history or closed-loop action evaluation.',
         'trajectory_holdout': args.trajectory_holdout, 'language_queries': len(queries),
+        'include_truth_reversals': args.include_truth_reversals,
+        'sampling_scope': 'Phase and optional reversal coverage, not a frequency estimate over all trajectory frames.',
+        'labels_modified': False,
         'trajectory_queries': query_records,
         'phase_ids': {'0': 'approach', '1': 'transport', '2': 'release_or_complete'}, 'cells': cells}
     output.parent.mkdir(parents=True, exist_ok=True)
