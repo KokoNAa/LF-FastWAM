@@ -1,0 +1,9 @@
+# Independent test evidence
+
+The development trial remains unchanged. This branch adds the reserved test-scene catalog protocol and a separate comparator for ten tasks with ten episodes each. It does not acquire GPUs, collect test scenes, select checkpoints or shut down the server.
+
+After a complete development matrix identifies a promising candidate, freeze actual checkpoint identities and the strongest relevant controls before exposing any test outcomes. The existing preparation declaration reserves seeds91700000..91800000, distinct100-seed attempt windows per task, ten accepted scenes per task and dual-expert feasibility screening. Supply the actual expanded training manifest and every development catalog as exclusions. Record code, input hashes, model selection and all rejected expert attempts.
+
+The comparator takes `--config` and a new `--output` JSON path. Its config contains `target`, a `methods` mapping from method name to complete evaluation root, and `exclude_records` listing actual training manifests and development episode JSONL files. Each method root must have the standard summary and complete ten-task CF episode/initial-state evidence. The comparator rejects partial matrices, duplicate/out-of-namespace/explicitly excluded seeds, wrong instruction-goal contracts and mismatched paired physical starts, catalogs or deployment. It computes exact equal-task macro CF, gains/losses and regressed tasks, with the historical burger predicate and separate strict final-slot supplement.
+
+This tool does not prove that the supplied exclusions are exhaustive, that model selection preceded test access, or that collection was expert-feasible. Those require the collection and controller records. Its output explicitly leaves `checkpoint_selection_freeze_verified` and `goal_achievement_claim` false. Do not promote a descriptive comparison into evidence of full goal completion without those audits, and do not tune on test outcomes.
