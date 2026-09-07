@@ -17,7 +17,7 @@ sys.path[:0] = [str(REPO), str(REPO/'src')]
 TASKS = ['place_a2b_left', 'place_a2b_right', 'place_burger_fries', 'stack_blocks_two', 'blocks_ranking_rgb']
 
 
-def training_audit(output, parent, steps, world):
+def training_audit(output, parent, steps, world, *, require_cup=True):
     """Inspect actual updates and samples, without whole-file hashing."""
     import torch
     before = torch.load(parent, map_location='cpu', weights_only=False)
@@ -52,7 +52,7 @@ def training_audit(output, parent, steps, world):
                 ordinary_controls += bool(item['ordinary_cf_control'])
     if any(norms != all_norms[0] for norms in all_norms[1:]):
         raise ValueError('Ranks disagree on global gradients')
-    if not cup_examples: raise ValueError('No new cup examples actually trained')
+    if require_cup and not cup_examples: raise ValueError('No new cup examples actually trained')
     return {'complete': True, 'steps': steps, 'examples': examples, 'cup_examples': cup_examples,
             'ordinary_cf_control_examples': ordinary_controls, 'changed_action_tensors': len(changed),
             'frozen_video_and_guard_equal': True, 'hash_scans': False}
@@ -66,6 +66,10 @@ def main():
     ap.add_argument('--correct-teacher', type=Path, default=teacher_root+'/repair-dense-native/step_000600.pt')
     ap.add_argument('--cf-teacher', type=Path, default=teacher_root+'/repair-shared-decisions/step_000400.pt')
     ap.add_argument('--fg', choices=['off', 'local', 'full'], required=True)
+    ap.add_argument('--target-tasks', nargs='+', default=['place_a2b_left', 'place_empty_cup'],
+                    choices=['place_a2b_left', 'blocks_ranking_rgb', 'place_empty_cup'])
+    ap.add_argument('--cf-retention-tasks', nargs='+',
+                    default=['place_a2b_right', 'place_burger_fries', 'stack_blocks_two'], choices=TASKS)
     ap.add_argument('--gpus', type=int, nargs='+', required=True)
     ap.add_argument('--steps', type=int, choices=[2, 100, 200], default=200)
     ap.add_argument('--deadline', default='2026-09-07T03:00:00+08:00')
@@ -128,7 +132,8 @@ def main():
             '--source-bank', args.source_bank, '--output', args.output/'joint', '--eraf', 'off',
             '--correct-teacher', args.correct_teacher, '--cf-teacher', args.cf_teacher,
             '--fg', args.fg, '--correct-weight', '4', '--cf-weight', '2', '--policy-scope', 'action',
-            '--correction-weight', '.25', '--target-tasks', 'place_a2b_left', 'place_empty_cup',
+            '--correction-weight', '.25', '--target-tasks', *args.target_tasks,
+            '--cf-retention-tasks', *args.cf_retention_tasks,
             '--skip-file-hashes']
         if args.evaluate_only:
             import torch
@@ -143,7 +148,8 @@ def main():
         else:
             start('train', command, args.gpus)
             while not done('train'): budget(); time.sleep(5)
-            audit = training_audit(args.output, args.checkpoint, args.steps, len(args.gpus))
+            audit = training_audit(args.output, args.checkpoint, args.steps, len(args.gpus),
+                                   require_cup='place_empty_cup' in args.target_tasks)
             (args.output/'training_audit.json').write_text(json.dumps(audit, indent=2)+'\n')
             if args.training_only:
                 plan['complete'] = True; save(); return
@@ -151,7 +157,8 @@ def main():
         catalogs = {'reg': (3, Path('/root/gpufree-data/LF-FastWAM/evaluate_results/robotwin/robotwin_uncond_3cam_384/cf-improvement-20260905-235608-base')),
                     'dev': (6, args.root/'catalog_dev')}
         cup_catalog = args.root/'cup_baseline_20260906_2221/catalog_dev/catalog.json'
-        queue = [('cup', None)] + [(kind, task) for task in TASKS for kind in catalogs]
+        queue = ([('cup', None)] if 'place_empty_cup' in args.target_tasks else [])
+        queue += [(kind, task) for task in TASKS for kind in catalogs]
         running = {}
         while queue or running:
             budget()
@@ -179,10 +186,11 @@ def main():
                 '--output', args.output/kind, '--checkpoint', checkpoint, '--catalog-root', catalog,
                 '--episodes', episodes, '--skip-file-hashes'], [])
             while not done('summarize_'+kind): budget(); time.sleep(1)
-        start('summarize_cup', [sys.executable, 'scripts/eval_robotwin_cup_cf.py', 'summarize',
-            '--output', args.output/'cup_summary.json', '--catalog', cup_catalog,
-            '--workers', args.output/'cup/worker.json'], [])
-        while not done('summarize_cup'): budget(); time.sleep(1)
+        if 'place_empty_cup' in args.target_tasks:
+            start('summarize_cup', [sys.executable, 'scripts/eval_robotwin_cup_cf.py', 'summarize',
+                '--output', args.output/'cup_summary.json', '--catalog', cup_catalog,
+                '--workers', args.output/'cup/worker.json'], [])
+            while not done('summarize_cup'): budget(); time.sleep(1)
         plan['complete'] = True; save()
     finally:
         for process in processes.values():
