@@ -4,6 +4,13 @@ from __future__ import annotations
 FG_OFF_PROTOCOL = 'task_domain_matched_target_only_v1'
 
 
+def validate_fg_gradient_route(route, *, eraf, fg):
+    if route not in {'joint', 'eraf_only'}:
+        raise ValueError('Unknown FG gradient route.')
+    if route == 'eraf_only' and (not eraf or fg == 'off'):
+        raise ValueError('ERAF-only FG gradients require active ERAF and FG supervision.')
+
+
 def mixture_counts(correct=4, cf=2):
     """Keep expert/FG exposure fixed while reallocating the six retention slots."""
     if isinstance(correct, bool) or isinstance(cf, bool) or not isinstance(correct, int) or not isinstance(cf, int):
@@ -37,9 +44,16 @@ def same_observation(captured):
 def backward_example(model, row, payload, noise, time, *, teachers, coefficient=1.,
                      eraf=True, fg='full', correct_weight=2., cf_weight=1.,
                      target_weight=2., endpoint_weight=1., conditional_gain=4.,
-                     gradient_observer=None, correction_weight=1.):
+                     gradient_observer=None, correction_weight=1., fg_gradient_route='joint'):
     import torch
     import math
+    validate_fg_gradient_route(fg_gradient_route, eraf=eraf, fg=fg)
+    routed_fg = fg_gradient_route == 'eraf_only' and bool(row.get('fg_correction'))
+    receivers = None
+    if routed_fg:
+        receivers = tuple(p for p in model.policy_guard_modules.parameters() if p.requires_grad)
+        if not receivers:
+            raise ValueError('FG routing has no trainable ERAF receivers.')
     if not math.isfinite(correction_weight) or correction_weight <= 0:
         raise ValueError('Correction/control weight must be positive and finite.')
     if row.get('fg_correction') or row.get('ordinary_cf_control'):
@@ -83,11 +97,17 @@ def backward_example(model, row, payload, noise, time, *, teachers, coefficient=
         if not bool(torch.isfinite(loss)):
             raise ValueError('Nonfinite action objective.')
         if gradient_observer is None:
-            (coefficient * loss).backward()
+            if routed_fg:
+                # Preserve gradients accumulated by previous ordinary/retention
+                # examples. Only this FG loss excludes the policy parameters.
+                (coefficient * loss).backward(inputs=receivers)
+            else:
+                (coefficient * loss).backward()
         else:
             # Diagnostics collect individual gradients without accumulating .grad
             # or stepping an optimizer. The default training path stays unchanged.
-            gradient_observer(coefficient * loss, component, retain_graph=retain_graph)
+            options = {'allowed_parameter_prefix': 'guard.'} if routed_fg else {}
+            gradient_observer(coefficient * loss, component, retain_graph=retain_graph, **options)
 
     def weight(language):
         if retention:

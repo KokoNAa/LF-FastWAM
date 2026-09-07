@@ -192,6 +192,7 @@ def main():
                         coefficient=1/12, eraf=recipe['eraf'] == 'on', fg=recipe['fg'],
                         correct_weight=recipe['correct_weight'], cf_weight=recipe['cf_weight'],
                         correction_weight=recipe['correction_weight'],
+                        fg_gradient_route=recipe['fg_gradient_route'],
                         gradient_observer=collector.observer(group, row['id']))
                     entries.append({'id': row['id'], 'group': group, 'pair_id': row['pair_id'],
                                     'scene_seed': row['scene_seed'], 'seed': seed, 'seen_variant': variant_index,

@@ -42,6 +42,8 @@ def main():
                     help='Declare preserved CF tasks; include the original three when adding target tasks.')
     ap.add_argument('--correction-weight', type=float, default=1.,
                     help='Scale FG slots and their matched ordinary-CF replacements equally.')
+    ap.add_argument('--fg-gradient-route', choices=['joint', 'eraf_only'], default='joint',
+                    help='Optionally send only FG corrective gradients to ERAF interfaces; ordinary/retention losses keep their full route.')
     ap.add_argument('--skip-file-hashes', action='store_true',
                     help='Use manifest metadata and direct optimizer/model tensor binding on resume.')
     ap.add_argument('--seed', type=int, default=42)
@@ -57,7 +59,7 @@ def main():
     import torch.distributed as dist
     from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint, validate_payload, file_sha256
     from experiments.robotwin.eraf_fg_data import RawReplay, validate_cf_retention_coverage
-    from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream, mixture_counts, supervision_payload, FG_OFF_PROTOCOL
+    from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream, mixture_counts, supervision_payload, FG_OFF_PROTOCOL, validate_fg_gradient_route
     from experiments.robotwin.eraf_action_protocol import validate_action_parent, parameter_learning_rates
     from experiments.robotwin.compact_replay import ReplayPayloads
     from experiments.robotwin.native_teacher import NativeTeacher
@@ -69,6 +71,7 @@ def main():
         ap.error('Positive steps and world size dividing global batch12 required.')
     if args.stage == 'interface' and args.eraf == 'off':
         ap.error('ERAF-off has no interface warmup.')
+    validate_fg_gradient_route(args.fg_gradient_route, eraf=args.eraf == 'on', fg=args.fg)
     counts = mixture_counts(args.correct_count, args.cf_count)
     parameter_learning_rates([], args.learning_rate, args.interface_learning_rate)
     parent_payload = validate_payload(torch.load(args.checkpoint, map_location='cpu', weights_only=False))
@@ -118,7 +121,7 @@ def main():
     optimization_contract = {k: getattr(args, k) for k in ('stage', 'fg', 'eraf', 'seed',
         'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation',
         'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks', 'cf_retention_tasks', 'task_balanced',
-        'interface_learning_rate', 'correct_count', 'cf_count')}
+        'interface_learning_rate', 'correct_count', 'cf_count', 'fg_gradient_route')}
     if args.skip_file_hashes:
         p = Path(args.manifest).resolve()
         optimization_contract['manifest_identity'] = {'path': str(p), 'bytes': p.stat().st_size,
@@ -149,7 +152,7 @@ def main():
                         'target_tasks': ['place_a2b_left', 'blocks_ranking_rgb'],
                         'cf_retention_tasks': ['place_a2b_right', 'place_burger_fries', 'stack_blocks_two'],
                         'task_balanced': False, 'interface_learning_rate': None,
-                        'correct_count': 4, 'cf_count': 2}
+                        'correct_count': 4, 'cf_count': 2, 'fg_gradient_route': 'joint'}
         for key, value in optimization_contract.items():
             if state['optimization_contract'].get(key, old_defaults.get(key)) != value:
                 if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
@@ -208,7 +211,7 @@ def main():
             report = backward_example(model, row, payload, noise, t, teachers=teachers,
                 coefficient=1. / (12 // world), eraf=args.eraf == 'on', fg=args.fg,
                 correct_weight=args.correct_weight, cf_weight=args.cf_weight,
-                correction_weight=args.correction_weight)
+                correction_weight=args.correction_weight, fg_gradient_route=args.fg_gradient_route)
             reports.append({'id': row['id'], 'seen_variant': variant_index,
                             'ordinary_cf_control': bool(row.get('ordinary_cf_control')), **report})
         average_gradients(selected.values())
@@ -228,7 +231,8 @@ def main():
                                 'target_tasks': args.target_tasks, 'cf_retention_tasks': args.cf_retention_tasks,
                                 'warm_policy_initialization': args.warm_policy,
                                 'interface_learning_rate': args.interface_learning_rate,
-                                'mixture_counts': counts, 'task_balanced': args.task_balanced},
+                                'mixture_counts': counts, 'task_balanced': args.task_balanced,
+                                'fg_gradient_route': args.fg_gradient_route},
                     record_hashes=not args.skip_file_hashes)
                 optimizer_payload = {'step': step, 'checkpoint': str(checkpoint_path),
                     'parameter_names': list(selected), 'optimization_contract': optimization_contract,

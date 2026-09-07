@@ -20,11 +20,11 @@ def scope(name):
 
 def diagnostic_recipe(plan=None):
     """Recover the executed action recipe; retain historical probe defaults."""
-    from experiments.robotwin.eraf_fg_training import mixture_counts
+    from experiments.robotwin.eraf_fg_training import mixture_counts, validate_fg_gradient_route
     recipe = dict(stage='joint', fg='full', eraf='off', seed=42, policy_scope='all',
                   correct_count=4, cf_count=2, correct_weight=4., cf_weight=2.,
                   correction_weight=1., task_balanced=False,
-                  disable_seen_language_augmentation=False)
+                  disable_seen_language_augmentation=False, fg_gradient_route='joint')
     if plan is not None:
         required = {'stage', 'fg', 'eraf', 'seed', 'correct_weight', 'cf_weight', 'global_batch'}
         if required - plan.keys():
@@ -41,6 +41,7 @@ def diagnostic_recipe(plan=None):
         raise ValueError('Invalid ERAF or policy scope.')
     if recipe['stage'] == 'interface' and recipe['eraf'] == 'off':
         raise ValueError('ERAF-off has no trainable interface.')
+    validate_fg_gradient_route(recipe['fg_gradient_route'], eraf=recipe['eraf'] == 'on', fg=recipe['fg'])
     for key in ('correct_weight', 'cf_weight', 'correction_weight'):
         if not math.isfinite(recipe[key]) or recipe[key] <= 0:
             raise ValueError(f'Invalid loss weight: {key}')
@@ -61,14 +62,18 @@ class GradientCollector:
         self.terms = []
 
     def observer(self, group, example_id):
-        def collect(loss, component, *, retain_graph=False):
+        def collect(loss, component, *, retain_graph=False, allowed_parameter_prefix=None):
             import torch
-            gradients = torch.autograd.grad(loss, tuple(self.parameters.values()),
+            active = {k: v for k, v in self.parameters.items()
+                      if allowed_parameter_prefix is None or k.startswith(allowed_parameter_prefix)}
+            if not active:
+                raise ValueError('No diagnostic parameters match the declared gradient route.')
+            gradients = torch.autograd.grad(loss, tuple(active.values()),
                                             allow_unused=True, retain_graph=retain_graph)
             total = self.groups.setdefault(group, {})
             squares = {}
             used = 0
-            for (name, _), gradient in zip(self.parameters.items(), gradients):
+            for (name, _), gradient in zip(active.items(), gradients):
                 if gradient is None:
                     continue
                 gradient = gradient.detach().float().cpu()

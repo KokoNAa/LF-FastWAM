@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from test_robotwin_eraf_fg_bridge import case
-from experiments.robotwin.eraf_fg_training import backward_example
+from experiments.robotwin.eraf_fg_training import backward_example, validate_fg_gradient_route
 from experiments.robotwin.eraf_fg_bridge import trainable_parameters
 from experiments.robotwin.gradient_diagnostic import GradientCollector, bucket, diagnostic_recipe
 
@@ -104,3 +104,54 @@ def test_observer_matches_real_checkpointed_model_gradients_with_tail_mask(case)
     for n, gradient in expected.items():
         assert torch.allclose(gradient, collector.groups['fg'][n], rtol=2e-4, atol=2e-6), n
     assert all(p.grad is None and torch.equal(p, before[n]) for n, p in selected.items())
+
+
+def test_fg_route_preserves_existing_policy_gradients_and_exact_eraf_gradient(case):
+    model, captured, noise, time = case
+    guard = trainable_parameters(model, 'interface')
+    policy = {'mot.mixtures.action.' + n: p for n, p in model.action_expert.named_parameters()}
+    for p in policy.values():
+        p.requires_grad_(True)
+    payload = {'captured': {'target': captured}, 'references': {'target': torch.zeros_like(noise)},
+               'valid': {'target': torch.tensor([[True, True, False, False]])}}
+    row = {'fg_correction': True, 'frame_index': 0}
+    backward_example(model, row, payload, noise, time, teachers={})
+    expected_guard = {n: p.grad.clone() for n, p in guard.items() if p.grad is not None}
+    expected_policy = {n: p.grad.clone() for n, p in policy.items() if p.grad is not None}
+    assert any(v.abs().sum() > 0 for v in expected_policy.values())
+    for p in guard.values():
+        p.grad = None
+    prior = {n: torch.full_like(p, .125) for n, p in policy.items()}
+    for n, p in policy.items():
+        p.grad = prior[n].clone()
+    backward_example(model, row, payload, noise, time, teachers={}, fg_gradient_route='eraf_only')
+    assert all(torch.equal(p.grad, prior[n]) for n, p in policy.items())
+    actual_guard = {n: p.grad for n, p in guard.items() if p.grad is not None}
+    assert expected_guard.keys() == actual_guard.keys()
+    assert all(torch.allclose(expected_guard[n], g, rtol=2e-4, atol=2e-6) for n, g in actual_guard.items())
+    for p in list(guard.values()) + list(policy.values()):
+        p.grad = None
+    # Ordinary expert/control rows still teach the shared policy under this recipe.
+    backward_example(model, {'ordinary_cf_control': True}, payload, noise, time, teachers={},
+                     fg_gradient_route='eraf_only')
+    assert all(torch.allclose(policy[n].grad, g, rtol=2e-4, atol=2e-6) for n, g in expected_policy.items())
+    for p in list(guard.values()) + list(policy.values()):
+        p.grad = None
+    collector = GradientCollector(guard | policy)
+    backward_example(model, row, payload, noise, time, teachers={}, fg_gradient_route='eraf_only',
+                     gradient_observer=collector.observer('fg', 'routed'))
+    assert collector.groups['fg'].keys() == expected_guard.keys()
+    assert all(torch.allclose(collector.groups['fg'][n], g, rtol=2e-4, atol=2e-6) for n, g in expected_guard.items())
+    assert collector.summary()['scopes']['action']['norms']['fg'] == 0
+    assert all(p.grad is None for p in list(guard.values()) + list(policy.values()))
+
+
+def test_fg_route_rejects_inactive_or_missing_eraf(case):
+    for eraf, fg in [(False, 'full'), (True, 'off')]:
+        with pytest.raises(ValueError, match='active ERAF'):
+            validate_fg_gradient_route('eraf_only', eraf=eraf, fg=fg)
+    model, captured, noise, time = case
+    model.requires_grad_(False)
+    with pytest.raises(ValueError, match='no trainable ERAF'):
+        backward_example(model, {'fg_correction': True}, {}, noise, time,
+                         teachers={}, fg_gradient_route='eraf_only')
