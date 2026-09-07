@@ -15,6 +15,7 @@ sys.path[:0] = [str(REPO), str(REPO / 'src')]
 
 
 def main():
+    from experiments.robotwin.expanded_fg import TASKS as EXPANDED_FG_TASKS
     ap = argparse.ArgumentParser(description=__doc__)
     for key in ('manifest', 'source-bank', 'checkpoint', 'output', 'correct-teacher', 'cf-teacher'):
         ap.add_argument('--' + key, required=True)
@@ -39,7 +40,7 @@ def main():
     ap.add_argument('--interface-scope', choices=['all', 'route_outputs'], default='all',
                     help='Open only the two semantic-to-action query outputs during interface warmup.')
     ap.add_argument('--target-tasks', nargs='+', default=['place_a2b_left', 'blocks_ranking_rgb'],
-                    choices=['place_a2b_left', 'blocks_ranking_rgb', 'place_empty_cup'])
+                    choices=['place_a2b_left', 'blocks_ranking_rgb', *EXPANDED_FG_TASKS])
     ap.add_argument('--cf-retention-tasks', nargs='+',
                     default=['place_a2b_right', 'place_burger_fries', 'stack_blocks_two'],
                     choices=['place_a2b_left', 'blocks_ranking_rgb', 'place_a2b_right',
@@ -113,7 +114,7 @@ def main():
         if args.fg != 'off':
             for split in ('train', 'replay_holdout'):
                 if {r['source_task'] for r in rows if r.get('fg_correction') and r['replay_split'] == split} != set(args.target_tasks):
-                    raise ValueError('FG train and holdout must cover both target tasks.')
+                    raise ValueError('FG train and holdout must cover exactly the declared target tasks.')
                 minimum = 24 if split == 'train' else 6
                 for task in args.target_tasks:
                     count = len({r['scene_seed'] for r in rows if r.get('fg_correction')
