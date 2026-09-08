@@ -42,3 +42,21 @@ def test_does_not_substitute_train_scenes_for_missing_holdout():
     rows = [r for r in fixture_rows() if r['scene_seed'] != 201]
     with pytest.raises(ValueError, match='Insufficient scenes'):
         select_rows(rows)
+
+
+def test_five_task_focus_uses_the_declared_tasks_and_same_sampling_rules():
+    tasks = ('blocks_ranking_rgb', 'place_a2b_left')
+    rename = dict(zip(TASKS, tasks))
+    rows = fixture_rows()
+    for row in rows:
+        row['id'] = row['id'].replace(row['source_task'], rename[row['source_task']])
+        row['source_task'] = rename[row['source_task']]
+    selected = select_rows(rows, tasks)
+    assert len(selected) == 18 and {r['diagnostic_task'] for r in selected} == set(tasks)
+    assert sum(r['replay_split'] == 'replay_holdout' for r in selected) == 12
+    assert [r['id'] for r in selected] == [r['id'] for r in select_rows(rows[::-1], tasks)]
+
+
+@pytest.mark.parametrize('tasks', [('blocks_ranking_rgb',), ('blocks_ranking_rgb', 'blocks_ranking_rgb'), ('unknown', 'place_a2b_left')])
+def test_invalid_task_scope_is_rejected(tasks):
+    with pytest.raises(ValueError, match='exactly two'): select_rows(fixture_rows(), tasks)

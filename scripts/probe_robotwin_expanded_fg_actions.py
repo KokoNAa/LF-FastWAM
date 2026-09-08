@@ -10,17 +10,20 @@ import sys
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / 'src')]
 TASKS = ('place_empty_cup', 'move_pillbottle_pad')
+SUPPORTED_TASKS = (*TASKS, 'blocks_ranking_rgb', 'place_a2b_left')
 
 
-def select_rows(rows):
+def select_rows(rows, tasks=TASKS):
     """One train and two holdout scenes per task/kind; selection uses no outputs."""
     from experiments.robotwin.pgc_data import ROBOTWIN_TEN_TASK_SPECS
     names = {s.pair_id: s.source_task for s in ROBOTWIN_TEN_TASK_SPECS}
+    if len(tasks) != 2 or len(set(tasks)) != 2 or not set(tasks) <= set(SUPPORTED_TASKS):
+        raise ValueError('Select exactly two distinct supported tasks before inference.')
     buckets = defaultdict(lambda: defaultdict(list))
     splits = defaultdict(set)
     for row in rows:
         task = row.get('source_task') or names.get(row['pair_id'])
-        if task not in TASKS or row['task_config'] != 'demo_clean':
+        if task not in tasks or row['task_config'] != 'demo_clean':
             continue
         split = row['replay_split']
         splits[task, row['scene_seed']].add(split)
@@ -34,7 +37,7 @@ def select_rows(rows):
     if any(len(s) != 1 for s in splits.values()):
         raise ValueError('A diagnostic scene crosses train/holdout splits.')
     result = []
-    for task in TASKS:
+    for task in tasks:
         for split, count in [('train', 1), ('replay_holdout', 2)]:
             for kind in ('ordinary', 'fg'):
                 scenes = buckets[task, split, kind]
@@ -61,6 +64,7 @@ def main():
     for key in ('manifest', 'source-bank', 'checkpoint', 'output'):
         ap.add_argument('--' + key, required=True)
     ap.add_argument('--eraf', choices=['on', 'off'], required=True)
+    ap.add_argument('--tasks', nargs=2, choices=SUPPORTED_TASKS, default=TASKS)
     args = ap.parse_args()
     import h5py
     import numpy as np
@@ -80,10 +84,10 @@ def main():
     manifest = json.loads(Path(args.manifest).read_text())
     if not manifest['complete']:
         raise ValueError('Incomplete manifest.')
-    rows = select_rows(manifest['states'])
+    rows = select_rows(manifest['states'], args.tasks)
     protocol = dict(checkpoint=args.checkpoint, checkpoint_sha256=checkpoint_hash,
                     manifest_sha256=manifest_hash, eraf=args.eraf, optimizer_updates=0,
-                    selected_rows=rows, inference_steps=10, noise_seed=42,
+                    selected_rows=rows, tasks=list(args.tasks), inference_steps=10, noise_seed=42,
                     scope='Small deterministic train/holdout action diagnostic, not CF success or independent test. Source-language outputs are compared to the CF expert only as a language-response diagnostic. Oracle-noised fits are not goal-selection tests.')
     (root/'protocol.json').write_text(json.dumps(protocol, indent=2)+'\n')
     policy = load_policy(args.checkpoint, manifest, seed=42)
