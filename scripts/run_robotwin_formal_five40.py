@@ -194,17 +194,18 @@ def summarize(root, plan):
     return result
 
 
-def main():
+def main(*, freeze_fn=None, parser_setup=None):
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output',type=Path,required=True)
     ap.add_argument('--deadline',required=True)
     ap.add_argument('--gpus',nargs='+',type=int,default=[0,1,2,3,4])
     ap.add_argument('--preflight-only',action='store_true')
+    if parser_setup is not None: parser_setup(ap)
     args=ap.parse_args();root=args.output.resolve()
     cutoff=datetime.fromisoformat(args.deadline)
     if cutoff.tzinfo is None or cutoff.timestamp() <= time.time():
         raise ValueError('Need a future absolute deadline')
-    plan=freeze(root,args.deadline,args.gpus)
+    plan=freeze(root,args.deadline,args.gpus) if freeze_fn is None else freeze_fn(args)
     if args.preflight_only:
         print(json.dumps(plan,indent=2));return
     root.mkdir(parents=True,exist_ok=False)
