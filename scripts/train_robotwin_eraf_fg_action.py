@@ -20,6 +20,8 @@ def main():
     for key in ('manifest', 'source-bank', 'checkpoint', 'output', 'correct-teacher', 'cf-teacher'):
         ap.add_argument('--' + key, required=True)
     ap.add_argument('--stage', choices=['interface', 'joint'], required=True)
+    ap.add_argument('--action-objective', choices=['flow_endpoint_v1','deployed_rollout_v1'], default='flow_endpoint_v1',
+                    help='Explicit experiment: supervise final24 executed actions through all ten denoising steps.')
     ap.add_argument('--fg', choices=['off', 'local', 'full'], default='full')
     ap.add_argument('--eraf', choices=['on', 'off'], default='on')
     ap.add_argument('--steps', type=int, default=800)
@@ -62,6 +64,8 @@ def main():
     ap.add_argument('--disable-seen-language-augmentation', action='store_true')
     ap.add_argument('--resume-state', help='Resume saved FP32 masters and optimizer at the supplied checkpoint.')
     args = ap.parse_args()
+    if args.action_objective == 'deployed_rollout_v1' and (args.policy_scope != 'action' or args.fg == 'local'):
+        ap.error('Deployed rollout objective requires action-only LoRA scope and full/off FG.')
     from experiments.robotwin.initial_anchor import validate_weights, effective_weight
     validate_weights(args.correction_task_weights)
     if args.zero_context_joint != bool(args.identity_audit):
@@ -74,6 +78,8 @@ def main():
     from experiments.robotwin.eraf_fg_bridge import load_policy, trainable_parameters, MasterAdamW, save_repair_checkpoint, validate_payload, file_sha256
     from experiments.robotwin.eraf_fg_data import RawReplay, validate_cf_retention_coverage
     from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream, mixture_counts, supervision_payload, FG_OFF_PROTOCOL, validate_fg_gradient_route
+    if args.action_objective == 'deployed_rollout_v1':
+        from experiments.robotwin.deployed_action_objective import backward_deployed_example as backward_example
     from experiments.robotwin.eraf_action_protocol import validate_action_parent, parameter_learning_rates, validate_joint_identity_audit
     from experiments.robotwin.compact_replay import ReplayPayloads
     from experiments.robotwin.native_teacher import NativeTeacher
@@ -142,7 +148,7 @@ def main():
         'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation',
         'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks', 'cf_retention_tasks', 'task_balanced',
         'interface_learning_rate', 'correct_count', 'cf_count', 'fg_gradient_route', 'interface_scope',
-        'correction_task_weights', 'initial_expert_tasks')}
+        'correction_task_weights', 'initial_expert_tasks', 'action_objective')}
     if args.skip_file_hashes:
         p = Path(args.manifest).resolve()
         optimization_contract['manifest_identity'] = {'path': str(p), 'bytes': p.stat().st_size,
@@ -174,7 +180,7 @@ def main():
                         'cf_retention_tasks': ['place_a2b_right', 'place_burger_fries', 'stack_blocks_two'],
                         'task_balanced': False, 'interface_learning_rate': None,
                         'correct_count': 4, 'cf_count': 2, 'fg_gradient_route': 'joint',
-                        'correction_task_weights': {}, 'initial_expert_tasks': []}
+                        'correction_task_weights': {}, 'initial_expert_tasks': [], 'action_objective': 'flow_endpoint_v1'}
         for key, value in optimization_contract.items():
             if state['optimization_contract'].get(key, old_defaults.get(key)) != value:
                 if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
@@ -263,7 +269,8 @@ def main():
                                 'identity_audit_sha256': args.identity_audit_sha256,
                                 'interface_learning_rate': args.interface_learning_rate,
                                 'mixture_counts': counts, 'task_balanced': args.task_balanced,
-                                'fg_gradient_route': args.fg_gradient_route},
+                                'fg_gradient_route': args.fg_gradient_route,
+                                'action_objective': args.action_objective},
                     record_hashes=not args.skip_file_hashes)
                 optimizer_payload = {'step': step, 'checkpoint': str(checkpoint_path),
                     'parameter_names': list(selected), 'optimization_contract': optimization_contract,

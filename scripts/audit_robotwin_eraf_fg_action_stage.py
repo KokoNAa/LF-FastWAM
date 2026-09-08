@@ -89,6 +89,12 @@ def audit(root):
         if len({journal[index]['grad_norm'] for journal in journals}) != 1:
             raise ValueError(f'Rank gradient norms differ at step{step}.')
         for rank, journal in enumerate(journals):
+            if plan.get('action_objective') == 'deployed_rollout_v1':
+                for example in journal[index]['examples']:
+                    if (example.get('action_objective') != 'deployed_rollout_v1'
+                        or example.get('denoising_steps') != 10 or example.get('executed_horizon') != 24
+                        or example.get('gradient_horizon') != 'all_ten_steps'):
+                        raise ValueError('Actual loss differs from the declared deployed rollout objective.')
             if [r['id'] for r in journal[index]['examples']] != [r['id'] for r in batch[rank::world]]:
                 raise ValueError(f'Actual sampled states differ at step{step}, rank{rank}.')
             if ([bool(r.get('ordinary_cf_control')) for r in journal[index]['examples']]
@@ -106,6 +112,7 @@ def audit(root):
         'optimizer_checkpoint_and_contract_match': True, 'all_rank_gradient_norms_equal': True,
         'all_sampled_state_ids_match': True, 'world_size': world, 'global_batch': plan['global_batch'],
         'first_step': start + 1, 'final_step': plan['steps'],
+        'action_objective': plan.get('action_objective', 'flow_endpoint_v1'),
         'note': 'Gradient norm equality is checked; individual gradient tensors are not archived.'}
 
 
