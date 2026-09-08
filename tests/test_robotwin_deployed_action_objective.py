@@ -78,3 +78,24 @@ def test_teacher_adapter_swap_restores_after_sampler_failure(monkeypatch):
     monkeypatch.setattr(objective,'sample',fail)
     with pytest.raises(RuntimeError,match='sampler failed'):objective.teacher_action(teacher,{},torch.ones(1))
     assert p.item()==2.
+
+
+def test_all_four_commands_share_explicit_objective():
+    from pathlib import Path
+    from scripts.run_robotwin_expanded_fg_trial import action_command,ARMS
+    plan=dict(manifest='/manifest',source_bank='/source',correct_teacher='/correct',strongest_checkpoint='/best',
+              arms={a:dict(s,parent='/parent/'+a) for a,s in ARMS.items()},action_objective='deployed_rollout_v1')
+    for arm in ARMS:
+        cmd=action_command(plan,Path('/trial'),arm)
+        assert cmd[cmd.index('--action-objective')+1]=='deployed_rollout_v1'
+        assert cmd[cmd.index('--steps')+1]=='200'
+        assert cmd[cmd.index('--save-every')+1]=='200'
+
+
+def test_paired_audit_rejects_silent_objective_change(tmp_path):
+    import json
+    from tests.test_robotwin_expanded_fg_trial import action_evidence
+    from scripts.audit_robotwin_expanded_fg_trial import audit_action_pairing
+    action_evidence(tmp_path)
+    path=tmp_path/'protocol.json';p=json.loads(path.read_text());p['action_objective']='deployed_rollout_v1';path.write_text(json.dumps(p))
+    with pytest.raises(AssertionError):audit_action_pairing(tmp_path)

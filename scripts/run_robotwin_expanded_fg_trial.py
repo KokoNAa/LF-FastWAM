@@ -56,6 +56,8 @@ def action_command(plan,root,arm):
     if plan.get('initial_expert_tasks'):
         cmd += ['--initial-expert-tasks',*plan['initial_expert_tasks'],
                 '--correction-task-weights',json.dumps(plan['correction_task_weights'],sort_keys=True)]
+    if plan.get('action_objective'):
+        cmd += ['--action-objective',plan['action_objective']]
     if plan['arms'][arm]['eraf']=='on':
         mode='fg' if arm=='eraf_fg' else 'ordinary'
         cmd += ['--zero-context-joint','--identity-audit',str(Path(plan.get('identity_root',root/'identity'))/mode/'summary.json')]
@@ -79,6 +81,18 @@ def run_action_stages(plan,root,previous,*,group,write,launch,budget,processes,s
         '--output',str(root/a/'joint')],[]) for a in ARMS})
     from scripts.audit_robotwin_expanded_fg_trial import audit_action_pairing
     write('paired_action_audit.json',audit_action_pairing(root))
+    if plan.get('record_final_hashes'):
+        from experiments.robotwin.eraf_fg_bridge import file_sha256
+        ledger={}
+        for arm in ARMS:
+            path=root/arm/'joint/step_000200.pt';stat=path.stat()
+            audit=json.loads((path.parent/'freeze_audit.json').read_text())
+            identity=dict(path=str(path.resolve()),bytes=stat.st_size,mtime_ns=stat.st_mtime_ns)
+            if not audit['complete'] or audit['checkpoint_identity']!=identity:
+                raise ValueError('Actual final weight differs from the completed training audit.')
+            ledger[arm]=identity|dict(sha256=file_sha256(path),actual_audit_identity_matches=True)
+        write('final_checkpoint_hashes.json',dict(complete=True,models=ledger,
+            scope='Actual audited final200 weights, hashed before CF evaluation.'))
     state['stage']='evaluating';pending=[(g,t,a) for g,s in plan['groups'].items() for t in s['tasks'] for a in ARMS];active={}
     while pending or active:
         budget()
@@ -105,6 +119,10 @@ def run_action_stages(plan,root,previous,*,group,write,launch,budget,processes,s
                 '--catalog-root',s['catalog'],'--episodes',str(s['episodes']),'--tasks',*s['tasks'],
                 '--conditions','counterfactual','--skip-file-hashes'],[])
     group('summarizing',commands)
+    if plan.get('record_final_hashes'):
+        for value in ledger.values():
+            if file_sha256(value['path'])!=value['sha256']:
+                raise ValueError('Actual checkpoint changed during CF evaluation.')
     config=comparison_config(previous,root,plan['groups'],plan.get('comparison_history_prefix','pre_expanded_fg_'))
     write('comparison_config.json',config);write('comparison.json',build_report(config))
     state.update(complete=True,terminal=True,stage='complete')

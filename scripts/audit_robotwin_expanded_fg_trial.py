@@ -23,6 +23,7 @@ def audit_action_pairing(root):
         assert all([r['step'] for r in j]==list(range(1,201)) for j in journals[a])
         assert p.get('initial_expert_tasks',[])==protocol.get('initial_expert_tasks',[])
         assert p.get('correction_task_weights',{})==protocol.get('correction_task_weights',{})
+        assert p.get('action_objective','flow_endpoint_v1')==protocol.get('action_objective','flow_endpoint_v1')
         streams[a]=mixture_stream(rows,42,p['fg'],task_balanced=True,correct_count=2,cf_count=4,
                                  initial_expert_tasks=p.get('initial_expert_tasks',[]))
     shared=replaced=0
@@ -40,6 +41,12 @@ def audit_action_pairing(root):
                     assert [e['initial_expert_anchor'] for e in examples]==[bool(r.get('initial_expert_anchor')) for r in expected]
                     assert [e['effective_correction_weight'] for e in examples]==[effective_weight(r,p['correction_weight'],p['correction_task_weights']) for r in expected]
                 assert all(math.isfinite(v) for e in examples for k,v in e.items() if k.startswith('flow_') or k=='endpoint_objective')
+                if p.get('action_objective')=='deployed_rollout_v1':
+                    assert all(e.get('action_objective')=='deployed_rollout_v1'
+                               and e.get('denoising_steps')==10 and e.get('executed_horizon')==24
+                               and e.get('gradient_horizon')=='all_ten_steps'
+                               and math.isfinite(e['deployed_objective']) for e in examples)
+                    assert all(math.isfinite(v) for e in examples for k,v in e.items() if k.startswith('deployed_'))
             for r in batch:
                 assert r['replay_split']=='train'
                 kind='fg' if r.get('fg_correction') else 'ordinary_cf_control' if r.get('ordinary_cf_control') else 'common'
