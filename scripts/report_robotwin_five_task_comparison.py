@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from fractions import Fraction
 from math import comb
 from pathlib import Path
 import random
@@ -39,8 +40,9 @@ def paired_summary(outcomes, *, draws=10000, seed=42):
     for values in outcomes.values():
         if not values or any(len(v) != 3 or any(type(x) is not bool for x in v) for v in values):
             raise ValueError('Every scene needs exactly three Boolean outcomes.')
-    macro = {a: sum(sum(row[i] for row in outcomes[t]) / len(outcomes[t]) for t in TASKS) / 5
-             for i, a in enumerate(ARMS)}
+    exact_macro = {a: sum(Fraction(sum(row[i] for row in outcomes[t]), len(outcomes[t])) for t in TASKS) / 5
+                   for i, a in enumerate(ARMS)}
+    macro = {a: float(value) for a, value in exact_macro.items()}
     samples = [[] for _ in PAIRS]
     rng = random.Random(seed)
     for _ in range(draws):
@@ -64,7 +66,7 @@ def paired_summary(outcomes, *, draws=10000, seed=42):
                               net=gains-losses, difference=(gains-losses)/len(values)))
         gains, losses = sum(x['gains'] for x in cells), sum(x['losses'] for x in cells)
         comparisons.append(dict(reference=a, candidate=b, by_task=cells, gains=gains, losses=losses,
-            net=gains-losses, macro_difference=macro[b]-macro[a],
+            net=gains-losses, macro_difference=float(exact_macro[b]-exact_macro[a]),
             paired_stratified_bootstrap_ci95=[quantile(samples[j], .025), quantile(samples[j], .975)],
             exact_paired_p_two_sided=exact_paired_p(gains, losses)))
     # Holm adjustment across all three reported pairwise tests.
@@ -73,7 +75,7 @@ def paired_summary(outcomes, *, draws=10000, seed=42):
         previous = max(previous, min(1., (3-rank)*item['exact_paired_p_two_sided']))
         item['holm_p_three_comparisons'] = previous
     return dict(macro_cf=macro, comparisons=comparisons,
-        desired_order_observed=macro['eraf_fg'] > macro['eraf_only'] > macro['no_eraf'],
+        desired_order_observed=exact_macro['eraf_fg'] > exact_macro['eraf_only'] > exact_macro['no_eraf'],
         bootstrap=dict(draws=draws, seed=seed, unit='paired scene within task',
                        scope='Scene sampling uncertainty for these five fixed tasks; not training-seed or unseen-task uncertainty.',
                        intervals='Marginal percentile 95% intervals; not simultaneous confidence intervals.'),

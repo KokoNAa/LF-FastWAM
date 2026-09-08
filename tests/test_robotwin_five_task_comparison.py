@@ -35,6 +35,17 @@ def test_missing_task_and_numeric_instead_of_boolean_outcomes_are_rejected():
     with pytest.raises(ValueError): paired_summary({t: [(1, False, False)] for t in TASKS}, draws=1000)
 
 
+def test_equal_success_counts_cannot_be_ordered_by_float_roundoff():
+    # Both sum to 5/60. Summing their per-task float rates gives different floats.
+    first, second = [0, 0, 0, 1, 4], [0, 0, 0, 0, 5]
+    assert sum(n/12 for n in first) != sum(n/12 for n in second)
+    outcomes = {t:[(i<first[j], i<second[j], i<second[j]) for i in range(12)] for j,t in enumerate(TASKS)}
+    result = paired_summary(outcomes, draws=1000)
+    assert len(set(result['macro_cf'].values())) == 1
+    assert all(c['macro_difference'] == 0 for c in result['comparisons'])
+    assert not result['desired_order_observed']
+
+
 def test_complete_report_checks_actual_model_goal_and_physical_bindings(matrix):
     root, plan = matrix
     plan.update(tasks=list(TASKS), independent_test=True)
