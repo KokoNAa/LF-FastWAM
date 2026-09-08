@@ -24,6 +24,9 @@ def audit(root):
     if plan.get('action_objective')=='trajectory_target_rollout_v1':
         from experiments.robotwin.trajectory_target import mixture_stream, validate_recipe
         validate_recipe(plan)
+    if plan.get('action_objective')=='five_task_expert_rollout_v1':
+        from experiments.robotwin.five_task_action import mixture_stream, validate_recipe
+        validate_recipe(plan)
     if read(root / 'complete.json').get('complete') is not True:
         raise ValueError('Training stage is incomplete.')
     if plan['fg'] == 'off' and plan['optimization_contract'].get('fg_off_protocol') != FG_OFF_PROTOCOL:
@@ -39,7 +42,7 @@ def audit(root):
     if (not parent_matches or candidate['optimizer_steps'] != plan['steps'] or candidate['stage'] != plan['stage']
             or candidate['fg_supervision'] != plan['fg'] or candidate['provenance']['eraf'] != plan['eraf']):
         raise ValueError('Checkpoint lineage/stage does not match the run plan.')
-    if plan.get('action_objective') in ('balanced_target_rollout_v1','trajectory_target_rollout_v1') and candidate['provenance'].get('action_objective')!=plan['action_objective']:
+    if plan.get('action_objective') in ('balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1') and candidate['provenance'].get('action_objective')!=plan['action_objective']:
         raise ValueError('Checkpoint objective provenance differs from the immutable plan.')
     allowed = set(plan['trainable_parameters'])
     changed, frozen = [], []
@@ -97,22 +100,27 @@ def audit(root):
         if len({journal[index]['grad_norm'] for journal in journals}) != 1:
             raise ValueError(f'Rank gradient norms differ at step{step}.')
         for rank, journal in enumerate(journals):
-            if plan.get('action_objective') in ('deployed_rollout_v1','balanced_target_rollout_v1','trajectory_target_rollout_v1'):
+            if plan.get('action_objective') in ('deployed_rollout_v1','balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1'):
                 for example in journal[index]['examples']:
                     if (example.get('action_objective') != plan['action_objective']
                         or example.get('denoising_steps') != 10 or example.get('executed_horizon') != 24
                         or example.get('gradient_horizon') != 'all_ten_steps'):
                         raise ValueError('Actual loss differs from the declared deployed rollout objective.')
-                    if plan['action_objective'] in ('balanced_target_rollout_v1','trajectory_target_rollout_v1') and (example.get('supervised_languages')!=['target'] or example.get('conditional_difference') is not False or 'deployed_source_mse_first24' in example):
+                    if plan['action_objective'] in ('balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1') and (example.get('supervised_languages')!=['target'] or example.get('conditional_difference') is not False or 'deployed_source_mse_first24' in example):
                         raise ValueError('Balanced objective unexpectedly supervised source language.')
             if [r['id'] for r in journal[index]['examples']] != [r['id'] for r in batch[rank::world]]:
                 raise ValueError(f'Actual sampled states differ at step{step}, rank{rank}.')
             if ([bool(r.get('ordinary_cf_control')) for r in journal[index]['examples']]
                     != [bool(r.get('ordinary_cf_control')) for r in batch[rank::world]]):
                 raise ValueError('Ordinary CF replacement supervision differs from the matched schedule.')
-            if plan.get('action_objective')=='trajectory_target_rollout_v1':
+            if plan.get('action_objective') in ('trajectory_target_rollout_v1','five_task_expert_rollout_v1'):
                 if [r.get('ordinary_target_trajectory') for r in journal[index]['examples']] != [bool(r.get('ordinary_target_trajectory')) for r in batch[rank::world]]:
                     raise ValueError('Actual ordinary trajectory supervision differs.')
+            if plan.get('action_objective')=='five_task_expert_rollout_v1':
+                for example, row in zip(journal[index]['examples'], batch[rank::world], strict=True):
+                    expected = 'teacher_action' if row.get('cf_retention') else 'expert_action'
+                    if example.get('supervision_target') != expected or example.get('replay_trajectory_third') != row.get('replay_trajectory_third'):
+                        raise ValueError('Five-task expert/teacher source or temporal stratum changed.')
             if plan.get('initial_expert_tasks') or plan.get('correction_task_weights'):
                 for example,row in zip(journal[index]['examples'],batch[rank::world],strict=True):
                     if (example.get('initial_expert_anchor') != bool(row.get('initial_expert_anchor'))

@@ -20,7 +20,7 @@ def main():
     for key in ('manifest', 'source-bank', 'checkpoint', 'output', 'correct-teacher', 'cf-teacher'):
         ap.add_argument('--' + key, required=True)
     ap.add_argument('--stage', choices=['interface', 'joint'], required=True)
-    ap.add_argument('--action-objective', choices=['flow_endpoint_v1','deployed_rollout_v1','balanced_target_rollout_v1','trajectory_target_rollout_v1'], default='flow_endpoint_v1',
+    ap.add_argument('--action-objective', choices=['flow_endpoint_v1','deployed_rollout_v1','balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1'], default='flow_endpoint_v1',
                     help='Explicit experiment: supervise final24 executed actions through all ten denoising steps.')
     ap.add_argument('--fg', choices=['off', 'local', 'full'], default='full')
     ap.add_argument('--eraf', choices=['on', 'off'], default='on')
@@ -64,7 +64,7 @@ def main():
     ap.add_argument('--disable-seen-language-augmentation', action='store_true')
     ap.add_argument('--resume-state', help='Resume saved FP32 masters and optimizer at the supplied checkpoint.')
     args = ap.parse_args()
-    if args.action_objective in ('deployed_rollout_v1','balanced_target_rollout_v1','trajectory_target_rollout_v1') and (args.policy_scope != 'action' or args.fg == 'local'):
+    if args.action_objective in ('deployed_rollout_v1','balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1') and (args.policy_scope != 'action' or args.fg == 'local'):
         ap.error('Deployed rollout objective requires action-only LoRA scope and full/off FG.')
     from experiments.robotwin.initial_anchor import validate_weights, effective_weight
     validate_weights(args.correction_task_weights)
@@ -85,6 +85,9 @@ def main():
         validate_recipe(vars(args))
     if args.action_objective == 'trajectory_target_rollout_v1':
         from experiments.robotwin.trajectory_target import backward_example, mixture_stream, mixture_counts, filter_fg_rows, validate_recipe
+        validate_recipe(vars(args))
+    if args.action_objective == 'five_task_expert_rollout_v1':
+        from experiments.robotwin.five_task_action import backward_example, mixture_stream, mixture_counts, filter_fg_rows, validate_recipe
         validate_recipe(vars(args))
     from experiments.robotwin.eraf_action_protocol import validate_action_parent, parameter_learning_rates, validate_joint_identity_audit
     from experiments.robotwin.compact_replay import ReplayPayloads
@@ -127,7 +130,7 @@ def main():
     if not manifest.get('complete'):
         raise ValueError('Action training requires complete prepared replay.')
     rows = manifest['states']
-    if args.action_objective in ('balanced_target_rollout_v1','trajectory_target_rollout_v1'):rows=filter_fg_rows(rows)
+    if args.action_objective in ('balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1'):rows=filter_fg_rows(rows)
     if args.steps > 2:
         validate_cf_retention_coverage(rows, args.cf_retention_tasks)
         if args.fg != 'off':
@@ -145,7 +148,7 @@ def main():
     selected = trainable_parameters(model, args.stage, eraf=args.eraf == 'on',
                                     policy_scope=args.policy_scope, interface_scope=args.interface_scope)
     adapters = {n: p for n, p in model.mot.named_parameters() if n.endswith(('.lora_A', '.lora_B'))}
-    if args.action_objective in ('balanced_target_rollout_v1','trajectory_target_rollout_v1'):
+    if args.action_objective in ('balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1'):
         teachers = {'cf': NativeTeacher(model, adapters, args.cf_teacher)}
     else:
         teachers = {'correct': NativeTeacher(model, adapters, args.correct_teacher),
@@ -255,6 +258,7 @@ def main():
             reports.append({'id': row['id'], 'seen_variant': variant_index,
                             'initial_expert_anchor': bool(row.get('initial_expert_anchor')),
                             'ordinary_target_trajectory': bool(row.get('ordinary_target_trajectory')),
+                            'replay_trajectory_third': row.get('replay_trajectory_third'),
                             'effective_correction_weight': effective_weight(row, args.correction_weight, args.correction_task_weights),
                             'ordinary_cf_control': bool(row.get('ordinary_cf_control')), **report})
         average_gradients(selected.values())
