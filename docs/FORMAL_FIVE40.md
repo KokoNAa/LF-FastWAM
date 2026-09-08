@@ -51,3 +51,10 @@ models/exclusions, completes smoke, builds the catalog, runs the fixed matrix,
 and verifies all 600 records. A failed child stops owned children and preserves
 partial records without reporting them as complete. It never shuts down the
 platform or touches unrelated jobs. Existing paused800 training stays paused.
+
+Postprocessing: scripts/report_robotwin_formal_five40.py only accepts a complete,
+verified600 matrix. It reports both the original CF-after-lift conditional rate
+and the stricter physical-release confirmation rate, using the same lift
+population as denominator. Strict nonconfirmation alone is not a placement
+failure. This report preserves every frozen outcome and scoring threshold;
+its source can be updated without altering the running evaluation checkout.
