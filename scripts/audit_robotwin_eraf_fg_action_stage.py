@@ -18,6 +18,9 @@ def audit(root):
     root = Path(root)
     read = lambda path: json.loads(Path(path).read_text())
     plan = read(root / 'plan.json')
+    if plan.get('action_objective')=='balanced_target_rollout_v1':
+        from experiments.robotwin.balanced_target import mixture_stream, validate_recipe
+        validate_recipe(plan)
     if read(root / 'complete.json').get('complete') is not True:
         raise ValueError('Training stage is incomplete.')
     if plan['fg'] == 'off' and plan['optimization_contract'].get('fg_off_protocol') != FG_OFF_PROTOCOL:
@@ -33,6 +36,8 @@ def audit(root):
     if (not parent_matches or candidate['optimizer_steps'] != plan['steps'] or candidate['stage'] != plan['stage']
             or candidate['fg_supervision'] != plan['fg'] or candidate['provenance']['eraf'] != plan['eraf']):
         raise ValueError('Checkpoint lineage/stage does not match the run plan.')
+    if plan.get('action_objective')=='balanced_target_rollout_v1' and candidate['provenance'].get('action_objective')!=plan['action_objective']:
+        raise ValueError('Checkpoint objective provenance differs from the immutable plan.')
     allowed = set(plan['trainable_parameters'])
     changed, frozen = [], []
     counts = {}
@@ -89,12 +94,14 @@ def audit(root):
         if len({journal[index]['grad_norm'] for journal in journals}) != 1:
             raise ValueError(f'Rank gradient norms differ at step{step}.')
         for rank, journal in enumerate(journals):
-            if plan.get('action_objective') == 'deployed_rollout_v1':
+            if plan.get('action_objective') in ('deployed_rollout_v1','balanced_target_rollout_v1'):
                 for example in journal[index]['examples']:
-                    if (example.get('action_objective') != 'deployed_rollout_v1'
+                    if (example.get('action_objective') != plan['action_objective']
                         or example.get('denoising_steps') != 10 or example.get('executed_horizon') != 24
                         or example.get('gradient_horizon') != 'all_ten_steps'):
                         raise ValueError('Actual loss differs from the declared deployed rollout objective.')
+                    if plan['action_objective']=='balanced_target_rollout_v1' and (example.get('supervised_languages')!=['target'] or example.get('conditional_difference') is not False or 'deployed_source_mse_first24' in example):
+                        raise ValueError('Balanced objective unexpectedly supervised source language.')
             if [r['id'] for r in journal[index]['examples']] != [r['id'] for r in batch[rank::world]]:
                 raise ValueError(f'Actual sampled states differ at step{step}, rank{rank}.')
             if ([bool(r.get('ordinary_cf_control')) for r in journal[index]['examples']]

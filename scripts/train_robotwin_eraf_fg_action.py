@@ -20,7 +20,7 @@ def main():
     for key in ('manifest', 'source-bank', 'checkpoint', 'output', 'correct-teacher', 'cf-teacher'):
         ap.add_argument('--' + key, required=True)
     ap.add_argument('--stage', choices=['interface', 'joint'], required=True)
-    ap.add_argument('--action-objective', choices=['flow_endpoint_v1','deployed_rollout_v1'], default='flow_endpoint_v1',
+    ap.add_argument('--action-objective', choices=['flow_endpoint_v1','deployed_rollout_v1','balanced_target_rollout_v1'], default='flow_endpoint_v1',
                     help='Explicit experiment: supervise final24 executed actions through all ten denoising steps.')
     ap.add_argument('--fg', choices=['off', 'local', 'full'], default='full')
     ap.add_argument('--eraf', choices=['on', 'off'], default='on')
@@ -64,7 +64,7 @@ def main():
     ap.add_argument('--disable-seen-language-augmentation', action='store_true')
     ap.add_argument('--resume-state', help='Resume saved FP32 masters and optimizer at the supplied checkpoint.')
     args = ap.parse_args()
-    if args.action_objective == 'deployed_rollout_v1' and (args.policy_scope != 'action' or args.fg == 'local'):
+    if args.action_objective in ('deployed_rollout_v1','balanced_target_rollout_v1') and (args.policy_scope != 'action' or args.fg == 'local'):
         ap.error('Deployed rollout objective requires action-only LoRA scope and full/off FG.')
     from experiments.robotwin.initial_anchor import validate_weights, effective_weight
     validate_weights(args.correction_task_weights)
@@ -80,6 +80,9 @@ def main():
     from experiments.robotwin.eraf_fg_training import backward_example, mixture_stream, mixture_counts, supervision_payload, FG_OFF_PROTOCOL, validate_fg_gradient_route
     if args.action_objective == 'deployed_rollout_v1':
         from experiments.robotwin.deployed_action_objective import backward_deployed_example as backward_example
+    if args.action_objective == 'balanced_target_rollout_v1':
+        from experiments.robotwin.balanced_target import backward_example, mixture_stream, mixture_counts, filter_fg_rows, validate_recipe
+        validate_recipe(vars(args))
     from experiments.robotwin.eraf_action_protocol import validate_action_parent, parameter_learning_rates, validate_joint_identity_audit
     from experiments.robotwin.compact_replay import ReplayPayloads
     from experiments.robotwin.native_teacher import NativeTeacher
@@ -121,6 +124,7 @@ def main():
     if not manifest.get('complete'):
         raise ValueError('Action training requires complete prepared replay.')
     rows = manifest['states']
+    if args.action_objective == 'balanced_target_rollout_v1':rows=filter_fg_rows(rows)
     if args.steps > 2:
         validate_cf_retention_coverage(rows, args.cf_retention_tasks)
         if args.fg != 'off':
@@ -138,8 +142,11 @@ def main():
     selected = trainable_parameters(model, args.stage, eraf=args.eraf == 'on',
                                     policy_scope=args.policy_scope, interface_scope=args.interface_scope)
     adapters = {n: p for n, p in model.mot.named_parameters() if n.endswith(('.lora_A', '.lora_B'))}
-    teachers = {'correct': NativeTeacher(model, adapters, args.correct_teacher),
-                'cf': NativeTeacher(model, adapters, args.cf_teacher)}
+    if args.action_objective == 'balanced_target_rollout_v1':
+        teachers = {'cf': NativeTeacher(model, adapters, args.cf_teacher)}
+    else:
+        teachers = {'correct': NativeTeacher(model, adapters, args.correct_teacher),
+                    'cf': NativeTeacher(model, adapters, args.cf_teacher)}
     rates = parameter_learning_rates(selected, args.learning_rate, args.interface_learning_rate)
     optimizer = MasterAdamW(selected.values(), lr=args.learning_rate,
                            learning_rates=rates if args.interface_learning_rate is not None else None)
@@ -209,8 +216,8 @@ def main():
             'optimization_contract': optimization_contract,
             'trainable_parameters': list(selected), 'optimizer_precision': 'FP32 master weights',
             'mixture': {'correct_retention': counts['correct'], 'cf_retention': counts['cf'],
-                        'expert_pairs': 3, 'fg': 0 if args.fg == 'off' else 3,
-                        'ordinary_cf_control': 3 if args.fg == 'off' else 0}}, indent=2))
+                        'expert_pairs': counts['pair'], 'fg': 0 if args.fg == 'off' else counts['fg'],
+                        'ordinary_cf_control': counts['fg'] if args.fg == 'off' else 0}}, indent=2))
     started = time.monotonic()
     journal = (root / f'rank{rank}.jsonl').open('x', buffering=1)
     for step in range(start + 1, args.steps + 1):

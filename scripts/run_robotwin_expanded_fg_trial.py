@@ -52,7 +52,10 @@ def action_command(plan,root,arm):
     from scripts.run_robotwin_ten_task_action_expansion import train_command
     cmd=train_command(plan,root,arm)
     cmd[cmd.index('--correction-weight')+1]='1'
-    cmd += ['--target-tasks',*TARGETS]
+    cmd += ['--target-tasks',*plan.get('target_tasks',TARGETS)]
+    if plan.get('action_objective')=='balanced_target_rollout_v1':
+        cmd[cmd.index('--correct-count')+1]='0'
+        cmd[cmd.index('--cf-count')+1]='4'
     if plan.get('initial_expert_tasks'):
         cmd += ['--initial-expert-tasks',*plan['initial_expert_tasks'],
                 '--correction-task-weights',json.dumps(plan['correction_task_weights'],sort_keys=True)]
