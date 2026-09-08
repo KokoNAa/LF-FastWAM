@@ -682,6 +682,7 @@ class GoalObserver:
         self.source_ever_success = False
         self.counterfactual_ever_success = False
         self.last_snapshot: GoalSnapshot | None = None
+        self.manipulation_observer = None
 
     def update(self) -> GoalSnapshot:
         snapshot = GoalSnapshot(
@@ -703,9 +704,16 @@ class GoalObserver:
             raise ValueError(f"Unsupported selected goal: {goal_name!r}")
         if self._selected_goal_installed:
             raise RuntimeError("A selected RoboTwin goal is already installed")
+        if getattr(self.env, '_record_manipulation_metrics', False):
+            from experiments.robotwin.manipulation_metrics import ManipulationObserver
+            self.manipulation_observer = ManipulationObserver(
+                self.env, self.pair.source_goal if goal_name == 'source' else self.pair.counterfactual_goal)
 
         def selected_check_success() -> bool:
-            return self.update().selected(goal_name).success
+            selected = self.update().selected(goal_name)
+            if self.manipulation_observer is not None:
+                self.manipulation_observer.sample(selected)
+            return selected.success
 
         self.env.check_success = selected_check_success
         self._selected_goal_installed = True
@@ -720,6 +728,8 @@ class GoalObserver:
     def episode_diagnostics(self, *, selected_goal: str) -> dict[str, Any]:
         snapshot = self.update()
         return {
+            **({'manipulation_metrics': self.manipulation_observer.report()}
+               if self.manipulation_observer is not None else {}),
             "selected_goal": selected_goal,
             "selected_goal_success": bool(
                 self.source_ever_success

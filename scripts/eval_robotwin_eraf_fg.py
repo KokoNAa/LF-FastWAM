@@ -65,6 +65,7 @@ def main():
     ap.add_argument('--policy-kind', choices=['repair', 'legacy'], default='repair')
     ap.add_argument('--memory-mode', choices=['carry', 'reset'], default='carry')
     ap.add_argument('--videos', action='store_true')
+    ap.add_argument('--manipulation-metrics', action='store_true')
     ap.add_argument('--skip-file-hashes', action='store_true',
                     help='Bind checkpoint/catalog file metadata without repeated full-file scans.')
     args = ap.parse_args()
@@ -147,6 +148,7 @@ def main():
         task, options = _load_robotwin_args(robotwin_root=Path(args.robotwin_root), task_name=task_name,
                                           task_config='demo_clean', output_root=root)
         install_pgc_observation_contract(task, pair_spec_from_source_task(task_name))
+        task._record_manipulation_metrics = args.manipulation_metrics
         official = official_module(args.robotwin_root)
         pair = select_intervention_pair(pairs, source_task=task_name)
         options.update(eval_mode=True, render_freq=0, need_plan=True, save_data=False,
@@ -256,6 +258,7 @@ def main():
                 'canonical_metadata': file_metadata(canonical_path) if args.skip_file_hashes else None,
                 'skip_file_hashes': args.skip_file_hashes, 'eraf': args.eraf, 'policy_kind': args.policy_kind,
                 'memory_mode': args.memory_mode,
+                'manipulation_metrics': args.manipulation_metrics,
                 'deployment': {'action_horizon': 32, 'replan_steps': 24, 'inference_steps': 10}}, indent=2))
     if args.mode == 'catalog':
         (root / 'catalog_plan.json').write_text(json.dumps(vars(args), indent=2))
