@@ -99,7 +99,8 @@ def test_fg_and_ordinary_control_have_identical_target_loss(monkeypatch):
         model = SimpleNamespace(torch_dtype=torch.float32, x=torch.nn.Parameter(torch.tensor(0.)))
         backward_example(model, row, payload(), torch.zeros((1,32,14)), None, teachers={})
         gradients.append(model.x.grad.item())
-    assert gradients == [-6., -6.]
+    assert gradients[0] == gradients[1]
+    assert gradients == pytest.approx([-6., -6.])
 
 
 def test_target_payload_never_accepts_unlabelled_or_native_rows():
