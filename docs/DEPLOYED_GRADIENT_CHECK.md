@@ -1,0 +1,9 @@
+# Fixed training-batch gradient alignment
+
+Motivation: the completed deployed-action fixed-state check found initial cup/pill action error increased on selected training as well as held-out states. Manifest inspection rules out direct cup/pill teacher-retention examples: both retention strata cover only the old five tasks. This check tests possible interference through shared trainable parameters without changing any checkpoint or the active CF experiment.
+
+At each completed final200 ERAF model, replay the first two actual sampler batches with their original per-example noise seeds. Use the exact trainable parameter names, task correction weights, loss branches and preservation teachers from the stage plan. Compute the weighted two-batch mean gradient (coefficient 1/24 per row) separately for initial cup, initial pill, other ordinary experts, FG or its matched ordinary replacement, Correct retention, and CF retention. Record norm/dot/cosine separately in action LoRA and ERAF parameters. The frozen final model is evaluated throughout; this does not reproduce sequential optimizer updates. No optimizer is instantiated.
+
+All 24 examples are training data selected without evaluating outcomes. Final parameter tensor digests, model/teacher/manifest/plan hashes must remain unchanged. The two arms must share 18 actual common rows and six task/seed-matched FG replacement positions. Only text/JSON is archived locally. The supervisor uses idle GPUs 0/2, requires the original primary controller to remain in joint training with at least 30 updates remaining in each control, yields on a primary-stage change, and kills only its own process groups within 360 seconds. No platform shutdown.
+
+Negative cosine is local Euclidean loss interference, not the actual Adam direction, global causal attribution or CF success. The unchanged complete four-arm CF evaluation remains required before selecting a new training candidate.
