@@ -62,7 +62,7 @@ def freeze(source, root, gpus):
     available = {int(x) for x in subprocess.check_output(['nvidia-smi','--query-gpu=index','--format=csv,noheader'],text=True).splitlines()}
     if len(gpus) != len(set(gpus)) or not set(gpus) <= available: raise ValueError('Invalid GPUs.')
     if shutil.disk_usage(RUNS).free < 10*1024**3: raise ValueError('Need 10 GiB free for outputs.')
-    starts = {task:91385000+1000*i for i,task in enumerate(TASKS)}
+    starts = {task:91305000+1000*i for i,task in enumerate(TASKS)}
     for start in starts.values(): validate_namespace('dev',start,400)
     excluded, receipts = set(), []
     for directory, dirs, names in os.walk(RUNS):
