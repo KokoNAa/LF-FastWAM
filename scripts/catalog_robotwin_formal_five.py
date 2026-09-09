@@ -25,11 +25,14 @@ def main():
     ap.add_argument('--exclude-records', action='append', default=[],
                     help='Training JSON manifest or prior catalog JSONL; repeat for every source. Required for test.')
     ap.add_argument('--gpu', type=int, required=True)
-    ap.add_argument('--deadline', required=True)
+    duration = ap.add_mutually_exclusive_group(required=True)
+    duration.add_argument('--deadline')
+    duration.add_argument('--no-deadline', action='store_true')
+    ap.add_argument('--task-config', choices=['demo_clean', 'demo_randomized'], default='demo_clean')
     ap.add_argument('--robotwin-root', type=Path, default=Path('/root/gpufree-data/LF-FastWAM/third_party/RoboTwin'))
     args = ap.parse_args()
-    cutoff = datetime.fromisoformat(args.deadline)
-    if cutoff.tzinfo is None:
+    cutoff = None if args.no_deadline else datetime.fromisoformat(args.deadline)
+    if cutoff is not None and cutoff.tzinfo is None:
         ap.error('Declare an absolute deadline.')
     if args.episodes < 1 or args.max_attempts < args.episodes:
         ap.error('Invalid episode or attempt count')
@@ -49,16 +52,16 @@ def main():
     pair = select_intervention_pair(load_intervention_manifest(
         REPO/'configs/eval/robotwin_cis_ten_tasks.json', robotwin_root=args.robotwin_root), source_task=args.task)
     task, options = _load_robotwin_args(robotwin_root=args.robotwin_root, task_name=args.task,
-                                        task_config='demo_clean', output_root=args.output)
+                                        task_config=args.task_config, output_root=args.output)
     install_pgc_task_contract(task, spec)
     options.update(eval_mode=True, render_freq=0, need_plan=True, save_data=False)
     official = official_module(args.robotwin_root)
-    root = args.output / args.task / 'demo_clean/correct'
+    root = args.output / args.task / args.task_config / 'correct'
     root.mkdir(parents=True, exist_ok=False)
     count = 0
     with (root/'episodes.jsonl').open('x', buffering=1) as journal, (root/'expert_screening.jsonl').open('x', buffering=1) as events:
         for seed in range(args.start_seed, args.start_seed + args.max_attempts):
-            if time.time() >= cutoff.timestamp():
+            if cutoff is not None and time.time() >= cutoff.timestamp():
                 raise TimeoutError('Authorized work cutoff reached')
             if seed in excluded:
                 events.write(json.dumps({'seed': seed, 'accepted': False, 'error': 'Excluded training/development seed'})+'\n')
@@ -98,7 +101,7 @@ def main():
                                   else official._deterministic_instruction(task_name=pair.counterfactual_task,
                                       episode_info=source_info, instruction_type='unseen', scene_seed=seed))
                 row = dict(format=EPISODE_FORMAT, pair_id=spec.pair_id, source_task=args.task,
-                    counterfactual_task=spec.counterfactual_task, task_config='demo_clean', condition='correct',
+                    counterfactual_task=spec.counterfactual_task, task_config=args.task_config, condition='correct',
                     episode_index=count, scene_seed=seed, instruction_type='unseen', source_instruction=source,
                     counterfactual_instruction=counterfactual, policy_instruction=source,
                     instruction_goal='source', selected_goal='source', initial_source_goal_success=False,
@@ -116,7 +119,8 @@ def main():
                     _close(task)
             if count == args.episodes:
                 break
-    report = dict(complete=count == args.episodes, episodes=count, required_episodes=args.episodes,
+    report = dict(task_config=args.task_config, domain_randomization=options['domain_randomization'],
+                  complete=count == args.episodes, episodes=count, required_episodes=args.episodes,
                   selection='matched physical starts; both expert endpoints satisfy their selected goal and reject the opposite; no policy selection',
                   control_replay_verified=False, start_seed=args.start_seed, catalog_split=args.split,
                   max_attempts=args.max_attempts, exclusion_records=exclusion_receipts,

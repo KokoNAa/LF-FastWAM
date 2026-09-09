@@ -57,6 +57,7 @@ def main():
     ap.add_argument('--catalog-root')
     ap.add_argument('--tasks', nargs='+', default=['place_a2b_left', 'place_a2b_right', 'place_burger_fries', 'stack_blocks_two', 'blocks_ranking_rgb'])
     ap.add_argument('--conditions', nargs='+', choices=['correct', 'counterfactual'], default=['correct', 'counterfactual'])
+    ap.add_argument('--task-config', choices=['demo_clean', 'demo_randomized'], default='demo_clean')
     ap.add_argument('--episodes', type=int, default=3)
     ap.add_argument('--gpu', type=int, default=0)
     ap.add_argument('--start-seed', type=int)
@@ -87,8 +88,10 @@ def main():
         for task in args.tasks:
             initial_by_condition = []
             for condition in args.conditions:
-                path = root / task / 'demo_clean' / condition
+                path = root / task / args.task_config / condition
                 report = json.loads((path / 'complete.json').read_text())
+                if report.get('task_config', 'demo_clean') != args.task_config:
+                    raise ValueError('Mixed evaluation domains.')
                 if not report['complete'] or report['checkpoint'] != args.checkpoint:
                     raise ValueError('Mixed or incomplete checkpoint evaluation.')
                 if bool(report.get('skip_file_hashes', False)) != args.skip_file_hashes:
@@ -98,7 +101,7 @@ def main():
                     raise ValueError('Evaluation checkpoint changed.')
                 signatures.append((report['eraf'], report['policy_kind'], report.get('memory_mode', 'carry'),
                                    json.dumps(report['deployment'], sort_keys=True)))
-                canonical_path = Path(args.catalog_root) / task / 'demo_clean/correct/episodes.jsonl'
+                canonical_path = Path(args.catalog_root) / task / args.task_config / 'correct/episodes.jsonl'
                 if (report.get('canonical_metadata') != file_metadata(canonical_path) if args.skip_file_hashes
                         else report['canonical_sha256'] != file_sha256(canonical_path)):
                     raise ValueError('Matched scene/instruction catalog changed.')
@@ -110,6 +113,8 @@ def main():
                     raise ValueError('Evaluation did not use the exact matched seeds and instructions.')
                 initial_by_condition.append(json.loads((path / 'initial_states.json').read_text()))
                 cell = json.loads((path / 'summary.json').read_text())
+                if cell.get('task_config', 'demo_clean') != args.task_config:
+                    raise ValueError('Summary domain differs from requested evaluation.')
                 if cell['total_episodes'] != args.episodes:
                     raise ValueError('Cell episode count changed.')
                 cells.append(cell | {'episodes': cell['total_episodes']})
@@ -121,7 +126,7 @@ def main():
                    'episodes': sum(r['episodes'] for r in cells)}
         (root / 'summary.json').write_text(json.dumps(summary, indent=2))
         from experiments.robotwin.eraf_fg_contract import CF_MINIMUM, acceptance
-        if args.episodes == 3 and set(args.tasks) == set(CF_MINIMUM) and len(args.conditions) == 2:
+        if args.task_config == 'demo_clean' and args.episodes == 3 and set(args.tasks) == set(CF_MINIMUM) and len(args.conditions) == 2:
             decision = acceptance(summary)
             (root / 'acceptance.json').write_text(json.dumps(decision, indent=2))
             print(json.dumps(decision), flush=True)
@@ -146,7 +151,7 @@ def main():
     checkpoint_metadata = file_metadata(args.checkpoint) if args.checkpoint and args.skip_file_hashes else None
     for task_name in args.tasks:
         task, options = _load_robotwin_args(robotwin_root=Path(args.robotwin_root), task_name=task_name,
-                                          task_config='demo_clean', output_root=root)
+                                          task_config=args.task_config, output_root=root)
         install_pgc_observation_contract(task, pair_spec_from_source_task(task_name))
         task._record_manipulation_metrics = args.manipulation_metrics
         official = official_module(args.robotwin_root)
@@ -156,7 +161,7 @@ def main():
                        eval_video_log=args.videos)
         video_size = official.get_eval_video_size(options) if args.videos else None
         if args.mode == 'catalog':
-            directory = root / task_name / 'demo_clean' / 'correct'
+            directory = root / task_name / args.task_config / 'correct'
             directory.mkdir(parents=True, exist_ok=False)
             journal = (directory / 'episodes.jsonl').open('x', buffering=1)
             events = (directory / 'screening.jsonl').open('x', buffering=1)
@@ -177,7 +182,7 @@ def main():
                               official._deterministic_instruction(task_name=pair.counterfactual_task,
                                   episode_info=info['info'], instruction_type='unseen', scene_seed=seed))
                     row = {'format': EPISODE_FORMAT, 'pair_id': pair.pair_id, 'source_task': task_name,
-                           'counterfactual_task': pair.counterfactual_task, 'task_config': 'demo_clean',
+                           'counterfactual_task': pair.counterfactual_task, 'task_config': args.task_config,
                            'condition': 'correct', 'episode_index': count, 'scene_seed': seed,
                            'instruction_type': 'unseen', 'source_instruction': source,
                            'counterfactual_instruction': target, 'policy_instruction': source,
@@ -200,10 +205,10 @@ def main():
             (directory / 'catalog_complete.json').write_text(json.dumps({'complete': True, 'episodes': count,
                 'selection': 'source expert only', 'start_seed': args.start_seed}))
             continue
-        canonical_path = Path(args.catalog_root) / task_name / 'demo_clean/correct/episodes.jsonl'
+        canonical_path = Path(args.catalog_root) / task_name / args.task_config / 'correct/episodes.jsonl'
         canonical = load_matched_episode_records(canonical_path, expected_pair_id=pair.pair_id,
             expected_source_task=task_name, expected_counterfactual_task=pair.counterfactual_task,
-            expected_task_config='demo_clean', expected_instruction_type='unseen', expected_episodes=args.episodes)
+            expected_task_config=args.task_config, expected_instruction_type='unseen', expected_episodes=args.episodes)
         if policy is None:
             manifest = json.loads(Path(args.manifest).read_text())
             if args.policy_kind == 'repair':
@@ -217,11 +222,11 @@ def main():
             if args.memory_mode == 'reset':
                 install_memory_reset(policy)
             print(f'[evaluation-runtime] eraf={args.eraf} memory={args.memory_mode}', flush=True)
-        policy.task_name, policy.task_config = task_name, 'demo_clean'
+        policy.task_name, policy.task_config = task_name, args.task_config
         from experiments.robotwin.fastwam_policy.deploy_policy import eval as evaluate, reset_model
         official.eval_function_decorator = lambda name, function: {'eval': evaluate, 'reset_model': reset_model}[function]
         for condition in args.conditions:
-            directory = root / task_name / 'demo_clean' / condition
+            directory = root / task_name / args.task_config / condition
             directory.mkdir(parents=True, exist_ok=False)
             options['eval_video_save_dir'] = directory if args.videos else None
             initial_hashes = []
@@ -246,10 +251,13 @@ def main():
             finally:
                 policy.begin_episode = original_begin
             summary = official._summarize_intervention_records(records=records, pair=pair, condition=condition,
-                task_config='demo_clean', instruction_type='unseen', checkpoint=args.checkpoint)
+                task_config=args.task_config, instruction_type='unseen', checkpoint=args.checkpoint)
             (directory / 'summary.json').write_text(json.dumps(summary, indent=2))
             (directory / 'initial_states.json').write_text(json.dumps(initial_hashes, indent=2))
             (directory / 'complete.json').write_text(json.dumps({'complete': len(records) == args.episodes,
+                'task_config': args.task_config,
+                'domain_randomization': options['domain_randomization'],
+                'task_config_sha256': file_sha256(Path(args.robotwin_root) / 'task_config' / (args.task_config + '.yml')),
                 'checkpoint': args.checkpoint, 'checkpoint_sha256': checkpoint_hash,
                 'canonical_sha256': None if args.skip_file_hashes else file_sha256(canonical_path),
                 'checkpoint_metadata': checkpoint_metadata,
