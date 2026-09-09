@@ -26,6 +26,16 @@ FORMAL = RUNS / 'robotwin_formal_five40/20260908-balanced-target200'
 CURRENT = RUNS / 'robotwin_five_task_repair/20260908-five-task-expert200'
 
 
+def validated_gpus(gpus, available=None):
+    selected = list(gpus)
+    if (not selected or any(type(g) is not int or g < 0 for g in selected)
+            or len(set(selected)) != len(selected) or 12 % len(selected)):
+        raise ValueError('Use distinct nonnegative GPU IDs; the count must divide global batch12.')
+    if available is not None and not set(selected) <= set(available):
+        raise ValueError('A requested GPU is unavailable.')
+    return selected
+
+
 def training_command(plan, root, arm):
     spec = plan['arms'][arm]
     cmd = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
@@ -72,6 +82,7 @@ def coverage(rows, steps):
 
 
 def admission(args):
+    gpus = validated_gpus(args.gpus)
     root = args.output.resolve()
     if root.exists() or not root.is_relative_to(RUNS):
         raise ValueError('Use a new output on the server data disk.')
@@ -85,7 +96,7 @@ def admission(args):
     rows = read(source['manifest'])['states']
     arms = dict(no_eraf=dict(eraf='off',fg='off'),eraf_only=dict(eraf='on',fg='off'),
                 eraf_fg=dict(eraf='on',fg='full'))
-    for a, gpus in zip(arms, ([],[0,1,2,3],[0,1,2,3]), strict=True): arms[a]['gpus'] = gpus
+    for arm, spec in arms.items(): spec['gpus'] = [] if arm == 'no_eraf' else list(gpus)
     bindings = {source['manifest']:sha(source['manifest']), str(SOURCE/'protocol.json'):sha(SOURCE/'protocol.json')}
     import torch
     manifest = read(source['manifest'])
@@ -113,14 +124,14 @@ def admission(args):
     if subprocess.check_output(['nvidia-smi','--query-compute-apps=pid','--format=csv,noheader'],text=True).strip():
         raise ValueError('A GPU compute process is already running.')
     devices = subprocess.check_output(['nvidia-smi','--query-gpu=index','--format=csv,noheader'],text=True)
-    if not set(range(5)) <= {int(x) for x in devices.splitlines()}: raise ValueError('Five GPUs required.')
+    validated_gpus(gpus, {int(x) for x in devices.splitlines()})
     if shutil.disk_usage(RUNS).free < 12*1024**3: raise ValueError('Need 12GiB free data-disk space.')
     config = REPO/'configs/eval/robotwin_cis_ten_tasks.json'; bindings[str(config)] = sha(config)
     plan = dict(format='robotwin_five_task_expert_trial_v1',complete=False,status='admitted',jobs={},
         code_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
         output=str(root),source_trial=str(SOURCE),prior_formal=str(FORMAL),manifest=source['manifest'],
         source_bank=source['source_bank'],strongest_checkpoint=source['strongest_checkpoint'],
-        arms=arms,tasks=list(TASKS),fg_tasks=list(FG_TASKS),steps=args.steps,seed=42,
+        arms=arms,gpus=gpus,tasks=list(TASKS),fg_tasks=list(FG_TASKS),steps=args.steps,seed=42,
         action_objective=OBJECTIVE,recipe='4 unit-weight old-policy anchors + 4 five-task target expert examples + 4 two-task FG or matched ordinary target examples; temporal thirds balanced.',
         semantic_training_this_trial=False,
         seed_starts=starts,dev_episodes=args.dev_episodes,deadline=args.deadline,input_sha256=bindings,
@@ -239,6 +250,8 @@ def main():
     ap.add_argument('--current-no-eraf-trial',type=Path,default=CURRENT,
                     help='Completed trial whose audited final no-eraf is the fixed action parent.')
     ap.add_argument('--steps',type=int,choices=[2,200],default=200)
+    ap.add_argument('--gpus',type=int,nargs='+',default=[0,1,2],
+                    help='GPU IDs used by each serial training stage and the evaluation queue (default: 0 1 2).')
     ap.add_argument('--dev-episodes',type=int,default=12);ap.add_argument('--dev-seed',type=int,default=91385000)
     ap.add_argument('--preflight-only',action='store_true')
     args=ap.parse_args();cutoff=datetime.fromisoformat(args.deadline)
@@ -278,7 +291,7 @@ def main():
             budget()
             for gpu,name in list(active.items()):
                 if poll(name):del active[gpu]
-            for gpu in range(5):
+            for gpu in plan['gpus']:
                 if gpu in active or not pending:continue
                 name,cmd=pending.pop(0);launch(name,cmd+['--gpu',str(gpu)],[gpu]);active[gpu]=name
             if active:time.sleep(5)

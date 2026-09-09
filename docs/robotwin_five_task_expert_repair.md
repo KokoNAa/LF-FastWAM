@@ -16,7 +16,7 @@
 
 训练数据、五任务专家动作配方和学习率保持不变：action LoRA LR3e-6、ERAF接口LR3e-5、global12、seed42，冻结视频和语义头。教师保持目标仍是当前 no-eraf。ERAF+FG阶段增加FG纠错监督，不进行另一轮语义预训练。相对于当前no-eraf，三个成品累计新增优化步数是 **0/200/400**，不能按相同新增训练预算的消融实验解释。
 
-默认五卡，每个训练阶段依次使用四卡；三模型评测使用五卡调度。完整训练后，重跑每任务12个相同的新开发场景，共180回合。默认开发种子起点91385000；历史场景重叠即拒绝，不自动换种子。夹起/放置指标、成功判据和推理配置不变。先执行2步ERAF→2步FG的独立冒烟；通过后从原始当前no-eraf重新开始正式200→200，不能接着冒烟权重训练。
+当前三卡：默认 `--gpus 0 1 2`，两个训练阶段依次使用全部三卡，global12保持不变，每rank分配4个样本；三模型评测也使用这三卡调度。GPU数量必须整除12，设备缺失或重复即拒绝。完整训练后，重跑每任务12个相同的新开发场景，共180回合。默认开发种子起点91385000；历史场景重叠即拒绝，不自动换种子。夹起/放置指标、成功判据和推理配置不变。先执行2步ERAF→2步FG的独立冒烟；通过后从原始当前no-eraf重新开始正式200→200，不能接着冒烟权重训练。
 
 服务器恢复后，在干净的 `codex/robotwin-five-task-repair` 工作区执行。先明确新的绝对截止时间，旧的凌晨关机窗口已经结束：
 
@@ -26,7 +26,7 @@ ROBOTWIN_OUTPUT=/root/gpufree-data/LF-FastWAM/runs/robotwin_five_task_repair/cur
 /opt/conda/bin/python scripts/run_robotwin_five_task_repair.py \
   --current-no-eraf-trial /root/gpufree-data/LF-FastWAM/runs/robotwin_five_task_repair/20260908-five-task-expert200 \
   --output "$ROBOTWIN_OUTPUT" --deadline "$ROBOTWIN_DEADLINE" \
-  --steps 200 --dev-episodes 12 --dev-seed 91385000
+  --gpus 0 1 2 --steps 200 --dev-episodes 12 --dev-seed 91385000
 ```
 
 预检加 `--preflight-only`，不会生成权重或启动训练。冒烟改用新的输出目录和 `--steps 2`。所有模型及视频仍只存服务器数据盘。

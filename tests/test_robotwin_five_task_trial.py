@@ -4,6 +4,17 @@ from experiments.robotwin.five_task_action import TASKS, FG_TASKS, OBJECTIVE
 from tests.test_robotwin_five_task_action import rows
 
 
+def test_three_gpu_schedule_preserves_global_batch_and_rejects_invalid_devices():
+    import pytest
+    from scripts.run_robotwin_five_task_repair import validated_gpus
+    assert validated_gpus([0,1,2], {0,1,2}) == [0,1,2]
+    assert validated_gpus([1,3,5], {1,3,5}) == [1,3,5]
+    assert 12 // len(validated_gpus([0,1,2])) == 4
+    for bad in ([],[0,0],[0,-1],[0,1,2,3,4],[False,1]):
+        with pytest.raises(ValueError): validated_gpus(bad)
+    with pytest.raises(ValueError,match='unavailable'):validated_gpus([0,1,2],{0,1})
+
+
 def test_stage_commands_keep_recipe_but_fg_continues_completed_eraf():
     plan = dict(steps=200,manifest='/manifest',source_bank='/bank',strongest_checkpoint='/R',arms={
         'no_eraf':dict(eraf='off',fg='off',parent='/R',gpus=[0]),
