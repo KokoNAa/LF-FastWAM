@@ -4,11 +4,11 @@ from experiments.robotwin.five_task_action import TASKS, FG_TASKS, OBJECTIVE
 from tests.test_robotwin_five_task_action import rows
 
 
-def test_three_commands_use_new_five_task_recipe_with_matching_budget():
+def test_stage_commands_keep_recipe_but_fg_continues_completed_eraf():
     plan = dict(steps=200,manifest='/manifest',source_bank='/bank',strongest_checkpoint='/R',arms={
         'no_eraf':dict(eraf='off',fg='off',parent='/R',gpus=[0]),
         'eraf_only':dict(eraf='on',fg='off',parent='/Sordinary',gpus=[1,2],identity_audit='/ordinary.json'),
-        'eraf_fg':dict(eraf='on',fg='full',parent='/Sfg',gpus=[3,4],identity_audit='/fg.json')})
+        'eraf_fg':dict(eraf='on',fg='full',parent='/completed_eraf',gpus=[3,4],parent_sha256='a'*64)})
     for arm,spec in plan['arms'].items():
         cmd=training_command(plan,Path('/output'),arm)
         for flag,value in [('--steps','200'),('--save-every','200'),('--cf-weight','1'),('--correct-count','0'),
@@ -18,7 +18,8 @@ def test_three_commands_use_new_five_task_recipe_with_matching_budget():
         start=cmd.index('--cf-retention-tasks')+1
         assert cmd[start:start+5]==list(TASKS)
         assert ('--warm-policy' in cmd)==(arm=='no_eraf')
-        assert ('--zero-context-joint' in cmd)==(arm!='no_eraf')
+        assert ('--zero-context-joint' in cmd)==(arm=='eraf_only')
+        assert ('--continue-eraf-with-fg' in cmd)==(arm=='eraf_fg')
 
 
 def test_preflight_counts_actual_sampler_and_balances_late_trajectory_exposure():

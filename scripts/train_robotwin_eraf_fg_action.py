@@ -34,6 +34,10 @@ def main():
     ap.add_argument('--zero-context-joint', action='store_true',
                     help='Opt in to joint training directly from an exact-identity residual bootstrap, without interface warmup.')
     ap.add_argument('--identity-audit', help='Hash-bound complete ten-task full-denoising identity report for --zero-context-joint.')
+    ap.add_argument('--continue-eraf-with-fg', action='store_true',
+                    help='Start FG training from every weight of a completed ERAF-on/FG-off joint model.')
+    ap.add_argument('--continuation-parent-sha256',
+                    help='Required exact completed ERAF checkpoint hash for FG continuation.')
     ap.add_argument('--correct-count', type=int, default=4)
     ap.add_argument('--cf-count', type=int, default=2)
     ap.add_argument('--correct-weight', type=float, default=2.)
@@ -70,6 +74,8 @@ def main():
     validate_weights(args.correction_task_weights)
     if args.zero_context_joint != bool(args.identity_audit):
         ap.error('--zero-context-joint and --identity-audit must be supplied together')
+    if args.continue_eraf_with_fg != bool(args.continuation_parent_sha256):
+        ap.error('--continue-eraf-with-fg and --continuation-parent-sha256 must be supplied together')
     if not math.isfinite(args.correction_weight) or args.correction_weight <= 0:
         ap.error('--correction-weight must be positive and finite')
     if len(set(args.target_tasks)) != len(args.target_tasks):ap.error('Duplicate target tasks')
@@ -106,13 +112,18 @@ def main():
     parent_payload = validate_payload(torch.load(args.checkpoint, map_location='cpu', weights_only=False))
     validate_action_parent(parent_payload, stage=args.stage, eraf=args.eraf, fg=args.fg,
                            resume=bool(args.resume_state), warm_policy=args.warm_policy,
-                           zero_context_joint=args.zero_context_joint)
+                           zero_context_joint=args.zero_context_joint,
+                           continue_eraf_with_fg=args.continue_eraf_with_fg)
+    if args.continue_eraf_with_fg and file_sha256(args.checkpoint) != args.continuation_parent_sha256:
+        raise ValueError('FG continuation parent does not match the completed ERAF checkpoint hash.')
+    args.continuation_parent_optimizer_steps = parent_payload['optimizer_steps'] if args.continue_eraf_with_fg else None
     if args.zero_context_joint:
         validate_joint_identity_audit(json.loads(Path(args.identity_audit).read_text()),
                                       checkpoint_sha256=file_sha256(args.checkpoint),
                                       manifest_sha256=file_sha256(args.manifest))
     args.identity_audit_sha256 = file_sha256(args.identity_audit) if args.identity_audit else None
-    del parent_payload
+    if not args.continue_eraf_with_fg:
+        del parent_payload
     torch.cuda.set_device(local)
     torch.manual_seed(args.seed)
     if world > 1:
@@ -145,6 +156,16 @@ def main():
                         raise ValueError(f'Formal FG training needs {minimum} {split} scenes for {task}, got {count}.')
     policy = load_policy(args.checkpoint, manifest, device=f'cuda:{local}', seed=args.seed)
     model = policy.model
+    if args.continue_eraf_with_fg:
+        from experiments.robotwin.eraf_action_protocol import verify_continuation_weights
+        verify_continuation_weights(parent_payload, model._lora_adapter_state_dict(), model.policy_guard_modules.state_dict())
+        if rank == 0:
+            (root/'continuation_initialization.json').write_text(json.dumps(dict(complete=True,
+                parent_checkpoint=args.checkpoint, parent_sha256=args.continuation_parent_sha256,
+                parent_optimizer_steps=args.continuation_parent_optimizer_steps,
+                all_policy_and_eraf_tensors_equal=True, optimizer_updates=0,
+                optimizer_restarted_for_fg=True, eraf_reinitialized=False), indent=2)+'\n')
+        del parent_payload
     selected = trainable_parameters(model, args.stage, eraf=args.eraf == 'on',
                                     policy_scope=args.policy_scope, interface_scope=args.interface_scope)
     adapters = {n: p for n, p in model.mot.named_parameters() if n.endswith(('.lora_A', '.lora_B'))}
@@ -281,6 +302,9 @@ def main():
                                 'target_tasks': args.target_tasks, 'cf_retention_tasks': args.cf_retention_tasks,
                                 'warm_policy_initialization': args.warm_policy,
                                 'zero_context_joint_initialization': args.zero_context_joint,
+                                'continue_eraf_with_fg': args.continue_eraf_with_fg,
+                                'continuation_parent_sha256': args.continuation_parent_sha256,
+                                'continuation_parent_optimizer_steps': args.continuation_parent_optimizer_steps,
                                 'identity_audit_sha256': args.identity_audit_sha256,
                                 'interface_learning_rate': args.interface_learning_rate,
                                 'mixture_counts': counts, 'task_balanced': args.task_balanced,

@@ -10,6 +10,27 @@ from experiments.robotwin.eraf_fg_bridge import MasterAdamW
 from experiments.robotwin.eraf_fg_training import balanced_group_stream, mixture_counts, mixture_stream
 
 
+def test_fg_continuation_only_accepts_trained_eraf_without_resetting_it():
+    from experiments.robotwin.eraf_action_protocol import verify_continuation_weights
+    parent=dict(stage='joint', optimizer_steps=200, fg_supervision='off', provenance={'eraf':'on'},
+        mot_trainable={'action':torch.tensor([3.])}, policy_guard={'learned_context':torch.tensor([7.])})
+    kwargs=dict(stage='joint',eraf='on',fg='full',continue_eraf_with_fg=True)
+    validate_action_parent(parent,**kwargs)
+    verify_continuation_weights(parent,copy.deepcopy(parent['mot_trainable']),copy.deepcopy(parent['policy_guard']))
+    for patch in ({'stage':'grounding'}, {'optimizer_steps':0}, {'fg_supervision':'full'},
+                  {'provenance':{'eraf':'off'}}):
+        with pytest.raises(ValueError,match='FG continuation'):
+            validate_action_parent(parent|patch,**kwargs)
+    for patch in ({'fg':'off'}, {'stage':'interface'}, {'eraf':'off'}, {'zero_context_joint':True},
+                  {'warm_policy':True}, {'resume':True}):
+        with pytest.raises(ValueError,match='FG continuation'):
+            validate_action_parent(parent,**(kwargs|patch))
+    with pytest.raises(ValueError,match='ERAF weights'):
+        verify_continuation_weights(parent,parent['mot_trainable'],{'learned_context':torch.zeros(1)})
+    with pytest.raises(ValueError,match='policy weights'):
+        verify_continuation_weights(parent,{'action':torch.zeros(1)},parent['policy_guard'])
+
+
 def test_joint_zero_context_is_explicit_and_cannot_accept_an_updated_or_wrong_arm():
     from experiments.robotwin.context_residual import ZEROED
     parent = dict(stage='bootstrap', optimizer_steps=0, context_injection_mode='context_residual_v1',

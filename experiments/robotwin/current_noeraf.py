@@ -1,4 +1,4 @@
-"""Build ERAF branches on the exact completed no-ERAF action policy."""
+"""Initialize ERAF on the current no-ERAF policy; FG later inherits trained ERAF."""
 from copy import deepcopy
 
 
@@ -13,9 +13,9 @@ def branch_parent(policy, semantic, *, policy_path, policy_sha256,
     if (policy['stage'] != 'joint' or policy['optimizer_steps'] <= 0
             or policy['fg_supervision'] != 'off' or policy['provenance'].get('eraf') != 'off'):
         raise ValueError('The action parent must be a completed no-ERAF, no-FG policy.')
-    if (fg not in ('off', 'full') or semantic['fg_supervision'] != fg
+    if (fg != 'off' or semantic['fg_supervision'] != fg
             or semantic['stage'] != 'grounding' or not is_zero_context_parent(semantic)):
-        raise ValueError('The semantic donor must be the matching zero-output grounding arm.')
+        raise ValueError('Only the matching ordinary zero-output donor initializes ERAF; FG must continue trained ERAF.')
     for key in ('base_checkpoint', 'geometry', 'guard_config', 'lora_config'):
         if policy[key] != semantic[key]:
             raise ValueError('Incompatible component architecture: ' + key)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create two zero-update ERAF initializations on an audited final no-ERAF policy."""
+"""Initialize ordinary ERAF on current no-ERAF; never create a separate FG parent."""
 from __future__ import annotations
 import argparse
 from pathlib import Path
@@ -25,7 +25,7 @@ def prepare(source, output, *, storage_root=Path('/root/gpufree-data/LF-FastWAM/
     policy = torch.load(path, map_location='cpu', weights_only=False)
     output.mkdir(parents=True, exist_ok=False)
     arms, inputs = {}, {path: digest}
-    for arm, fg in (('eraf_only', 'off'), ('eraf_fg', 'full')):
+    for arm, fg in (('eraf_only', 'off'),):
         donor_path = protocol['arms'][arm]['parent']
         donor_sha = sha(donor_path)
         if donor_sha != protocol['input_sha256'][donor_path]:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train ERAF branches on the current completed no-ERAF control and evaluate all three."""
+"""Train current no-ERAF -> ERAF -> ERAF+FG in order, then evaluate all three."""
 from __future__ import annotations
 import argparse
 from collections import Counter
@@ -43,6 +43,10 @@ def training_command(plan, root, arm):
            '--cf-retention-tasks', *TASKS]
     if spec['eraf'] == 'off':
         cmd += ['--warm-policy']
+    elif arm == 'eraf_fg':
+        if not spec.get('parent_sha256'):
+            raise ValueError('FG must wait for the completed, audited ERAF checkpoint hash.')
+        cmd += ['--continue-eraf-with-fg', '--continuation-parent-sha256', spec['parent_sha256']]
     else:
         cmd += ['--zero-context-joint', '--identity-audit', spec['identity_audit']]
     return cmd
@@ -68,7 +72,6 @@ def coverage(rows, steps):
 
 
 def admission(args):
-    from experiments.robotwin.eraf_action_protocol import validate_joint_identity_audit
     root = args.output.resolve()
     if root.exists() or not root.is_relative_to(RUNS):
         raise ValueError('Use a new output on the server data disk.')
@@ -80,28 +83,11 @@ def admission(args):
     if sha(source['manifest']) != source['manifest_sha256']:
         raise ValueError('Training bank changed.')
     rows = read(source['manifest'])['states']
-    arms = {a: dict(eraf=source['arms'][a]['eraf'], fg=source['arms'][a]['fg'], parent=source['arms'][a]['parent'])
-            for a in ('no_eraf','eraf_only','eraf_fg')}
-    for a, gpus in zip(arms, ([0],[1,2],[3,4]), strict=True): arms[a]['gpus'] = gpus
+    arms = dict(no_eraf=dict(eraf='off',fg='off'),eraf_only=dict(eraf='on',fg='off'),
+                eraf_fg=dict(eraf='on',fg='full'))
+    for a, gpus in zip(arms, ([],[0,1,2,3],[0,1,2,3]), strict=True): arms[a]['gpus'] = gpus
     bindings = {source['manifest']:sha(source['manifest']), str(SOURCE/'protocol.json'):sha(SOURCE/'protocol.json')}
-    for arm, spec in arms.items():
-        bindings[spec['parent']] = sha(spec['parent'])
-        if spec['eraf'] == 'on':
-            mode = 'fg' if arm == 'eraf_fg' else 'ordinary'
-            path = str(Path(source['identity_root'])/mode/'summary.json')
-            validate_joint_identity_audit(read(path), checkpoint_sha256=bindings[spec['parent']], manifest_sha256=source['manifest_sha256'])
-            spec['identity_audit'] = path; bindings[path] = sha(path)
-    if bindings[arms['no_eraf']['parent']] != source['source_policy_sha256']:
-        raise ValueError('Common warm action parent changed.')
     import torch
-    common = torch.load(arms['no_eraf']['parent'], map_location='cpu', weights_only=False)
-    for arm in ('eraf_only', 'eraf_fg'):
-        other = torch.load(arms[arm]['parent'], map_location='cpu', weights_only=False)
-        if common['mot_trainable'].keys() != other['mot_trainable'].keys() or any(
-                not torch.equal(value, other['mot_trainable'][key]) for key, value in common['mot_trainable'].items()):
-            raise ValueError('Action/video adapter initialization differs across arms: '+arm)
-        del other
-    del common
     manifest = read(source['manifest'])
     for key in ('original_train_config','stats_path','base_checkpoint'):
         bindings[manifest[key]] = sha(manifest[key])
@@ -136,7 +122,7 @@ def admission(args):
         source_bank=source['source_bank'],strongest_checkpoint=source['strongest_checkpoint'],
         arms=arms,tasks=list(TASKS),fg_tasks=list(FG_TASKS),steps=args.steps,seed=42,
         action_objective=OBJECTIVE,recipe='4 unit-weight old-policy anchors + 4 five-task target expert examples + 4 two-task FG or matched ordinary target examples; temporal thirds balanced.',
-        semantic_training_this_trial=False,shared_action_initialization_verified_by_source_identity=True,
+        semantic_training_this_trial=False,
         seed_starts=starts,dev_episodes=args.dev_episodes,deadline=args.deadline,input_sha256=bindings,
         exclusions=exclusions,excluded_unique_seeds=len(seeds),expected_schedule=coverage(rows,args.steps),
         checkpoint_selection='Predeclared final step only; no partial-CF selection.',
@@ -154,7 +140,7 @@ def admission(args):
     if current_protocol['manifest'] != plan['manifest']:
         raise ValueError('Current baseline and branch training banks differ.')
     policy = torch.load(baseline, map_location='cpu', weights_only=False)
-    for arm, fg in (('eraf_only','off'),('eraf_fg','full')):
+    for arm, fg in (('eraf_only','off'),):
         donor_path = current_protocol['arms'][arm]['parent']
         donor_sha = sha(donor_path)
         if donor_sha != current_protocol['input_sha256'][donor_path]:
@@ -170,18 +156,55 @@ def admission(args):
     del policy
     arms['no_eraf'].update(parent=baseline, final_checkpoint=baseline, final_sha256=baseline_sha,
         frozen_reference=True, additional_optimizer_steps=0, gpus=[])
+    arms['eraf_fg'].update(parent=str(root/'eraf_only/joint'/f'step_{args.steps:06d}.pt'),
+        parent_sha256=None, depends_on='eraf_only', inherits_all_eraf_weights=True)
     for n in ('final_models.json','completion_audit.json','protocol.json'):
         bindings[str(current/n)] = sha(current/n)
     bindings[baseline] = baseline_sha
-    plan.update(format='robotwin_current_no_eraf_branch_trial_v1',
+    plan.update(format='robotwin_current_no_eraf_serial_trial_v1',
         current_no_eraf_trial=str(current), baseline_checkpoint=baseline, baseline_sha256=baseline_sha,
         strongest_checkpoint=baseline, train_arms=['eraf_only','eraf_fg'],
         additional_optimizer_steps={'no_eraf':0,'eraf_only':args.steps,'eraf_fg':args.steps},
-        actual_parent_adapter_tensors_equal=False, shared_action_initialization_verified_by_source_identity=False,
-        initialization='All action/video adapters from current final no-eraf; separate existing semantic guards are initialization only; no semantic donor policy adapters.',
-        comparison_scope='Incremental ERAF/FG additions to a fixed completed baseline; extra training is not matched to the baseline.',
+        cumulative_optimizer_steps_since_baseline={'no_eraf':0,'eraf_only':args.steps,'eraf_fg':2*args.steps},
+        eraf_initialization_matches_current_no_eraf=False, fg_initialization_matches_completed_eraf=False,
+        initialization='Current no-eraf + ordinary semantic initialization -> ERAF final -> FG continuation of all ERAF final weights. No separate FG semantic donor.',
+        comparison_scope='Serial addition of ERAF then FG; cumulative extra training is 0/200/400 for a200-step stage, not equal across models.',
         training_identity_audit_required=True)
     return plan, seeds
+
+
+def train_serial_stages(plan, root, *, group, save):
+    """The second optimizer cannot start until the first model and its audit finish."""
+    if plan['train_arms'] != ['eraf_only', 'eraf_fg']:
+        raise ValueError('The training order must be ERAF then ERAF+FG.')
+    for arm in plan['train_arms']:
+        spec = plan['arms'][arm]
+        if arm == 'eraf_fg':
+            previous = plan['arms']['eraf_only']
+            if spec['parent'] != previous['final_checkpoint'] or sha(spec['parent']) != previous['final_sha256']:
+                raise ValueError('FG parent must be the unchanged completed ERAF model.')
+            spec['parent_sha256'] = previous['final_sha256']
+            plan['input_sha256'][spec['parent']] = previous['final_sha256']
+        plan['status'] = 'training_' + arm; save()
+        group([('train_'+arm, training_command(plan, root, arm), spec['gpus'])])
+        plan['status'] = 'auditing_' + arm; save()
+        group([('audit_'+arm, [sys.executable, str(REPO/'scripts/audit_robotwin_eraf_fg_action_stage.py'),
+            '--output', str(root/arm/'joint')], [])])
+        audit = read(root/arm/'joint/freeze_audit.json')
+        if not audit['complete'] or audit['final_step'] != plan['steps']:
+            raise ValueError('A completed audited stage is required before continuing.')
+        spec['final_checkpoint'] = str(root/arm/'joint'/f"step_{plan['steps']:06d}.pt")
+        spec['final_sha256'] = sha(spec['final_checkpoint'])
+        if arm == 'eraf_fg':
+            initial = read(root/arm/'joint/continuation_initialization.json')
+            if (not audit.get('fg_continuation_parent_and_initialization_verified')
+                    or not initial['complete'] or not initial['all_policy_and_eraf_tensors_equal']
+                    or initial['parent_checkpoint'] != spec['parent']
+                    or initial['parent_sha256'] != spec['parent_sha256']
+                    or sha(spec['parent']) != spec['parent_sha256']):
+                raise ValueError('FG initialization or the retained ERAF reference changed.')
+            plan['fg_initialization_matches_completed_eraf'] = True
+        write(root/'stage_models.json', plan['arms']); save()
 
 
 def summarize(root, plan):
@@ -268,7 +291,7 @@ def main():
         prepared=read(root/'initialization/preparation.json')
         if not prepared['complete'] or prepared['baseline_sha256']!=plan['baseline_sha256']:
             raise ValueError('Branch preparation did not bind the current baseline.')
-        for arm in plan['train_arms']:
+        for arm in ('eraf_only',):
             spec=plan['arms'][arm];proof=prepared['arms'][arm]
             if proof['path']!=spec['parent'] or not proof['policy_adapters_equal'] or proof['baseline_sha256']!=plan['baseline_sha256']:
                 raise ValueError('An ERAF branch has the wrong action parent.')
@@ -278,22 +301,15 @@ def main():
         group([('identity_'+a,[sys.executable,str(REPO/'scripts/probe_robotwin_eraf_context_tokens.py'),
             '--manifest',plan['manifest'],'--source-bank',plan['source_bank'],'--checkpoint',plan['arms'][a]['parent'],
             '--output',str(root/'identity'/a),'--require-residual-identity','--include-expanded-tasks'],
-            [plan['arms'][a]['gpus'][0]]) for a in plan['train_arms']])
+            [plan['arms'][a]['gpus'][0]]) for a in ('eraf_only',)])
         from experiments.robotwin.eraf_action_protocol import validate_joint_identity_audit
-        for a in plan['train_arms']:
+        for a in ('eraf_only',):
             spec=plan['arms'][a]
             validate_joint_identity_audit(read(spec['identity_audit']),checkpoint_sha256=sha(spec['parent']),
                 manifest_sha256=sha(plan['manifest']))
             plan['input_sha256'][spec['identity_audit']]=sha(spec['identity_audit'])
-        plan.update(actual_parent_adapter_tensors_equal=True,
-            shared_action_initialization_verified_by_source_identity=True)
-        plan['status']='training';save()
-        group([('train_'+a,training_command(plan,root,a),plan['arms'][a]['gpus']) for a in plan['train_arms']])
-        plan['status']='auditing_training';save()
-        group([('audit_'+a,[sys.executable,str(REPO/'scripts/audit_robotwin_eraf_fg_action_stage.py'),'--output',str(root/a/'joint')],[]) for a in plan['train_arms']])
-        for arm in plan['train_arms']:
-            spec=plan['arms'][arm]
-            spec['final_checkpoint']=str(root/arm/'joint'/f"step_{args.steps:06d}.pt");spec['final_sha256']=sha(spec['final_checkpoint'])
+        plan['eraf_initialization_matches_current_no_eraf']=True;save()
+        train_serial_stages(plan,root,group=group,save=save)
         write(root/'final_models.json',plan['arms']);save()
         if not plan['smoke_only']:
             plan['status']='screening_dev_scenes';save()
@@ -314,6 +330,7 @@ def main():
             if sha(spec['final_checkpoint'])!=spec['final_sha256']:raise ValueError('Final model changed.')
         plan.update(complete=True,status='complete',finished_at=datetime.now().astimezone().isoformat());save()
         write(root/'terminal_verification.json',dict(complete=True,additional_optimizer_steps=plan['additional_optimizer_steps'],
+            cumulative_optimizer_steps_since_baseline=plan['cumulative_optimizer_steps_since_baseline'],
             episodes=0 if plan['smoke_only'] else 3*5*args.dev_episodes,all_jobs_exit_zero=True,inputs_unchanged=True,
             independent_test=False,goal_achieved=False))
     except BaseException as error:

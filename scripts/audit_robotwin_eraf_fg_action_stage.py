@@ -42,6 +42,22 @@ def audit(root):
     if (not parent_matches or candidate['optimizer_steps'] != plan['steps'] or candidate['stage'] != plan['stage']
             or candidate['fg_supervision'] != plan['fg'] or candidate['provenance']['eraf'] != plan['eraf']):
         raise ValueError('Checkpoint lineage/stage does not match the run plan.')
+    continuation = bool(plan.get('continue_eraf_with_fg'))
+    if continuation:
+        from experiments.robotwin.eraf_action_protocol import validate_action_parent
+        validate_action_parent(parent,stage=plan['stage'],eraf=plan['eraf'],fg=plan['fg'],
+            resume=bool(plan.get('resume_state')),warm_policy=plan.get('warm_policy',False),
+            zero_context_joint=plan.get('zero_context_joint',False),continue_eraf_with_fg=True)
+        initial=read(root/'continuation_initialization.json')
+        digest=file_sha256(plan['checkpoint'])
+        if (digest!=plan['continuation_parent_sha256'] or not initial['complete']
+                or initial['parent_checkpoint']!=plan['checkpoint'] or initial['parent_sha256']!=digest
+                or not initial['all_policy_and_eraf_tensors_equal'] or initial['optimizer_updates']!=0
+                or initial['eraf_reinitialized'] or initial['parent_optimizer_steps']!=parent['optimizer_steps']
+                or not candidate['provenance'].get('continue_eraf_with_fg')
+                or candidate['provenance'].get('continuation_parent_sha256')!=digest
+                or candidate['provenance'].get('continuation_parent_optimizer_steps')!=parent['optimizer_steps']):
+            raise ValueError('FG stage did not retain its completed ERAF parent and initialization evidence.')
     if plan.get('action_objective') in ('balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1') and candidate['provenance'].get('action_objective')!=plan['action_objective']:
         raise ValueError('Checkpoint objective provenance differs from the immutable plan.')
     allowed = set(plan['trainable_parameters'])
@@ -126,7 +142,7 @@ def audit(root):
                     if (example.get('initial_expert_anchor') != bool(row.get('initial_expert_anchor'))
                         or example.get('effective_correction_weight') != effective_weight(row,plan['correction_weight'],plan['correction_task_weights'])):
                         raise ValueError('Actual initial anchors or task weights differ from the immutable contract.')
-    return {'complete': True, 'checkpoint_sha256': digest, 'checkpoint_identity': metadata(checkpoint),
+    result = {'complete': True, 'checkpoint_sha256': digest, 'checkpoint_identity': metadata(checkpoint),
         'hash_scans': not skip_hashes, 'parent_checkpoint': plan['checkpoint'],
         'changed_lora_tensors': counts['mot_trainable'], 'changed_guard_tensors': counts['policy_guard'],
         'unchanged_frozen_tensors': len(frozen), 'unexpected_changes': unexpected,
@@ -135,6 +151,9 @@ def audit(root):
         'first_step': start + 1, 'final_step': plan['steps'],
         'action_objective': plan.get('action_objective', 'flow_endpoint_v1'),
         'note': 'Gradient norm equality is checked; individual gradient tensors are not archived.'}
+    if continuation:
+        result['fg_continuation_parent_and_initialization_verified']=True
+    return result
 
 
 def main():
