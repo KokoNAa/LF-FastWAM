@@ -104,3 +104,26 @@ def test_full_trial_preserves_matched_200_step_recipe_and_uses_completed_parent(
     expected[expected.index('--cf-teacher') + 1] = '/eraf200'
     assert new == expected + ['--cf-teacher-mode', 'parent_eraf']
     assert plan['steps'] == 200 and plan['strongest_checkpoint'] == '/no_eraf'
+
+
+def test_reference_reuse_rejects_changed_manifest_or_catalog_before_training(tmp_path):
+    import json
+    from scripts.run_robotwin_parent_eraf_trial import reference_bindings
+    from scripts.run_robotwin_formal_five40 import sha
+    manifest = tmp_path / 'manifest.json'
+    manifest.write_text('{"original": true}')
+    catalog = tmp_path / 'catalog/task/demo_clean/correct/episodes.jsonl'
+    catalog.parent.mkdir(parents=True)
+    catalog.write_text('{"scene_seed": 42}\n')
+    (tmp_path / 'catalog_frozen.json').write_text(json.dumps({'task': sha(catalog)}))
+    inputs = {str(manifest): sha(manifest)}
+    prior = dict(input_sha256=inputs, episode_sha256={})
+    plan = dict(input_sha256=inputs)
+    assert reference_bindings(tmp_path, prior, plan)[str(catalog)] == sha(catalog)
+    manifest.write_text('{"changed": true}')
+    with pytest.raises(ValueError, match='Previously frozen'):
+        reference_bindings(tmp_path, prior, plan)
+    manifest.write_text('{"original": true}')
+    catalog.write_text('{"scene_seed": 43}\n')
+    with pytest.raises(ValueError, match='Previously frozen'):
+        reference_bindings(tmp_path, prior, plan)

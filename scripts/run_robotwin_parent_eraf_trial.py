@@ -23,6 +23,22 @@ SMOKE_CODE = '94200fc251fff5199ba5d0afd5599e8f41c0cb26'
 REPORT_CODE = '460cdcbf98361fcaedbde7e19f3861c1f89fbd3b'
 
 
+def reference_bindings(source, prior, source_plan):
+    """Reuse the original frozen inputs, not a new snapshot of possibly changed files."""
+    expected = dict(prior['input_sha256'])
+    for path, digest in source_plan['input_sha256'].items():
+        if expected.get(path) != digest:
+            raise ValueError('Source completion audit differs from its frozen inputs: ' + path)
+    for task, digest in read(source / 'catalog_frozen.json').items():
+        expected[str(source / 'catalog' / task / 'demo_clean/correct/episodes.jsonl')] = digest
+    for rel, digest in prior['episode_sha256'].items():
+        expected[str(source / rel)] = digest
+    for path, digest in expected.items():
+        if sha(path) != digest:
+            raise ValueError('Previously frozen source input changed: ' + path)
+    return expected
+
+
 def candidate_command(source_plan, root, parent):
     """Preserve the original 200-step recipe; change only the frozen CF teacher."""
     plan = json.loads(json.dumps(source_plan))
@@ -61,23 +77,30 @@ def main():
               'scripts/audit_robotwin_eraf_fg_action_stage.py']
     if git('diff', SMOKE_CODE, 'HEAD', '--', *tested):
         raise ValueError('Training implementation differs from the tested smoke.')
+    changed = set(git('diff', '--name-only', prior['code_commit'], 'HEAD', '--',
+                      'src', 'experiments', 'scripts', 'configs').splitlines())
+    permitted = set(tested) | {'scripts/probe_robotwin_deployed_gradients.py',
+                              'scripts/probe_robotwin_parent_eraf_teacher.py',
+                              'scripts/run_robotwin_parent_eraf_trial.py'}
+    if changed - permitted:
+        raise ValueError('Reference evaluation runtime changed: ' + str(sorted(changed - permitted)))
     if subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip():
         raise ValueError('GPUs must be idle before starting.')
     if shutil.disk_usage(source).free < 8 * 1024**3:
         raise ValueError('Need 8 GiB free on the data disk.')
     bindings = {str(source / n): sha(source / n) for n in
                 ('protocol.json', 'final_models.json', 'completion_audit.json', 'catalog_frozen.json')}
+    bindings.update(reference_bindings(source, prior, source_plan))
     bindings.update({str(smoke / 'complete.json'): sha(smoke / 'complete.json')})
     for arm, spec in models.items():
         if sha(spec['final_checkpoint']) != spec['final_sha256']:
             raise ValueError('Source model changed: ' + arm)
         bindings[spec['final_checkpoint']] = spec['final_sha256']
-    for rel, digest in prior['episode_sha256'].items():
-        if sha(source / rel) != digest:
-            raise ValueError('Source episode evidence changed: ' + rel)
-        bindings[str(source / rel)] = digest
-    for path in (source_plan['manifest'], REPO / 'configs/eval/robotwin_cis_ten_tasks.json'):
-        bindings[str(path)] = sha(path)
+    config = REPO / 'configs/eval/robotwin_cis_ten_tasks.json'
+    source_configs = [p for p in prior['input_sha256'] if p.endswith('/configs/eval/robotwin_cis_ten_tasks.json')]
+    if len(source_configs) != 1 or sha(config) != prior['input_sha256'][source_configs[0]]:
+        raise ValueError('Intervention configuration differs from the original comparison.')
+    bindings[str(config)] = sha(config)
     root.mkdir(parents=True)
     (root / 'catalog').symlink_to(source / 'catalog', target_is_directory=True)
     (root / 'evaluation').mkdir()
