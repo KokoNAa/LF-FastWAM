@@ -127,8 +127,15 @@ def report(root, *, draws=10000):
             for name in ('episodes.jsonl', 'initial_states.json', 'complete.json'):
                 sources[str((folder/name).relative_to(root))] = sha(folder/name)
         outcomes[task] = list(zip(*values))
+    training = plan.get('training_comparison')
+    if plan.get('format') == 'robotwin_current_no_eraf_serial_trial_v1':
+        training = dict(source_format=plan['format'],
+            additional_optimizer_steps=plan['additional_optimizer_steps'],
+            cumulative_optimizer_steps_since_baseline=plan['cumulative_optimizer_steps_since_baseline'],
+            equal_additional_training_budget=False)
     return dict(format='robotwin_five_task_paired_comparison_v1', complete=True, episodes=15*n,
         episodes_per_cell=n, cells=cells, source_sha256=sources,
+        training_comparison=training,
         independent_test=bool(plan.get('independent_test', False)),
         checkpoint_sha256={a: m['sha256' if formal else 'final_sha256'] for a, m in models.items()},
         correct_evaluated=False, **paired_summary(outcomes, draws=draws))
@@ -140,6 +147,12 @@ def markdown(result):
     text = [f'# 五任务三组配对比较：{scope}', '',
         f'每任务每模型 {n} 个配对场景，总计 {15*n} 回合；五任务等权。', '',
         '| 任务 | no-eraf | ERAF | ERAF+FG |', '|---|---:|---:|---:|']
+    training = result.get('training_comparison')
+    if training and training['source_format'] == 'robotwin_current_no_eraf_serial_trial_v1':
+        budgets = training['cumulative_optimizer_steps_since_baseline']
+        text[4:4] = ['训练链：固定当前 no-eraf → ERAF → 从已完成的 ERAF 续训 FG。',
+            '相对当前 no-eraf，累计新增优化器步数（no-eraf / ERAF / ERAF+FG）：'
+            + ' / '.join(str(budgets[a]) for a in ARMS) + '。训练量不同，不能仅据此将差异归因于模块。', '']
     for t in TASKS:
         text.append('| '+TASK_NAMES[t]+' | '+' | '.join(frac(next(c['cf'] for c in result['cells'] if c['task']==t and c['arm']==a), n) for a in ARMS)+' |')
     text.extend(['| 宏平均 | '+' | '.join(f'{100*result["macro_cf"][a]:.1f}%' for a in ARMS)+' |', '',

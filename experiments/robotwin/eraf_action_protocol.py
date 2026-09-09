@@ -19,7 +19,14 @@ def is_zero_context_parent(parent):
                 for k in ZEROED))
 
 
-def validate_action_parent(parent, *, stage, eraf, fg, resume=False, warm_policy=False, zero_context_joint=False):
+def validate_action_parent(parent, *, stage, eraf, fg, resume=False, warm_policy=False,
+                           zero_context_joint=False, continue_eraf_with_fg=False):
+    if continue_eraf_with_fg:
+        if (resume or warm_policy or zero_context_joint or stage != 'joint' or eraf != 'on' or fg != 'full'
+                or parent.get('stage') != 'joint' or parent.get('optimizer_steps', 0) <= 0
+                or parent.get('fg_supervision') != 'off' or parent.get('provenance', {}).get('eraf') != 'on'):
+            raise ValueError('FG continuation requires a trained ERAF-on, FG-off joint parent and a fresh FG optimizer.')
+        return
     if zero_context_joint:
         if (resume or warm_policy or stage != 'joint' or eraf != 'on'
                 or parent.get('fg_supervision') != fg or not is_zero_context_parent(parent)):
@@ -51,6 +58,17 @@ def validate_action_parent(parent, *, stage, eraf, fg, resume=False, warm_policy
             raise ValueError('Joint ERAF training needs its own matching interface arm.')
     elif parent['stage'] != 'grounding':
         raise ValueError('ERAF-off controls need a common semantic checkpoint or explicit warm policy.')
+
+
+def verify_continuation_weights(parent, policy_adapters, guard):
+    """Check the actual loaded weights before FG can perform its first update."""
+    import torch
+    for label, expected, actual in [('policy', parent['mot_trainable'], policy_adapters),
+                                    ('ERAF', parent['policy_guard'], guard)]:
+        if expected.keys() != actual.keys() or any(
+                v.dtype != actual[k].dtype or not torch.equal(v.cpu(), actual[k].detach().cpu())
+                for k, v in expected.items()):
+            raise ValueError('FG continuation changed or reset initial ' + label + ' weights.')
 
 
 def validate_joint_identity_audit(audit, *, checkpoint_sha256, manifest_sha256):
