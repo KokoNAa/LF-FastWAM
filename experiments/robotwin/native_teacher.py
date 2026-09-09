@@ -18,21 +18,43 @@ def teacher_parameters(parameters, values):
 
 
 class NativeTeacher:
-    def __init__(self, model, parameters, checkpoint):
+    def __init__(self, model, parameters, checkpoint, *, eraf=False):
         import torch
         payload = torch.load(checkpoint, map_location='cpu', weights_only=False)
         state = payload['mot_trainable']
         if set(state) != set(parameters):
             raise ValueError('Native teacher must have exactly the same adapter parameter names.')
         self.model = model
-        self.parameters = parameters
+        self.eraf = eraf
+        self.parameters = dict(parameters)
+        if eraf:
+            if (payload.get('stage') != 'joint' or payload.get('optimizer_steps', 0) <= 0
+                    or payload.get('fg_supervision') != 'off'
+                    or payload.get('provenance', {}).get('eraf') != 'on'):
+                raise ValueError('Full ERAF teacher requires a completed ERAF-on, FG-off joint checkpoint.')
+            guard = model.policy_guard_modules
+            # Keep the live objects (including persistent buffers), swapping only storage.
+            guard_tensors = guard.state_dict(keep_vars=True)
+            if set(guard_tensors) != set(payload['policy_guard']):
+                raise ValueError('Teacher must have exactly the same ERAF tensor names.')
+            if set(dict(guard.named_buffers())) - set(guard_tensors):
+                raise ValueError('ERAF teacher cannot leave unbound nonpersistent buffers.')
+            state = dict(state)
+            for name, tensor in guard_tensors.items():
+                key = 'policy_guard.' + name
+                if key in self.parameters:
+                    raise ValueError('Teacher tensor name collision: ' + key)
+                self.parameters[key] = tensor
+                state[key] = payload['policy_guard'][name]
         self.values = {}
-        for name, parameter in parameters.items():
+        for name, parameter in self.parameters.items():
             if state[name].shape != parameter.shape:
                 raise ValueError(f'Teacher adapter shape mismatch: {name}')
-            self.values[name] = state[name].to(parameter).detach()
+            self.values[name] = state[name].to(parameter).detach().clone()
 
     def predict(self, captured, noisy, timestep):
+        if self.eraf:
+            raise ValueError('Full ERAF teacher requires the deployed ten-step teacher_action sampler.')
         import torch
         from experiments.robotwin.joint_adapter_repair import build_cache
         with torch.no_grad(), teacher_parameters(self.parameters, self.values):

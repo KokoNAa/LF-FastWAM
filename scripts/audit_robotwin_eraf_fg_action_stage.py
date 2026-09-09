@@ -60,6 +60,12 @@ def audit(root):
             raise ValueError('FG stage did not retain its completed ERAF parent and initialization evidence.')
     if plan.get('action_objective') in ('balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1') and candidate['provenance'].get('action_objective')!=plan['action_objective']:
         raise ValueError('Checkpoint objective provenance differs from the immutable plan.')
+    from experiments.robotwin.parent_eraf_teacher import validate_teacher_binding
+    teacher_digest = validate_teacher_binding(plan)
+    if teacher_digest is not None:
+        for record in (plan, plan['optimization_contract'], candidate['provenance']):
+            if record.get('cf_teacher_mode') != 'parent_eraf' or record.get('cf_teacher_sha256') != teacher_digest:
+                raise ValueError('Full parent ERAF teacher differs from immutable provenance.')
     allowed = set(plan['trainable_parameters'])
     changed, frozen = [], []
     counts = {}
@@ -153,6 +159,8 @@ def audit(root):
         'note': 'Gradient norm equality is checked; individual gradient tensors are not archived.'}
     if continuation:
         result['fg_continuation_parent_and_initialization_verified']=True
+    if teacher_digest is not None:
+        result['full_parent_eraf_teacher_sha256'] = teacher_digest
     return result
 
 

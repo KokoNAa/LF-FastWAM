@@ -73,7 +73,11 @@ def main():
     selected=trainable_parameters(model,plan['stage'],eraf=True,policy_scope=plan['policy_scope'],interface_scope=plan['interface_scope'])
     if list(selected)!=plan['trainable_parameters']:raise ValueError('Trainable parameter set differs.')
     adapters={n:p for n,p in model.mot.named_parameters() if n.endswith(('.lora_A','.lora_B'))}
-    teachers={k:NativeTeacher(model,adapters,plan[k+'_teacher']) for k in ('correct','cf')}
+    from experiments.robotwin.parent_eraf_teacher import validate_teacher_binding
+    validate_teacher_binding(plan)
+    teachers={k:NativeTeacher(model,adapters,plan[k+'_teacher'],
+                             eraf=k=='cf' and plan.get('cf_teacher_mode')=='parent_eraf')
+              for k in ('correct','cf')}
     state=lambda:{'adapters':{n:p.detach() for n,p in adapters.items()},'guard':model.policy_guard_modules.state_dict()}
     before=tensor_digest(state());raw=RawReplay(plan['source_bank'])
     payloads=ReplayPayloads([r for _,_,r in queries],model.device)

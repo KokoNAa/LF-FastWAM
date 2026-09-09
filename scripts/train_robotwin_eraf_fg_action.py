@@ -38,6 +38,8 @@ def main():
                     help='Start FG training from every weight of a completed ERAF-on/FG-off joint model.')
     ap.add_argument('--continuation-parent-sha256',
                     help='Required exact completed ERAF checkpoint hash for FG continuation.')
+    ap.add_argument('--cf-teacher-mode', choices=['native_off', 'parent_eraf'], default='native_off',
+                    help='Opt in to preserving the complete ERAF parent during joint five-task FG continuation.')
     ap.add_argument('--correct-count', type=int, default=4)
     ap.add_argument('--cf-count', type=int, default=2)
     ap.add_argument('--correct-weight', type=float, default=2.)
@@ -76,6 +78,8 @@ def main():
         ap.error('--zero-context-joint and --identity-audit must be supplied together')
     if args.continue_eraf_with_fg != bool(args.continuation_parent_sha256):
         ap.error('--continue-eraf-with-fg and --continuation-parent-sha256 must be supplied together')
+    from experiments.robotwin.parent_eraf_teacher import validate_teacher_binding
+    args.cf_teacher_sha256 = validate_teacher_binding(vars(args))
     if not math.isfinite(args.correction_weight) or args.correction_weight <= 0:
         ap.error('--correction-weight must be positive and finite')
     if len(set(args.target_tasks)) != len(args.target_tasks):ap.error('Duplicate target tasks')
@@ -170,7 +174,8 @@ def main():
                                     policy_scope=args.policy_scope, interface_scope=args.interface_scope)
     adapters = {n: p for n, p in model.mot.named_parameters() if n.endswith(('.lora_A', '.lora_B'))}
     if args.action_objective in ('balanced_target_rollout_v1','trajectory_target_rollout_v1','five_task_expert_rollout_v1'):
-        teachers = {'cf': NativeTeacher(model, adapters, args.cf_teacher)}
+        teachers = {'cf': NativeTeacher(model, adapters, args.cf_teacher,
+                                       eraf=args.cf_teacher_mode == 'parent_eraf')}
     else:
         teachers = {'correct': NativeTeacher(model, adapters, args.correct_teacher),
                     'cf': NativeTeacher(model, adapters, args.cf_teacher)}
@@ -182,7 +187,8 @@ def main():
         'learning_rate', 'correct_weight', 'cf_weight', 'disable_seen_language_augmentation',
         'policy_scope', 'correction_weight', 'skip_file_hashes', 'target_tasks', 'cf_retention_tasks', 'task_balanced',
         'interface_learning_rate', 'correct_count', 'cf_count', 'fg_gradient_route', 'interface_scope',
-        'correction_task_weights', 'initial_expert_tasks', 'action_objective')}
+        'correction_task_weights', 'initial_expert_tasks', 'action_objective',
+        'cf_teacher_mode', 'cf_teacher_sha256')}
     if args.skip_file_hashes:
         p = Path(args.manifest).resolve()
         optimization_contract['manifest_identity'] = {'path': str(p), 'bytes': p.stat().st_size,
@@ -214,7 +220,8 @@ def main():
                         'cf_retention_tasks': ['place_a2b_right', 'place_burger_fries', 'stack_blocks_two'],
                         'task_balanced': False, 'interface_learning_rate': None,
                         'correct_count': 4, 'cf_count': 2, 'fg_gradient_route': 'joint',
-                        'correction_task_weights': {}, 'initial_expert_tasks': [], 'action_objective': 'flow_endpoint_v1'}
+                        'correction_task_weights': {}, 'initial_expert_tasks': [], 'action_objective': 'flow_endpoint_v1',
+                        'cf_teacher_mode': 'native_off', 'cf_teacher_sha256': None}
         for key, value in optimization_contract.items():
             if state['optimization_contract'].get(key, old_defaults.get(key)) != value:
                 if key not in ('learning_rate', 'correct_weight', 'cf_weight'):
@@ -309,6 +316,8 @@ def main():
                                 'interface_learning_rate': args.interface_learning_rate,
                                 'mixture_counts': counts, 'task_balanced': args.task_balanced,
                                 'fg_gradient_route': args.fg_gradient_route,
+                                'cf_teacher_mode': args.cf_teacher_mode,
+                                'cf_teacher_sha256': args.cf_teacher_sha256,
                                 'action_objective': args.action_objective},
                     record_hashes=not args.skip_file_hashes)
                 optimizer_payload = {'step': step, 'checkpoint': str(checkpoint_path),

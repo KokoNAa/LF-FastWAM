@@ -49,7 +49,8 @@ def teacher_action(teacher, captured, noise):
     import torch
     from experiments.robotwin.native_teacher import teacher_parameters
     with torch.no_grad(), teacher_parameters(teacher.parameters, teacher.values):
-        return sample(teacher.model, captured, noise, eraf=False, checkpoint=False).detach()
+        return sample(teacher.model, captured, noise,
+                      eraf=getattr(teacher, 'eraf', False), checkpoint=False).detach().clone()
 
 
 def backward_deployed_example(model, row, payload, noise, time, *, teachers, coefficient=1.,
