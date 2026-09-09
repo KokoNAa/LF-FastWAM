@@ -91,3 +91,16 @@ def test_parent_teacher_requires_exact_joint_continuation_and_hash(tmp_path):
         with pytest.raises(ValueError):
             validate_teacher_binding(plan | patch)
     assert validate_teacher_binding({}) is None
+
+
+def test_full_trial_preserves_matched_200_step_recipe_and_uses_completed_parent(tmp_path):
+    from scripts.run_robotwin_five_task_repair import training_command
+    from scripts.run_robotwin_parent_eraf_trial import candidate_command, PARENT_SHA
+    plan = dict(manifest='/manifest', source_bank='/bank', strongest_checkpoint='/no_eraf', steps=200,
+                arms={'eraf_fg': dict(parent='/eraf200', parent_sha256=PARENT_SHA, eraf='on', fg='full', gpus=[0,1,2])})
+    old = training_command(plan, tmp_path, 'eraf_fg')
+    new = candidate_command(plan, tmp_path, '/eraf200')
+    expected = list(old)
+    expected[expected.index('--cf-teacher') + 1] = '/eraf200'
+    assert new == expected + ['--cf-teacher-mode', 'parent_eraf']
+    assert plan['steps'] == 200 and plan['strongest_checkpoint'] == '/no_eraf'
