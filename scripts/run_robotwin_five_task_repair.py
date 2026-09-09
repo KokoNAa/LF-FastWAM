@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Matched five-task expert/FG training and a declared development evaluation."""
+"""Train ERAF branches on the current completed no-ERAF control and evaluate all three."""
 from __future__ import annotations
 import argparse
 from collections import Counter
@@ -23,6 +23,7 @@ from scripts.run_robotwin_formal_five40 import read, write, sha, records
 RUNS = Path('/root/gpufree-data/LF-FastWAM/runs')
 SOURCE = RUNS / 'robotwin_expanded_fg/20260908-balanced-target200'
 FORMAL = RUNS / 'robotwin_formal_five40/20260908-balanced-target200'
+CURRENT = RUNS / 'robotwin_five_task_repair/20260908-five-task-expert200'
 
 
 def training_command(plan, root, arm):
@@ -143,11 +144,48 @@ def admission(args):
         independent_test=False,goal_achieved=False,correct_evaluated=False,platform_shutdown=None,
         next_stage='Only a development improvement can nominate frozen models for a new 40-scene-per-task independent test.',
         model_storage='server_only',smoke_only=args.steps==2)
-    plan['actual_parent_adapter_tensors_equal'] = True
+    from experiments.robotwin.current_noeraf import current_baseline, branch_parent
+    current = args.current_no_eraf_trial.resolve()
+    ledger, audit, current_protocol = (read(current/n) for n in
+                                      ('final_models.json','completion_audit.json','protocol.json'))
+    baseline, baseline_sha = current_baseline(current, ledger, audit)
+    if sha(baseline) != baseline_sha:
+        raise ValueError('Current final no-ERAF weights changed.')
+    if current_protocol['manifest'] != plan['manifest']:
+        raise ValueError('Current baseline and branch training banks differ.')
+    policy = torch.load(baseline, map_location='cpu', weights_only=False)
+    for arm, fg in (('eraf_only','off'),('eraf_fg','full')):
+        donor_path = current_protocol['arms'][arm]['parent']
+        donor_sha = sha(donor_path)
+        if donor_sha != current_protocol['input_sha256'][donor_path]:
+            raise ValueError('Current source semantic donor changed.')
+        donor = torch.load(donor_path, map_location='cpu', weights_only=False)
+        # Preflight validates actual tensor compatibility without creating model files.
+        candidate = branch_parent(policy, donor, policy_path=baseline, policy_sha256=baseline_sha,
+            semantic_path=donor_path, semantic_sha256=donor_sha, fg=fg)
+        del donor, candidate
+        bindings[donor_path] = donor_sha
+        arms[arm].update(parent=str(root/'initialization'/(arm+'.pt')),
+            identity_audit=str(root/'identity'/arm/'summary.json'), semantic_donor=donor_path)
+    del policy
+    arms['no_eraf'].update(parent=baseline, final_checkpoint=baseline, final_sha256=baseline_sha,
+        frozen_reference=True, additional_optimizer_steps=0, gpus=[])
+    for n in ('final_models.json','completion_audit.json','protocol.json'):
+        bindings[str(current/n)] = sha(current/n)
+    bindings[baseline] = baseline_sha
+    plan.update(format='robotwin_current_no_eraf_branch_trial_v1',
+        current_no_eraf_trial=str(current), baseline_checkpoint=baseline, baseline_sha256=baseline_sha,
+        strongest_checkpoint=baseline, train_arms=['eraf_only','eraf_fg'],
+        additional_optimizer_steps={'no_eraf':0,'eraf_only':args.steps,'eraf_fg':args.steps},
+        actual_parent_adapter_tensors_equal=False, shared_action_initialization_verified_by_source_identity=False,
+        initialization='All action/video adapters from current final no-eraf; separate existing semantic guards are initialization only; no semantic donor policy adapters.',
+        comparison_scope='Incremental ERAF/FG additions to a fixed completed baseline; extra training is not matched to the baseline.',
+        training_identity_audit_required=True)
     return plan, seeds
 
 
 def summarize(root, plan):
+    from fractions import Fraction
     from scripts.report_robotwin_formal_five40 import summarize_cell
     cells, signatures = [], {}
     for arm, spec in plan['arms'].items():
@@ -166,8 +204,8 @@ def summarize(root, plan):
                 if h!=dict(scene_seed=c['scene_seed'],sha256=c['initial_physical_state_sha256']): raise ValueError('Physical state changed.')
             if task in signatures and initial!=signatures[task]: raise ValueError('Unpaired physical scenes.')
             signatures[task]=initial;cells.append(dict(arm=arm,task=task,**summarize_cell(eps)))
-    macro={a:sum(c['cf_rate'] for c in cells if c['arm']==a)/5 for a in plan['arms']}
-    return dict(complete=True,episodes=3*5*plan['dev_episodes'],cells=cells,macro_cf=macro,
+    macro={a:sum(Fraction(c['cf'],plan['dev_episodes']) for c in cells if c['arm']==a)/5 for a in plan['arms']}
+    return dict(complete=True,episodes=3*5*plan['dev_episodes'],cells=cells,macro_cf={a:float(v) for a,v in macro.items()},
                 desired_order_on_dev=macro['eraf_fg']>macro['eraf_only']>macro['no_eraf'],
                 independent_test=False,goal_achieved=False)
 
@@ -175,8 +213,10 @@ def summarize(root, plan):
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output',type=Path,required=True);ap.add_argument('--deadline',required=True)
+    ap.add_argument('--current-no-eraf-trial',type=Path,default=CURRENT,
+                    help='Completed trial whose audited final no-eraf is the fixed action parent.')
     ap.add_argument('--steps',type=int,choices=[2,200],default=200)
-    ap.add_argument('--dev-episodes',type=int,default=12);ap.add_argument('--dev-seed',type=int,default=91370000)
+    ap.add_argument('--dev-episodes',type=int,default=12);ap.add_argument('--dev-seed',type=int,default=91385000)
     ap.add_argument('--preflight-only',action='store_true')
     args=ap.parse_args();cutoff=datetime.fromisoformat(args.deadline)
     if cutoff.tzinfo is None or cutoff.timestamp()<=time.time() or args.dev_episodes<1: ap.error('Future absolute deadline and positive episode count required.')
@@ -222,11 +262,37 @@ def main():
     def stop(sig,frame):raise InterruptedError('Signal '+str(sig))
     signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
     try:
+        plan['status']='initializing_on_current_no_eraf';save()
+        group([('prepare_current_parents',[sys.executable,str(REPO/'scripts/prepare_robotwin_current_noeraf.py'),
+            '--source-trial',plan['current_no_eraf_trial'],'--output',str(root/'initialization')],[])])
+        prepared=read(root/'initialization/preparation.json')
+        if not prepared['complete'] or prepared['baseline_sha256']!=plan['baseline_sha256']:
+            raise ValueError('Branch preparation did not bind the current baseline.')
+        for arm in plan['train_arms']:
+            spec=plan['arms'][arm];proof=prepared['arms'][arm]
+            if proof['path']!=spec['parent'] or not proof['policy_adapters_equal'] or proof['baseline_sha256']!=plan['baseline_sha256']:
+                raise ValueError('An ERAF branch has the wrong action parent.')
+            if sha(spec['parent'])!=proof['sha256']:
+                raise ValueError('Prepared parent checkpoint changed.')
+            plan['input_sha256'][spec['parent']]=proof['sha256']
+        group([('identity_'+a,[sys.executable,str(REPO/'scripts/probe_robotwin_eraf_context_tokens.py'),
+            '--manifest',plan['manifest'],'--source-bank',plan['source_bank'],'--checkpoint',plan['arms'][a]['parent'],
+            '--output',str(root/'identity'/a),'--require-residual-identity','--include-expanded-tasks'],
+            [plan['arms'][a]['gpus'][0]]) for a in plan['train_arms']])
+        from experiments.robotwin.eraf_action_protocol import validate_joint_identity_audit
+        for a in plan['train_arms']:
+            spec=plan['arms'][a]
+            validate_joint_identity_audit(read(spec['identity_audit']),checkpoint_sha256=sha(spec['parent']),
+                manifest_sha256=sha(plan['manifest']))
+            plan['input_sha256'][spec['identity_audit']]=sha(spec['identity_audit'])
+        plan.update(actual_parent_adapter_tensors_equal=True,
+            shared_action_initialization_verified_by_source_identity=True)
         plan['status']='training';save()
-        group([('train_'+a,training_command(plan,root,a),s['gpus']) for a,s in plan['arms'].items()])
+        group([('train_'+a,training_command(plan,root,a),plan['arms'][a]['gpus']) for a in plan['train_arms']])
         plan['status']='auditing_training';save()
-        group([('audit_'+a,[sys.executable,str(REPO/'scripts/audit_robotwin_eraf_fg_action_stage.py'),'--output',str(root/a/'joint')],[]) for a in plan['arms']])
-        for arm,spec in plan['arms'].items():
+        group([('audit_'+a,[sys.executable,str(REPO/'scripts/audit_robotwin_eraf_fg_action_stage.py'),'--output',str(root/a/'joint')],[]) for a in plan['train_arms']])
+        for arm in plan['train_arms']:
+            spec=plan['arms'][arm]
             spec['final_checkpoint']=str(root/arm/'joint'/f"step_{args.steps:06d}.pt");spec['final_sha256']=sha(spec['final_checkpoint'])
         write(root/'final_models.json',plan['arms']);save()
         if not plan['smoke_only']:
@@ -247,7 +313,7 @@ def main():
         for spec in plan['arms'].values():
             if sha(spec['final_checkpoint'])!=spec['final_sha256']:raise ValueError('Final model changed.')
         plan.update(complete=True,status='complete',finished_at=datetime.now().astimezone().isoformat());save()
-        write(root/'terminal_verification.json',dict(complete=True,steps_per_arm=args.steps,
+        write(root/'terminal_verification.json',dict(complete=True,additional_optimizer_steps=plan['additional_optimizer_steps'],
             episodes=0 if plan['smoke_only'] else 3*5*args.dev_episodes,all_jobs_exit_zero=True,inputs_unchanged=True,
             independent_test=False,goal_achieved=False))
     except BaseException as error:

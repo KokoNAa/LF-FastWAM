@@ -1,5 +1,38 @@
 # 五任务专家动作与 FG 改进实验
 
+## 2026-09-09：以当前 no-eraf 成品为母本
+
+用户要求 ERAF 和 ERAF+FG 都从当前 no-eraf 成品继续训练。本节取代下方旧的“共同 R 分叉”执行方案；旧结果和旧权重不改写。
+
+固定母本为 `robotwin_five_task_repair/20260908-five-task-expert200/no_eraf/joint/step_000200.pt`，SHA256 为 `e9ebee0cc0b1c532548b0d71444a259c617e6c833005dbee0b0e653a10157540`。它在已完成的180回合开发比较中为35/60；新场景上的成功率仍需重新测量。
+
+- no-eraf：保留此成品，新增训练步数为0。
+- ERAF：动作及视频适配器全部取自此成品，普通语义预训练的 guard 仅作模块初始化，再联合训练200步。
+- ERAF+FG：动作及视频适配器全部取自同一个成品，FG语义预训练的 guard 仅作模块初始化，再用FG方案联合训练200步。它独立从 no-eraf 分支，不接 ERAF 的最终成品。
+
+初始化操作不执行优化器更新；语义 donor 的既有1500步记录在独立来源中，不伪称在当前母本上重新进行了语义预训练。禁止使用 donor 的旧动作权重。新初始化的直接 `parent_checkpoint` 和 `parent_sha256` 指向当前 no-eraf 成品；同时保留 donor 的路径、哈希和训练历史。
+
+`prepare_robotwin_current_noeraf.py` 保存后重新读取两个初始化检查点，逐张量核对动作/视频权重来自当前母本，guard 来自对应 donor，并验证冻结的视频特征未变化。控制器随后在完整十步去噪和全部十任务身份探针上验证零输出 ERAF 与 OFF 完全一致，报告绑定新检查点哈希；旧身份报告不能代替。通过后才开始两组训练。教师保持目标也改为当前 no-eraf，避免蒸馏回旧 R。
+
+末段训练仍采用下方五任务专家动作配方：action LoRA LR3e-6、ERAF接口LR3e-5、global12、seed42，冻结视频和语义头。两组各200步；固定 no-eraf 基线没有额外200步，因此这是“在现成策略上增加模块和训练”的比较，不能声称三组新增训练预算相等。
+
+默认五卡，两组训练各占两卡；评测重跑三个模型，每任务12个相同的新开发场景，共180回合。默认开发种子起点改为91385000，任何历史场景重叠都会拒绝，不能自动换种子。夹起/放置指标、成功判据和推理配置不变。先执行独立2步冒烟，验证后再以原母本重新启动200步；不能用冒烟权重续训。
+
+服务器恢复后，在干净的 `codex/robotwin-five-task-repair` 工作区执行。先明确新的绝对截止时间，旧的凌晨关机窗口已经结束：
+
+```bash
+: "${ROBOTWIN_DEADLINE:?请先设置本轮带时区的绝对截止时间}"
+ROBOTWIN_OUTPUT=/root/gpufree-data/LF-FastWAM/runs/robotwin_five_task_repair/current-noeraf-eraf-200
+/opt/conda/bin/python scripts/run_robotwin_five_task_repair.py \
+  --current-no-eraf-trial /root/gpufree-data/LF-FastWAM/runs/robotwin_five_task_repair/20260908-five-task-expert200 \
+  --output "$ROBOTWIN_OUTPUT" --deadline "$ROBOTWIN_DEADLINE" \
+  --steps 200 --dev-episodes 12 --dev-seed 91385000
+```
+
+预检加 `--preflight-only`，不会生成权重或启动训练。冒烟改用新的输出目录和 `--steps 2`。所有模型及视频仍只存服务器数据盘。
+
+## 以下为已完成的旧 R 分叉实验记录
+
 2026-09-08。目标是验证五任务宏平均 CF 的 ERAF+FG > ERAF > no-eraf，尚未实现。本实验不改变任务、成功判据、相机、动作执行窗口或对照模型定义。
 
 ## 已确认的训练错位
