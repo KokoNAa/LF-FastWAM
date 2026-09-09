@@ -42,3 +42,8 @@ an audited two-step three-GPU training smoke. The smoke checkpoint is never the
 parent of the full experiment. The existing 14:50 HKT cutoff is binding; if the
 full run cannot fit, a runtime extension is required. Finishing code or a smoke
 test is not evidence of the desired model ordering.
+
+The user subsequently removed the work cutoff on September 9. The controller
+now accepts either an explicit `--deadline` or `--no-deadline`; the latter
+records the absence of a cutoff in the run plan. It still stops its own jobs
+on failure or insufficient data-disk space and never shuts down the platform.

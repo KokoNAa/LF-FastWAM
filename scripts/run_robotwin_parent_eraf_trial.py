@@ -51,11 +51,15 @@ def candidate_command(source_plan, root, parent):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    for name in ('source-trial', 'smoke-root', 'report-worktree', 'output', 'deadline'):
+    for name in ('source-trial', 'smoke-root', 'report-worktree', 'output'):
         ap.add_argument('--' + name, required=True)
+    duration = ap.add_mutually_exclusive_group(required=True)
+    duration.add_argument('--deadline', help='Authorized absolute work cutoff with time zone.')
+    duration.add_argument('--no-deadline', action='store_true',
+                          help='Use only after the user explicitly removes the work cutoff.')
     args = ap.parse_args()
-    cutoff = datetime.fromisoformat(args.deadline)
-    if cutoff.tzinfo is None or cutoff.timestamp() <= time.time():
+    cutoff = None if args.no_deadline else datetime.fromisoformat(args.deadline)
+    if cutoff is not None and (cutoff.tzinfo is None or cutoff.timestamp() <= time.time()):
         ap.error('A future authorized absolute deadline is required.')
     source, smoke, validation, root = map(Path, (args.source_trial, args.smoke_root, args.report_worktree, args.output))
     if root.exists():
@@ -111,7 +115,8 @@ def main():
                             final_checkpoint=str(root / 'eraf_fg/joint/step_000200.pt'), final_sha256=None)
     plan = dict(format='robotwin_parent_eraf_retention_trial_v1', complete=False, status='admitted', jobs={},
                 source_trial=str(source), arms=models, tasks=list(TASKS), dev_episodes=12, steps=200,
-                code_commit=code, deadline=args.deadline, input_sha256=bindings, training_command=cmd,
+                code_commit=code, deadline=args.deadline, no_deadline=args.no_deadline,
+                input_sha256=bindings, training_command=cmd,
                 training_comparison=dict(source_format='robotwin_current_no_eraf_serial_trial_v1',
                     cumulative_optimizer_steps_since_baseline=dict(no_eraf=0, eraf_only=200, eraf_fg=400),
                     equal_additional_training_budget=False),
@@ -125,7 +130,8 @@ def main():
     processes = {}
     def save(): write(root / 'status.json', plan)
     def budget():
-        if time.time() >= cutoff.timestamp(): raise TimeoutError('Authorized work deadline reached; platform stays on.')
+        if cutoff is not None and time.time() >= cutoff.timestamp():
+            raise TimeoutError('Authorized work deadline reached; platform stays on.')
         if shutil.disk_usage(root).free < 3 * 1024**3: raise RuntimeError('Data-disk reserve reached.')
     def launch(name, command, gpus):
         budget()
