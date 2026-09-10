@@ -39,3 +39,14 @@ def test_benchmark_success_need_not_satisfy_strict_placement():
 def test_rejects_inconsistent_physical_or_goal_evidence(mutation,message):
     row=valid_episode();mutation(row)
     with pytest.raises(ValueError,match=message):validate_episode(row)
+
+
+def test_checkpoint_loader_identity_is_model_specific():
+    from scripts.audit_robotwin_world_language_closed import validate_policy_mode
+    released=dict(eraf='off',policy_kind='legacy',skip_file_hashes=False)
+    adapter=dict(eraf='off',policy_kind='repair',skip_file_hashes=False)
+    validate_policy_mode(released,'released')
+    validate_policy_mode(adapter,'no_eraf')
+    with pytest.raises(ValueError,match='policy/binding'):validate_policy_mode(adapter,'released')
+    with pytest.raises(ValueError,match='policy/binding'):validate_policy_mode(released,'no_eraf')
+    with pytest.raises(ValueError,match='policy/binding'):validate_policy_mode({**adapter,'eraf':'on'},'no_eraf')

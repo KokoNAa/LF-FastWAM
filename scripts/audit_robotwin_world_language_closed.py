@@ -20,6 +20,10 @@ def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def read(p):return json.loads(p.read_text())
 def lines(p):return [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
 
+def validate_policy_mode(proof, model):
+    expected={'released':'legacy','no_eraf':'repair'}[model]
+    require(proof['eraf']=='off' and proof['policy_kind']==expected and not proof['skip_file_hashes'],'Wrong policy/binding mode')
+
 def validate_episode(row):
     """Check cross-field constraints; summaries alone cannot prove physical events."""
     selected=row['selected_goal'];require(selected in ['source','counterfactual'],'Unknown selected goal')
@@ -81,7 +85,7 @@ def audit(root,allow_partial=False):
             if not marker.exists() or not job or job.get('status')!='exited':pending.append(name);continue
             require(read(marker)==dict(complete=True,video_language=v,noise_seed=seed,intervention='Video text only; action text and all other production inputs retained.'),'Changed intervention marker')
             command=job['command']
-            for flag,val in [('--world-video-language',v),('--policy-seed',str(seed)),('--output',str(folder)),('--episodes','10'),('--task-config','demo_randomized'),('--eraf','off')]:
+            for flag,val in [('--world-video-language',v),('--policy-seed',str(seed)),('--output',str(folder)),('--episodes','10'),('--task-config','demo_randomized'),('--eraf','off'),('--policy-kind','legacy' if model=='released' else 'repair')]:
                 require(flag in command and command[command.index(flag)+1]==val,'Worker command mismatch: '+flag)
             bind(marker);inp_path=folder/'world_language_inputs.jsonl';inputs=lines(inp_path);bind(inp_path)
             by_key={(x['source_task'],x['scene_seed']):x for x in inputs};require(len(inputs)==len(by_key)==50,'First-input coverage')
@@ -91,7 +95,7 @@ def audit(root,allow_partial=False):
                 cell=folder/task/'demo_randomized'/condition;p,canonical=catalog[task]
                 proof=read(cell/'complete.json');records=lines(cell/'episodes.jsonl');initial=read(cell/'initial_states.json')
                 require(proof['complete'] and proof['manipulation_metrics'] and proof['instruction_type']=='canonical','Incomplete or changed evaluation')
-                require(proof['eraf']=='off' and proof['policy_kind']=='legacy' and not proof['skip_file_hashes'],'Wrong policy/binding mode')
+                validate_policy_mode(proof,model)
                 require(proof['checkpoint_sha256']==plan['checkpoint_sha256'][model] and proof['canonical_sha256']==sha(p),'Checkpoint/catalog binding mismatch')
                 require(proof['deployment']==dict(action_horizon=32,replan_steps=24,inference_steps=10),'Changed production sampling')
                 require(proof['task_config']=='demo_randomized' and len(records)==len(initial)==10,'Domain/count mismatch')
