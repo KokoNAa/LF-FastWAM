@@ -182,13 +182,16 @@ def main():
                                 generation_quality=None,paired_semantic_change=None,evidence=None))
             write(template,dict(complete=False,selection_sha256=sha(frozen),annotations=annotations))
         print(json.dumps(dict(panels=len(manifest),output=str(out))));return
-    values=defaultdict(list);records=[]
+    values=defaultdict(list);records=[];initial_checks=[]
     for model in plan['models']:
         for row in plan['states']:
             folder=probe/model/'video'/row['id']
             if not verified_state(folder,plan_hash):raise ValueError('All-state video measurement cannot summarize partial coverage')
             mask=roi_masks(row)
             clips={(lang,seed):load_prediction(folder,lang,seed) for lang in ['source','target'] for seed in plan['noise_seeds']}
+            initial_hashes={hashlib.sha256(clip[0].tobytes()).hexdigest() for clip in clips.values()}
+            if len(initial_hashes)!=1:raise ValueError('Decoded initial frame differs across language/noise conditions')
+            initial_checks.append(dict(id=row['id'],model=model,sha256=next(iter(initial_hashes)),clips=len(clips)))
             for seed in plan['noise_seeds']:
                 effect=image_delta(clips['source',seed],clips['target',seed],mask)
                 records.append(dict(id=row['id'],model=model,kind='language',seed=seed,**effect))
@@ -202,6 +205,7 @@ def main():
                         for name,value in effect.items():values[(model,row['task'],row['phase'],'noise_'+name)].append((row['scene_seed'],value))
     stats=[dict(model=m,task=t,phase=p,metric=k,**clustered(v)) for (m,t,p,k),v in sorted(values.items())]
     write(out/'pixel_sensitivity.json',dict(complete=True,plan_sha256=plan_hash,records=records,statistics=stats,
+        initial_frame_checks=initial_checks,
         interpretation='Pixel sensitivity only; not a semantic success rate. Excludes fixed initial frame.'))
     print(json.dumps(dict(records=len(records),output=str(out))))
 
