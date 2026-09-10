@@ -91,6 +91,10 @@ def audit(root):
         if '-closed-' in name:
             marker=root/'closed_loop'/name/'world_language_complete.json'
             require(marker.exists() and read(marker)['complete'],'Missing closed worker marker: '+name)
+    # Recheck metadata after all hashes, including paths reused across groups.
+    for name,record in records.items():
+        p=Path(name);current=p.stat()
+        require((current.st_size,current.st_mtime_ns,str(p.resolve()))==(record['size'],record['mtime_ns'],record['resolved_path']),'File identity changed during final audit: '+name)
     # Guard against another controller mutation during this final-only audit.
     require(read(status_path)==status,'Controller status changed during final audit')
     result=dict(format='robotwin_world_language_final_runtime_audit_v1',complete=True,verified_at=time.time(),frozen_worktree=str(frozen),frozen_commit=head,processes=processes,verified_groups=groups,files=records,evidence_sha256={str(p):sha(p) for p in [status_path,launch_path,plan_path,snapshot_path,assets_path,review_path]},scope='Final owned process exits and immutable source/checkpoint/input/assets only. Requires separate completed data, semantic review and scientific-report audits; this is not whole-study completion.')
