@@ -3,6 +3,17 @@ import pytest
 from scripts.review_robotwin_world_language_videos import selected_states,image_delta,validate_annotations
 
 
+def test_early_panels_preserve_frozen_sample_and_require_both_models(tmp_path,monkeypatch):
+    import scripts.review_robotwin_world_language_videos as review
+    selection=dict(states=['chosen_first','chosen_second','chosen_third'],models=['base','adapted'])
+    present={('chosen_first','base'),('chosen_first','adapted'),('chosen_second','base'),
+             ('chosen_third','base'),('chosen_third','adapted'),('unselected','base'),('unselected','adapted')}
+    monkeypatch.setattr(review,'verified_state',lambda folder,_: {} if (folder.name,folder.parents[1].name) in present else None)
+    with pytest.raises(ValueError,match='chosen_second'):
+        review.available_review_states(selection,tmp_path,'plan')
+    assert review.available_review_states(selection,tmp_path,'plan',True)==['chosen_first','chosen_third']
+
+
 def test_qualitative_selection_is_catalog_order_not_outcome_or_seed_order():
     scenes=[dict(task='a',scene_seed=n) for n in [9,3,1]]
     states=[dict(task='a',scene_seed=n,phase=p,id=f'{n}_{p}') for n in [9,3,1] for p in ['initial','source_mid','source_late']]

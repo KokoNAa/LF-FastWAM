@@ -66,6 +66,19 @@ def selected_states(plan):
     return [r for r in plan['states'] if (r['task'],r['scene_seed']) in scenes and r['phase'] in phases]
 
 
+def available_review_states(selection,probe,plan_hash,allow_partial=False):
+    """Keep the frozen sample; permit early review only when both models exist."""
+    available=[]
+    for ident in selection['states']:
+        ready=all(verified_state(probe/model/'video'/ident,plan_hash) is not None
+                  for model in selection['models'])
+        if not ready:
+            if allow_partial:continue
+            raise ValueError('Selected video not completed: '+ident)
+        available.append(ident)
+    return available
+
+
 def load_prediction(folder,language,seed):
     frames=[np.asarray(Image.open(folder/f'video_{language}_{seed}/{i:02d}.png').convert('RGB')) for i in range(9)]
     result=np.stack(frames)
@@ -137,7 +150,10 @@ def panel(row,probe,seed,path,models=('released','no_eraf')):
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--root',type=Path,required=True)
-    ap.add_argument('--mode',choices=['freeze','measure','panels','validate'],required=True);args=ap.parse_args()
+    ap.add_argument('--mode',choices=['freeze','measure','panels','validate'],required=True)
+    ap.add_argument('--allow-partial',action='store_true',help='Panels only: render completed members of the unchanged frozen sample into a separate partial manifest.')
+    args=ap.parse_args()
+    if args.allow_partial and args.mode!='panels':ap.error('--allow-partial is only valid with --mode panels')
     probe=args.root/'probes';plan=read(probe/'plan.json');plan_hash=sha(probe/'plan.json')
     out=args.root/'video_review';out.mkdir(exist_ok=True)
     selection=dict(format='robotwin_world_language_video_review_v1',plan_sha256=plan_hash,
@@ -160,19 +176,27 @@ def main():
     lookup={r['id']:r for r in plan['states']}
     if args.mode=='panels':
         manifest=[]
-        for ident in selection['states']:
-            for model in plan['models']:
-                if not verified_state(probe/model/'video'/ident,plan_hash):raise ValueError('Selected video not completed: '+ident)
+        available=available_review_states(selection,probe,plan_hash,args.allow_partial)
+        for ident in available:
             for seed in plan['noise_seeds']:
                 path=out/f'{ident}_seed{seed}.jpg'
-                record=panel(lookup[ident],probe,seed,path)
+                candidate=path.with_suffix('.candidate.jpg')
+                record=panel(lookup[ident],probe,seed,candidate)
+                if path.exists():
+                    if sha(path)!=record['sha256']:raise ValueError('Previously reviewable panel changed: '+str(path))
+                    candidate.unlink()
+                else:candidate.replace(path)
+                record['path']=str(path)
                 manifest.append(dict(state_id=ident,seed=seed,**record))
-        write(out/'panels.json',dict(complete=True,panels=manifest,selection_sha256=sha(frozen)))
+        suffix='_partial' if args.allow_partial else ''
+        write(out/f'panels{suffix}.json',dict(complete=len(available)==len(selection['states']),
+            panels=manifest,selection_sha256=sha(frozen),expected_panels=len(selection['states'])*len(plan['noise_seeds']),
+            pending_states=[ident for ident in selection['states'] if ident not in available]))
         # Template stays separate; never overwrite actual review annotations.
-        template=out/'annotation_template.json'
-        if not template.exists():
+        template=out/f'annotation_template{suffix}.json'
+        if args.allow_partial or not template.exists():
             annotations=[]
-            for ident in selection['states']:
+            for ident in available:
                 for model in plan['models']:
                     for seed in plan['noise_seeds']:
                         for language in ['source','target']:
@@ -181,7 +205,8 @@ def main():
                                 visible_change=None,relation_established=None,clear_contradiction=None,
                                 generation_quality=None,paired_semantic_change=None,evidence=None))
             write(template,dict(complete=False,selection_sha256=sha(frozen),annotations=annotations))
-        print(json.dumps(dict(panels=len(manifest),output=str(out))));return
+        print(json.dumps(dict(panels=len(manifest),expected_panels=len(selection['states'])*len(plan['noise_seeds']),
+                              partial=args.allow_partial,output=str(out))));return
     values=defaultdict(list);records=[];initial_checks=[]
     for model in plan['models']:
         for row in plan['states']:
