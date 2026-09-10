@@ -71,6 +71,8 @@ def prepare(args):
     proof = read(args.collection/'status.json')
     if not proof['complete']: raise ValueError('Wait for verified paired collection completion')
     manifest = read(MANIFEST)
+    if not read(args.collection/'protocol.json').get('eval_mode'):
+        raise ValueError('Formal collection must use evaluation textures')
     config = yaml.safe_load(Path(manifest['original_train_config']).read_text())
     assert config['data']['train']['num_frames'] == 33
     assert config['data']['train']['action_video_freq_ratio'] == 4
@@ -90,6 +92,12 @@ def prepare(args):
             scene = dict(task=task, pair_id=a['pair_id'], scene_seed=a['scene_seed'],
                 episode_index=a['episode_index'], instructions=instructions(a), raw_paths=paths,
                 initial_state_sha256=a['initial_state_sha256'])
+            initial = [json.loads(line) for line in (pair/'initial_goal_audit.jsonl').read_text().splitlines()
+                       if json.loads(line)['seed'] == a['scene_seed']]
+            assert initial and all(r['eval_mode'] and not r['source_initial'] and not r['target_initial'] for r in initial)
+            assert len({r['physical_state_sha256'] for r in initial}) == 1
+            scene['initial_physical_state_sha256'] = initial[0]['physical_state_sha256']
+            scene['counterfactual_task'] = a['counterfactual_task']
             scenes.append(scene)
             with h5py.File(paths['native']) as x, h5py.File(paths['counterfactual']) as y:
                 q = {'source':x['joint_action/vector'][:], 'target':y['joint_action/vector'][:]}
@@ -128,6 +136,22 @@ def prepare(args):
         input_sha256=files, training_performed=False,
         code_commit=os.popen('git rev-parse HEAD').read().strip())
     write(root/'plan.json',plan)
+    from experiments.robotwin.language_interventions import EPISODE_FORMAT
+    for task in TASKS:
+        folder=root/'catalog'/task/'demo_randomized/correct'
+        folder.mkdir(parents=True,exist_ok=False)
+        catalog=[]
+        for scene in [r for r in scenes if r['task']==task]:
+            catalog.append(dict(format=EPISODE_FORMAT,pair_id=scene['pair_id'],source_task=task,
+                counterfactual_task=scene['counterfactual_task'],task_config='demo_randomized',condition='correct',
+                instruction_type='canonical',scene_seed=scene['scene_seed'],episode_index=scene['episode_index'],
+                source_instruction=scene['instructions']['source'],counterfactual_instruction=scene['instructions']['target'],
+                policy_instruction=scene['instructions']['source'],instruction_goal='source',selected_goal='source',
+                initial_source_goal_success=False,initial_counterfactual_goal_success=False,
+                initial_physical_state_sha256=scene['initial_physical_state_sha256'],catalog_only=True,
+                selection='Both expert goals feasible, both initial goals false, evaluation textures.'))
+        (folder/'episodes.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in catalog))
+        write(folder/'catalog_complete.json',dict(complete=True,episodes=len(catalog)))
     print(json.dumps(dict(states=len(states),scenes=len(scenes),tasks=TASKS)),flush=True)
 
 
@@ -326,14 +350,24 @@ def worker(args):
             folder=args.output/args.model/args.experiment/row['id']
             proof=folder/'complete.json'
             if proof.exists():
-                raise ValueError('Explicitly verify completed outputs before resuming an existing worker')
+                done=read(proof)
+                if done.get('plan_sha256')!=sha(args.output/'plan.json'):
+                    raise ValueError('Completed state belongs to a different plan')
+                if not done.get('output_sha256') or any(sha(folder/p)!=h for p,h in done['output_sha256'].items()):
+                    raise ValueError('Completed state output checksum mismatch')
+                print(json.dumps(dict(verified_resume=row['id'],model=args.model,experiment=args.experiment)),flush=True)
+                continue
+            if folder.exists() and list(folder.iterdir()):
+                raise ValueError('Partial state requires inspection before retry: '+str(folder))
             folder.mkdir(parents=True,exist_ok=True)
             torch.cuda.reset_peak_memory_stats()
             start=time.time()
             result=(run_features if args.experiment=='features_cache' else run_video)(policy,row,folder)
             result.update(elapsed_seconds=time.time()-start,peak_cuda_bytes=torch.cuda.max_memory_allocated())
+            result['plan_sha256']=sha(args.output/'plan.json')
+            result['output_sha256']={str(p.relative_to(folder)):sha(p) for p in folder.rglob('*') if p.is_file()}
             write(proof,result)
-            print(json.dumps(dict(model=args.model,experiment=args.experiment,state=i+1,total=len(rows),**result)),flush=True)
+            print(json.dumps(dict(model=args.model,state=i+1,total=len(rows),**result)),flush=True)
             torch.cuda.empty_cache()
 
 
