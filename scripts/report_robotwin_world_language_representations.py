@@ -31,13 +31,21 @@ def feature_matrix(comparisons,kind):
 
 def report(root):
     probe=root/'probes';plan=read(probe/'plan.json');plan_hash=sha(probe/'plan.json')
+    identity_path=root/'checkpoint_identity_audit.json';identity=read(identity_path)
+    if (identity['plan_sha256']!=plan_hash or identity['selected_checkpoints']!=plan['checkpoints']
+            or identity['selected_checkpoint_sha256']!=plan['checkpoint_sha256']
+            or identity['no_eraf_base_checkpoint']!=plan['checkpoints']['released']):
+        raise ValueError('Checkpoint identity audit does not match the frozen experiment')
     groups={}
     for model in plan['models']:
         for state in plan['states']:
             folder=probe/model/'features_cache'/state['id']
             proof=verified_state(folder,plan_hash)
             if not proof:raise ValueError('All-layer report requires complete feature coverage')
-            if proof['checkpoint']!=plan['checkpoints'][model]:raise ValueError('Wrong checkpoint')
+            # Frozen worker run_features stores model.lora_base_checkpoint here.
+            # Both primary models share the released base; selected adapter identity
+            # is bound by the plan hash and controller's --model/load_policy path.
+            if proof['checkpoint']!=plan['checkpoints']['released']:raise ValueError('Wrong base checkpoint')
             for comparison in COMPARISONS:
                 data=read(folder/(comparison+'-features.json'))['comparisons']
                 for kind in ['hidden','k','v']:
@@ -64,6 +72,9 @@ def report(root):
         writer=csv.DictWriter(f,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
     np.savez_compressed(out/'representation_maps.npz',**maps)
     result=dict(complete=True,plan_sha256=plan_hash,states_per_model=len(plan['states']),layer_rows=len(rows),maps=map_records,
+        checkpoint_identity_audit_sha256=sha(identity_path),
+        selected_checkpoints=plan['checkpoints'],selected_checkpoint_sha256=plan['checkpoint_sha256'],
+        feature_proof_checkpoint_semantics='checkpoint denotes the shared LoRA base; selected checkpoint identities are listed separately.',
         map_axes=['layer','height','width'],map_shape=[30,12,10],camera_rows=dict(head=[0,8],wrists=[8,12]),
         camera_columns=dict(left_wrist=[0,5],right_wrist=[5,10]),
         interpretation='Mean token RMS difference across scenes in each task/phase. Spatial magnitude is sensitivity, not causal attention or semantic correctness. CSV scene_sd is scene variability, not a confidence interval; endpoint confidence intervals are in the quantitative report.',
