@@ -46,12 +46,13 @@ def main():
                 assert len(rows)==30
                 ax.plot(range(30),[float(r['relative_l2_mean']) for r in rows],color=color,label=label,lw=1.8)
             if i==0:ax.set_title(NAMES[j])
-            if j==0:ax.set_ylabel(model.replace('_','-')+'\nRelative L2')
+            if j==0:ax.set_ylabel(model.replace('_','-')+'\nRelative L2 (symlog)')
             if i==1:ax.set_xlabel('Video layer')
-            ax.grid(alpha=.2);ax.set_xlim(0,29);ax.set_ylim(bottom=0)
+            ax.grid(alpha=.2);ax.set_xlim(0,29);ax.set_yscale('symlog',linthresh=1e-4)
+    axes[0,0].set_ylim(0,max(float(r['relative_l2_mean']) for r in layers)*1.1)
     fig.suptitle('Source versus counterfactual language: video representations at the same initial observation',y=.995)
     fig.legend(*axes[0,0].get_legend_handles_labels(),loc='upper center',bbox_to_anchor=(.5,.955),ncol=3,frameon=False)
-    fig.text(.5,.025,'Means over 10 scenes per task. K/V are computed before the current block\'s text fusion; first-layer K/V can remain identical.\nRepresentation sensitivity is not evidence of correct goal execution.',ha='center',fontsize=9)
+    fig.text(.5,.025,'Means over 10 scenes per task. Shared symlog scale, linear below 0.0001. K/V precede the current block\'s text fusion.\nFirst-layer K/V can remain identical. Representation sensitivity is not evidence of correct goal execution.',ha='center',fontsize=9)
     fig.tight_layout(rect=[0,.08,1,.91]);save(fig,'video_language_layer_profiles')
     fig,axes=plt.subplots(1,2,figsize=(13,5),sharey=True)
     for i,(branch,held,title) in enumerate([('video','action','Change video language; hold action text'),('action','video','Change action text; hold video KV')]):
