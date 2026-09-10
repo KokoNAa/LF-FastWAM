@@ -111,6 +111,10 @@ def report(root):
                     for metric in ['wrong_minus_correct_mse','wrong_minus_correct_roi_mse']:
                         add(model,task,phase,f'video_{metric}_sigma{r["sigma"]}',scene,r[metric],
                             noise_seed=r['seed'],reference=r['reference'])
+                        # Retain direction-specific evidence: an average over the
+                        # two expert futures can conceal opposite language biases.
+                        add(model,task,phase,f'video_ref_{r["reference"]}_{metric}_sigma{r["sigma"]}',
+                            scene,r[metric],noise_seed=r['seed'],reference=r['reference'])
                 for seed in plan['noise_seeds']:
                     hashes={r['noisy_sha256'] for r in results['rows'] if r['sigma']==1 and r['seed']==seed}
                     assert len(hashes)==1,'Pure video noise must match for shared-state reference pairs'
@@ -187,6 +191,9 @@ def report(root):
     with (out/'statistics.csv').open('w') as f:
         w=csv.DictWriter(f,fieldnames=['model','task','phase','metric','scenes','repeated_observations','mean','ci95'])
         w.writeheader();w.writerows(summary)
+    with (out/'per_scene_observations.jsonl').open('w') as f:
+        for row in raw_rows:
+            f.write(json.dumps(row)+'\n')
     return output
 
 
