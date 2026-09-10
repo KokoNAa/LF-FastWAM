@@ -45,8 +45,9 @@ def instructions(row):
         a, b = pairs[0]['source'], pairs[0]['target']
         # Keep exactly the same object names; change only the command construction.
         def paraphrase(s):
-            if not s.startswith('Place '): raise ValueError('Unreviewed placement template')
-            return 'Please position '+s[len('Place '):]
+            for prefix,replacement in [('Place ','Please position '),('Position ','Please place ')]:
+                if s.startswith(prefix):return replacement+s[len(prefix):]
+            raise ValueError('Unreviewed placement template')
         pa, pb = paraphrase(a), paraphrase(b)
     elif task == 'blocks_ranking_rgb':
         pa = 'Put the blocks in a row: red on the left, green in the middle, and blue on the right.'
