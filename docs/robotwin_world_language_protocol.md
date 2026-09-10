@@ -10,6 +10,9 @@ The scope includes all four experiments below, not just representation distance.
 Use five tasks (RGB ranking, two-block stack, left/right placement, burger/fries),
 ten fresh demo_randomized scenes each. Select by feasibility of both expert goals,
 never by policy success. Audit scene exclusion against available training manifests.
+Require both goals false initially and eval_mode=true during collection and policy
+evaluation, so both use the unseen texture partition. The earlier collection smoke
+used the inherited default eval_mode=false and is excluded from the final study.
 The three placement tasks use the existing paired shared-grasp planner to supply
 identical post-grasp decision observations. Preserve that collection distinction.
 

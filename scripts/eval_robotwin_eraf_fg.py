@@ -65,11 +65,14 @@ def main():
     ap.add_argument('--eraf', choices=['on', 'off'], default='on')
     ap.add_argument('--policy-kind', choices=['repair', 'legacy'], default='repair')
     ap.add_argument('--memory-mode', choices=['carry', 'reset'], default='carry')
+    ap.add_argument('--instruction-type', choices=['seen', 'unseen', 'canonical'], default='unseen')
     ap.add_argument('--videos', action='store_true')
     ap.add_argument('--manipulation-metrics', action='store_true')
     ap.add_argument('--skip-file-hashes', action='store_true',
                     help='Bind checkpoint/catalog file metadata without repeated full-file scans.')
     args = ap.parse_args()
+    if args.mode == 'catalog' and args.instruction_type == 'canonical':
+        ap.error('Canonical instructions require an externally verified matched catalog.')
     if args.mode == 'worker' and args.memory_mode == 'reset' and (args.eraf != 'on' or args.policy_kind != 'repair'):
         ap.error('Memory reset requires an ERAF-on repair checkpoint.')
     for key in ('output', 'robotwin_root', 'interventions', 'manifest', 'checkpoint', 'catalog_root'):
@@ -177,14 +180,14 @@ def main():
                     if not task.plan_success or not task.check_success() or not GoalObserver(task, pair).update().source.success:
                         raise ValueError('Source expert could not solve the scene.')
                     source = official._deterministic_instruction(task_name=pair.source_task,
-                        episode_info=info['info'], instruction_type='unseen', scene_seed=seed)
+                        episode_info=info['info'], instruction_type=args.instruction_type, scene_seed=seed)
                     target = (str(pair.counterfactual_instruction) if pair.counterfactual_instruction is not None else
                               official._deterministic_instruction(task_name=pair.counterfactual_task,
-                                  episode_info=info['info'], instruction_type='unseen', scene_seed=seed))
+                                  episode_info=info['info'], instruction_type=args.instruction_type, scene_seed=seed))
                     row = {'format': EPISODE_FORMAT, 'pair_id': pair.pair_id, 'source_task': task_name,
                            'counterfactual_task': pair.counterfactual_task, 'task_config': args.task_config,
                            'condition': 'correct', 'episode_index': count, 'scene_seed': seed,
-                           'instruction_type': 'unseen', 'source_instruction': source,
+                           'instruction_type': args.instruction_type, 'source_instruction': source,
                            'counterfactual_instruction': target, 'policy_instruction': source,
                            'instruction_goal': 'source', 'selected_goal': 'source',
                            'initial_source_goal_success': False, 'initial_counterfactual_goal_success': False,
@@ -208,7 +211,7 @@ def main():
         canonical_path = Path(args.catalog_root) / task_name / args.task_config / 'correct/episodes.jsonl'
         canonical = load_matched_episode_records(canonical_path, expected_pair_id=pair.pair_id,
             expected_source_task=task_name, expected_counterfactual_task=pair.counterfactual_task,
-            expected_task_config=args.task_config, expected_instruction_type='unseen', expected_episodes=args.episodes)
+            expected_task_config=args.task_config, expected_instruction_type=args.instruction_type, expected_episodes=args.episodes)
         if policy is None:
             manifest = json.loads(Path(args.manifest).read_text())
             if args.policy_kind == 'repair':
@@ -245,13 +248,13 @@ def main():
                 goal = 'source' if condition == 'correct' else 'counterfactual'
                 _, _, records = official.eval_policy(task_name, task, deepcopy(options), policy, 0,
                     test_num=args.episodes, video_size=video_size,
-                    instruction_type='unseen', skip_get_obs_within_replan=True, condition=condition,
+                    instruction_type=args.instruction_type, skip_get_obs_within_replan=True, condition=condition,
                     intervention_pair=pair, instruction_goal=goal, selected_goal=goal,
                     episode_results_path=directory / 'episodes.jsonl', matched_episode_records=canonical)
             finally:
                 policy.begin_episode = original_begin
             summary = official._summarize_intervention_records(records=records, pair=pair, condition=condition,
-                task_config=args.task_config, instruction_type='unseen', checkpoint=args.checkpoint)
+                task_config=args.task_config, instruction_type=args.instruction_type, checkpoint=args.checkpoint)
             (directory / 'summary.json').write_text(json.dumps(summary, indent=2))
             (directory / 'initial_states.json').write_text(json.dumps(initial_hashes, indent=2))
             (directory / 'complete.json').write_text(json.dumps({'complete': len(records) == args.episodes,
@@ -266,6 +269,7 @@ def main():
                 'canonical_metadata': file_metadata(canonical_path) if args.skip_file_hashes else None,
                 'skip_file_hashes': args.skip_file_hashes, 'eraf': args.eraf, 'policy_kind': args.policy_kind,
                 'memory_mode': args.memory_mode,
+                'instruction_type': args.instruction_type,
                 'manipulation_metrics': args.manipulation_metrics,
                 'deployment': {'action_horizon': 32, 'replan_steps': 24, 'inference_steps': 10}}, indent=2))
     if args.mode == 'catalog':

@@ -72,7 +72,8 @@ def main():
         VK_ICD_FILENAMES='/etc/vulkan/icd.d/nvidia_icd.json', OMP_NUM_THREADS='2', MKL_NUM_THREADS='2')
     protocol = dict(format='robotwin_world_language_collection_v1', tasks=TASKS,
         episodes_per_task=args.episodes, start_seed=args.start_seed, task_config='demo_randomized',
-        training_allowed=False, selection='Expert feasibility only; no policy outcome selection.',
+        eval_mode=True, training_allowed=False,
+        selection='Both initial goals false and both expert goals feasible; no policy outcome selection.',
         shared_grasp_prefix_tasks=TASKS[2:], code_commit=subprocess.check_output(
             ['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip())
     if (root/'protocol.json').exists():
@@ -89,7 +90,7 @@ def main():
                 status['jobs'][task] = dict(status='verified'); continue
             if folder.exists():
                 raise RuntimeError('Partial collection requires inspection before retry: '+str(folder))
-            cmd = [sys.executable, str(REPO/'scripts/collect_pgc_robotwin_pairs.py'),
+            cmd = [sys.executable, str(REPO/'scripts/collect_robotwin_world_language_pairs.py'),
                 '--output-root', str(folder), '--robotwin-root', args.robotwin_root,
                 '--task-config', 'demo_randomized', '--episodes', str(args.episodes),
                 '--source-tasks', task, '--start-seed', str(args.start_seed+index*1000000),
