@@ -88,7 +88,7 @@ def main():
     axes[0].set_ylabel('Wrong minus correct: task-region velocity MSE')
     fig.suptitle('Language discrimination across video denoising levels',y=.99)
     fig.legend(*axes[0].get_legend_handles_labels(),loc='upper center',bbox_to_anchor=(.5,.93),ncol=4,frameon=False)
-    finish(fig,'video_denoising_margins','Positive: matching language predicts the expert future better than mismatched language. Shading: 95% scene-bootstrap intervals.\n10 scenes/task, 3 noise draws; critical states as above. Conditional denoising fit is separate from generated-video semantics and closed-loop success.',[0,.14,1,.84])
+    finish(fig,'video_denoising_margins','Positive: matching language predicts the expert future better than mismatched language. Shading: 95% scene-bootstrap intervals.\nRanking/stacking: initial; placement: shared decision. 10 scenes/task, 3 noise draws. Conditional fit is not generated-video or closed-loop success.',[0,.14,1,.84])
     data=dict(plan_sha256=p['plan_sha256'],sources={str(f):sha(f) for f in [args.quantitative,args.pixel,args.reference_audit]},phases=PHASES,statistics=list(used.values()))
     dp=out/'figure_data.json';dp.write_text(json.dumps(data,indent=2)+'\n')
     manifest=dict(complete=True,figures=3,files=files,figure_data_sha256=sha(dp),scope='Completed video numerical experiments only. Qualitative review and closed-loop outcomes remain separate. No multiple-comparison correction or independent noise-seed sample interpretation.')
