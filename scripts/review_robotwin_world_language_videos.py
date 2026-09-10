@@ -117,7 +117,7 @@ def image_delta(a,b,mask):
                 task_roi_rmse=float(np.sqrt(np.mean(diff[:,mask]**2))))
 
 
-def panel(row,probe,seed,path,models=('released','no_eraf')):
+def panel(row,probe,seed,path,models=('released','no_eraf'),*,positions=(0,2,4,6,8),full_mosaic=False,include_experts=True):
     import h5py
     # Four generated rows, then one or two valid expert references.
     streams=[]
@@ -126,14 +126,16 @@ def panel(row,probe,seed,path,models=('released','no_eraf')):
         for language in ['source','target']:
             streams.append((model+' / '+language,load_prediction(folder,language,seed)))
     branches=['source','target'] if row['dual_reference_valid'] else [row['observation_branch']]
-    for branch in branches:
+    for branch in branches if include_experts else []:
         with h5py.File(row['raw_paths'][BRANCH[branch]]) as h:
             streams.append(('expert / '+branch,np.stack([raw_mosaic(h,f) for f in row['video_indices']])))
-    positions=[0,2,4,6,8]
-    head_height=256
+    positions=list(positions)
+    head_height=384 if full_mosaic else 256
     width=320*len(positions);top=112;row_height=head_height+30
     canvas=Image.new('RGB',(width,top+len(streams)*row_height),'white');draw=ImageDraw.Draw(canvas)
-    lines=[row['id']+f' | noise {seed} | head camera | action offsets 0,8,16,24,32',
+    camera='full camera mosaic' if full_mosaic else 'head camera'
+    offsets=','.join(str(4*f) for f in positions)
+    lines=[row['id']+f' | noise {seed} | {camera} | action offsets {offsets}',
            'SOURCE: '+row['instructions']['source'],'TARGET: '+row['instructions']['target'],
            'Same observation for both references: '+str(row['dual_reference_valid'])]
     y=4
@@ -150,10 +152,12 @@ def panel(row,probe,seed,path,models=('released','no_eraf')):
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--root',type=Path,required=True)
-    ap.add_argument('--mode',choices=['freeze','measure','panels','validate'],required=True)
+    ap.add_argument('--mode',choices=['freeze','measure','panels','details','validate'],required=True)
+    ap.add_argument('--state-id',help='Details only: one member of the unchanged frozen review selection.')
     ap.add_argument('--allow-partial',action='store_true',help='Panels only: render completed members of the unchanged frozen sample into a separate partial manifest.')
     args=ap.parse_args()
     if args.allow_partial and args.mode!='panels':ap.error('--allow-partial is only valid with --mode panels')
+    if (args.mode=='details') != bool(args.state_id):ap.error('--state-id is required only with --mode details')
     probe=args.root/'probes';plan=read(probe/'plan.json');plan_hash=sha(probe/'plan.json')
     out=args.root/'video_review';out.mkdir(exist_ok=True)
     selection=dict(format='robotwin_world_language_video_review_v1',plan_sha256=plan_hash,
@@ -168,12 +172,31 @@ def main():
         panels=read(out/'panels.json');annotations=read(out/'annotations.json')
         for p in panels['panels']:
             if sha(Path(p['path']))!=p['sha256']:raise ValueError('Inspected panel changed')
+        for row in annotations['annotations']:
+            for p in row.get('supplemental_panels',[]):
+                if sha(Path(p['path']))!=p['sha256']:raise ValueError('Inspected supplemental panel changed')
         result=validate_annotations(selection,sha(frozen),panels,annotations)
         result.update(selection_sha256=sha(frozen),annotations_sha256=sha(out/'annotations.json'),
                       panels_sha256=sha(out/'panels.json'))
         write(out/'semantic_review_coverage.json',result)
         print(json.dumps(result));return
     lookup={r['id']:r for r in plan['states']}
+    if args.mode=='details':
+        if args.state_id not in selection['states']:raise ValueError('Details cannot change the frozen review sample')
+        subset=dict(selection,states=[args.state_id])
+        available_review_states(subset,probe,plan_hash)
+        folder=out/'details';folder.mkdir(exist_ok=True);manifest=[]
+        for seed in plan['noise_seeds']:
+            path=folder/f'{args.state_id}_seed{seed}.jpg';candidate=path.with_suffix('.candidate.jpg')
+            record=panel(lookup[args.state_id],probe,seed,candidate,positions=(1,3,5,7,8),full_mosaic=True,include_experts=False)
+            if path.exists():
+                if sha(path)!=record['sha256']:raise ValueError('Previously inspected detail changed')
+                candidate.unlink()
+            else:candidate.replace(path)
+            record['path']=str(path);manifest.append(dict(state_id=args.state_id,seed=seed,**record))
+        write(folder/f'{args.state_id}.json',dict(complete=True,selection_sha256=sha(frozen),panels=manifest,
+            purpose='Supplemental intermediate frames and wrist views for the existing selected state; not additional samples.'))
+        print(json.dumps(dict(state_id=args.state_id,detail_panels=len(manifest),output=str(folder))));return
     if args.mode=='panels':
         manifest=[]
         available=available_review_states(selection,probe,plan_hash,args.allow_partial)
