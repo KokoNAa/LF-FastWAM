@@ -75,6 +75,29 @@ def video_error_metrics(row):
     return result
 
 
+def paired_video_statistics(rows):
+    """Subtract matched observations before averaging noise seeds within scenes."""
+    cells=defaultdict(dict)
+    for row in rows:
+        if not row['metric'].startswith('video_'):continue
+        model=row['model']
+        if model not in {'released','no_eraf'}:raise ValueError('Unknown paired video model')
+        key=tuple(row[k] for k in ['task','phase','metric','scene_seed','noise_seed','reference'])
+        if model in cells[key]:raise ValueError('Duplicate paired video observation')
+        cells[key][model]=row['value']
+    groups=defaultdict(list);matched=0;unpaired=0
+    for key,values in cells.items():
+        if set(values)!={'released','no_eraf'}:
+            unpaired+=len(values);continue
+        task,phase,metric,scene,noise,reference=key
+        groups[(task,phase,metric)].append((scene,values['no_eraf']-values['released']))
+        matched+=1
+    return dict(contrast='no_eraf minus released',matched_metric_observations=matched,
+        unpaired_metric_observations=unpaired,
+        interpretation='Negative absolute correct-error differences indicate better conditional fit; positive discrimination-margin differences indicate greater separation, not necessarily better absolute fit.',
+        statistics=[dict(task=t,phase=p,metric=m,**clustered(v)) for (t,p,m),v in sorted(groups.items())])
+
+
 def report(root):
     probe=root/'probes';plan=read(probe/'plan.json');plan_hash=sha(probe/'plan.json')
     values=defaultdict(list);counts=defaultdict(int);raw_rows=[]
@@ -199,7 +222,8 @@ def report(root):
         state_coverage={m:{e:counts[(m,e)] for e in ['features_cache','video']} for m in plan['models']},
         expected_states_per_model_experiment=len(plan['states']),closed_loop=closed,
         expected_closed_loop_episodes=1200,actual_closed_loop_episodes=sum(x['episodes'] for x in closed.values()),
-        statistics=summary,uncertainty='Average repeated noise seeds and states within each scene; percentile bootstrap across scenes.',
+        statistics=summary,paired_video=paired_video_statistics(raw_rows),
+        uncertainty='Average repeated noise seeds and states within each scene; percentile bootstrap across scenes.',
         termination_interpretation='Ordinary selected-goal termination follows action-side instruction. First-goal categories use the verified immediate-termination invariant; ambiguous cases are reported separately. Ever-goal and manipulation counts retain the ordinary full-rollout definition.',
         pending='Independent input/code/process audit and generated-video semantic scoring remain required.')
     write(out/'quantitative_report.json',output)

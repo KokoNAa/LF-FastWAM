@@ -21,6 +21,24 @@ def test_video_discrimination_does_not_replace_absolute_fit(reference):
     with pytest.raises(ValueError,match='margin mismatch'):video_error_metrics(swapped)
 
 
+def test_video_model_contrast_pairs_noise_and_reference_before_scene_aggregation():
+    from scripts.report_robotwin_world_language import paired_video_statistics
+    def row(model,scene,noise,value,reference='source'):
+        return dict(model=model,task='task',phase='initial',metric='video_correct_mse_sigma1.0',
+                    scene_seed=scene,noise_seed=noise,reference=reference,value=value)
+    rows=[row('released',1,42,10),row('no_eraf',1,42,12),
+          row('released',1,43,20),row('no_eraf',1,43,22),
+          row('released',2,42,100),row('no_eraf',2,42,104),
+          row('released',3,42,1000),row('no_eraf',3,43,9000),
+          row('no_eraf',3,42,9000,reference='target')]
+    result=paired_video_statistics(rows)
+    assert result['matched_metric_observations']==3
+    assert result['unpaired_metric_observations']==3
+    stat=result['statistics'][0]
+    assert stat['scenes']==2 and stat['mean']==3 and stat['repeated_observations']==3
+    with pytest.raises(ValueError,match='Duplicate'):paired_video_statistics(rows+[rows[0]])
+
+
 def test_noise_replicates_do_not_reweight_scenes():
     x=clustered([(1,1.)]*30+[(2,0.)])
     y=clustered([(1,1.),(2,0.)])
