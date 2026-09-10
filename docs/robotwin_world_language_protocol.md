@@ -47,3 +47,13 @@ Report actual counts, no rate scaling or hypothetical episodes. Aggregate seeds
 within scenes before confidence intervals. Archive code SHA, protocol/input hashes,
 per-scene results, process exits and rendered figures. A completion flag alone does
 not prove the four experiments or semantic scoring were completed.
+
+Closed-loop termination retains the ordinary selected-goal rule associated with
+the action-side instruction. Video-only comparisons hold that rule fixed. For
+cross-action-language comparisons additionally report first-goal categories, using
+the verified immediate termination at a selected success. If both goals were ever
+true and only the selected goal is true finally, the opposite goal occurred first.
+Simultaneous final goals or an unverifiable termination invariant are ambiguous.
+Do not confuse these first-choice outcomes with full-rollout ever-success or grasp
+counts. Confirm the simulator still immediately returns and the outer loop still
+stops before another physics step when auditing this derivation.

@@ -30,6 +30,25 @@ def clustered(values,replicates=5000):
         ci95=[float(x) for x in np.quantile(samples,[.025,.975])])
 
 
+def first_goal_category(row):
+    """Infer first goal using audited immediate selected-goal termination.
+
+    take_action returns on the first selected check_success; the outer loop then
+    stops without stepping physics. Thus if both were ever true and only the
+    selected goal is true finally, the opposite goal occurred first. Simultaneous
+    final goals or a violated termination invariant remain explicitly ambiguous.
+    """
+    goals=['source','counterfactual']
+    ever={g:bool(row[g+'_goal_ever_success']) for g in goals}
+    final={g:bool(row[g+'_goal_final_success']) for g in goals}
+    if any(final[g] and not ever[g] for g in goals):raise ValueError('Final goal missing from ever-goal record')
+    if not any(ever.values()):return 'neither'
+    if not all(ever.values()):return next(g for g in goals if ever[g])
+    selected=row['selected_goal'];other=next(g for g in goals if g!=selected)
+    if final[selected] and not final[other]:return other
+    return 'ambiguous'
+
+
 def verified_state(folder,plan_hash):
     p=folder/'complete.json'
     if not p.exists():return None
@@ -132,6 +151,11 @@ def report(root):
                             for metric in ['source_goal_ever_success','counterfactual_goal_ever_success']:
                                 add(model,task,f'closed_v_{v}_a_{a}',metric,x['scene_seed'],float(x[metric]),noise_seed=seed)
                                 paired_outcomes[(model,task,x['scene_seed'],seed,v,a,metric)]=float(x[metric])
+                            first=first_goal_category(x)
+                            for category in ['source','counterfactual','neither','ambiguous']:
+                                metric='first_goal_'+category
+                                add(model,task,f'closed_v_{v}_a_{a}',metric,x['scene_seed'],float(first==category),noise_seed=seed)
+                                paired_outcomes[(model,task,x['scene_seed'],seed,v,a,metric)]=float(first==category)
                             for metric in ['any_correct_object_lifted','all_instruction_objects_lifted','full_goal_after_any_lift','correct_placement_after_lift']:
                                 add(model,task,f'closed_v_{v}_a_{a}',metric,x['scene_seed'],float(x['manipulation_metrics'][metric]),noise_seed=seed)
                             rows.append(x)
@@ -141,7 +165,8 @@ def report(root):
         task,s=scene['task'],scene['scene_seed']
         for model in plan['models']:
             for seed in plan['noise_seeds']:
-                for metric in ['source_goal_ever_success','counterfactual_goal_ever_success']:
+                for metric in ['source_goal_ever_success','counterfactual_goal_ever_success',
+                               'first_goal_source','first_goal_counterfactual','first_goal_ambiguous']:
                     def get(v,a):return paired_outcomes.get((model,task,s,seed,v,a,metric))
                     A,B,C,D=get('source','source'),get('target','source'),get('source','target'),get('target','target')
                     if None not in [A,B,C,D]:
@@ -156,6 +181,7 @@ def report(root):
         expected_states_per_model_experiment=len(plan['states']),closed_loop=closed,
         expected_closed_loop_episodes=1200,actual_closed_loop_episodes=sum(x['episodes'] for x in closed.values()),
         statistics=summary,uncertainty='Average repeated noise seeds and states within each scene; percentile bootstrap across scenes.',
+        termination_interpretation='Ordinary selected-goal termination follows action-side instruction. First-goal categories use the verified immediate-termination invariant; ambiguous cases are reported separately. Ever-goal and manipulation counts retain the ordinary full-rollout definition.',
         pending='Independent input/code/process audit and generated-video semantic scoring remain required.')
     write(out/'quantitative_report.json',output)
     with (out/'statistics.csv').open('w') as f:

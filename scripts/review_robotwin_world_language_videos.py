@@ -66,11 +66,11 @@ def image_delta(a,b,mask):
                 task_roi_rmse=float(np.sqrt(np.mean(diff[:,mask]**2))))
 
 
-def panel(row,probe,seed,path):
+def panel(row,probe,seed,path,models=('released','no_eraf')):
     import h5py
     # Four generated rows, then one or two valid expert references.
     streams=[]
-    for model in ['released','no_eraf']:
+    for model in models:
         folder=probe/model/'video'/row['id']
         for language in ['source','target']:
             streams.append((model+' / '+language,load_prediction(folder,language,seed)))
