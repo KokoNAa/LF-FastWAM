@@ -60,6 +60,21 @@ def verified_state(folder,plan_hash):
     return record
 
 
+def video_error_metrics(row):
+    """Keep absolute fit alongside discrimination; a larger gap can mean worse fit."""
+    correct=row['reference']
+    if correct not in {'source','target'}:raise ValueError('Unknown video reference')
+    wrong='target' if correct=='source' else 'source'
+    result={}
+    for stored,label in [('mse','mse'),('object_roi_mse','roi_mse')]:
+        c,w=(float(row['errors'][language][stored]) for language in [correct,wrong])
+        if not np.isfinite([c,w]).all() or min(c,w)<0:raise ValueError('Invalid video error')
+        margin=row['wrong_minus_correct_'+label]
+        if not np.isclose(w-c,margin,rtol=1e-6,atol=1e-7):raise ValueError('Video margin mismatch')
+        result.update({f'correct_{label}':c,f'wrong_{label}':w,f'wrong_minus_correct_{label}':margin})
+    return result
+
+
 def report(root):
     probe=root/'probes';plan=read(probe/'plan.json');plan_hash=sha(probe/'plan.json')
     values=defaultdict(list);counts=defaultdict(int);raw_rows=[]
@@ -108,13 +123,13 @@ def report(root):
                 assert len(set(keys))==expected
                 assert results['joint_equivalence']['max_abs']<=.02
                 for r in results['rows']:
-                    for metric in ['wrong_minus_correct_mse','wrong_minus_correct_roi_mse']:
-                        add(model,task,phase,f'video_{metric}_sigma{r["sigma"]}',scene,r[metric],
+                    for metric,value in video_error_metrics(r).items():
+                        add(model,task,phase,f'video_{metric}_sigma{r["sigma"]}',scene,value,
                             noise_seed=r['seed'],reference=r['reference'])
                         # Retain direction-specific evidence: an average over the
                         # two expert futures can conceal opposite language biases.
                         add(model,task,phase,f'video_ref_{r["reference"]}_{metric}_sigma{r["sigma"]}',
-                            scene,r[metric],noise_seed=r['seed'],reference=r['reference'])
+                            scene,value,noise_seed=r['seed'],reference=r['reference'])
                 for seed in plan['noise_seeds']:
                     hashes={r['noisy_sha256'] for r in results['rows'] if r['sigma']==1 and r['seed']==seed}
                     assert len(hashes)==1,'Pure video noise must match for shared-state reference pairs'

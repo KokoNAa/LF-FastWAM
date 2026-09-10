@@ -2,6 +2,25 @@ import pytest
 from scripts.report_robotwin_world_language import clustered,first_goal_category
 
 
+@pytest.mark.parametrize('reference',['source','target'])
+def test_video_discrimination_does_not_replace_absolute_fit(reference):
+    from scripts.report_robotwin_world_language import video_error_metrics
+    wrong='target' if reference=='source' else 'source'
+    def record(correct_error,wrong_error):
+        return dict(reference=reference,errors={
+            reference:dict(mse=correct_error,object_roi_mse=2*correct_error),
+            wrong:dict(mse=wrong_error,object_roi_mse=2*wrong_error)},
+            wrong_minus_correct_mse=wrong_error-correct_error,
+            wrong_minus_correct_roi_mse=2*(wrong_error-correct_error))
+    baseline=video_error_metrics(record(1,1.1))
+    adapted=video_error_metrics(record(3,5))
+    assert adapted['wrong_minus_correct_mse']>baseline['wrong_minus_correct_mse']
+    assert adapted['correct_mse']>baseline['correct_mse']
+    assert adapted['correct_roi_mse']==6 and adapted['wrong_roi_mse']==10
+    swapped=record(1,2);swapped['reference']=wrong
+    with pytest.raises(ValueError,match='margin mismatch'):video_error_metrics(swapped)
+
+
 def test_noise_replicates_do_not_reweight_scenes():
     x=clustered([(1,1.)]*30+[(2,0.)])
     y=clustered([(1,1.),(2,0.)])
