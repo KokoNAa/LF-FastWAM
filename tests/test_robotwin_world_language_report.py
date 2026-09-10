@@ -34,3 +34,12 @@ def test_first_goal_preserves_opposite_goal_before_selected_termination(
 def test_first_goal_rejects_inconsistent_diagnostics():
     with pytest.raises(ValueError):first_goal_category(dict(selected_goal='source',source_goal_ever_success=False,
         counterfactual_goal_ever_success=False,source_goal_final_success=True,counterfactual_goal_final_success=False))
+def test_representation_grid_uses_patched_visual_tokens_and_requires_all_layers():
+    from scripts.report_robotwin_world_language_representations import feature_matrix
+    import pytest
+    rows=[dict(layer=i,kind='hidden',rms=0.,relative_l2=0.,cosine_distance=0.,max_abs=0.,
+               token_delta_rms=list(range(120))) for i in reversed(range(30))]
+    matrix=feature_matrix(rows,'hidden')
+    assert matrix.shape==(30,124)
+    assert matrix[0,4:].reshape(12,10)[8,0]==80
+    with pytest.raises(ValueError,match='Incomplete'):feature_matrix(rows[1:],'hidden')
