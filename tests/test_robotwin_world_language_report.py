@@ -30,7 +30,8 @@ def test_video_model_contrast_pairs_noise_and_reference_before_scene_aggregation
           row('released',1,43,20),row('no_eraf',1,43,22),
           row('released',2,42,100),row('no_eraf',2,42,104),
           row('released',3,42,1000),row('no_eraf',3,43,9000),
-          row('no_eraf',3,42,9000,reference='target')]
+          row('no_eraf',3,42,9000,reference='target'),
+          dict(model='no_eraf',metric='video_at_source_action_action_rms',value=0.5)]
     result=paired_video_statistics(rows)
     assert result['matched_metric_observations']==3
     assert result['unpaired_metric_observations']==3

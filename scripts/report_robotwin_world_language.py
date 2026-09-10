@@ -79,7 +79,7 @@ def paired_video_statistics(rows):
     """Subtract matched observations before averaging noise seeds within scenes."""
     cells=defaultdict(dict)
     for row in rows:
-        if not row['metric'].startswith('video_'):continue
+        if not row['metric'].startswith(('video_correct_','video_wrong_','video_ref_')):continue
         model=row['model']
         if model not in {'released','no_eraf'}:raise ValueError('Unknown paired video model')
         key=tuple(row[k] for k in ['task','phase','metric','scene_seed','noise_seed','reference'])
@@ -238,4 +238,4 @@ def report(root):
 
 if __name__=='__main__':
     ap=argparse.ArgumentParser();ap.add_argument('--root',type=Path,required=True);a=ap.parse_args()
-    r=report(a.root);print(json.dumps({k:v for k,v in r.items() if k not in ['statistics','closed_loop']}))
+    r=report(a.root);print(json.dumps({k:v for k,v in r.items() if k not in ['statistics','closed_loop','paired_video']}))
