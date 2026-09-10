@@ -20,6 +20,44 @@ from scripts.report_robotwin_world_language import verified_state,clustered
 BRANCH={'source':'native','target':'counterfactual'}
 
 
+def validate_annotations(selection, selection_hash, panels, annotations):
+    """Require actual evidence for every preselected clip; never fill ratings."""
+    if panels['selection_sha256']!=selection_hash or annotations['selection_sha256']!=selection_hash:
+        raise ValueError('Review selection changed')
+    expected={(ident,model,seed,language) for ident in selection['states']
+              for model in selection['models'] for seed in selection['noise_seeds']
+              for language in ['source','target']}
+    panel_keys={(p['state_id'],p['seed']):p for p in panels['panels']}
+    if len(panel_keys)!=len(panels['panels']):raise ValueError('Duplicate review panel')
+    enums=dict(relation_established={'yes','no','unobservable'},
+        clear_contradiction={'yes','insufficient_evidence'},
+        generation_quality={'usable','ambiguous','malformed'},
+        paired_semantic_change={'semantic_change','other_visual_change','no_visible_change','unobservable'})
+    seen=set();counts=defaultdict(lambda:defaultdict(int));paired={}
+    for row in annotations['annotations']:
+        key=tuple(row[k] for k in ['state_id','model','seed','language'])
+        if key not in expected or key in seen:raise ValueError('Unexpected or duplicate clip annotation')
+        seen.add(key)
+        panel_record=panel_keys.get((row['state_id'],row['seed']))
+        if panel_record is None or row.get('panel_sha256')!=panel_record['sha256']:
+            raise ValueError('Annotation is not bound to its inspected panel')
+        for field in ['visible_change','evidence']:
+            if not isinstance(row.get(field),str) or not row[field].strip():
+                raise ValueError('Missing actual visual evidence: '+field)
+        for field,allowed in enums.items():
+            if row.get(field) not in allowed:raise ValueError('Missing or invalid rating: '+field)
+            counts[(row['model'],field)][row[field]]+=1
+        if row['relation_established']=='yes' and row['clear_contradiction']=='yes':
+            raise ValueError('Established relation and clear contradiction require review')
+        pair=key[:3]
+        if paired.setdefault(pair,row['paired_semantic_change'])!=row['paired_semantic_change']:
+            raise ValueError('Paired comparison must agree across the two language records')
+    if seen!=expected:raise ValueError('Predetermined qualitative review is incomplete')
+    return dict(complete=True,clips=len(seen),paired_comparisons=len(paired),
+        counts=[dict(model=m,field=f,counts=dict(v)) for (m,f),v in sorted(counts.items())],
+        limitation='Qualitative sampled-window annotations, not physical success rates. Schema validation cannot establish annotation accuracy.')
+
+
 def selected_states(plan):
     """The first two catalog entries; never inspect predictions for selection."""
     scenes={(r['task'],r['scene_seed']) for task in plan['tasks']
@@ -99,7 +137,7 @@ def panel(row,probe,seed,path,models=('released','no_eraf')):
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--root',type=Path,required=True)
-    ap.add_argument('--mode',choices=['freeze','measure','panels'],required=True);args=ap.parse_args()
+    ap.add_argument('--mode',choices=['freeze','measure','panels','validate'],required=True);args=ap.parse_args()
     probe=args.root/'probes';plan=read(probe/'plan.json');plan_hash=sha(probe/'plan.json')
     out=args.root/'video_review';out.mkdir(exist_ok=True)
     selection=dict(format='robotwin_world_language_video_review_v1',plan_sha256=plan_hash,
@@ -110,6 +148,15 @@ def main():
     if frozen.exists():assert read(frozen)==selection
     else:write(frozen,selection)
     if args.mode=='freeze':print(json.dumps(selection));return
+    if args.mode=='validate':
+        panels=read(out/'panels.json');annotations=read(out/'annotations.json')
+        for p in panels['panels']:
+            if sha(Path(p['path']))!=p['sha256']:raise ValueError('Inspected panel changed')
+        result=validate_annotations(selection,sha(frozen),panels,annotations)
+        result.update(selection_sha256=sha(frozen),annotations_sha256=sha(out/'annotations.json'),
+                      panels_sha256=sha(out/'panels.json'))
+        write(out/'semantic_review_coverage.json',result)
+        print(json.dumps(result));return
     lookup={r['id']:r for r in plan['states']}
     if args.mode=='panels':
         manifest=[]
@@ -130,6 +177,7 @@ def main():
                     for seed in plan['noise_seeds']:
                         for language in ['source','target']:
                             annotations.append(dict(state_id=ident,model=model,seed=seed,language=language,
+                                panel_sha256=next(p['sha256'] for p in manifest if p['state_id']==ident and p['seed']==seed),
                                 visible_change=None,relation_established=None,clear_contradiction=None,
                                 generation_quality=None,paired_semantic_change=None,evidence=None))
             write(template,dict(complete=False,selection_sha256=sha(frozen),annotations=annotations))

@@ -41,6 +41,15 @@ Likewise, expert-trajectory similarity is not proof that an alternative trajecto
 violates the goal. Do not infer gripper contact or physical grasp from pixels alone.
 Verified contact/grasp/release outcomes come from the closed-loop simulator.
 
+Interpret left/right and ordering using the task's goal convention, calibrated
+camera geometry or a valid expert reference. Image-screen left is not necessarily
+world-coordinate left. If the relevant relation cannot be established from the
+available view, retain an unobservable rating instead of guessing the convention.
+The overview panels display frames 0, 2, 4, 6 and 8 of each nine-frame clip; inspect
+the original intermediate frames and wrist views when needed to resolve ambiguity.
+Bind each annotation to the inspected panel hash and retain concrete visual
+evidence. A schema/coverage validator cannot establish that a visual rating is true.
+
 The qualitative sample is not a 50-scene video success-rate benchmark. Report its
 actual sample coverage, uncertainty and limitations separately. Do not substitute
 this review for the 1,200 closed-loop episodes or numerical all-state experiments.
