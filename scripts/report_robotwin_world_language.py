@@ -15,6 +15,9 @@ from scripts.probe_robotwin_world_language import read,sha,TASKS
 from scripts.run_robotwin_world_language_collection import write
 from experiments.robotwin.world_language_probe import metrics,preference
 
+GOAL_METRICS = ['source_goal_ever_success', 'counterfactual_goal_ever_success',
+                'source_goal_final_success', 'counterfactual_goal_final_success']
+
 
 def clustered(values,replicates=5000):
     """values=(scene_id, scalar). First average repeated seeds/states per scene."""
@@ -190,7 +193,7 @@ def report(root):
                             assert inp['noise_seed']==seed and inp['video_language']==v
                             assert inp['action_instruction']==c['source_instruction' if a=='source' else 'counterfactual_instruction']
                             assert inp['video_instruction']==c['source_instruction' if v=='source' else 'counterfactual_instruction']
-                            for metric in ['source_goal_ever_success','counterfactual_goal_ever_success']:
+                            for metric in GOAL_METRICS:
                                 add(model,task,f'closed_v_{v}_a_{a}',metric,x['scene_seed'],float(x[metric]),noise_seed=seed)
                                 paired_outcomes[(model,task,x['scene_seed'],seed,v,a,metric)]=float(x[metric])
                             first=first_goal_category(x)
@@ -202,12 +205,14 @@ def report(root):
                                 add(model,task,f'closed_v_{v}_a_{a}',metric,x['scene_seed'],float(x['manipulation_metrics'][metric]),noise_seed=seed)
                             rows.append(x)
                     closed[name]=dict(episodes=len(rows),source_success=sum(x['source_goal_ever_success'] for x in rows),
-                        cf_success=sum(x['counterfactual_goal_ever_success'] for x in rows))
+                        cf_success=sum(x['counterfactual_goal_ever_success'] for x in rows),
+                        source_final_success=sum(x['source_goal_final_success'] for x in rows),
+                        cf_final_success=sum(x['counterfactual_goal_final_success'] for x in rows))
     for scene in plan['scenes']:
         task,s=scene['task'],scene['scene_seed']
         for model in plan['models']:
             for seed in plan['noise_seeds']:
-                for metric in ['source_goal_ever_success','counterfactual_goal_ever_success',
+                for metric in [*GOAL_METRICS,
                                'first_goal_source','first_goal_counterfactual','first_goal_ambiguous']:
                     def get(v,a):return paired_outcomes.get((model,task,s,seed,v,a,metric))
                     A,B,C,D=get('source','source'),get('target','source'),get('source','target'),get('target','target')
