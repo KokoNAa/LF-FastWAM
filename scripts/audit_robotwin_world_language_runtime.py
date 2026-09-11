@@ -44,11 +44,22 @@ def validate_processes(status,launch,proc_root=Path('/proc')):
         checked.append(dict(name=name,pid=job['pid'],start_time=job['start_time'],exit_code=job['exit_code'],current_pid_identity=actual))
     actual=process_identity(launch['pid'],proc_root)
     require(actual is None or actual['start']!=launch['start_time'] or actual['state']=='Z','Owned controller still live')
-    return dict(jobs=checked,controller=dict(**launch,current_pid_identity=actual))
+    previous=[]
+    ancestor=launch.get('previous_controller')
+    while ancestor:
+        old=process_identity(ancestor['pid'],proc_root)
+        require(old is None or old['start']!=ancestor['start_time'] or old['state']=='Z','Previous owned controller still live')
+        previous.append(dict(**ancestor,current_pid_identity=old))
+        ancestor=ancestor.get('previous_controller')
+    require(not status.get('paused') and not status.get('active_jobs'),'Controller still paused or has active jobs')
+    return dict(jobs=checked,controller=dict(**launch,current_pid_identity=actual),previous_controllers=previous)
 
 def audit(root):
-    status_path=root/'status.json';launch_path=root/'launch_resume1.json';plan_path=root/'probes/plan.json'
-    status=read(status_path);launch=read(launch_path);plan=read(plan_path)
+    status_path=root/'status.json';plan_path=root/'probes/plan.json'
+    status=read(status_path)
+    launch_name=status.get('controller_launch','launch_resume1.json')
+    require(launch_name in ['launch_resume1.json','launch_multigpu.json'],'Unexpected controller launch record')
+    launch_path=root/launch_name;launch=read(launch_path);plan=read(plan_path)
     processes=validate_processes(status,launch)
     require(plan['training_performed'] is False,'Unexpected training in inference-only study')
     frozen=Path(status['jobs']['prepare']['command'][1]).parents[1]
@@ -76,6 +87,19 @@ def audit(root):
             count+=1;size+=before.st_size
         groups[label]=dict(files=count,bytes=size)
         print(json.dumps(dict(verified_group=label,**groups[label])),flush=True)
+    extra_evidence=[]
+    if launch_name=='launch_multigpu.json':
+        scheduler=Path(launch['scheduler_path']);scheduler_repo=scheduler.parents[1]
+        blob=subprocess.check_output(['git','show',launch['scheduler_commit']+':scripts/run_robotwin_world_language_parallel.py'],cwd=scheduler_repo)
+        require(hashlib.sha256(blob).hexdigest()==launch['scheduler_sha256'],'Scheduler source differs from launch git object')
+        verify('parallel_scheduler',{str(scheduler):launch['scheduler_sha256']})
+        resume=root/'resume_multigpu_input_audit.json';recovery=Path(launch['recovery_receipt'])
+        require(sha(resume)==launch['input_audit_sha256'] and read(resume)['complete'],'Resume input audit changed')
+        require(sha(recovery)==launch['recovery_receipt_sha256'],'Recovery receipt changed')
+        rec=read(recovery);old_status=recovery.parent/'status_before.json'
+        require(sha(old_status)==rec['status_before_sha256'],'Pre-recovery status changed')
+        verify('archived_interrupted_arm',{str(recovery.parent/rec['arm']/p):v for p,v in rec['files'].items()})
+        extra_evidence.extend([resume,recovery,old_status,root/'launch_resume1.json'])
     verify('runtime_snapshot',snapshot['files'])
     # The actual versioned eval_policy path is absent from the old snapshot map.
     # Its reviewed hash is separately bound to the frozen git object.
@@ -97,7 +121,7 @@ def audit(root):
         require((current.st_size,current.st_mtime_ns,str(p.resolve()))==(record['size'],record['mtime_ns'],record['resolved_path']),'File identity changed during final audit: '+name)
     # Guard against another controller mutation during this final-only audit.
     require(read(status_path)==status,'Controller status changed during final audit')
-    result=dict(format='robotwin_world_language_final_runtime_audit_v1',complete=True,verified_at=time.time(),frozen_worktree=str(frozen),frozen_commit=head,processes=processes,verified_groups=groups,files=records,evidence_sha256={str(p):sha(p) for p in [status_path,launch_path,plan_path,snapshot_path,assets_path,review_path]},scope='Final owned process exits and immutable source/checkpoint/input/assets only. Requires separate completed data, semantic review and scientific-report audits; this is not whole-study completion.')
+    result=dict(format='robotwin_world_language_final_runtime_audit_v1',complete=True,verified_at=time.time(),frozen_worktree=str(frozen),frozen_commit=head,processes=processes,verified_groups=groups,files=records,evidence_sha256={str(p):sha(p) for p in [status_path,launch_path,plan_path,snapshot_path,assets_path,review_path,*extra_evidence]},scope='Final owned process exits and immutable source/checkpoint/input/assets only. Requires separate completed data, semantic review and scientific-report audits; this is not whole-study completion.')
     path=root/'final_runtime_audit.json';path.write_text(json.dumps(result,indent=2)+'\n');return result
 
 if __name__=='__main__':

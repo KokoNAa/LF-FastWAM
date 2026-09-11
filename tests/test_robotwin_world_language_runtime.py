@@ -35,3 +35,13 @@ def test_final_audit_refuses_incomplete_jobs_or_live_controller(tmp_path):
     with pytest.raises(ValueError,match='successful process exit'):validate_processes(bad,l,tmp_path)
     proc(tmp_path,l['pid'],l['start_time'])
     with pytest.raises(ValueError,match='controller still live'):validate_processes(s,l,tmp_path)
+
+
+def test_parallel_final_audit_checks_old_controller_and_active_queue(tmp_path):
+    s,l=state();l['previous_controller']=dict(pid=901,start_time='old',code_commit='frozen')
+    assert len(validate_processes(s,l,tmp_path)['previous_controllers'])==1
+    proc(tmp_path,901,'old')
+    with pytest.raises(ValueError,match='Previous owned controller'):validate_processes(s,l,tmp_path)
+    (tmp_path/'901/stat').unlink()
+    s['active_jobs']=['still-running']
+    with pytest.raises(ValueError,match='active jobs'):validate_processes(s,l,tmp_path)
