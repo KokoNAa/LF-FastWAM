@@ -75,11 +75,13 @@ def load_state(policy, row):
     from experiments.robotwin.no_eraf_probe import observation_hash
     from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
     model = policy.model
-    obs, refs, frames, roi = {}, {}, {}, []
+    from scripts.review_robotwin_world_language_videos import raw_mosaic
+    obs, refs, frames, display, roi = {}, {}, {}, {}, []
     for branch, raw in [('source','native'), ('target','counterfactual')]:
         with h5py.File(row['raw_paths'][raw]) as h:
             obs[branch] = observation(h, row['frame'])
             frames[branch] = [policy._build_robotwin_image_tensor(observation(h,f))[0] for f in row['video_indices']]
+            display[branch] = [raw_mosaic(h,f) for f in row['video_indices']]
             for f in row['video_indices']:
                 ids = np.asarray(h['pgc_entity_state/entity_actor_ids'][f])[
                     np.asarray(h['pgc_entity_state/entity_valid'][f],dtype=bool)]
@@ -91,14 +93,17 @@ def load_state(policy, row):
     image = policy._build_robotwin_image_tensor(obs['source'])
     proprio = policy._normalize_state(obs['source']['joint_action']['vector'])
     first = model._encode_input_image_latents_tensor(image)
-    contexts = {}
+    contexts, text_lengths = {}, {}
     for name in ['source','target','source_paraphrase','target_paraphrase','empty']:
         c,m = model.encode_prompt(DEFAULT_PROMPT.format(task=row['instructions'][name]))
+        text_lengths[name] = c.shape[1]
         contexts[name] = model._append_proprio_to_context(c,m,proprio)
-    for c,m in contexts.values():
+        if not torch.equal(contexts[name][0][:,:-1],c) or not torch.equal(contexts[name][1][:,:-1],m):
+            raise ValueError('Appending proprio modified text embeddings or mask')
+    for name,(c,m) in contexts.items():
         if not torch.equal(c[:,-1],contexts['source'][0][:,-1]):
             raise ValueError('Proprio changed with language')
-        if c.shape[1] != 513 or model.proprio_dim != 14:
+        if c.shape[1] != text_lengths[name]+1 or model.proprio_dim != 14:
             raise ValueError('Unverified text/proprio boundary')
     for name, fs in frames.items():
         clean = model._encode_video_latents(torch.stack(fs,dim=1).unsqueeze(0))
@@ -110,7 +115,7 @@ def load_state(policy, row):
         raise ValueError('Invalid operation/background regions')
     if torch.equal(refs['source'][:,:,1:],refs['target'][:,:,1:]):
         raise ValueError('Expert futures do not diverge in this window')
-    return dict(image=image,first=first,refs=refs,contexts=contexts,roi=roi,frames=frames,
+    return dict(image=image,first=first,refs=refs,contexts=contexts,roi=roi,frames=frames,display=display,
                 observation_sha256=oh(obs['source']),proprio=proprio)
 
 
@@ -233,11 +238,9 @@ def run_generation(policy,row,state,folder,plan,seed,*,smoke=False):
     conditions=plan['generation_conditions']
     if smoke: conditions=[c for c in conditions if c['name'] in ['source','target','source_mask_layer_all']]
     rows=[]; expected_noise=None
-    for branch,frames in state['frames'].items():
+    for branch,frames in state['display'].items():
         d=folder/f'expert_{branch}';d.mkdir(exist_ok=True)
-        for i,t in enumerate(frames):
-            arr=((numpy_tensor(t).transpose(1,2,0)+1)*127.5).clip(0,255).astype('uint8')
-            Image.fromarray(arr).save(d/f'{i:02d}.png')
+        for i,arr in enumerate(frames): Image.fromarray(arr).save(d/f'{i:02d}.png')
     for c in conditions:
         dest=folder/c['name'];dest.mkdir()
         latent,frames,proof=generate(policy,state,plan,seed,c)
@@ -286,7 +289,7 @@ def worker(args):
             state=load_state(policy,row)
             write(folder/'inputs.json',dict(state=row,model=args.model,seed=args.seed,
                   plan_sha256=plan_hash,observation_sha256=state['observation_sha256'],
-                  contexts={k:dict(context_sha256=hash_tensor(v[0]),mask_sha256=hash_tensor(v[1])) for k,v in state['contexts'].items()}))
+                  contexts={k:dict(shape=list(v[0].shape),context_sha256=hash_tensor(v[0]),mask_sha256=hash_tensor(v[1])) for k,v in state['contexts'].items()}))
             run_fixed(policy,row,state,folder,plan,args.seed,smoke=args.smoke)
             if args.smoke or (row['id'] in plan['generation_states'] and args.seed in plan['generation_seeds']):
                 gen=folder/'generated';gen.mkdir()
