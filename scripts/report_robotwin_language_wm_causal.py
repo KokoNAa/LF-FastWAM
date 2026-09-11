@@ -25,7 +25,7 @@ def scene_summary(rows):
 
 
 def summarize(root,allow_partial=False):
-    plan=read(root/'plan.json');ph=sha(root/'plan.json');records=[];pending=[];proofs={};clips=0
+    plan=read(root/'plan.json');ph=sha(root/'plan.json');records=[];pending=[];proofs={};clips=0;layers=[];generations=[]
     for model in plan['models']:
         for seed in plan['noise_seeds']:
             for state in plan['states']:
@@ -39,7 +39,14 @@ def summarize(root,allow_partial=False):
                 proofs[str(d/'complete.json')]=sha(d/'complete.json')
                 for row in fixed['rows']:
                     records.append(dict(model=model,task=state['task'],scene=state['scene_seed'],**row))
-                if generated:clips+=read(d/'generated/generations.json')['clips']
+                for group in fixed['layer_residuals']:
+                    for row in group['rows']:
+                        layers.append(dict(model=model,task=state['task'],scene=state['scene_seed'],seed=seed,
+                                           reference=group['reference'],sigma=group['sigma'],**row))
+                if generated:
+                    gen=read(d/'generated/generations.json');clips+=gen['clips']
+                    for row in gen['rows']:
+                        generations.append(dict(model=model,task=state['task'],state=state['id'],seed=seed,**row))
     if pending and not allow_partial:raise ValueError(f'{len(pending)} states remain')
     groups=defaultdict(list);conditions=defaultdict(dict)
     for row in records:
@@ -70,6 +77,7 @@ def summarize(root,allow_partial=False):
     report=dict(format='robotwin_language_wm_causal_report_v1',complete=False,compute_complete=not pending,
         plan_sha256=ph,states_verified=len(proofs),expected_states=60,fixed_rows=len(records),
         generated_clips=clips,expected_generated_clips=270,pending=pending,statistics=statistics,
+        layer_residuals=layers,generation_records=generations,
         verified_state_proofs=proofs,semantic_review_complete=False,
         uncertainty='Average paired noise within each scene. Two scenes/task: descriptive means/ranges, no population CI.',
         caveats=['New raw measurements; no success-rate weighting.',
@@ -134,6 +142,22 @@ def plots(report,out):
     axs[0,0].legend(fontsize=8)
     fig.suptitle('Text masking inside WM | sigma=1 | 2 scenes/task, 3 paired noise repeats\nPositive: correct language fits this expert future better; descriptive means')
     for ext in ['png','pdf']:fig.savefig(out/f'wm_text_masking.{ext}',dpi=180)
+    plt.close(fig)
+    fig,axs=plt.subplots(2,5,figsize=(16,6),layout='constrained')
+    for mi,model in enumerate(models):
+        for ti,task in enumerate(tasks):
+            ax=axs[mi,ti]
+            for field,label in [('object_rms','Object region'),('background_rms','Background')]:
+                values=[np.mean([r[field] for r in report['layer_residuals'] if r['model']==model
+                         and r['task']==task and r['sigma']==1. and r['reference']=='target' and r['layer']==layer])
+                        for layer in range(30)]
+                ax.plot(range(30),values,label=label)
+            ax.axvline(9.5,color='gray',lw=.6,ls='--');ax.axvline(19.5,color='gray',lw=.6,ls='--')
+            ax.set_title(f'{model} / {labels[ti]}',fontsize=10);ax.set_xlabel('Video layer (0-based)')
+            if ti==0:ax.set_ylabel('Source-target cross-attention residual RMS')
+    axs[0,0].legend(fontsize=8)
+    fig.suptitle('Where text changes WM representations | future tokens | sigma=1\nExpert-union object regions; sensitivity maps do not establish object-level causality')
+    for ext in ['png','pdf']:fig.savefig(out/f'wm_layer_residuals.{ext}',dpi=180)
     plt.close(fig)
     fig,axs=plt.subplots(2,2,figsize=(13,8),layout='constrained')
     for mi,model in enumerate(models):
