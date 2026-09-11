@@ -91,13 +91,16 @@ def summarize(root,allow_partial=False):
     return report,out
 
 
-def panels(root,out):
+def panels(root,out,allow_partial=False):
     from PIL import Image,ImageDraw
     plan=read(root/'plan.json');items=[]
     variants=[c['name'] for c in plan['generation_conditions'] if c['name'] not in ['source','target']]
     for model in plan['models']:
         for state in [r for r in plan['states'] if r['id'] in plan['generation_states']]:
             folder=root/'results'/model/'seed42'/state['id']/'generated'
+            if not (folder.parent/'complete.json').exists():
+                if allow_partial: continue
+                raise ValueError('Cannot review unfinished generated conditions')
             for page,start in enumerate(range(0,len(variants),5)):
                 labels=['source','target']+variants[start:start+5]+['expert_source','expert_target']
                 width=5*320;height=124+len(labels)*286
@@ -117,7 +120,7 @@ def panels(root,out):
                 img.save(path,quality=94)
                 items.append(dict(model=model,state=state['id'],path=str(path),sha256=sha(path),conditions=labels,
                                   frame_indices=[0,2,4,6,8],reviewed=False))
-    write(out/'panels.json',dict(complete=True,panels=items,semantics_reviewed=False))
+    write(out/'panels.json',dict(complete=len(items)==50,panels=items,semantics_reviewed=False))
 
 
 def plots(report,out):
@@ -181,8 +184,8 @@ def main():
     ap.add_argument('--allow-partial',action='store_true');ap.add_argument('--render',action='store_true')
     args=ap.parse_args();report,out=summarize(args.output,args.allow_partial)
     if args.render:
-        if not report['compute_complete']:raise ValueError('Render final panels after all shards complete')
-        plots(report,out);panels(args.output,out)
+        if report['compute_complete']: plots(report,out)
+        panels(args.output,out,allow_partial=args.allow_partial)
     print(json.dumps({k:report[k] for k in ['compute_complete','states_verified','fixed_rows','generated_clips']}))
 
 
